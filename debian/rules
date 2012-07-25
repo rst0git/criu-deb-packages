@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=-all
+
+%:
+	dh ${@}
+
+override_dh_auto_test:
+	# disabled: doesn't work yet
+
+override_dh_builddeb:
+	dh_builddeb -- -Zxz -z9
+
+override_dh_strip:
+	dh_strip --dbg-package=crtools-dbg

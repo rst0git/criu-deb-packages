@@ -1,0 +1,25 @@
+Source: crtools
+Section: admin
+Priority: optional
+Maintainer: Daniel Baumann <daniel.baumann@progress-technologies.net>
+Build-Depends: debhelper (>= 9), libprotobuf-c0-dev, protobuf-c-compiler
+Standards-Version: 3.9.3
+Homepage: http://www.criu.org/
+
+Package: crtools
+Architecture: linux-any
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: checkpoint and restore in userspace
+ crtools contains the utilities to checkpoint and restore processes in
+ userspace.
+
+Package: crtools-dbg
+Section: debug
+Priority: extra
+Architecture: linux-any
+Depends: ${misc:Depends}, crtools (= ${binary:Version})
+Description: checkpoint and restore in userspace (debug)
+ crtools contains the utilities to checkpoint and restore processes in
+ userspace.
+ .
+ This package contains the debugging symbols.
