@@ -1,3 +1,9 @@
+crtools (0.1-2) unstable; urgency=low
+
+  * Restricting architectures to linux on amd64 only (Closes: #683416).
+
+ -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Tue, 31 Jul 2012 19:56:38 +0200
+
 crtools (0.1-1) unstable; urgency=low
 
   * Initial release.

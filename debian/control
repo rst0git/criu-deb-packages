@@ -7,7 +7,7 @@ Standards-Version: 3.9.3
 Homepage: http://www.criu.org/
 
 Package: crtools
-Architecture: linux-any
+Architecture: amd64
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Description: checkpoint and restore in userspace
  crtools contains the utilities to checkpoint and restore processes in
@@ -16,7 +16,7 @@ Description: checkpoint and restore in userspace
 Package: crtools-dbg
 Section: debug
 Priority: extra
-Architecture: linux-any
+Architecture: amd64
 Depends: ${misc:Depends}, crtools (= ${binary:Version})
 Description: checkpoint and restore in userspace (debug)
  crtools contains the utilities to checkpoint and restore processes in
