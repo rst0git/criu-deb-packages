@@ -32,6 +32,7 @@ struct sockaddr;
 struct msghdr;
 struct rusage;
 struct file_handle;
+struct robust_list_head;
 
 #ifndef F_GETFD
 #define F_GETFD 1
@@ -51,6 +52,10 @@ struct file_handle;
 
 #ifndef CLONE_NEWIPC
 #define CLONE_NEWIPC	0x08000000
+#endif
+
+#ifndef CLONE_NEWNET
+#define CLONE_NEWNET	0x40000000
 #endif
 
 #define setns	sys_setns

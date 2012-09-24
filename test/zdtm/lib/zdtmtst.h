@@ -4,11 +4,16 @@
 #include <sys/types.h>
 
 /* set up test */
+extern void test_ext_init(int argc, char **argv);
 extern void test_init(int argc, char **argv);
 extern void test_init_ns(int argc, char **argv, unsigned long clone_flags, int (*fn)(int , char **));
 
 #ifndef CLONE_NEWUTS
 #define CLONE_NEWUTS 0x04000000
+#endif
+
+#ifndef CLONE_NEWIPC
+#define CLONE_NEWIPC 0x08000000
 #endif
 
 /*wrapper for fork: init log offset*/
@@ -58,6 +63,7 @@ extern void __push_opt(struct long_opt *opt);
 #define __param_check(name, p, type) \
 	static inline type *__check_##name(void) { return(p); }
 
+extern void parseargs(int, char **);
 extern int parse_opt_bool(char *param, void *arg);
 #define param_check_bool(name, p) __param_check(name, p, int)
 extern int parse_opt_int(char *param, void *arg);
@@ -78,7 +84,8 @@ extern int parse_opt_string(char *param, void *arg);
 #define __stringify(x)          __stringify_1(x)
 
 /* message helpers */
-#define LOG_BUF_SIZE 0x1000
+extern void setup_outfile(void);
+extern int test_log_init(const char *outfile, const char *suffix);
 #define err(format, arg...)	\
 	test_msg("ERR: %s:%d: " format " (errno = %d)\n", \
 		__FILE__, __LINE__, ## arg, errno)
@@ -100,5 +107,8 @@ extern void task_waiter_fini(task_waiter_t *t);
 extern void task_waiter_wait4(task_waiter_t *t, unsigned int lockid);
 extern void task_waiter_complete(task_waiter_t *t, unsigned int lockid);
 extern void task_waiter_complete_current(task_waiter_t *t);
+extern int tcp_init_server(int *port);
+extern int tcp_accept_server(int sock);
+extern int tcp_init_client(char *servIP, unsigned short servPort);
 
 #endif /* _VIMITESU_H_ */

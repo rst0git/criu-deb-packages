@@ -7,10 +7,12 @@
 
 #include "crtools.h"
 
+#include "mount.h"
 #include "files.h"
 #include "image.h"
 #include "list.h"
 #include "util.h"
+#include "atomic.h"
 
 #include "protobuf.h"
 #include "protobuf/regfile.pb-c.h"
@@ -35,27 +37,19 @@ struct ghost_file {
 			char *path;
 		};
 	};
+	unsigned int users;
 };
 
 static u32 ghost_file_ids = 1;
 static LIST_HEAD(ghost_files);
+
+static mutex_t *ghost_file_mutex;
 
 /*
  * This constant is selected without any calculations. Just do not
  * want to pick up too big files with us in the image.
  */
 #define MAX_GHOST_FILE_SIZE	(1 * 1024 * 1024)
-
-void clear_ghost_files(void)
-{
-	struct ghost_file *gf;
-
-	pr_info("Unlinking ghosts\n");
-	list_for_each_entry(gf, &ghost_files, list) {
-		pr_info("\t`- %s\n", gf->path);
-		unlink(gf->path);
-	}
-}
 
 static int open_remap_ghost(struct reg_file_info *rfi,
 		RemapFilePathEntry *rfe)
@@ -76,7 +70,7 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 
 	pr_info("Opening ghost file %#x for %s\n", rfe->remap_id, rfi->path);
 
-	gf = xmalloc(sizeof(*gf));
+	gf = shmalloc(sizeof(*gf));
 	if (!gf)
 		return -1;
 	gf->path = xmalloc(PATH_MAX);
@@ -87,7 +81,7 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	if (ifd < 0)
 		goto err;
 
-	if (pb_read(ifd, &gfe, ghost_file_entry) < 0)
+	if (pb_read_one(ifd, &gfe, PB_GHOST_FILE) < 0)
 		goto err;
 
 	snprintf(gf->path, PATH_MAX, "%s.cr.%x.ghost", rfi->path, rfe->remap_id);
@@ -122,16 +116,18 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	close(gfd);
 
 	gf->id = rfe->remap_id;
+	gf->users = 0;
 	list_add_tail(&gf->list, &ghost_files);
 gf_found:
-	rfi->remap_path = gf->path;
+	gf->users++;
+	rfi->ghost = gf;
 	return 0;
 
 err:
 	if (gfe)
 		ghost_file_entry__free_unpacked(gfe, NULL);
 	xfree(gf->path);
-	xfree(gf);
+	shfree_last(gf);
 	return -1;
 }
 
@@ -148,7 +144,7 @@ static int collect_remaps(void)
 		struct file_desc *fdesc;
 		struct reg_file_info *rfi;
 
-		ret = pb_read_eof(fd, &rfe, remap_file_path_entry);
+		ret = pb_read_one_eof(fd, &rfe, PB_REMAP_FPATH);
 		if (ret <= 0)
 			break;
 
@@ -183,7 +179,7 @@ tail:
 
 static int dump_ghost_file(int _fd, u32 id, const struct stat *st)
 {
-	int img, fd;
+	int img, fd = -1;
 	GhostFileEntry gfe = GHOST_FILE_ENTRY__INIT;
 	char lpath[32];
 
@@ -197,7 +193,7 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st)
 	gfe.gid = st->st_gid;
 	gfe.mode = st->st_mode;
 
-	if (pb_write(img, &gfe, ghost_file_entry))
+	if (pb_write_one(img, &gfe, PB_GHOST_FILE))
 		return -1;
 
 	if (S_ISREG(st->st_mode)) {
@@ -215,7 +211,7 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st)
 			return -1;
 	}
 
-	close(fd);
+	close_safe(&fd);
 	close(img);
 	return 0;
 }
@@ -253,11 +249,11 @@ dump_entry:
 	rpe.orig_id = id;
 	rpe.remap_id = gf->id | REMAP_GHOST;
 
-	return pb_write(fdset_fd(glob_fdset, CR_FD_REMAP_FPATH),
-			&rpe, remap_file_path_entry);
+	return pb_write_one(fdset_fd(glob_fdset, CR_FD_REMAP_FPATH),
+			&rpe, PB_REMAP_FPATH);
 }
 
-static int check_path_remap(char *path, const struct stat *ost, int lfd, u32 id)
+static int check_path_remap(char *rpath, const struct stat *ost, int lfd, u32 id)
 {
 	int ret;
 	struct stat pst;
@@ -269,9 +265,9 @@ static int check_path_remap(char *path, const struct stat *ost, int lfd, u32 id)
 		 * be careful whether anybody still has any of its hardlinks
 		 * also open.
 		 */
-		return dump_ghost_remap(path, ost, lfd, id);
+		return dump_ghost_remap(rpath + 1, ost, lfd, id);
 
-	ret = stat(path, &pst);
+	ret = fstatat(mntns_root, rpath, &pst, 0);
 	if (ret < 0) {
 		/*
 		 * FIXME linked file, but path is not accessible (unless any
@@ -284,6 +280,10 @@ static int check_path_remap(char *path, const struct stat *ost, int lfd, u32 id)
 	}
 
 	if ((pst.st_ino != ost->st_ino) || (pst.st_dev != ost->st_dev)) {
+		if (opts.evasive_devices &&
+		    (S_ISCHR(ost->st_mode) || S_ISBLK(ost->st_mode)) &&
+		    pst.st_rdev == ost->st_rdev)
+			return 0;
 		/*
 		 * FIXME linked file, but the name we see it by is reused
 		 * by somebody else.
@@ -304,13 +304,13 @@ static int check_path_remap(char *path, const struct stat *ost, int lfd, u32 id)
 int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 {
 	char fd_str[128];
-	char path[PATH_MAX];
+	char rpath[PATH_MAX + 1] = ".", *path = rpath + 1;
 	int len, rfd;
 
 	RegFileEntry rfe = REG_FILE_ENTRY__INIT;
 
 	snprintf(fd_str, sizeof(fd_str), "/proc/self/fd/%d", lfd);
-	len = readlink(fd_str, path, sizeof(path) - 1);
+	len = readlink(fd_str, path, sizeof(rpath) - 2);
 	if (len < 0) {
 		pr_perror("Can't readlink %s", fd_str);
 		return len;
@@ -320,7 +320,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	pr_info("Dumping path for %d fd via self %d [%s]\n",
 			p->fd, lfd, path);
 
-	if (check_path_remap(path, &p->stat, lfd, id))
+	if (check_path_remap(rpath, &p->stat, lfd, id))
 		return -1;
 
 	rfe.id		= id;
@@ -331,12 +331,11 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 
 	rfd = fdset_fd(glob_fdset, CR_FD_REG_FILES);
 
-	return pb_write(rfd, &rfe, reg_file_entry);
+	return pb_write_one(rfd, &rfe, PB_REG_FILES);
 }
 
 static const struct fdtype_ops regfile_ops = {
 	.type		= FD_TYPES__REG,
-	.make_gen_id	= make_gen_id,
 	.dump		= dump_one_reg_file,
 };
 
@@ -354,12 +353,14 @@ static int open_path(struct file_desc *d,
 
 	rfi = container_of(d, struct reg_file_info, d);
 
-	if (rfi->remap_path)
-		if (link(rfi->remap_path, rfi->path) < 0) {
+	if (rfi->ghost) {
+		mutex_lock(ghost_file_mutex);
+		if (link(rfi->ghost->path, rfi->path) < 0) {
 			pr_perror("Can't link %s -> %s\n",
-					rfi->remap_path, rfi->path);
+					rfi->ghost->path, rfi->path);
 			return -1;
 		}
+	}
 
 	tmp = open_cb(rfi, arg);
 	if (tmp < 0) {
@@ -367,8 +368,15 @@ static int open_path(struct file_desc *d,
 		return -1;
 	}
 
-	if (rfi->remap_path)
+	if (rfi->ghost) {
 		unlink(rfi->path);
+		BUG_ON(!rfi->ghost->users);
+		if (--rfi->ghost->users == 0) {
+			pr_info("Unlink the ghost %s\n", rfi->ghost->path);
+			unlink(rfi->ghost->path);
+		}
+		mutex_unlock(ghost_file_mutex);
+	}
 
 	if (restore_fown(tmp, rfi->rfe->fown))
 		return -1;
@@ -422,44 +430,38 @@ static struct file_desc_ops reg_desc_ops = {
 	.open = open_fe_fd,
 };
 
-int collect_reg_files(void)
+static int collect_one_regfile(void *o, ProtobufCMessage *base)
 {
-	struct reg_file_info *rfi = NULL;
-	int fd, ret = -1;
+	struct reg_file_info *rfi = o;
 
-	fd = open_image_ro(CR_FD_REG_FILES);
-	if (fd < 0)
+	rfi->rfe = pb_msg(base, RegFileEntry);
+	rfi->path = rfi->rfe->name;
+	rfi->ghost = NULL;
+
+	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
+	file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);
+
+	return 0;
+}
+
+int prepare_shared_reg_files(void)
+{
+	ghost_file_mutex = shmalloc(sizeof(*ghost_file_mutex));
+	if (!ghost_file_mutex)
 		return -1;
 
-	while (1) {
-		RegFileEntry *rfe;
+	mutex_init(ghost_file_mutex);
+	return 0;
+}
 
-		rfi = xmalloc(sizeof(*rfi));
-		ret = -1;
-		if (rfi == NULL)
-			break;
+int collect_reg_files(void)
+{
+	int ret;
 
-		rfi->path = NULL;
+	ret = collect_image(CR_FD_REG_FILES, PB_REG_FILES,
+			sizeof(struct reg_file_info), collect_one_regfile);
+	if (!ret)
+		ret = collect_remaps();
 
-		ret = pb_read_eof(fd, &rfe, reg_file_entry);
-		if (ret <= 0)
-			break;
-
-		rfi->rfe = rfe;
-		rfi->path = rfe->name;
-
-		rfi->remap_path = NULL;
-
-		pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
-		file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);
-	}
-
-	if (rfi) {
-		xfree(rfi->path);
-		xfree(rfi);
-	}
-
-	close(fd);
-
-	return collect_remaps();
+	return ret;
 }

@@ -1,7 +1,7 @@
 #ifndef CR_PARASITE_H_
 #define CR_PARASITE_H_
 
-#define PARASITE_STACK_SIZE	2048
+#define PARASITE_STACK_SIZE	(16 << 10)
 #define PARASITE_ARG_SIZE	8196
 
 #define PARASITE_MAX_SIZE	(64 << 10)
@@ -11,8 +11,6 @@
 #include <sys/un.h>
 
 #include "image.h"
-#include "sockets.h"
-
 #include "util-net.h"
 
 #include "../protobuf/vma.pb-c.h"
@@ -21,7 +19,6 @@
 
 enum {
 	PARASITE_CMD_INIT,
-	PARASITE_CMD_TCONNECT,
 	PARASITE_CMD_SET_LOGFD,
 	PARASITE_CMD_FINI,
 
@@ -34,13 +31,17 @@ enum {
 	PARASITE_CMD_DUMP_MISC,
 	PARASITE_CMD_DUMP_TID_ADDR,
 	PARASITE_CMD_DRAIN_FDS,
+	PARASITE_CMD_GET_PROC_FD,
 
 	PARASITE_CMD_MAX,
 };
 
 struct parasite_init_args {
-	int			sun_len;
-	struct sockaddr_un	saddr;
+	int			h_addr_len;
+	struct sockaddr_un	h_addr;
+
+	int			p_addr_len;
+	struct sockaddr_un	p_addr;
 };
 
 struct parasite_dump_pages_args {
@@ -83,9 +84,14 @@ struct parasite_dump_tid_info {
 #define PARASITE_MAX_FDS	(PAGE_SIZE / sizeof(int))
 
 struct parasite_drain_fd {
-	int			fds[PARASITE_MAX_FDS];
-	int			nr_fds;
+	int	nr_fds;
+	int	fds[PARASITE_MAX_FDS];
 };
+
+static inline int drain_fds_size(struct parasite_drain_fd *dfds)
+{
+	return sizeof(dfds->nr_fds) + dfds->nr_fds * sizeof(dfds->fds[0]);
+}
 
 /*
  * Some useful offsets

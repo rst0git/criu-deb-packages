@@ -3,6 +3,8 @@
 #include <linux/sockios.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <string.h>
 
 #include "crtools.h"
 #include "util.h"
@@ -19,12 +21,6 @@
 #include "protobuf.h"
 #include "protobuf/tcp-stream.pb-c.h"
 
-#ifndef TCP_REPAIR
-#define TCP_REPAIR		19      /* TCP sock is under repair right now */
-#define TCP_REPAIR_QUEUE	20
-#define TCP_QUEUE_SEQ		21
-#define TCP_REPAIR_OPTIONS	22
-
 struct tcp_repair_opt {
 	u32	opt_code;
 	u32	opt_val;
@@ -36,13 +32,13 @@ enum {
 	TCP_SEND_QUEUE,
 	TCP_QUEUES_NR,
 };
-#endif
 
 #ifndef TCPOPT_SACK_PERM
 #define TCPOPT_SACK_PERM TCPOPT_SACK_PERMITTED
 #endif
 
-static LIST_HEAD(tcp_repair_sockets);
+static LIST_HEAD(cpt_tcp_repair_sockets);
+static LIST_HEAD(rst_tcp_repair_sockets);
 
 static int tcp_repair_on(int fd)
 {
@@ -53,14 +49,6 @@ static int tcp_repair_on(int fd)
 		pr_perror("Can't turn TCP repair mode ON");
 
 	return ret;
-}
-
-static void tcp_repair_off(int fd)
-{
-	int aux = 0;
-
-	if (setsockopt(fd, SOL_TCP, TCP_REPAIR, &aux, sizeof(aux)) < 0)
-		pr_perror("Failed to turn off repair mode on socket");
 }
 
 static int tcp_repair_establised(int fd, struct inet_sk_desc *sk)
@@ -79,19 +67,22 @@ static int tcp_repair_establised(int fd, struct inet_sk_desc *sk)
 		goto err1;
 	}
 
-	ret = nf_lock_connection(sk);
-	if (ret < 0)
-		goto err2;
+	if (!(opts.namespaces_flags & CLONE_NEWNET)) {
+		ret = nf_lock_connection(sk);
+		if (ret < 0)
+			goto err2;
+	}
 
 	ret = tcp_repair_on(sk->rfd);
 	if (ret < 0)
 		goto err3;
 
-	list_add_tail(&sk->rlist, &tcp_repair_sockets);
+	list_add_tail(&sk->rlist, &cpt_tcp_repair_sockets);
 	return 0;
 
 err3:
-	nf_unlock_connection(sk);
+	if (!(opts.namespaces_flags & CLONE_NEWNET))
+		nf_unlock_connection(sk);
 err2:
 	close(sk->rfd);
 err1:
@@ -112,11 +103,11 @@ static void tcp_unlock_one(struct inet_sk_desc *sk)
 	close(sk->rfd);
 }
 
-void tcp_unlock_all(void)
+void cpt_unlock_tcp_connections(void)
 {
 	struct inet_sk_desc *sk, *n;
 
-	list_for_each_entry_safe(sk, n, &tcp_repair_sockets, rlist)
+	list_for_each_entry_safe(sk, n, &cpt_tcp_repair_sockets, rlist)
 		tcp_unlock_one(sk);
 }
 
@@ -213,8 +204,11 @@ static int tcp_stream_get_options(int sk, TcpStreamEntry *tse)
 		goto err_sopt;
 
 	tse->opt_mask = ti.tcpi_options;
-	if (ti.tcpi_options & TCPI_OPT_WSCALE)
+	if (ti.tcpi_options & TCPI_OPT_WSCALE) {
 		tse->snd_wscale = ti.tcpi_snd_wscale;
+		tse->rcv_wscale = ti.tcpi_rcv_wscale;
+		tse->has_rcv_wscale = true;
+	}
 
 	pr_info("\toptions: mss_clamp %x wscale %x tstamp %d sack %d\n",
 			(int)tse->mss_clamp,
@@ -274,7 +268,7 @@ static int dump_tcp_conn_state(struct inet_sk_desc *sk)
 	if (img_fd < 0)
 		goto err_img;
 
-	ret = pb_write(img_fd, &tse, tcp_stream_entry);
+	ret = pb_write_one(img_fd, &tse, PB_TCP_STREAM);
 	if (ret < 0)
 		goto err_iw;
 
@@ -407,9 +401,10 @@ static int restore_tcp_opts(int sk, TcpStreamEntry *tse)
 	}
 
 	if (tse->opt_mask & TCPI_OPT_WSCALE) {
-		pr_debug("\t\tWill set wscale to %u\n", tse->snd_wscale);
+		pr_debug("\t\tWill set snd_wscale to %u\n", tse->snd_wscale);
+		pr_debug("\t\tWill set rcv_wscale to %u\n", tse->rcv_wscale);
 		opts[onr].opt_code = TCPOPT_WINDOW;
-		opts[onr].opt_val = tse->snd_wscale;
+		opts[onr].opt_val = tse->snd_wscale + (tse->rcv_wscale << 16);
 		onr++;
 	}
 
@@ -441,11 +436,11 @@ static int restore_tcp_conn_state(int sk, struct inet_sk_info *ii)
 
 	pr_info("Restoring TCP connection id %x ino %x\n", ii->ie->id, ii->ie->ino);
 
-	ifd = open_image_ro(CR_FD_TCP_STREAM, ii->ie->id);
+	ifd = open_image_ro(CR_FD_TCP_STREAM, ii->ie->ino);
 	if (ifd < 0)
 		goto err;
 
-	if (pb_read(ifd, &tse, tcp_stream_entry) < 0)
+	if (pb_read_one(ifd, &tse, PB_TCP_STREAM) < 0)
 		goto err_c;
 
 	if (restore_tcp_seqs(sk, tse))
@@ -474,6 +469,51 @@ err:
 	return -1;
 }
 
+/*
+ * rst_tcp_socks contains sockets in repair mode,
+ * which will be off in restorer before resuming.
+ */
+static int *rst_tcp_socks = NULL;
+static int rst_tcp_socks_num = 0;
+int rst_tcp_socks_size = 0;
+
+int rst_tcp_socks_remap(void *addr)
+{
+	void *ret;
+	if (!rst_tcp_socks) {
+		BUG_ON(rst_tcp_socks_size);
+		return 0;
+	}
+
+	rst_tcp_socks[rst_tcp_socks_num] = -1;
+
+	ret = mmap(addr, rst_tcp_socks_size, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+
+	if (ret != addr) {
+		pr_perror("mmap() failed\n");
+		return -1;
+	}
+
+	memcpy(addr, rst_tcp_socks, rst_tcp_socks_size);
+
+	return 0;
+}
+
+static int rst_tcp_socks_add(int fd)
+{
+	/* + 2 = ( new one + guard (-1) ) */
+	if ((rst_tcp_socks_num + 2) * sizeof(int) > rst_tcp_socks_size) {
+		rst_tcp_socks_size += PAGE_SIZE;
+		rst_tcp_socks = xrealloc(rst_tcp_socks, rst_tcp_socks_size);
+		if (rst_tcp_socks == NULL)
+			return -1;
+	}
+
+	rst_tcp_socks[rst_tcp_socks_num++] = fd;
+	return 0;
+}
+
 int restore_one_tcp(int fd, struct inet_sk_info *ii)
 {
 	pr_info("Restoring TCP connection\n");
@@ -481,23 +521,25 @@ int restore_one_tcp(int fd, struct inet_sk_info *ii)
 	if (tcp_repair_on(fd))
 		return -1;
 
+	if (rst_tcp_socks_add(fd))
+		return -1;
+
 	if (restore_tcp_conn_state(fd, ii))
 		return -1;
 
-	tcp_repair_off(fd);
 	return 0;
 }
 
 void tcp_locked_conn_add(struct inet_sk_info *ii)
 {
-	list_add_tail(&ii->rlist, &tcp_repair_sockets);
+	list_add_tail(&ii->rlist, &rst_tcp_repair_sockets);
 }
 
-void tcp_unlock_connections(void)
+void rst_unlock_tcp_connections(void)
 {
 	struct inet_sk_info *ii;
 
-	list_for_each_entry(ii, &tcp_repair_sockets, rlist)
+	list_for_each_entry(ii, &rst_tcp_repair_sockets, rlist)
 		nf_unlock_connection_info(ii);
 }
 
@@ -506,13 +548,14 @@ void show_tcp_stream(int fd, struct cr_options *opt)
 	TcpStreamEntry *tse;
 	pr_img_head(CR_FD_TCP_STREAM);
 
-	if (pb_read_eof(fd, &tse, tcp_stream_entry) > 0) {
+	if (pb_read_one_eof(fd, &tse, PB_TCP_STREAM) > 0) {
 		pr_msg("IN:   seq %10u len %10u\n", tse->inq_seq, tse->inq_len);
 		pr_msg("OUT:  seq %10u len %10u\n", tse->outq_seq, tse->outq_len);
 		pr_msg("OPTS: %#x\n", (int)tse->opt_mask);
 		pr_msg("\tmss_clamp %u\n", (int)tse->mss_clamp);
 		if (tse->opt_mask & TCPI_OPT_WSCALE)
-			pr_msg("\twscale %u\n", (int)tse->snd_wscale);
+			pr_msg("\tsnd wscale %u\n", (int)tse->snd_wscale);
+			pr_msg("\trcv wscale %u\n", (int)tse->rcv_wscale);
 		if (tse->opt_mask & TCPI_OPT_TIMESTAMPS)
 			pr_msg("\ttimestamps\n");
 		if (tse->opt_mask & TCPI_OPT_SACK)

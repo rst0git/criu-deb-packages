@@ -4,7 +4,12 @@
 #include <sys/eventfd.h>
 #include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <sys/signalfd.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+
 #include "proc_parse.h"
 #include "sockets.h"
 #include "crtools.h"
@@ -14,6 +19,54 @@
 #include "files.h"
 #include "sk-inet.h"
 #include "proc_parse.h"
+#include "mount.h"
+#include "tty.h"
+
+static int check_tty(void)
+{
+	int master = -1, slave = -1;
+	const int lock = 1;
+	struct termios t;
+	char *slavename;
+	int ret = -1;
+
+	if (ARRAY_SIZE(t.c_cc) < TERMIOS_NCC) {
+		pr_msg("struct termios has %d @c_cc while "
+			"at least %d expected.\n",
+			(int)ARRAY_SIZE(t.c_cc),
+			TERMIOS_NCC);
+		goto out;
+	}
+
+	master = open("/dev/ptmx", O_RDWR);
+	if (master < 0) {
+		pr_msg("Can't open master pty.\n");
+		goto out;
+	}
+
+	if (ioctl(master, TIOCSPTLCK, &lock)) {
+		pr_msg("Unable to lock pty device.\n");
+		goto out;
+	}
+
+	slavename = ptsname(master);
+	slave = open(slavename, O_RDWR);
+	if (slave < 0) {
+		if (errno != EIO) {
+			pr_msg("Unexpected error code on locked pty.\n");
+			goto out;
+		}
+	} else {
+		pr_msg("Managed to open locked pty.\n");
+		goto out;
+	}
+
+	ret = 0;
+out:
+	close_safe(&master);
+	close_safe(&slave);
+	return ret;
+}
 
 static int check_map_files(void)
 {
@@ -31,7 +84,7 @@ static int check_sock_diag(void)
 {
 	int ret;
 
-	ret = collect_sockets();
+	ret = collect_sockets(getpid());
 	if (!ret)
 		return 0;
 
@@ -179,6 +232,35 @@ static int check_fdinfo_eventfd(void)
 	return 0;
 }
 
+static int check_one_sfd(union fdinfo_entries *e, void *arg)
+{
+	return 0;
+}
+
+static int check_fdinfo_signalfd(void)
+{
+	int fd, ret;
+	sigset_t mask;
+
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGUSR1);
+	fd = signalfd(-1, &mask, 0);
+	if (fd < 0) {
+		pr_perror("Can't make signalfd");
+		return -1;
+	}
+
+	ret = parse_fdinfo(fd, FD_TYPES__SIGNALFD, check_one_sfd, NULL);
+	close(fd);
+
+	if (ret) {
+		pr_err("Error parsing proc fdinfo\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 static int check_one_epoll(union fdinfo_entries *e, void *arg)
 {
 	*(int *)arg = e->epl.tfd;
@@ -274,6 +356,7 @@ static int check_fdinfo_ext(void)
 
 	ret |= check_fdinfo_eventfd();
 	ret |= check_fdinfo_eventpoll();
+	ret |= check_fdinfo_signalfd();
 	ret |= check_fdinfo_inotify();
 
 	return ret;
@@ -302,6 +385,11 @@ int cr_check(void)
 {
 	int ret = 0;
 
+	if (mntns_collect_root(getpid())) {
+		pr_err("Can't collect root mount point\n");
+		return -1;
+	}
+
 	ret |= check_map_files();
 	ret |= check_sock_diag();
 	ret |= check_ns_last_pid();
@@ -313,6 +401,7 @@ int cr_check(void)
 	ret |= check_tcp_repair();
 	ret |= check_fdinfo_ext();
 	ret |= check_unaligned_vmsplice();
+	ret |= check_tty();
 
 	if (!ret)
 		pr_msg("Looks good.\n");

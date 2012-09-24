@@ -36,6 +36,26 @@
 
 #include "crtools.h"
 
+/* /proc/PID/maps can contain not up to date information about stack */
+void mark_stack_vma(unsigned long sp, struct list_head *vma_area_list)
+{
+	struct vma_area *vma_area;
+	list_for_each_entry(vma_area, vma_area_list, list) {
+		if (in_vma_area(vma_area, sp)) {
+			vma_area->vma.status |= VMA_AREA_STACK;
+			vma_area->vma.flags  |= MAP_GROWSDOWN;
+
+			/*
+			 * The kernel doesn't show stack guard pages on
+			 * proc output, so add pages here by hands.
+			 */
+			vma_area->vma.start -= PAGE_SIZE;
+			return;
+		}
+	}
+	BUG();
+}
+
 void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
 {
 	if (!vma_area)
@@ -156,6 +176,21 @@ void close_proc()
 	proc_dir_fd = -1;
 }
 
+int set_proc_fd(int fd)
+{
+	int sfd = get_service_fd(PROC_FD_OFF);
+
+	sfd = dup2(fd, sfd);
+	if (sfd < 0) {
+		pr_perror("Can't set proc fd\n");
+		return -1;
+	}
+
+	proc_dir_fd = sfd;
+
+	return 0;
+}
+
 int set_proc_mountpoint(char *path)
 {
 	int sfd = get_service_fd(PROC_FD_OFF), fd;
@@ -224,7 +259,9 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...)
 	return openat(dirfd, path, flags);
 }
 
-int get_service_fd(int type)
+static int service_fd_rlim_cur;
+
+int init_service_fd(void)
 {
 	struct rlimit rlimit;
 
@@ -238,7 +275,21 @@ int get_service_fd(int type)
 		return -1;
 	}
 
-	return rlimit.rlim_cur - type;
+	service_fd_rlim_cur = (int)rlimit.rlim_cur;
+	BUG_ON(service_fd_rlim_cur < SERVICE_FD_MAX);
+
+	return 0;
+}
+
+int get_service_fd(enum sfd_type type)
+{
+	BUG_ON((int)type <= SERVICE_FD_MIN || (int)type >= SERVICE_FD_MAX);
+	return service_fd_rlim_cur - type;
+}
+
+bool is_service_fd(int fd, enum sfd_type type)
+{
+	return fd == get_service_fd(type);
 }
 
 int copy_file(int fd_in, int fd_out, size_t bytes)
@@ -293,4 +344,63 @@ int is_anon_link_type(int lfd, char *type)
 	link[ret] = 0;
 	snprintf(aux, sizeof(aux), "anon_inode:%s", type);
 	return !strcmp(link, aux);
+}
+
+static void *sh_buf;
+static unsigned int sh_bytes_left;
+static size_t sh_last_size;
+#define SH_BUF_CHUNK	4096
+
+void *shmalloc(size_t bytes)
+{
+	void *ret;
+
+	if (bytes > SH_BUF_CHUNK) {
+		pr_err("Too big shared buffer requested %lu\n", bytes);
+		return NULL;
+	}
+
+	if (sh_bytes_left < bytes) {
+		sh_buf = mmap(NULL, SH_BUF_CHUNK, PROT_READ | PROT_WRITE,
+				MAP_SHARED | MAP_ANON, 0, 0);
+		if (sh_buf == MAP_FAILED) {
+			pr_perror("Can't alloc shared buffer");
+			return NULL;
+		}
+
+		sh_bytes_left = SH_BUF_CHUNK;
+	}
+
+	ret = sh_buf;
+	sh_buf += bytes;
+	sh_bytes_left -= bytes;
+	sh_last_size = bytes;
+
+	return ret;
+}
+
+/* Only last chunk can be released */
+void shfree_last(void *ptr)
+{
+	BUG_ON(sh_buf - sh_last_size != ptr);
+	sh_buf -= sh_last_size;
+	sh_bytes_left += sh_last_size;
+	sh_last_size = 0;
+}
+
+int run_scripts(char *action)
+{
+	struct script *script;
+	int ret = 0;
+
+	if (setenv("CRTOOLS_SCRIPT_ACTION", action, 1)) {
+		pr_perror("Can't set CRTOOL_SCRIPT_ACTION=%s\n", action);
+		return -1;
+	}
+
+	list_for_each_entry(script, &opts.scripts, node)
+		ret |= system(script->path);
+
+	unsetenv("CRTOOLS_SCRIPT_ACTION");
+	return ret;
 }

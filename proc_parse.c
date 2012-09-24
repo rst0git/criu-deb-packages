@@ -13,6 +13,7 @@
 #include "list.h"
 #include "util.h"
 #include "crtools.h"
+#include "mount.h"
 
 #include "proc_parse.h"
 #include "protobuf.h"
@@ -53,7 +54,7 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 	struct vma_area *vma_area = NULL;
 	u64 start, end, pgoff;
 	unsigned long ino;
-	char r,w,x,s;
+	char r, w, x, s;
 	int dev_maj, dev_min;
 	int ret = -1, nr = 0;
 
@@ -143,10 +144,7 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 			goto err;
 		}
 
-		if (strstr(buf, "[stack")) {
-			vma_area->vma.status |= VMA_AREA_REGULAR | VMA_AREA_STACK;
-			vma_area->vma.flags  |= MAP_GROWSDOWN;
-		} else if (strstr(buf, "[vsyscall]")) {
+		if (strstr(buf, "[vsyscall]")) {
 			vma_area->vma.status |= VMA_AREA_VSYSCALL;
 		} else if (strstr(buf, "[vdso]")) {
 			vma_area->vma.status |= VMA_AREA_REGULAR | VMA_AREA_VDSO;
@@ -592,6 +590,7 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new)
 	unsigned int kmaj, kmin;
 	int ret, n;
 	char *opt;
+	char *fstype;
 
 	ret = sscanf(str, "%i %i %u:%u %ms %ms %ms %n",
 			&new->mnt_id, &new->parent_mnt_id,
@@ -612,9 +611,12 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new)
 		return -1;
 
 	str += n;
-	ret = sscanf(str, "%ms %ms %ms", &new->fstype, &new->source, &opt);
+	ret = sscanf(str, "%ms %ms %ms", &fstype, &new->source, &opt);
 	if (ret != 3)
 		return -1;
+
+	new->fstype = find_fstype_by_name(fstype);
+	free(fstype);
 
 	new->options = xmalloc(strlen(opt));
 	if (!new->options)
@@ -632,7 +634,7 @@ struct mount_info *parse_mountinfo(pid_t pid)
 {
 	struct mount_info *list = NULL;
 	FILE *f;
-	char str[256];
+	char str[1024];
 
 	snprintf(str, sizeof(str), "/proc/%d/mountinfo", pid);
 	f = fopen(str, "r");
@@ -658,7 +660,7 @@ struct mount_info *parse_mountinfo(pid_t pid)
 		}
 
 		pr_info("\ttype %s source %s %x %s @ %s flags %x options %s\n",
-				new->fstype, new->source,
+				new->fstype->name, new->source,
 				new->s_dev, new->root, new->mountpoint,
 				new->flags, new->options);
 
@@ -680,10 +682,13 @@ err:
 
 static char nybble(const char n)
 {
-       if      (n >= '0' && n <= '9') return n - '0';
-       else if (n >= 'A' && n <= 'F') return n - ('A' - 10);
-       else if (n >= 'a' && n <= 'f') return n - ('a' - 10);
-       return 0;
+	if (n >= '0' && n <= '9')
+		return n - '0';
+	else if (n >= 'A' && n <= 'F')
+		return n - ('A' - 10);
+	else if (n >= 'a' && n <= 'f')
+		return n - ('a' - 10);
+	return 0;
 }
 
 static void parse_fhandle_encoded(char *tok, FhEntry *fh)
@@ -714,6 +719,7 @@ int parse_fdinfo(int fd, int type,
 {
 	FILE *f;
 	char str[256];
+	bool entry_met = false;
 
 	sprintf(str, "/proc/self/fdinfo/%d", fd);
 	f = fopen(str, "r");
@@ -741,6 +747,8 @@ int parse_fdinfo(int fd, int type,
 			ret = cb(&entry, arg);
 			if (ret)
 				return ret;
+
+			entry_met = true;
 			continue;
 		}
 		if (fdinfo_field(str, "tfd")) {
@@ -755,6 +763,24 @@ int parse_fdinfo(int fd, int type,
 			ret = cb(&entry, arg);
 			if (ret)
 				return ret;
+
+			entry_met = true;
+			continue;
+		}
+		if (fdinfo_field(str, "sigmask")) {
+			signalfd_entry__init(&entry.sfd);
+
+			if (type != FD_TYPES__SIGNALFD)
+				goto parse_err;
+			ret = sscanf(str, "sigmask: %Lx",
+					(unsigned long long *)&entry.sfd.sigmask);
+			if (ret != 1)
+				goto parse_err;
+			ret = cb(&entry, arg);
+			if (ret)
+				return ret;
+
+			entry_met = true;
 			continue;
 		}
 		if (fdinfo_field(str, "inotify wd")) {
@@ -791,13 +817,24 @@ int parse_fdinfo(int fd, int type,
 
 			if (ret)
 				return ret;
+
+			entry_met = true;
 			continue;
 		}
 	}
 
 	fclose(f);
-	return 0;
 
+	if (entry_met)
+		return 0;
+	/*
+	 * An eventpoll file may have no target fds set thus
+	 * resulting in no tfd: lines in proc. This is normal.
+	 */
+	if (type == FD_TYPES__EVENTPOLL)
+		return 0;
+
+	pr_err("No records of type %d found in fdinfo file\n", type);
 parse_err:
 	pr_perror("%s: error parsing [%s] for %d\n", __func__, str, type);
 	return -1;

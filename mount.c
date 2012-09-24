@@ -9,6 +9,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/mount.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #include "crtools.h"
 #include "types.h"
@@ -22,6 +24,7 @@
 #include "protobuf/mnt.pb-c.h"
 
 static struct mount_info *mntinfo;
+int mntns_root = -1;
 
 int open_mount(unsigned int s_dev)
 {
@@ -178,13 +181,237 @@ static struct mount_info *mnt_build_tree(struct mount_info *list)
 	return tree;
 }
 
-static char *fstypes[] = {
-	"unsupported",
-	"proc",
-	"sysfs",
+static DIR *open_mountpoint(struct mount_info *pm)
+{
+	int fd, ret;
+	char path[PATH_MAX + 1];
+	struct stat st;
+	DIR *fdir;
+
+	if (!list_empty(&pm->children)) {
+		pr_err("Something is mounted on top of %s\n", pm->fstype->name);
+		return NULL;
+	}
+
+	snprintf(path, sizeof(path), ".%s", pm->mountpoint);
+	fd = openat(mntns_root, path, O_RDONLY);
+	if (fd < 0) {
+		pr_perror("Can't open %s", pm->mountpoint);
+		return NULL;
+	}
+
+	ret = fstat(fd, &st);
+	if (ret < 0) {
+		pr_perror("fstat(%s) failed", path);
+		close(fd);
+		return NULL;
+	}
+
+	if (st.st_dev != pm->s_dev) {
+		pr_err("The file system %#x %s %s is inaccessible\n",
+				pm->s_dev, pm->fstype->name, pm->mountpoint);
+		close(fd);
+		return NULL;
+	}
+
+	fdir = fdopendir(fd);
+	if (fdir == NULL) {
+		close(fd);
+		pr_perror("Can't open %s", pm->mountpoint);
+		return NULL;
+	}
+
+	return fdir;
+}
+
+static int close_mountpoint(DIR *dfd)
+{
+	if (closedir(dfd)) {
+		pr_perror("Unable to close directory");
+		return -1;
+	}
+	return 0;
+}
+
+static int tmpfs_dump(struct mount_info *pm)
+{
+	int ret, status;
+	pid_t pid;
+
+	pid = fork();
+	if (pid == -1) {
+		pr_perror("fork() failed\n");
+		return -1;
+	} else if (pid == 0) {
+		char tmpfs_path[PATH_MAX];
+		int fd, fd_img;
+		DIR *fdir;
+
+		fdir = open_mountpoint(pm);
+		if (fdir == NULL)
+			exit(1);
+
+		fd = dirfd(fdir);
+		if (fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) & ~FD_CLOEXEC) == -1) {
+			pr_perror("Can not drop FD_CLOEXEC");
+			exit(1);
+		}
+
+		fd_img = open_image(CR_FD_TMPFS, O_DUMP, pm->mnt_id);
+		if (fd_img < 0)
+			exit(1);
+
+		ret = dup2(fd_img, STDOUT_FILENO);
+		if (ret < 0) {
+			pr_perror("dup2() failed");
+			exit(1);
+		}
+		ret = dup2(log_get_fd(), STDERR_FILENO);
+		if (ret < 0) {
+			pr_perror("dup2() failed");
+			exit(1);
+		}
+		close(fd_img);
+
+		/*
+		 * tmpfs is in another mount namespace,
+		 * a direct path is inaccessible
+		 */
+
+		snprintf(tmpfs_path, sizeof(tmpfs_path),
+					       "/proc/self/fd/%d", fd);
+
+		execlp("tar", "tar", "--create",
+			"--gzip",
+			"--check-links",
+			"--preserve-permissions",
+			"--sparse",
+			"--numeric-owner",
+			"--directory", tmpfs_path, ".", NULL);
+		pr_perror("exec failed");
+		exit(1);
+	}
+
+	ret = waitpid(pid, &status, 0);
+	if (ret == -1) {
+		pr_perror("waitpid() failed");
+		return -1;
+	}
+
+	if (status) {
+		pr_err("Can't dump tmpfs content\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int tmpfs_restore(struct mount_info *pm)
+{
+	int ret, status = -1;
+	sigset_t mask, oldmask;
+	pid_t pid;
+
+	ret = sigprocmask(SIG_SETMASK, NULL, &oldmask);
+	if (ret == -1) {
+		pr_perror("Can not get mask of blocked signals");
+		return -1;
+	}
+	mask = oldmask;
+	sigaddset(&mask, SIGCHLD);
+	ret = sigprocmask(SIG_SETMASK, &mask, NULL);
+	if (ret == -1) {
+		pr_perror("Can not set mask of blocked signals");
+		return -1;
+	}
+
+	pid = fork();
+	if (pid == -1) {
+		pr_perror("fork() failed\n");
+		goto out_unlock;
+	} else if (pid == 0) {
+		int fd_img;
+
+		fd_img = open_image_ro(CR_FD_TMPFS, pm->mnt_id);
+		if (fd_img < 0)
+			exit(1);
+
+		ret = dup2(fd_img, STDIN_FILENO);
+		if (ret < 0) {
+			pr_perror("dup2() failed");
+			exit(1);
+		}
+		close(fd_img);
+
+		execlp("tar", "tar", "--extract", "--gzip",
+					"--directory", pm->mountpoint, NULL);
+		pr_perror("exec failed");
+		exit(1);
+	}
+
+	ret = waitpid(pid, &status, 0);
+	if (ret == -1) {
+		pr_perror("waitpid() failed");
+		goto out_unlock;
+	}
+
+	if (status) {
+		pr_err("Can't restore tmpfs content\n");
+		status = -1;
+		goto out_unlock;
+	}
+
+out_unlock:
+	ret = sigprocmask(SIG_SETMASK, &oldmask, NULL);
+	if (ret == -1) {
+		pr_perror("Can not set mask of blocked signals");
+		BUG();
+	}
+
+	return status;
+}
+
+static int binfmt_misc_dump(struct mount_info *pm)
+{
+	int ret = -1;
+	struct dirent *de;
+	DIR *fdir = NULL;
+
+	fdir = open_mountpoint(pm);
+	if (fdir == NULL)
+		return -1;
+
+	while ((de = readdir(fdir))) {
+		if (!strcmp(de->d_name, "."))
+			continue;
+		if (!strcmp(de->d_name, ".."))
+			continue;
+		if (!strcmp(de->d_name, "register"))
+			continue;
+		if (!strcmp(de->d_name, "status"))
+			continue;
+
+		pr_err("binfmt_misc isn't empty: %s\n", de->d_name);
+		goto out;
+	}
+
+	ret = 0;
+out:
+	close_mountpoint(fdir);
+	return ret;
+}
+
+static struct fstype fstypes[] = {
+	{ "unsupported" },
+	{ "proc" },
+	{ "sysfs" },
+	{ "devtmpfs" },
+	{ "binfmt_misc", binfmt_misc_dump },
+	{ "tmpfs", tmpfs_dump, tmpfs_restore },
+	{ "devpts" },
 };
 
-static u32 encode_fstype(char *fst)
+struct fstype *find_fstype_by_name(char *fst)
 {
 	int i;
 
@@ -197,22 +424,24 @@ static u32 encode_fstype(char *fst)
 	 */
 
 	for (i = 0; i < ARRAY_SIZE(fstypes); i++)
-		if (!strcmp(fstypes[i], fst))
-			return i;
+		if (!strcmp(fstypes[i].name, fst))
+			return fstypes + i;
 
-	return 0;
+	return &fstypes[0];
 }
 
-static char *decode_fstype(u32 fst)
+static u32 encode_fstype(struct fstype *fst)
 {
-	static char uns[12];
+	return fst - fstypes;
+}
 
-	if (fst >= ARRAY_SIZE(fstypes)) {
-		sprintf(uns, "x%d", fst);
-		return uns;
-	}
+static struct fstype *decode_fstype(u32 fst)
+{
 
-	return fstypes[fst];
+	if (fst >= ARRAY_SIZE(fstypes))
+		return &fstypes[0];
+
+	return &fstypes[fst];
 }
 
 static inline int is_root(char *p)
@@ -233,6 +462,9 @@ static int dump_one_mountpoint(struct mount_info *pm, int fd)
 			pm->root, pm->mountpoint);
 
 	me.fstype		= encode_fstype(pm->fstype);
+	if (fstypes[me.fstype].dump && fstypes[me.fstype].dump(pm))
+		return -1;
+
 	me.mnt_id		= pm->mnt_id;
 	me.root_dev		= pm->s_dev;
 	me.parent_mnt_id	= pm->parent_mnt_id;
@@ -243,11 +475,12 @@ static int dump_one_mountpoint(struct mount_info *pm, int fd)
 	me.options		= pm->options;
 
 	if (!me.fstype && !is_root_mount(pm)) {
-		pr_err("FS %s unsupported\n", pm->fstype);
+		pr_err("FS mnt %s dev %#x root %s unsupported\n",
+				pm->mountpoint, pm->s_dev, pm->root);
 		return -1;
 	}
 
-	if (pb_write(fd, &me, mnt_entry))
+	if (pb_write_one(fd, &me, PB_MOUNTPOINTS))
 		return -1;
 
 	return 0;
@@ -334,16 +567,20 @@ static char *resolve_source(struct mount_info *mi)
 static int do_new_mount(struct mount_info *mi)
 {
 	char *src;
+	struct fstype *tp = mi->fstype;
 
 	src = resolve_source(mi);
 	if (!src)
 		return -1;
 
-	if (mount(src, mi->mountpoint, mi->fstype,
+	if (mount(src, mi->mountpoint, tp->name,
 				mi->flags, mi->options) < 0) {
 		pr_perror("Can't mount at %s", mi->mountpoint);
 		return -1;
 	}
+
+	if (tp->restore && tp->restore(mi))
+		return -1;
 
 	return 0;
 }
@@ -364,7 +601,7 @@ static int do_mount_one(struct mount_info *mi)
 	if (!mi->parent)
 		return 0;
 
-	pr_debug("\tMounting %s @%s\n", mi->fstype, mi->mountpoint);
+	pr_debug("\tMounting %s @%s\n", mi->fstype->name, mi->mountpoint);
 
 	if (fsroot_mounted(mi))
 		return do_new_mount(mi);
@@ -375,6 +612,13 @@ static int do_mount_one(struct mount_info *mi)
 static int do_umount_one(struct mount_info *mi)
 {
 	if (!mi->parent)
+		return 0;
+
+	/*
+	 * Don't umount the future root. It can be a mountpoint only,
+	 * otherwise pivot_root() fails.
+	 */
+	if (opts.root && !strcmp(opts.root, mi->mountpoint))
 		return 0;
 
 	if (umount(mi->mountpoint)) {
@@ -388,6 +632,7 @@ static int do_umount_one(struct mount_info *mi)
 
 static int clean_mnt_ns(void)
 {
+	int ret;
 	struct mount_info *pm;
 
 	pr_info("Cleaning mount namespace\n");
@@ -400,7 +645,15 @@ static int clean_mnt_ns(void)
 	if (!pm)
 		return -1;
 
-	return mnt_tree_for_each_reverse(pm, do_umount_one);
+	ret = mnt_tree_for_each_reverse(pm, do_umount_one);
+
+	while (mntinfo) {
+		pm = mntinfo->next;
+		xfree(mntinfo);
+		mntinfo = pm;
+	}
+
+	return ret;
 }
 
 static int populate_mnt_ns(int ns_pid)
@@ -411,6 +664,33 @@ static int populate_mnt_ns(int ns_pid)
 
 	pr_info("Populating mount namespace\n");
 
+	if (opts.root) {
+		char put_root[PATH_MAX] = "crtools-put-root.XXXXXX";
+
+		if (chdir(opts.root)) {
+			pr_perror("chdir(%s) failed", opts.root);
+			return -1;
+		}
+		if (mkdtemp(put_root) == NULL) {
+			pr_perror("Can't create a temparary directory");
+			return -1;
+		}
+		if (pivot_root(".", put_root)) {
+			pr_perror("pivot_root(., %s) failed", put_root);
+			if (rmdir(put_root))
+				pr_perror("Can't remove the directory %s", put_root);
+			return -1;
+		}
+		if (umount2(put_root, MNT_DETACH)) {
+			pr_perror("Can't umount %s", put_root);
+			return -1;
+		}
+		if (rmdir(put_root)) {
+			pr_perror("Can't remove the directory %s", put_root);
+			return -1;
+		}
+	}
+
 	img = open_image_ro(CR_FD_MOUNTPOINTS, ns_pid);
 	if (img < 0)
 		return -1;
@@ -420,7 +700,7 @@ static int populate_mnt_ns(int ns_pid)
 	while (1) {
 		struct mount_info *pm;
 
-		ret = pb_read_eof(img, &me, mnt_entry);
+		ret = pb_read_one_eof(img, &me, PB_MOUNTPOINTS);
 		if (ret <= 0)
 			break;
 
@@ -468,6 +748,7 @@ static int populate_mnt_ns(int ns_pid)
 		mnt_entry__free_unpacked(me, NULL);
 
 	close(img);
+	mntinfo = pms;
 
 	pms = mnt_build_tree(pms);
 	if (!pms)
@@ -497,5 +778,41 @@ int prepare_mnt_ns(int ns_pid)
 
 void show_mountpoints(int fd, struct cr_options *o)
 {
-	pb_show_plain(fd, mnt_entry);
+	pb_show_plain(fd, PB_MOUNTPOINTS);
+}
+
+int mntns_collect_root(pid_t pid)
+{
+	int fd, pfd;
+	int ret;
+	char path[PATH_MAX + 1];
+
+	/*
+	 * If /proc/pid/root links on '/', it signs that a root of the task
+	 * and a root of mntns is the same.
+	 */
+
+	pfd = open_pid_proc(pid);
+	ret = readlinkat(pfd, "root", path, sizeof(path) - 1);
+	if (ret < 0)
+		return ret;
+
+	path[ret] = '\0';
+
+	if (ret != 1 || path[0] != '/') {
+		pr_err("The root task has another root than mntns: %s\n", path);
+		close_pid_proc();
+		return -1;
+	}
+
+	fd = openat(pfd, "root", O_RDONLY | O_DIRECTORY, 0);
+	close_pid_proc();
+	if (fd < 0) {
+		pr_perror("Can't open the task root");
+		return -1;
+	}
+
+	mntns_root = fd;
+
+	return 0;
 }

@@ -1,8 +1,11 @@
 #include <sys/mman.h>
+#include <errno.h>
+#include <signal.h>
+#include <linux/limits.h>
+#include <sys/mount.h>
 
 #include "syscall.h"
 #include "parasite.h"
-#include "util.h"
 
 #include <string.h>
 
@@ -40,11 +43,11 @@ static int brk_init(void)
 	/*
 	 *  Map 10 MB. Hope this will be enough for unix skb's...
 	 */
-        ret = sys_mmap(NULL, MAX_HEAP_SIZE,
+	ret = sys_mmap(NULL, MAX_HEAP_SIZE,
 			    PROT_READ | PROT_WRITE,
 			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (ret < 0)
-               return -ENOMEM;
+		return -ENOMEM;
 
 	brk_start = brk_tail = (void *)ret;
 	brk_end = brk_start + MAX_HEAP_SIZE;
@@ -104,12 +107,18 @@ static void sys_write_msg(const char *msg)
 
 static inline int should_dump_page(VmaEntry *vmae, u64 pme)
 {
-	return (pme & (PME_PRESENT | PME_SWAP)) &&
-		/*
-		 * Optimisation for private mapping pages, that haven't
-		 * yet being COW-ed
-		 */
-		!(vma_entry_is(vmae, VMA_FILE_PRIVATE) && (pme & PME_FILE));
+	if (vma_entry_is(vmae, VMA_AREA_VDSO))
+		return 1;
+	/*
+	 * Optimisation for private mapping pages, that haven't
+	 * yet being COW-ed
+	 */
+	if (vma_entry_is(vmae, VMA_FILE_PRIVATE) && (pme & PME_FILE))
+		return 0;
+	if (pme & (PME_PRESENT | PME_SWAP))
+		return 1;
+
+	return 0;
 }
 
 static int fd_pages = -1;
@@ -264,7 +273,7 @@ static int dump_pages_fini(void)
 
 static int dump_sigact(struct parasite_dump_sa_args *da)
 {
-	int sig, ret;
+	int sig, ret = 0;
 
 	for (sig = 1; sig < SIGMAX; sig++) {
 		if (sig == SIGKILL || sig == SIGSTOP)
@@ -350,7 +359,11 @@ static int init(struct parasite_init_args *args)
 	if (tsock < 0)
 		return -tsock;
 
-	ret = sys_bind(tsock, (struct sockaddr *) &args->saddr, args->sun_len);
+	ret = sys_bind(tsock, (struct sockaddr *) &args->p_addr, args->p_addr_len);
+	if (ret < 0)
+		return ret;
+
+	ret = sys_connect(tsock, (struct sockaddr *)&args->h_addr, args->h_addr_len);
 	if (ret < 0)
 		return ret;
 
@@ -364,9 +377,56 @@ static int init(struct parasite_init_args *args)
 	return ret;
 }
 
-static int tconnect(struct parasite_init_args *args)
+static char proc_mountpoint[] = "proc.crtools";
+static int parasite_get_proc_fd()
 {
-	return sys_connect(tsock, (struct sockaddr *) &args->saddr, args->sun_len);
+	int ret, fd = -1;
+	char buf[2];
+
+	ret = sys_readlink("/proc/self", buf, sizeof(buf));
+	if (ret < 0 && ret != -ENOENT) {
+		sys_write_msg("Can't readlink /proc/self\n");
+		return ret;
+	}
+
+	/* Fast path -- if /proc belongs to this pidns */
+	if (ret == 1 && buf[0] == '1') {
+		fd = sys_open("/proc", O_RDONLY, 0);
+		goto out_send_fd;
+	}
+
+	if (sys_mkdir(proc_mountpoint, 0700)) {
+		sys_write_msg("Can't create a directory ");
+		sys_write_msg(proc_mountpoint);
+		sys_write_msg("\n");
+		return ret;
+	}
+
+	if (sys_mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL)) {
+		sys_write_msg("mount failed\n");
+		ret = -1;
+		goto out_rmdir;
+	}
+
+	fd = sys_open(proc_mountpoint, O_RDONLY, 0);
+
+	if (sys_umount2(proc_mountpoint, MNT_DETACH)) {
+		sys_write_msg("Can't umount procfs\n");
+		return -1;
+	}
+
+out_rmdir:
+	if (sys_rmdir(proc_mountpoint)) {
+		sys_write_msg("Can't remove directory\n");
+		return -1;
+	}
+
+out_send_fd:
+	if (fd < 0)
+		return fd;
+	ret = send_fd(tsock, NULL, 0, fd);
+	sys_close(fd);
+	return ret;
 }
 
 static int parasite_set_logfd()
@@ -404,8 +464,6 @@ int __used parasite_service(unsigned long cmd, void *args)
 	switch (cmd) {
 	case PARASITE_CMD_INIT:
 		return init((struct parasite_init_args *) args);
-	case PARASITE_CMD_TCONNECT:
-		return tconnect((struct parasite_init_args *) args);
 	case PARASITE_CMD_FINI:
 		return fini();
 	case PARASITE_CMD_SET_LOGFD:
@@ -426,6 +484,8 @@ int __used parasite_service(unsigned long cmd, void *args)
 		return dump_tid_info((struct parasite_dump_tid_info *)args);
 	case PARASITE_CMD_DRAIN_FDS:
 		return drain_fds((struct parasite_drain_fd *)args);
+	case PARASITE_CMD_GET_PROC_FD:
+		return parasite_get_proc_fd();
 	}
 
 	sys_write_msg("Unknown command to parasite\n");

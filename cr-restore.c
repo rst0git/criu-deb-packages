@@ -32,6 +32,7 @@
 #include "syscall.h"
 #include "restorer.h"
 #include "sockets.h"
+#include "sk-packet.h"
 #include "lock.h"
 #include "files.h"
 #include "files-reg.h"
@@ -40,6 +41,7 @@
 #include "sk-inet.h"
 #include "eventfd.h"
 #include "eventpoll.h"
+#include "signalfd.h"
 #include "proc_parse.h"
 #include "restorer-blob.h"
 #include "crtools.h"
@@ -48,16 +50,19 @@
 #include "mount.h"
 #include "inotify.h"
 #include "pstree.h"
+#include "net.h"
+#include "tty.h"
 
 #include "protobuf.h"
 #include "protobuf/sa.pb-c.h"
 #include "protobuf/itimer.pb-c.h"
 #include "protobuf/vma.pb-c.h"
 
-static struct pstree_item *me;
+static struct pstree_item *current;
 
 static int restore_task_with_children(void *);
 static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *vmas, int nr_vmas);
+static int prepare_restorer_blob(void);
 
 static int shmem_remap(void *old_addr, void *new_addr, unsigned long size)
 {
@@ -73,7 +78,19 @@ static int shmem_remap(void *old_addr, void *new_addr, unsigned long size)
 	return 0;
 }
 
-static int prepare_shared(void)
+static int crtools_prepare_shared(void)
+{
+	if (prepare_shared_fdinfo())
+		return -1;
+
+	/* Connections are unlocked from crtools */
+	if (collect_inet_sockets())
+		return -1;
+
+	return 0;
+}
+
+static int root_prepare_shared(void)
 {
 	int ret = 0;
 	struct pstree_item *pi;
@@ -83,7 +100,10 @@ static int prepare_shared(void)
 	if (prepare_shmem_restore())
 		return -1;
 
-	if (prepare_shared_fdinfo())
+	if (prepare_shared_tty())
+		return -1;
+
+	if (prepare_shared_reg_files())
 		return -1;
 
 	if (collect_reg_files())
@@ -95,10 +115,10 @@ static int prepare_shared(void)
 	if (collect_fifo())
 		return -1;
 
-	if (collect_inet_sockets())
+	if (collect_unix_sockets())
 		return -1;
 
-	if (collect_unix_sockets())
+	if (collect_packet_sockets())
 		return -1;
 
 	if (collect_eventfd())
@@ -107,10 +127,19 @@ static int prepare_shared(void)
 	if (collect_eventpoll())
 		return -1;
 
+	if (collect_signalfd())
+		return -1;
+
 	if (collect_inotify())
 		return -1;
 
+	if (collect_tty())
+		return -1;
+
 	for_each_pstree_item(pi) {
+		if (pi->state == TASK_HELPER)
+			continue;
+
 		ret = prepare_shmem_pid(pi->pid.virt);
 		if (ret < 0)
 			break;
@@ -120,14 +149,24 @@ static int prepare_shared(void)
 			break;
 	}
 
+	if (ret < 0)
+		goto err;
+
 	mark_pipe_master();
+
+	tty_setup_slavery();
+
 	ret = resolve_unix_peers();
+	if (ret)
+		goto err;
 
-	if (!ret) {
-		show_saved_shmems();
-		show_saved_files();
-	}
+	ret = prepare_restorer_blob();
+	if (ret)
+		goto err;
 
+	show_saved_shmems();
+	show_saved_files();
+err:
 	return ret;
 }
 
@@ -151,9 +190,16 @@ static int read_and_open_vmas(int pid, struct list_head *vmas, int *nr_vmas)
 
 		(*nr_vmas)++;
 		list_add_tail(&vma->list, vmas);
-		ret = pb_read_eof(fd, &e, vma_entry);
+		ret = pb_read_one_eof(fd, &e, PB_VMAS);
 		if (ret <= 0)
 			break;
+
+		if (e->fd != -1) {
+			ret = -1;
+			pr_err("Error in vma->fd setting (%Ld)\n",
+					(unsigned long long)e->fd);
+			break;
+		}
 
 		vma->vma = *e;
 		vma_entry__free_unpacked(e, NULL);
@@ -215,7 +261,7 @@ static int prepare_sigactions(int pid)
 		if (sig == SIGKILL || sig == SIGSTOP)
 			continue;
 
-		ret = pb_read(fd_sigact, &e, sa_entry);
+		ret = pb_read_one(fd_sigact, &e, PB_SIGACT);
 		if (ret < 0)
 			break;
 
@@ -250,7 +296,7 @@ static int pstree_wait_helpers()
 {
 	struct pstree_item *pi;
 
-	list_for_each_entry(pi, &me->children, list) {
+	list_for_each_entry(pi, &current->children, list) {
 		int status, ret;
 
 		if (pi->state != TASK_HELPER)
@@ -283,7 +329,7 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (pstree_wait_helpers())
 		return -1;
 
-	if (prepare_fds(me))
+	if (prepare_fds(current))
 		return -1;
 
 	if (prepare_fs(pid))
@@ -291,6 +337,8 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	if (prepare_sigactions(pid))
 		return -1;
+
+	log_closedir();
 
 	return prepare_and_sigreturn(pid, core);
 }
@@ -425,14 +473,14 @@ static int restore_one_task(int pid)
 	int fd, ret;
 	CoreEntry *core;
 
-	if (me->state == TASK_HELPER)
+	if (current->state == TASK_HELPER)
 		return restore_one_fake(pid);
 
 	fd = open_image_ro(CR_FD_CORE, pid);
 	if (fd < 0)
 		return -1;
 
-	ret = pb_read(fd, &core, core_entry);
+	ret = pb_read_one(fd, &core, PB_CORE);
 	close(fd);
 
 	if (ret < 0)
@@ -461,14 +509,10 @@ out:
 	return ret;
 }
 
-/*
- * This stack size is important for the restorer
- * itself only. At the final phase, we will switch
- * to the original stack the program had at checkpoint
- * time.
- */
-#define STACK_SIZE	(8 * 4096)
+/* All arguments should be above stack, because it grows down */
 struct cr_clone_arg {
+	char stack[PAGE_SIZE];
+	char stack_ptr[0];
 	struct pstree_item *item;
 	unsigned long clone_flags;
 	int fd;
@@ -477,55 +521,76 @@ struct cr_clone_arg {
 static inline int fork_with_pid(struct pstree_item *item, unsigned long ns_clone_flags)
 {
 	int ret = -1;
-	char buf[32];
 	struct cr_clone_arg ca;
-	void *stack;
 	pid_t pid = item->pid.virt;
 
 	pr_info("Forking task with %d pid (flags 0x%lx)\n", pid, ns_clone_flags);
 
-	stack = mmap(NULL, STACK_SIZE, PROT_WRITE | PROT_READ,
-			MAP_PRIVATE | MAP_GROWSDOWN | MAP_ANONYMOUS, -1, 0);
-	if (stack == MAP_FAILED) {
-		pr_perror("Failed to map stack for the child");
-		goto err;
-	}
-
-	snprintf(buf, sizeof(buf), "%d", pid - 1);
 	ca.item = item;
 	ca.clone_flags = ns_clone_flags;
-	ca.fd = open(LAST_PID_PATH, O_RDWR);
-	if (ca.fd < 0) {
-		pr_perror("%d: Can't open %s", pid, LAST_PID_PATH);
-		goto err;
-	}
-
-	if (flock(ca.fd, LOCK_EX)) {
-		pr_perror("%d: Can't lock %s", pid, LAST_PID_PATH);
-		goto err_close;
-	}
 
 	if (!(ca.clone_flags & CLONE_NEWPID)) {
+		char buf[32];
+
+		ca.fd = open(LAST_PID_PATH, O_RDWR);
+		if (ca.fd < 0) {
+			pr_perror("%d: Can't open %s", pid, LAST_PID_PATH);
+			goto err;
+		}
+
+		if (flock(ca.fd, LOCK_EX)) {
+			close(ca.fd);
+			pr_perror("%d: Can't lock %s", pid, LAST_PID_PATH);
+			goto err;
+		}
+
+		snprintf(buf, sizeof(buf), "%d", pid - 1);
 		if (write_img_buf(ca.fd, buf, strlen(buf)))
 			goto err_unlock;
-	} else
+	} else {
+		ca.fd = -1;
 		BUG_ON(pid != 1);
+	}
 
-	ret = clone(restore_task_with_children, stack + STACK_SIZE,
+	if (ca.clone_flags & CLONE_NEWNET)
+		/*
+		 * When restoring a net namespace we need to communicate
+		 * with the original (i.e. -- init) one. Thus, prepare for
+		 * that before we leave the existing namespaces.
+		 */
+		if (netns_pre_create())
+			goto err_unlock;
+
+	ret = clone(restore_task_with_children, ca.stack_ptr,
 			ca.clone_flags | SIGCHLD, &ca);
 
 	if (ret < 0)
 		pr_perror("Can't fork for %d", pid);
 
-err_unlock:
-	if (flock(ca.fd, LOCK_UN))
-		pr_perror("%d: Can't unlock %s", pid, LAST_PID_PATH);
+	if (ca.clone_flags & CLONE_NEWPID)
+		item->pid.real = ret;
 
-err_close:
-	close_safe(&ca.fd);
+	if (opts.pidfile && root_item == item) {
+		int fd;
+
+		fd = open(opts.pidfile, O_WRONLY | O_TRUNC | O_CREAT, 0600);
+		if (fd == -1) {
+			pr_perror("Can't open %s", opts.pidfile);
+			kill(ret, SIGKILL);
+		} else {
+			dprintf(fd, "%d", ret);
+			close(fd);
+		}
+	}
+
+err_unlock:
+	if (ca.fd >= 0) {
+		if (flock(ca.fd, LOCK_UN))
+			pr_perror("%d: Can't unlock %s", pid, LAST_PID_PATH);
+
+		close(ca.fd);
+	}
 err:
-	if (stack != MAP_FAILED)
-		munmap(stack, STACK_SIZE);
 	return ret;
 }
 
@@ -538,7 +603,7 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 
 	exit = siginfo->si_code & CLD_EXITED;
 	status = siginfo->si_status;
-	if (!me || status)
+	if (!current || status)
 		goto err;
 
 	/* Skip a helper if it was completed successfully */
@@ -552,14 +617,14 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 		if (status)
 			break;
 
-		list_for_each_entry(pi, &me->children, list) {
+		list_for_each_entry(pi, &current->children, list) {
 			if (pi->state != TASK_HELPER)
 				continue;
 			if (pi->pid.virt == siginfo->si_pid)
 				break;
 		}
 
-		if (&pi->list == &me->children)
+		if (&pi->list == &current->children)
 			break; /* The process is not a helper */
 	}
 
@@ -572,7 +637,7 @@ err:
 	futex_abort_and_wake(&task_entries->nr_in_progress);
 }
 
-/* 
+/*
  * FIXME Din't fail on xid restore failure. MySQL uses runaway
  * pgid and sid and there's nothing we can do about it yet :(
  */
@@ -595,21 +660,21 @@ static void restore_sid(void)
 	 * we can call setpgid() on custom values.
 	 */
 
-	if (me->pid.virt == me->sid) {
-		pr_info("Restoring %d to %d sid\n", me->pid.virt, me->sid);
+	if (current->pid.virt == current->sid) {
+		pr_info("Restoring %d to %d sid\n", current->pid.virt, current->sid);
 		sid = setsid();
-		if (sid != me->sid) {
+		if (sid != current->sid) {
 			pr_perror("Can't restore sid (%d)", sid);
 			xid_fail();
 		}
 	} else {
 		sid = getsid(getpid());
-		if (sid != me->sid) {
+		if (sid != current->sid) {
 			/* Skip the root task if it's not init */
-			if (me == root_item && root_item->pid.virt != 1)
+			if (current == root_item && root_item->pid.virt != 1)
 				return;
 			pr_err("Requested sid %d doesn't match inherited %d\n",
-					me->sid, sid);
+					current->sid, sid);
 			xid_fail();
 		}
 	}
@@ -619,53 +684,51 @@ static void restore_pgid(void)
 {
 	pid_t pgid;
 
-	pr_info("Restoring %d to %d pgid\n", me->pid.virt, me->pgid);
+	pr_info("Restoring %d to %d pgid\n", current->pid.virt, current->pgid);
 
 	pgid = getpgrp();
-	if (me->pgid == pgid)
+	if (current->pgid == pgid)
 		return;
 
 	pr_info("\twill call setpgid, mine pgid is %d\n", pgid);
-	if (setpgid(0, me->pgid) != 0) {
-		pr_perror("Can't restore pgid (%d/%d->%d)", me->pid.virt, pgid, me->pgid);
+	if (setpgid(0, current->pgid) != 0) {
+		pr_perror("Can't restore pgid (%d/%d->%d)", current->pid.virt, pgid, current->pgid);
 		xid_fail();
 	}
 }
 
-static char proc_mountpoint[PATH_MAX] = "/proc";
-
-static int prepare_proc(void)
+static int mount_proc(void)
 {
-	snprintf(proc_mountpoint, sizeof(proc_mountpoint), "/tmp/crtools-proc.XXXXXX");
+	int ret;
+	char proc_mountpoint[PATH_MAX];
+
+	snprintf(proc_mountpoint, sizeof(proc_mountpoint), "crtools-proc.XXXXXX");
 	if (mkdtemp(proc_mountpoint) == NULL) {
-		pr_err("mkdtemp failed %m");
+		pr_perror("mkdtemp failed %s", proc_mountpoint);
 		return -1;
 	}
 
-	return 0;
-}
-
-static void umount_proc(void)
-{
-	int err;
-	err = umount(proc_mountpoint);
-	if (err == -1)
-		pr_err("Can't umount %s\n", proc_mountpoint);
-	err = rmdir(proc_mountpoint);
-	if (err == -1)
-		pr_err("Can't delete %s\n", proc_mountpoint);
-}
-
-static void mount_proc(void)
-{
-	int ret;
-
-	ret = mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL);
-	if (ret == -1) {
-		pr_err("mount failed");
-		exit(1);
+	pr_info("Mount procfs in %s\n", proc_mountpoint);
+	if (mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL)) {
+		pr_perror("mount failed");
+		ret = -1;
+		goto out_rmdir;
 	}
-	set_proc_mountpoint(proc_mountpoint);
+
+	ret = set_proc_mountpoint(proc_mountpoint);
+
+	if (umount2(proc_mountpoint, MNT_DETACH) == -1) {
+		pr_perror("Can't umount %s", proc_mountpoint);
+		return -1;
+	}
+
+out_rmdir:
+	if (rmdir(proc_mountpoint) == -1) {
+		pr_perror("Can't remove %s", proc_mountpoint);
+		return -1;
+	}
+
+	return ret;
 }
 
 static int restore_task_with_children(void *_arg)
@@ -678,11 +741,11 @@ static int restore_task_with_children(void *_arg)
 
 	close_safe(&ca->fd);
 
-	me = ca->item;
+	current = ca->item;
 
 	pid = getpid();
-	if (me->pid.virt != pid) {
-		pr_err("Pid %d do not match expected %d\n", pid, me->pid.virt);
+	if (current->pid.virt != pid) {
+		pr_err("Pid %d do not match expected %d\n", pid, current->pid.virt);
 		exit(-1);
 	}
 
@@ -690,16 +753,24 @@ static int restore_task_with_children(void *_arg)
 	if (ret < 0)
 		exit(1);
 
-	if (me->parent == NULL)
+	/* Restore root task */
+	if (current->parent == NULL) {
 		if (collect_mount_info())
 			exit(-1);
 
-	if (ca->clone_flags) {
-		ret = prepare_namespace(me->pid.virt, ca->clone_flags);
-		if (ret)
+		if (prepare_namespace(current->pid.virt, ca->clone_flags))
 			exit(-1);
 
-		mount_proc();
+		/*
+		 * We need non /proc proc mount for restoring pid and mount
+		 * namespaces and do not care for the rest of the cases.
+		 * Thus -- mount proc at custom location for any new namespace
+		 */
+		if (mount_proc())
+			exit(-1);
+
+		if (root_prepare_shared())
+			exit(-1);
 	}
 
 	/*
@@ -711,12 +782,12 @@ static int restore_task_with_children(void *_arg)
 	sigdelset(&blockmask, SIGCHLD);
 	ret = sigprocmask(SIG_BLOCK, &blockmask, NULL);
 	if (ret) {
-		pr_perror("%d: Can't block signals", me->pid.virt);
+		pr_perror("%d: Can't block signals", current->pid.virt);
 		exit(1);
 	}
 
 	pr_info("Restoring children:\n");
-	list_for_each_entry(child, &me->children, list) {
+	list_for_each_entry(child, &current->children, list) {
 		if (!restore_before_setsid(child))
 			continue;
 
@@ -730,7 +801,7 @@ static int restore_task_with_children(void *_arg)
 	restore_sid();
 
 	pr_info("Restoring children:\n");
-	list_for_each_entry(child, &me->children, list) {
+	list_for_each_entry(child, &current->children, list) {
 		if (restore_before_setsid(child))
 			continue;
 		ret = fork_with_pid(child, 0);
@@ -738,21 +809,21 @@ static int restore_task_with_children(void *_arg)
 			exit(1);
 	}
 
-	if (me->pgid == me->pid.virt)
+	if (current->pgid == current->pid.virt)
 		restore_pgid();
 
 	futex_dec_and_wake(&task_entries->nr_in_progress);
 	futex_wait_while(&task_entries->start, CR_STATE_FORKING);
 
-	if (me->pgid != me->pid.virt)
+	if (current->pgid != current->pid.virt)
 		restore_pgid();
 
-	if (me->state != TASK_HELPER) {
+	if (current->state != TASK_HELPER) {
 		futex_dec_and_wake(&task_entries->nr_in_progress);
 		futex_wait_while(&task_entries->start, CR_STATE_RESTORE_PGID);
 	}
 
-	return restore_one_task(me->pid.virt);
+	return restore_one_task(current->pid.virt);
 }
 
 static int restore_root_task(struct pstree_item *init, struct cr_options *opts)
@@ -762,7 +833,7 @@ static int restore_root_task(struct pstree_item *init, struct cr_options *opts)
 
 	ret = sigaction(SIGCHLD, NULL, &act);
 	if (ret < 0) {
-		perror("sigaction() failed\n");
+		pr_perror("sigaction() failed\n");
 		return -1;
 	}
 
@@ -773,18 +844,9 @@ static int restore_root_task(struct pstree_item *init, struct cr_options *opts)
 
 	ret = sigaction(SIGCHLD, &act, &old_act);
 	if (ret < 0) {
-		perror("sigaction() failed\n");
+		pr_perror("sigaction() failed\n");
 		return -1;
 	}
-
-	/*
-	 * We need non /proc proc mount for restoring pid and mount namespaces
-	 * and do not care for the rest of the cases. Thus -- mount proc at
-	 * custom location for any new namespace
-	 */
-
-	if (opts->namespaces_flags && prepare_proc())
-		return -1;
 
 	/*
 	 * FIXME -- currently we assume that all the tasks live
@@ -831,36 +893,34 @@ static int restore_root_task(struct pstree_item *init, struct cr_options *opts)
 	futex_wait_while_gt(&task_entries->nr_in_progress, 0);
 	ret = (int)futex_get(&task_entries->nr_in_progress);
 
-out:
-	if (opts->namespaces_flags)
-		umount_proc();
-
-	if (ret < 0) {
-		struct pstree_item *pi;
-		pr_err("Someone can't be restored\n");
-
-		for_each_pstree_item(pi)
-			kill(pi->pid.virt, SIGKILL);
-
-		return 1;
-	}
-
 	futex_set_and_wake(&task_entries->nr_in_progress, task_entries->nr);
 	futex_set_and_wake(&task_entries->start, CR_STATE_RESTORE_SIGCHLD);
 	futex_wait_until(&task_entries->nr_in_progress, 0);
 
+	/* Restore SIGCHLD here to skip SIGCHLD from a network sctip */
 	ret = sigaction(SIGCHLD, &old_act, NULL);
 	if (ret < 0) {
-		perror("sigaction() failed\n");
-		return -1;
+		pr_perror("sigaction() failed\n");
+		goto out;
 	}
 
-	/*
-	 * Maybe rework ghosts to be auto-unlinkable?
-	 */
+	network_unlock();
+out:
+	if (ret < 0) {
+		struct pstree_item *pi;
+		pr_err("Someone can't be restored\n");
 
-	clear_ghost_files();
-	tcp_unlock_connections();
+		if (opts->namespaces_flags & CLONE_NEWPID) {
+			/* Kill init */
+			if (root_item->pid.real > 0)
+				kill(root_item->pid.real, SIGKILL);
+		} else {
+			for_each_pstree_item(pi)
+				if (pi->pid.virt > 0)
+					kill(pi->pid.virt, SIGKILL);
+		}
+		return 1;
+	}
 
 	pr_info("Go on!!!\n");
 	futex_set_and_wake(&task_entries->start, CR_STATE_COMPLETE);
@@ -896,10 +956,10 @@ int cr_restore_tasks(pid_t pid, struct cr_options *opts)
 	if (prepare_pstree() < 0)
 		return -1;
 
-	if (prepare_shared() < 0)
+	if (prepare_pstree_ids() < 0)
 		return -1;
 
-	if (prepare_pstree_ids() < 0)
+	if (crtools_prepare_shared() < 0)
 		return -1;
 
 	futex_set(&task_entries->nr_in_progress, task_entries->nr_tasks + task_entries->nr_helpers);
@@ -1016,7 +1076,7 @@ static int prepare_itimers(int pid, struct task_restore_core_args *args)
 	if (fd < 0)
 		return fd;
 
-	ret = pb_read(fd, &ie, itimer_entry);
+	ret = pb_read_one(fd, &ie, PB_ITIMERS);
 	if (ret < 0)
 		goto out;
 	ret = itimer_restore_and_fix("real", ie, &args->itimers[0]);
@@ -1024,7 +1084,7 @@ static int prepare_itimers(int pid, struct task_restore_core_args *args)
 	if (ret < 0)
 		goto out;
 
-	ret = pb_read(fd, &ie, itimer_entry);
+	ret = pb_read_one(fd, &ie, PB_ITIMERS);
 	if (ret < 0)
 		goto out;
 	ret = itimer_restore_and_fix("virt", ie, &args->itimers[1]);
@@ -1032,7 +1092,7 @@ static int prepare_itimers(int pid, struct task_restore_core_args *args)
 	if (ret < 0)
 		goto out;
 
-	ret = pb_read(fd, &ie, itimer_entry);
+	ret = pb_read_one(fd, &ie, PB_ITIMERS);
 	if (ret < 0)
 		goto out;
 	ret = itimer_restore_and_fix("prof", ie, &args->itimers[2]);
@@ -1059,7 +1119,7 @@ static int prepare_creds(int pid, struct task_restore_core_args *args)
 	if (fd < 0)
 		return fd;
 
-	ret = pb_read(fd, &ce, creds_entry);
+	ret = pb_read_one(fd, &ce, PB_CREDS);
 	close_safe(&fd);
 
 	if (ret < 0)
@@ -1116,7 +1176,7 @@ static int prepare_mm(pid_t pid, struct task_restore_core_args *args)
 	if (fd < 0)
 		return -1;
 
-	if (pb_read(fd, &mm, mm_entry) < 0)
+	if (pb_read_one(fd, &mm, PB_MM) < 0)
 		return -1;
 
 	args->mm = *mm;
@@ -1143,9 +1203,47 @@ out:
 	return ret;
 }
 
+static void *restorer;
+static unsigned long restorer_len;
+
+static int prepare_restorer_blob(void)
+{
+	/*
+	 * We map anonymous mapping, not mremap the restorer itself later.
+	 * Otherwise the resoter vma would be tied to crtools binary which 
+	 * in turn will lead to set-exe-file prctl to fail with EBUSY.
+	 */
+
+	restorer_len = round_up(sizeof(restorer_blob), PAGE_SIZE);
+	restorer = mmap(NULL, restorer_len,
+			PROT_READ | PROT_WRITE | PROT_EXEC,
+			MAP_PRIVATE | MAP_ANON, 0, 0);
+	if (restorer == MAP_FAILED) {
+		pr_err("Can't map restorer code");
+		return -1;
+	}
+
+	memcpy(restorer, &restorer_blob, sizeof(restorer_blob));
+	return 0;
+}
+
+static int remap_restorer_blob(void *addr)
+{
+	void *mem;
+
+	mem = mremap(restorer, restorer_len, restorer_len,
+			MREMAP_FIXED | MREMAP_MAYMOVE, addr);
+	if (mem != addr) {
+		pr_perror("Can't remap restorer blob");
+		return -1;
+	}
+
+	return 0;
+}
+
 static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_vmas, int nr_vmas)
 {
-	long restore_code_len, restore_task_vma_len;
+	long restore_task_vma_len;
 	long restore_thread_vma_len, self_vmas_len, vmas_len;
 
 	void *mem = MAP_FAILED;
@@ -1165,7 +1263,6 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 
 	pr_info("Restore via sigreturn\n");
 
-	restore_code_len	= 0;
 	restore_task_vma_len	= 0;
 	restore_thread_vma_len	= 0;
 
@@ -1173,6 +1270,9 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 	close_proc();
 	if (ret < 0)
 		goto err;
+
+	/* required to unmap stack _with_ guard page */
+	mark_stack_vma((long) &self_vma_list, &self_vma_list);
 
 	self_vmas_len = round_up((ret + 1) * sizeof(VmaEntry), PAGE_SIZE);
 	vmas_len = round_up((nr_vmas + 1) * sizeof(VmaEntry), PAGE_SIZE);
@@ -1190,36 +1290,22 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 		goto err;
 	}
 
-	restore_code_len	= sizeof(restorer_blob);
-	restore_code_len	= round_up(restore_code_len, 16);
-
-	restore_task_vma_len	= round_up(restore_code_len + sizeof(*task_args), PAGE_SIZE);
-
-	/*
-	 * Thread statistics
-	 */
-
-	/*
-	 * Compute how many memory we will need
-	 * to restore all threads, every thread
-	 * requires own stack and heap, it's ~40K
-	 * per thread.
-	 */
-
-	restore_thread_vma_len = sizeof(*thread_args) * me->nr_threads;
-	restore_thread_vma_len = round_up(restore_thread_vma_len, 16);
+	restore_task_vma_len   = round_up(sizeof(*task_args), PAGE_SIZE);
+	restore_thread_vma_len = round_up(sizeof(*thread_args) * current->nr_threads, PAGE_SIZE);
 
 	pr_info("%d threads require %ldK of memory\n",
-			me->nr_threads,
+			current->nr_threads,
 			KBYTES(restore_thread_vma_len));
 
 	restore_thread_vma_len = round_up(restore_thread_vma_len, PAGE_SIZE);
 
 	exec_mem_hint = restorer_get_vma_hint(pid, tgt_vmas, &self_vma_list,
+					      restorer_len +
 					      restore_task_vma_len +
 					      restore_thread_vma_len +
-					      self_vmas_len +
-					      SHMEMS_SIZE + TASK_ENTRIES_SIZE);
+					      self_vmas_len + vmas_len +
+					      SHMEMS_SIZE + TASK_ENTRIES_SIZE +
+					      rst_tcp_socks_size);
 	if (exec_mem_hint == -1) {
 		pr_err("No suitable area for task_restore bootstrap (%ldK)\n",
 		       restore_task_vma_len + restore_thread_vma_len);
@@ -1229,33 +1315,33 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 	pr_info("Found bootstrap VMA hint at: 0x%lx (needs ~%ldK)\n", exec_mem_hint,
 			KBYTES(restore_task_vma_len + restore_thread_vma_len));
 
+	ret = remap_restorer_blob((void *)exec_mem_hint);
+	if (ret < 0)
+		goto err;
+
+	/*
+	 * Prepare a memory map for restorer. Note a thread space
+	 * might be completely unused so it's here just for convenience.
+	 */
+	restore_code_start		= (void *)exec_mem_hint;
+	restore_thread_exec_start	= restore_code_start + restorer_blob_offset____export_restore_thread;
+	restore_task_exec_start		= restore_code_start + restorer_blob_offset____export_restore_task;
+
+	exec_mem_hint += restorer_len;
+
 	/* VMA we need to run task_restore code */
 	mem = mmap((void *)exec_mem_hint,
 			restore_task_vma_len + restore_thread_vma_len,
-			PROT_READ | PROT_WRITE | PROT_EXEC,
+			PROT_READ | PROT_WRITE,
 			MAP_PRIVATE | MAP_ANON | MAP_FIXED, 0, 0);
 	if (mem != (void *)exec_mem_hint) {
 		pr_err("Can't mmap section for restore code\n");
 		goto err;
 	}
 
-	/*
-	 * Prepare a memory map for restorer. Note a thread space
-	 * might be completely unused so it's here just for convenience.
-	 */
-	restore_code_start		= mem;
-	restore_thread_exec_start	= restore_code_start + restorer_blob_offset____export_restore_thread;
-	restore_task_exec_start		= restore_code_start + restorer_blob_offset____export_restore_task;
-	task_args			= restore_code_start + restore_code_len;
-	thread_args			= (void *)((long)task_args + sizeof(*task_args));
-
-	memzero_p(task_args);
-	memzero(thread_args, sizeof(*thread_args) * me->nr_threads);
-
-	/*
-	 * Code at a new place.
-	 */
-	memcpy(restore_code_start, &restorer_blob, sizeof(restorer_blob));
+	memzero(mem, restore_task_vma_len + restore_thread_vma_len);
+	task_args	= mem;
+	thread_args	= mem + restore_task_vma_len;
 
 	/*
 	 * Adjust stack.
@@ -1295,6 +1381,12 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 	if (!task_args->tgt_vmas)
 		goto err;
 
+	mem += vmas_len;
+	if (rst_tcp_socks_remap(mem))
+		goto err;
+	task_args->rst_tcp_socks = mem;
+	task_args->rst_tcp_socks_size = rst_tcp_socks_size;
+
 	/*
 	 * Arguments for task restoration.
 	 */
@@ -1303,6 +1395,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 
 	task_args->pid		= pid;
 	task_args->logfd	= log_get_fd();
+	task_args->loglevel	= log_get_loglevel();
 	task_args->sigchld_act	= sigchld_act;
 	task_args->fd_pages	= fd_pages;
 
@@ -1312,6 +1405,12 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 	task_args->ids			= *core->ids;
 	task_args->gpregs		= *core->thread_info->gpregs;
 	task_args->blk_sigset		= core->tc->blk_sigset;
+
+	if (core->thread_core) {
+		task_args->has_futex		= true;
+		task_args->futex_rla		= core->thread_core->futex_rla;
+		task_args->futex_rla_len	= core->thread_core->futex_rla_len;
+	}
 
 	/* No longer need it */
 	core_entry__free_unpacked(core, NULL);
@@ -1333,16 +1432,16 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 	/*
 	 * Now prepare run-time data for threads restore.
 	 */
-	task_args->nr_threads		= me->nr_threads;
+	task_args->nr_threads		= current->nr_threads;
 	task_args->clone_restore_fn	= (void *)restore_thread_exec_start;
 	task_args->thread_args		= thread_args;
 
 	/*
 	 * Fill up per-thread data.
 	 */
-	for (i = 0; i < me->nr_threads; i++) {
+	for (i = 0; i < current->nr_threads; i++) {
 		int fd_core;
-		thread_args[i].pid = me->threads[i].virt;
+		thread_args[i].pid = current->threads[i].virt;
 
 		/* skip self */
 		if (thread_args[i].pid == pid)
@@ -1355,7 +1454,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 			goto err;
 		}
 
-		ret = pb_read(fd_core, &core, core_entry);
+		ret = pb_read_one(fd_core, &core, PB_CORE);
 		close(fd_core);
 
 		if (core->tc || core->ids) {
@@ -1373,6 +1472,12 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core, struct list_head *tgt_v
 		thread_args[i].rst_lock		= &task_args->rst_lock;
 		thread_args[i].gpregs		= *core->thread_info->gpregs;
 		thread_args[i].clear_tid_addr	= core->thread_info->clear_tid_addr;
+
+		if (core->thread_core) {
+			thread_args[i].has_futex	= true;
+			thread_args[i].futex_rla	= core->thread_core->futex_rla;
+			thread_args[i].futex_rla_len	= core->thread_core->futex_rla_len;
+		}
 
 		core_entry__free_unpacked(core, NULL);
 

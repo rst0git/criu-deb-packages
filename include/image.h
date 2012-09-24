@@ -11,6 +11,13 @@
 #define CRTOOLS_IMAGES_V1	1
 
 /*
+ * Raw images are images in which data is stored in some
+ * non-crtool format (ip tool dumps, tarballs, etc.)
+ */
+
+#define RAW_IMAGE_MAGIC		0x0
+
+/*
  * The magic-s below correspond to coordinates
  * of various Russian towns in the NNNNEEEE form.
  */
@@ -29,6 +36,7 @@
 #define SIGACT_MAGIC		0x55344201 /* Murom */
 #define UNIXSK_MAGIC		0x54373943 /* Ryazan */
 #define INETSK_MAGIC		0x56443851 /* Pereslavl */
+#define PACKETSK_MAGIC		0x60454618 /* Veliky Ustyug */
 #define ITIMERS_MAGIC		0x57464056 /* Kostroma */
 #define SK_QUEUES_MAGIC		0x56264026 /* Suzdal */
 #define UTSNS_MAGIC		0x54473203 /* Smolensk */
@@ -46,9 +54,17 @@
 #define EVENTFD_MAGIC		0x44523722 /* Anapa */
 #define EVENTPOLL_MAGIC		0x45023858 /* Krasnodar */
 #define EVENTPOLL_TFD_MAGIC	0x44433746 /* Novorossiysk */
+#define SIGNALFD_MAGIC		0x57323820 /* Uglich */
 #define INOTIFY_MAGIC		0x48424431 /* Volgograd */
 #define INOTIFY_WD_MAGIC	0x54562009 /* Svetlogorsk (Rauschen) */
 #define MOUNTPOINTS_MAGIC	0x55563928 /* Petushki */
+#define NETDEV_MAGIC		0x57373951 /* Yaroslavl */
+#define TTY_MAGIC		0x59433025 /* Pushkin */
+#define TTY_INFO_MAGIC		0x59453036 /* Kolpino */
+
+#define IFADDR_MAGIC		RAW_IMAGE_MAGIC
+#define ROUTE_MAGIC		RAW_IMAGE_MAGIC
+#define TMPFS_MAGIC		RAW_IMAGE_MAGIC
 
 #define PAGE_IMAGE_SIZE	4096
 #define PAGE_RSS	1

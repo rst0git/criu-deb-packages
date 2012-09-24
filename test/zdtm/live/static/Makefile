@@ -1,7 +1,7 @@
 LIBDIR	= ../../lib
 LIB	= $(LIBDIR)/libzdtmtst.a
 override CPPFLAGS += -I$(LIBDIR)
-CFLAGS	= -g -O2 -Wall -Werror -Wno-unused-result
+CFLAGS	= -g -O2 -Wall -Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
 
 TST_NOFILE	=				\
 		busyloop00			\
@@ -12,6 +12,7 @@ TST_NOFILE	=				\
 		zombie00			\
 		fpu00				\
 		futex				\
+		futex-rl			\
 		mmx00				\
 		sse00				\
 		sse20				\
@@ -23,6 +24,7 @@ TST_NOFILE	=				\
 		socket6_udp			\
 		socket_udplite			\
 		socket_aio			\
+		packet_sock			\
 		msgque				\
 		inotify_system			\
 		inotify_system_nodel		\
@@ -38,6 +40,7 @@ TST_NOFILE	=				\
 		sockets_spair			\
 		sockets_dgram			\
 		socket_queues			\
+		socket-tcp			\
 		ipc_namespace			\
 		selfexe00			\
 		sem				\
@@ -45,13 +48,21 @@ TST_NOFILE	=				\
 		xids00				\
 		file_fown			\
 		eventfs00			\
+		signalfd00			\
 		inotify00			\
 		uptime_grow			\
 		session00			\
 		pty00				\
+		pty01				\
+		pty02				\
+		pty03				\
+		pty04				\
 		tty00				\
 		mountpoints			\
+		netns				\
 		session01			\
+		socket-ext			\
+		unhashed_proc			\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -137,18 +148,18 @@ fifo-rowo-pair.pid: fifo-rowo-pair
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --name_master=$<.master.test --name_slave=$<.slave.test
 
 %.out:	%.pid %
-	-kill -TERM `< $<`
+	-kill -TERM `cat $<`
 
 $(TST_STATE:%=%.state):	%.state: %
 	$(<D)/$(<F) --statefile=$@ --outfile=$<.out start
 
-$(TST_STATE:%=%.out): %.out: % %.state
+$(TST_STATE:%=%.out): %.out: %
 	-$(<D)/$(<F) --statefile=$<.state --outfile=$@ stop
 
 start:	$(PID) $(STATE)
 
 %.is_running:	%.pid
-	kill -0 `< $<`
+	kill -0 `cat $<`
 
 check_start:	$(PID:%.pid=%.is_running)
 
@@ -166,10 +177,12 @@ $(TST):	$(LIB)
 
 futex.o:		override CFLAGS += -pthread
 futex:			override LDFLAGS += -pthread
+futex-rl.o:		override CFLAGS += -pthread
+futex-rl:		override LDFLAGS += -pthread
 jobctl00:		override LDLIBS += -lutil
-socket_listen:		override LDLIBS += -lrt
-socket_aio:		override LDLIBS += -lrt
-uptime_grow:	override LDLIBS += -lrt
+socket_listen:		override LDLIBS += -lrt -pthread
+socket_aio:		override LDLIBS += -lrt -pthread
+uptime_grow:	override LDLIBS += -lrt -pthread
 unlink_largefile:	override CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
 inotify_system_nodel:	override CFLAGS += -DNODEL
 pthread00:		override LDLIBS += -pthread

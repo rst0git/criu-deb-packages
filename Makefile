@@ -1,32 +1,12 @@
 include Makefile.inc
 
-CFLAGS		+= -I./include
-CFLAGS		+= -O0 -ggdb3
-
-LIBS		+= -lrt -lpthread -lprotobuf-c
-
-DEFINES		+= -D_FILE_OFFSET_BITS=64
-DEFINES		+= -D_GNU_SOURCE
-
-ifneq ($(WERROR),0)
-	WARNINGS += -Werror
-endif
-
-ifeq ($(DEBUG),1)
-	DEFINES += -DCR_DEBUG
-endif
-
-WARNINGS	+= -Wall
-CFLAGS		+= $(WARNINGS) $(DEFINES)
-
 PROGRAM		:= crtools
-
-export CC ECHO MAKE CFLAGS LIBS ARCH DEFINES
 
 OBJS		+= parasite-syscall.o
 OBJS		+= cr-restore.o
 OBJS		+= crtools.o
 OBJS		+= image.o
+OBJS		+= net.o
 OBJS		+= proc_parse.o
 OBJS		+= cr-dump.o
 OBJS		+= cr-show.o
@@ -43,6 +23,7 @@ OBJS		+= sockets.o
 OBJS		+= sk-inet.o
 OBJS		+= sk-tcp.o
 OBJS		+= sk-unix.o
+OBJS		+= sk-packet.o
 OBJS		+= sk-queue.o
 OBJS		+= files.o
 OBJS		+= files-reg.o
@@ -58,8 +39,10 @@ OBJS		+= eventfd.o
 OBJS		+= eventpoll.o
 OBJS		+= mount.o
 OBJS		+= inotify.o
+OBJS		+= signalfd.o
 OBJS		+= pstree.o
 OBJS		+= protobuf.o
+OBJS		+= tty.o
 
 PROTOBUF-LIB	:= protobuf/protobuf-lib.o
 
@@ -70,13 +53,14 @@ MAKEFLAGS	+= --no-print-directory
 include Makefile.syscall
 include Makefile.pie
 
-.PHONY: all test-legacy zdtm test rebuild clean distclean tags cscope	\
+.PHONY: all zdtm test rebuild clean distclean tags cscope	\
 	docs help pie protobuf
 
-all: protobuf pie
+all: pie
 	$(Q) $(MAKE) $(PROGRAM)
 
-pie: $(PIE-GEN)
+pie: protobuf
+	$(Q) $(MAKE) $(PIE-GEN)
 
 protobuf:
 	$(Q) $(MAKE) -C protobuf/
@@ -101,9 +85,6 @@ $(PROGRAM): $(OBJS) $(SYS-OBJ) $(PROTOBUF-LIB)
 	$(E) "  LINK    " $@
 	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) -o $@
 
-test-legacy: all
-	$(Q) $(MAKE) -C test/legacy all
-
 zdtm: all
 	$(Q) $(MAKE) -C test/zdtm all
 
@@ -114,6 +95,8 @@ rebuild:
 	$(E) "  FORCE-REBUILD"
 	$(Q) $(RM) -f ./*.o
 	$(Q) $(RM) -f ./*.d
+	$(Q) $(RM) -f ./protobuf/*.pb-c.c
+	$(Q) $(RM) -f ./protobuf/*.pb-c.h
 	$(Q) $(MAKE)
 
 clean: cleanpie cleansyscall
@@ -127,7 +110,6 @@ clean: cleanpie cleansyscall
 	$(Q) $(RM) -f ./$(PROGRAM)
 	$(Q) $(RM) -rf ./test/dump/
 	$(Q) $(MAKE) -C protobuf/ clean
-	$(Q) $(MAKE) -C test/legacy clean
 	$(Q) $(MAKE) -C test/zdtm cleandep
 	$(Q) $(MAKE) -C test/zdtm clean
 	$(Q) $(MAKE) -C test/zdtm cleanout

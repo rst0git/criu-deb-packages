@@ -57,7 +57,7 @@ static int dump_one_fifo(int lfd, u32 id, const struct fd_parms *p)
 	e.id		= id;
 	e.pipe_id	= pipe_id(p);
 
-	if (pb_write(img, &e, fifo_entry))
+	if (pb_write_one(img, &e, PB_FIFO))
 		return -1;
 
 	return dump_one_pipe_data(&pd_fifo, lfd, p);
@@ -65,7 +65,6 @@ static int dump_one_fifo(int lfd, u32 id, const struct fd_parms *p)
 
 static const struct fdtype_ops fifo_ops = {
 	.type		= FD_TYPES__FIFO,
-	.make_gen_id	= make_gen_id,
 	.dump		= dump_one_fifo,
 };
 
@@ -123,44 +122,40 @@ static struct file_desc_ops fifo_desc_ops = {
 	.open		= open_fifo_fd,
 };
 
-int collect_fifo(void)
+static int collect_one_fifo(void *o, ProtobufCMessage *base)
 {
-	struct fifo_info *info = NULL, *f;
-	int img, ret;
+	struct fifo_info *info = o, *f;
 
-	img = open_image_ro(CR_FD_FIFO);
-	if (img < 0)
-		return -1;
-
-	while (1) {
-		ret = -1;
-		info = xzalloc(sizeof(*info));
-		if (!info)
-			break;
-
-		ret = pb_read_eof(img, &info->fe, fifo_entry);
-		if (ret <= 0)
-			break;
-
-		pr_info("Collected fifo entry ID %#x PIPE ID %#x\n",
+	info->fe = pb_msg(base, FifoEntry);
+	pr_info("Collected fifo entry ID %#x PIPE ID %#x\n",
 			info->fe->id, info->fe->pipe_id);
 
-		file_desc_add(&info->d, info->fe->id, &fifo_desc_ops);
+	file_desc_add(&info->d, info->fe->id, &fifo_desc_ops);
 
-		/* check who will restore the fifo data */
-		list_for_each_entry(f, &fifo_head, list)
-			if (f->fe->pipe_id == info->fe->pipe_id)
-				break;
+	/* check who will restore the fifo data */
+	list_for_each_entry(f, &fifo_head, list)
+		if (f->fe->pipe_id == info->fe->pipe_id)
+			break;
 
-		if (&f->list == &fifo_head) {
-			list_add(&info->list, &fifo_head);
-			info->restore_data = true;
-		}
+	if (&f->list == &fifo_head) {
+		list_add(&info->list, &fifo_head);
+		info->restore_data = true;
+	} else {
+		INIT_LIST_HEAD(&info->list);
+		info->restore_data = false;
 	}
 
-	xfree(info ? info->fe : NULL);
-	xfree(info);
-	close(img);
+	return 0;
+}
 
-	return collect_pipe_data(CR_FD_FIFO_DATA, pd_hash_fifo);
+int collect_fifo(void)
+{
+	int ret;
+
+	ret = collect_image(CR_FD_FIFO, PB_FIFO,
+			sizeof(struct fifo_info), collect_one_fifo);
+	if (!ret)
+		ret = collect_pipe_data(CR_FD_FIFO_DATA, pd_hash_fifo);
+
+	return ret;
 }

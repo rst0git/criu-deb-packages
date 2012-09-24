@@ -102,7 +102,7 @@ int dump_pstree(struct pstree_item *root_item)
 		for (i = 0; i < item->nr_threads; i++)
 			e.threads[i] = item->threads[i].virt;
 
-		ret = pb_write(pstree_fd, &e, pstree_entry);
+		ret = pb_write_one(pstree_fd, &e, PB_PSTREE);
 		xfree(e.threads);
 
 		if (ret)
@@ -131,7 +131,7 @@ int prepare_pstree(void)
 	while (1) {
 		PstreeEntry *e;
 
-		ret = pb_read_eof(ps_fd, &e, pstree_entry);
+		ret = pb_read_one_eof(ps_fd, &e, PB_PSTREE);
 		if (ret <= 0)
 			break;
 
@@ -141,16 +141,13 @@ int prepare_pstree(void)
 			break;
 
 		pi->pid.virt = e->pid;
-		if (e->pid > max_pid)
-			max_pid = e->pid;
+		max_pid = max((int)e->pid, max_pid);
 
 		pi->pgid = e->pgid;
-		if (e->pgid > max_pid)
-			max_pid = e->pgid;
+		max_pid = max((int)e->pgid, max_pid);
 
 		pi->sid = e->sid;
-		if (e->sid > max_pid)
-			max_pid = e->sid;
+		max_pid = max((int)e->sid, max_pid);
 
 		if (e->ppid == 0) {
 			BUG_ON(root_item);

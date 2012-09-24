@@ -3,12 +3,13 @@ Section: admin
 Priority: optional
 Maintainer: Daniel Baumann <daniel.baumann@progress-technologies.net>
 Build-Depends: debhelper (>= 9), libprotobuf-c0-dev, protobuf-c-compiler
-Standards-Version: 3.9.3
+Standards-Version: 3.9.4
 Homepage: http://www.criu.org/
 
 Package: crtools
 Architecture: amd64
 Depends: ${misc:Depends}, ${shlibs:Depends}
+Recommends: iproute2
 Description: checkpoint and restore in userspace
  crtools contains the utilities to checkpoint and restore processes in
  userspace.

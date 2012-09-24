@@ -48,7 +48,7 @@ int read_sk_queues(void)
 			pr_err("Failed to allocate packet header\n");
 			break;
 		}
-		ret = pb_read_eof(fd, &pkt->entry, sk_packet_entry);
+		ret = pb_read_one_eof(fd, &pkt->entry, PB_SK_QUEUES);
 		if (ret <= 0)
 			break;
 
@@ -142,7 +142,7 @@ int dump_sk_queue(int sock_fd, int sock_id)
 			goto err_set_sock;
 		}
 
-		ret = pb_write(fdset_fd(glob_fdset, CR_FD_SK_QUEUES), &pe, sk_packet_entry);
+		ret = pb_write_one(fdset_fd(glob_fdset, CR_FD_SK_QUEUES), &pe, PB_SK_QUEUES);
 		if (ret < 0) {
 			ret = -EIO;
 			goto err_set_sock;
@@ -168,34 +168,21 @@ err_brk:
 	return ret;
 }
 
+static void sk_queue_data_handler(int fd, void *obj, int show_pages_content)
+{
+	SkPacketEntry *e = obj;
+
+	if (show_pages_content) {
+		pr_msg("\n");
+		print_image_data(fd, e->length);
+	} else
+		lseek(fd, e->length, SEEK_CUR);
+}
+
 void show_sk_queues(int fd, struct cr_options *o)
 {
-	SkPacketEntry *pe;
-	int ret;
-
-	pr_img_head(CR_FD_SK_QUEUES);
-	while (1) {
-		void *data;
-
-		ret = pb_read_eof(fd, &pe, sk_packet_entry);
-		if (ret <= 0)
-			break;
-		pr_msg("pkt for %u length %u bytes\n",
-			pe->id_for, (unsigned int)pe->length);
-
-		data = xmalloc(pe->length);
-		if (!data)
-			break;
-		ret = read_img_buf(fd, (unsigned char *)data, pe->length);
-		if (ret < 0) {
-			xfree(data);
-			break;
-		}
-		print_data(0, (unsigned char *)data, pe->length);
-		sk_packet_entry__free_unpacked(pe, NULL);
-		xfree(data);
-	}
-	pr_img_tail(CR_FD_SK_QUEUES);
+	pb_show_plain_payload(fd, PB_SK_QUEUES,
+			sk_queue_data_handler, o->show_pages_content);
 }
 
 int restore_sk_queue(int fd, unsigned int peer_id)

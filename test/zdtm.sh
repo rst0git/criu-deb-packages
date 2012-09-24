@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 ZP="zdtm/live"
 
@@ -16,12 +16,15 @@ static/sleeping00
 static/write_read00
 static/write_read01
 static/write_read02
+static/write_read10
 static/wait00
 static/vdso00
 static/file_shared
 static/timers
 static/futex
+static/futex-rl
 static/xids00
+static/pthread00
 streaming/pipe_loop00
 streaming/pipe_shared00
 transition/file_read
@@ -34,6 +37,7 @@ static/pstree
 static/caps00
 static/cmdlinenv00
 static/socket_listen
+static/packet_sock
 static/socket_udp
 static/socket6_udp
 static/socket_udplite
@@ -41,30 +45,38 @@ static/selfexe00
 static/unlink_fstat00
 static/unlink_fstat02
 static/eventfs00
+static/signalfd00
 static/inotify00
 static/unbound_sock
 static/fifo-rowo-pair
 static/fifo-ghost
 static/fifo
 static/fifo_wronly
-"
-# Duplicate list with pidns/ prefix
-TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#pidns/#')
-
-# These ones are not in pidns
-TEST_LIST="$TEST_LIST
 static/zombie00
 transition/fork
+"
+# Duplicate list with ns/ prefix
+TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#ns/#')
+
+# These ones are not in ns
+TEST_LIST="$TEST_LIST
 static/file_fown
+static/socket-ext
+static/socket-tcp
+static/pty00
+static/pty01
+static/pty03
+static/pty04
 "
 
 MNT_TEST_LIST="
 static/mountpoints
 "
 
-# These ones are in pidns
+# These ones are in ns
 TEST_LIST="$TEST_LIST
-pidns/static/session00
+ns/static/session00
+ns/static/session01
 "
 
 UTS_TEST_LIST="
@@ -88,26 +100,63 @@ ARGS=""
 PID=""
 PIDNS=""
 
+umount_zdtm_root()
+{
+	[ -z "$ZDTM_ROOT" ] && return;
+	umount -l "$ZDTM_ROOT"
+	rmdir "$ZDTM_ROOT"
+}
+trap umount_zdtm_root EXIT
+
+construct_root()
+{
+	local root=$1
+	local test_path=$2
+	local libdir=$root/lib64
+
+	mkdir $libdir
+	for i in `ldd $test_path | awk '{ print $1 }' | grep -v vdso`; do
+		local lib=`basename $i`
+		[ -f $libdir/$lib ] && continue ||
+		[ -f $i ] && cp $i $libdir && continue ||
+		[ -f /lib64/$i ] && cp /lib64/$i $libdir && continue ||
+		[ -f /usr/lib64/$i ] && cp /usr/lib64/$i $libdir || return 1
+	done
+}
+
 start_test()
 {
 	local tdir=$1
 	local tname=$2
+	export ZDTM_ROOT
+	TPID=`readlink -f $tdir`/$tname.init.pid
 
-	killall -9 $tname &> /dev/null
+	killall -9 $tname > /dev/null 2>&1
 	make -C $tdir cleanout
 
 	if [ -z "$PIDNS" ]; then
 		make -C $tdir $tname.pid
 		PID=`cat $test.pid` || return 1
 	else
-		killall -9 test_init
-		$TINIT  $tdir $tname || {
+		if [ -z "$ZDTM_ROOT" ]; then
+			mkdir dump
+			ZDTM_ROOT=`mktemp -d dump/crtools-root.XXXXXX`
+			ZDTM_ROOT=`readlink -f $ZDTM_ROOT`
+			mount --bind . $ZDTM_ROOT || return 1
+		fi
+		construct_root $ZDTM_ROOT $tdir/$tname || return 1
+	(	export ZDTM_NEWNS=1
+		export ZDTM_PIDFILE=$TPID
+		cd $ZDTM_ROOT
+		rm -f $ZDTM_PIDFILE
+		make -C $tdir $tname.pid || {
 			echo ERROR: fail to start $tdir/$tname
 			return 1;
 		}
+	)
 
-		PID=`ps h -C test_init -o pid`
-		PID=$((PID))
+		PID=`cat "$TPID"`
+		ps -p $PID || return 1
 	fi
 }
 
@@ -119,7 +168,7 @@ stop_test()
 	if [ -z "$PIDNS" ]; then
 		make -C $tdir $tname.out
 	else
-		killall test_init
+		kill `cat "$TPID"`
 	fi
 }
 
@@ -144,8 +193,8 @@ run_test()
 {
 	local test=$1
 
-	expr "$test" : 'pidns/' > /dev/null && PIDNS=1 || PIDNS=""
-	test=${ZP}/${test#pidns/}
+	expr "$test" : 'ns/' > /dev/null && PIDNS=1 || PIDNS=""
+	test=${ZP}/${test#ns/}
 
 	shift
 	local args=$*
@@ -167,32 +216,53 @@ run_test()
 	DUMP_PATH=`pwd`/$ddump
 
 	if [ -n "$PIDNS" ]; then
-		args="--namespace pid $args"
+		[ -z "$CR_IP_TOOL" ] && CR_IP_TOOL=ip
+		$CR_IP_TOOL a help 2>&1 | grep -q showdump || {
+			cat >&2 <<EOF
+The util "ip" is incompatible. The good one can be cloned from
+git://git.criu.org/iproute2. It should be compiled and a path
+to ip is written in \$CR_IP_TOOL.
+EOF
+			exit 1;
+		}
+		args="-n uts -n ipc -n net -n pid -n mnt --root $ZDTM_ROOT --pidfile $TPID $args"
 	fi
 
 	echo Dump $PID
 	mkdir -p $ddump
 	save_fds $PID  $ddump/dump.fd
-	setsid $CRTOOLS dump -D $ddump -o dump.log -v 4 -t $PID $args $ARGS || {
+	setsid $CRTOOLS dump --tcp-established -x --evasive-devices -D $ddump -o dump.log -v 4 -t $PID $args $ARGS || {
 		echo WARNING: process $tname is left running for your debugging needs
 		return 1
 	}
 	if expr " $ARGS" : ' -s' > /dev/null; then
-		save_fds $pid  $ddump/dump.fd.after
+		save_fds $PID  $ddump/dump.fd.after
 		diff_fds $ddump/dump.fd $ddump/dump.fd.after || return 1
 		killall -CONT $tname
 	else
-		while :; do
-			killall -9 $tname &> /dev/null || break
-			echo Waiting...
-			sleep 0.1
+		# Wait while tasks are dying, otherwise PIDs would be busy.
+		for i in $ddump/core-*.img; do
+			local pid
+
+			[ -n "$PIDNS" ] && break;
+
+			pid=`expr "$i" : '.*/core-\([0-9]*\).img'`
+			while :; do
+				kill -0 $pid > /dev/null 2>&1 || break;
+				echo Waiting the process $pid
+				sleep 0.1
+			done
 		done
 
 		echo Restore $PID
-		setsid $CRTOOLS restore --log-pid -D $ddump -o restore.log -v 4 -d -t $PID $args || return 2
+		setsid $CRTOOLS restore --tcp-established -x -D $ddump -o restore.log -v 4 -d -t $PID $args || return 2
 
-		save_fds $PID  $ddump/restore.fd
-		diff_fds $ddump/dump.fd $ddump/restore.fd || return 2
+		for i in `seq 5`; do
+			save_fds $PID  $ddump/restore.fd
+			diff_fds $ddump/dump.fd $ddump/restore.fd && break
+			sleep 0.2
+		done
+		[ $i -eq 5 ] && return 2;
 	fi
 
 	echo Check results $PID
@@ -202,7 +272,7 @@ run_test()
 		test -f $test.out && break
 		echo Waiting...
 		sleep 0.$sltime
-		[ $sltime -le 9 ] && ((sltime++))
+		[ $sltime -le 9 ] && sltime=$((sltime+1))
 	done
 	cat $test.out
 	cat $test.out | grep PASS || return 2
@@ -210,17 +280,21 @@ run_test()
 
 case_error()
 {
-	test=${ZP}/${1#pidns/}
+	test=${ZP}/${1#ns/}
 	local test_log=`pwd`/$test.out
 
 	echo "Test: $test"
 	echo "====================== ERROR ======================"
 
 	if [ -n "$DUMP_PATH" ]; then
-		[ -e "$DUMP_PATH/dump.log" ] &&
+		[ -e "$DUMP_PATH/dump.log" ] && {
 			echo "Dump log   : $DUMP_PATH/dump.log"
-		[ -e "$DUMP_PATH/restore.log" ] &&
+			cat $DUMP_PATH/dump.log* | grep Error
+		}
+		[ -e "$DUMP_PATH/restore.log" ] && {
 			echo "Restore log: $DUMP_PATH/restore.log"
+			cat $DUMP_PATH/restore.log* | grep Error
+		}
 	fi
 	[ -e "$test_log" ] &&
 		echo "Output file: $test_log"
@@ -229,7 +303,7 @@ case_error()
 
 cd `dirname $0` || exit 1
 
-if [ "$1" == "-d" ]; then
+if [ "$1" = "-d" ]; then
 	ARGS="-s"
 	shift
 fi
@@ -247,9 +321,9 @@ if [ $# -eq 0 ]; then
 	for t in $IPC_TEST_LIST; do
 		run_test $t -n ipc || case_error $t
 	done
-elif [ "$1" == "-l" ]; then
+elif [ "$1" = "-l" ]; then
 	echo $TEST_LIST $UTS_TEST_LIST $MNT_TEST_LIST $IPC_TEST_LIST | tr ' ' '\n'
-elif [ "$1" == "-h" ]; then
+elif [ "$1" = "-h" ]; then
 	cat >&2 <<EOF
 This script is used for executing unit tests.
 Usage:
