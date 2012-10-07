@@ -9,7 +9,7 @@ Homepage: http://www.criu.org/
 Package: crtools
 Architecture: amd64
 Depends: ${misc:Depends}, ${shlibs:Depends}
-Recommends: iproute2
+Recommends: iproute
 Description: checkpoint and restore in userspace
  crtools contains the utilities to checkpoint and restore processes in
  userspace.

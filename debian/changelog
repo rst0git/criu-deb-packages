@@ -1,3 +1,9 @@
+crtools (0.2-2) unstable; urgency=low
+
+  * Recommending iproute instead of iproute2 (Closes: #689050).
+
+ -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Sun, 07 Oct 2012 11:30:39 +0200
+
 crtools (0.2-1) unstable; urgency=low
 
   * Merging upstream version 0.2.
