@@ -235,140 +235,66 @@ static int close_mountpoint(DIR *dfd)
 
 static int tmpfs_dump(struct mount_info *pm)
 {
-	int ret, status;
-	pid_t pid;
+	int ret = -1;
+	char tmpfs_path[PATH_MAX];
+	int fd, fd_img = -1;
+	DIR *fdir = NULL;
 
-	pid = fork();
-	if (pid == -1) {
-		pr_perror("fork() failed\n");
+	fdir = open_mountpoint(pm);
+	if (fdir == NULL)
 		return -1;
-	} else if (pid == 0) {
-		char tmpfs_path[PATH_MAX];
-		int fd, fd_img;
-		DIR *fdir;
 
-		fdir = open_mountpoint(pm);
-		if (fdir == NULL)
-			exit(1);
+	fd = dirfd(fdir);
+	if (fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) & ~FD_CLOEXEC) == -1) {
+		pr_perror("Can not drop FD_CLOEXEC");
+		goto out;
+	}
 
-		fd = dirfd(fdir);
-		if (fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) & ~FD_CLOEXEC) == -1) {
-			pr_perror("Can not drop FD_CLOEXEC");
-			exit(1);
-		}
+	fd_img = open_image(CR_FD_TMPFS, O_DUMP, pm->mnt_id);
+	if (fd_img < 0)
+		goto out;
 
-		fd_img = open_image(CR_FD_TMPFS, O_DUMP, pm->mnt_id);
-		if (fd_img < 0)
-			exit(1);
+	snprintf(tmpfs_path, sizeof(tmpfs_path),
+				       "/proc/self/fd/%d", fd);
 
-		ret = dup2(fd_img, STDOUT_FILENO);
-		if (ret < 0) {
-			pr_perror("dup2() failed");
-			exit(1);
-		}
-		ret = dup2(log_get_fd(), STDERR_FILENO);
-		if (ret < 0) {
-			pr_perror("dup2() failed");
-			exit(1);
-		}
-		close(fd_img);
-
-		/*
-		 * tmpfs is in another mount namespace,
-		 * a direct path is inaccessible
-		 */
-
-		snprintf(tmpfs_path, sizeof(tmpfs_path),
-					       "/proc/self/fd/%d", fd);
-
-		execlp("tar", "tar", "--create",
+	ret = cr_system(-1, fd_img, -1, "tar", (char *[])
+			{ "tar", "--create",
 			"--gzip",
 			"--check-links",
 			"--preserve-permissions",
 			"--sparse",
 			"--numeric-owner",
-			"--directory", tmpfs_path, ".", NULL);
-		pr_perror("exec failed");
-		exit(1);
-	}
+			"--directory", tmpfs_path, ".", NULL });
 
-	ret = waitpid(pid, &status, 0);
-	if (ret == -1) {
-		pr_perror("waitpid() failed");
-		return -1;
-	}
-
-	if (status) {
+	if (ret)
 		pr_err("Can't dump tmpfs content\n");
-		return -1;
-	}
 
-	return 0;
+out:
+	close_safe(&fd_img);
+	close_mountpoint(fdir);
+	return ret;
 }
 
 static int tmpfs_restore(struct mount_info *pm)
 {
-	int ret, status = -1;
-	sigset_t mask, oldmask;
-	pid_t pid;
+	int ret;
+	int fd_img;
 
-	ret = sigprocmask(SIG_SETMASK, NULL, &oldmask);
-	if (ret == -1) {
-		pr_perror("Can not get mask of blocked signals");
+	fd_img = open_image_ro(CR_FD_TMPFS, pm->mnt_id);
+	if (fd_img < 0)
 		return -1;
-	}
-	mask = oldmask;
-	sigaddset(&mask, SIGCHLD);
-	ret = sigprocmask(SIG_SETMASK, &mask, NULL);
-	if (ret == -1) {
-		pr_perror("Can not set mask of blocked signals");
-		return -1;
-	}
 
-	pid = fork();
-	if (pid == -1) {
-		pr_perror("fork() failed\n");
-		goto out_unlock;
-	} else if (pid == 0) {
-		int fd_img;
+	ret = cr_system(fd_img, -1, -1, "tar",
+			(char *[]) {"tar", "--extract", "--gzip",
+				"--directory", pm->mountpoint, NULL});
+	close(fd_img);
 
-		fd_img = open_image_ro(CR_FD_TMPFS, pm->mnt_id);
-		if (fd_img < 0)
-			exit(1);
-
-		ret = dup2(fd_img, STDIN_FILENO);
-		if (ret < 0) {
-			pr_perror("dup2() failed");
-			exit(1);
-		}
-		close(fd_img);
-
-		execlp("tar", "tar", "--extract", "--gzip",
-					"--directory", pm->mountpoint, NULL);
-		pr_perror("exec failed");
-		exit(1);
-	}
-
-	ret = waitpid(pid, &status, 0);
-	if (ret == -1) {
-		pr_perror("waitpid() failed");
-		goto out_unlock;
-	}
-
-	if (status) {
+	if (ret) {
 		pr_err("Can't restore tmpfs content\n");
-		status = -1;
-		goto out_unlock;
+		return -1;
 	}
 
-out_unlock:
-	ret = sigprocmask(SIG_SETMASK, &oldmask, NULL);
-	if (ret == -1) {
-		pr_perror("Can not set mask of blocked signals");
-		BUG();
-	}
-
-	return status;
+	return 0;
 }
 
 static int binfmt_misc_dump(struct mount_info *pm)
@@ -382,9 +308,7 @@ static int binfmt_misc_dump(struct mount_info *pm)
 		return -1;
 
 	while ((de = readdir(fdir))) {
-		if (!strcmp(de->d_name, "."))
-			continue;
-		if (!strcmp(de->d_name, ".."))
+		if (dir_dots(de))
 			continue;
 		if (!strcmp(de->d_name, "register"))
 			continue;
@@ -614,13 +538,6 @@ static int do_umount_one(struct mount_info *mi)
 	if (!mi->parent)
 		return 0;
 
-	/*
-	 * Don't umount the future root. It can be a mountpoint only,
-	 * otherwise pivot_root() fails.
-	 */
-	if (opts.root && !strcmp(opts.root, mi->mountpoint))
-		return 0;
-
 	if (umount(mi->mountpoint)) {
 		pr_perror("Can't umount at %s", mi->mountpoint);
 		return -1;
@@ -656,6 +573,38 @@ static int clean_mnt_ns(void)
 	return ret;
 }
 
+static int cr_pivot_root()
+{
+	char put_root[] = "crtools-put-root.XXXXXX";
+
+	pr_info("Move the root to %s", opts.root);
+
+	if (chdir(opts.root)) {
+		pr_perror("chdir(%s) failed", opts.root);
+		return -1;
+	}
+	if (mkdtemp(put_root) == NULL) {
+		pr_perror("Can't create a temparary directory");
+		return -1;
+	}
+	if (pivot_root(".", put_root)) {
+		pr_perror("pivot_root(., %s) failed", put_root);
+		if (rmdir(put_root))
+			pr_perror("Can't remove the directory %s", put_root);
+		return -1;
+	}
+	if (umount2(put_root, MNT_DETACH)) {
+		pr_perror("Can't umount %s", put_root);
+		return -1;
+	}
+	if (rmdir(put_root)) {
+		pr_perror("Can't remove the directory %s", put_root);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int populate_mnt_ns(int ns_pid)
 {
 	MntEntry *me = NULL;
@@ -663,33 +612,6 @@ static int populate_mnt_ns(int ns_pid)
 	struct mount_info *pms = NULL;
 
 	pr_info("Populating mount namespace\n");
-
-	if (opts.root) {
-		char put_root[PATH_MAX] = "crtools-put-root.XXXXXX";
-
-		if (chdir(opts.root)) {
-			pr_perror("chdir(%s) failed", opts.root);
-			return -1;
-		}
-		if (mkdtemp(put_root) == NULL) {
-			pr_perror("Can't create a temparary directory");
-			return -1;
-		}
-		if (pivot_root(".", put_root)) {
-			pr_perror("pivot_root(., %s) failed", put_root);
-			if (rmdir(put_root))
-				pr_perror("Can't remove the directory %s", put_root);
-			return -1;
-		}
-		if (umount2(put_root, MNT_DETACH)) {
-			pr_perror("Can't umount %s", put_root);
-			return -1;
-		}
-		if (rmdir(put_root)) {
-			pr_perror("Can't remove the directory %s", put_root);
-			return -1;
-		}
-	}
 
 	img = open_image_ro(CR_FD_MOUNTPOINTS, ns_pid);
 	if (img < 0)
@@ -722,22 +644,22 @@ static int populate_mnt_ns(int ns_pid)
 		pr_debug("\t\tGetting root for %d\n", pm->mnt_id);
 		pm->root = xstrdup(me->root);
 		if (!pm->root)
-			return -1;
+			goto err;
 
 		pr_debug("\t\tGetting mpt for %d\n", pm->mnt_id);
 		pm->mountpoint = xstrdup(me->mountpoint);
 		if (!pm->mountpoint)
-			return -1;
+			goto err;
 
 		pr_debug("\t\tGetting source for %d\n", pm->mnt_id);
 		pm->source = xstrdup(me->source);
 		if (!pm->source)
-			return -1;
+			goto err;
 
 		pr_debug("\t\tGetting opts for %d\n", pm->mnt_id);
 		pm->options = xstrdup(me->options);
 		if (!pm->options)
-			return -1;
+			goto err;
 
 		pr_debug("\tRead %d mp @ %s\n", pm->mnt_id, pm->mountpoint);
 		pm->next = pms;
@@ -755,6 +677,9 @@ static int populate_mnt_ns(int ns_pid)
 		return -1;
 
 	return mnt_tree_for_each(pms, do_mount_one);
+err:
+	close_safe(&img);
+	return -1;
 }
 
 int prepare_mnt_ns(int ns_pid)
@@ -769,7 +694,11 @@ int prepare_mnt_ns(int ns_pid)
 	 * prior to recreating new ones.
 	 */
 
-	ret = clean_mnt_ns();
+	if (opts.root)
+		ret = cr_pivot_root();
+	else
+		ret = clean_mnt_ns();
+
 	if (!ret)
 		ret = populate_mnt_ns(ns_pid);
 

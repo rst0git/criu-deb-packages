@@ -16,6 +16,7 @@
 #include "crtools.h"
 #include "util.h"
 #include "util-net.h"
+#include "sockets.h"
 
 #include "sk-queue.h"
 
@@ -127,9 +128,9 @@ int dump_sk_queue(int sock_fd, int sock_id)
 
 		ret = pe.length = recvmsg(sock_fd, &msg, MSG_DONTWAIT | MSG_PEEK);
 		if (ret < 0) {
-			if (ret == -EAGAIN)
+			if (errno == EAGAIN)
 				break; /* we're done */
-			pr_perror("sys_recvmsg fail: error\n");
+			pr_perror("recvmsg fail: error\n");
 			goto err_set_sock;
 		}
 		if (msg.msg_flags & MSG_TRUNC) {
@@ -160,9 +161,10 @@ err_set_sock:
 	/*
 	 * Restore original peek offset.
 	 */
-	ret = setsockopt(sock_fd, SOL_SOCKET, SO_PEEK_OFF, &orig_peek_off, sizeof(int));
-	if (ret < 0)
+	if (setsockopt(sock_fd, SOL_SOCKET, SO_PEEK_OFF, &orig_peek_off, sizeof(int))) {
 		pr_perror("setsockopt failed on restore\n");
+		ret = -1;
+	}
 err_brk:
 	xfree(data);
 	return ret;
@@ -171,12 +173,7 @@ err_brk:
 static void sk_queue_data_handler(int fd, void *obj, int show_pages_content)
 {
 	SkPacketEntry *e = obj;
-
-	if (show_pages_content) {
-		pr_msg("\n");
-		print_image_data(fd, e->length);
-	} else
-		lseek(fd, e->length, SEEK_CUR);
+	print_image_data(fd, e->length, show_pages_content);
 }
 
 void show_sk_queues(int fd, struct cr_options *o)
@@ -192,12 +189,16 @@ int restore_sk_queue(int fd, unsigned int peer_id)
 
 	pr_info("Trying to restore recv queue for %u\n", peer_id);
 
+	if (restore_prepare_socket(fd))
+		return -1;
+
 	img_fd = open_image_ro(CR_FD_SK_QUEUES);
 	if (img_fd < 0)
 		return -1;
 
 	list_for_each_entry_safe(pkt, tmp, &packets_list, list) {
 		SkPacketEntry *entry = pkt->entry;
+		char *buf;
 
 		if (entry->id_for != peer_id)
 			continue;
@@ -205,15 +206,38 @@ int restore_sk_queue(int fd, unsigned int peer_id)
 		pr_info("\tRestoring %d-bytes skb for %u\n",
 			(unsigned int)entry->length, peer_id);
 
-		ret = sendfile(fd, img_fd, &pkt->img_off, entry->length);
+		/*
+		 * Don't try to use sendfile here, because it use sendpage() and
+		 * all data are splitted on pages and a new skb is allocated for
+		 * each page. It creates a big overhead on SNDBUF.
+		 * sendfile() isn't suatable for DGRAM sockets, because message
+		 * boundaries messages should be saved.
+		 */
+
+		buf = xmalloc(entry->length);
+		if (buf ==NULL)
+			goto err;
+
+		if (lseek(img_fd, pkt->img_off, SEEK_SET) == -1) {
+			pr_perror("lseek() failed");
+			xfree(buf);
+			goto err;
+		}
+		if (read_img_buf(img_fd, buf, entry->length) != 1) {
+			xfree(buf);
+			goto err;
+		}
+
+		ret = write(fd, buf, entry->length);
+		xfree(buf);
 		if (ret < 0) {
-			pr_perror("Failed to sendfile packet");
-			return -1;
+			pr_perror("Failed to send packet");
+			goto err;
 		}
 		if (ret != entry->length) {
 			pr_err("Restored skb trimmed to %d/%d\n",
 			       ret, (unsigned int)entry->length);
-			return -1;
+			goto err;
 		}
 		list_del(&pkt->list);
 		sk_packet_entry__free_unpacked(entry, NULL);
@@ -222,4 +246,7 @@ int restore_sk_queue(int fd, unsigned int peer_id)
 
 	close(img_fd);
 	return 0;
+err:
+	close_safe(&img_fd);
+	return -1;
 }

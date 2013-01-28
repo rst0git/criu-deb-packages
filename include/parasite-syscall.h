@@ -17,7 +17,7 @@ struct parasite_ctl {
 
 	int			signals_blocked;
 
-	void 			* addr_cmd;				/* addr for command */
+	unsigned int		* addr_cmd;				/* addr for command */
 	void 			* addr_args;				/* address for arguments */
 	int			tsock;					/* transport socket for transfering fds */
 };
@@ -30,12 +30,14 @@ extern int parasite_dump_itimers_seized(struct parasite_ctl *ctl, struct cr_fdse
 
 struct parasite_dump_misc;
 extern int parasite_dump_misc_seized(struct parasite_ctl *ctl, struct parasite_dump_misc *misc);
+extern int parasite_dump_creds(struct parasite_ctl *ctl, CredsEntry *ce);
 extern int parasite_dump_pages_seized(struct parasite_ctl *ctl,
 				      struct list_head *vma_area_list,
 				      struct cr_fdset *cr_fdset);
-struct parasite_dump_tid_info;
+struct parasite_dump_thread;
 extern int parasite_dump_thread_seized(struct parasite_ctl *ctl, pid_t pid,
-					unsigned int **tid_add, pid_t *tid);
+					unsigned int **tid_add, pid_t *tid,
+					void *blocked);
 
 struct parasite_drain_fd;
 struct fd_opts;
@@ -44,8 +46,16 @@ extern int parasite_drain_fds_seized(struct parasite_ctl *ctl,
 					int *lfds, struct fd_opts *flags);
 extern int parasite_get_proc_fd_seized(struct parasite_ctl *ctl);
 
-extern int parasite_cure_seized(struct parasite_ctl *ctl);
+struct pstree_item;
+extern int parasite_cure_seized(struct parasite_ctl *ctl, struct pstree_item *item);
 extern struct parasite_ctl *parasite_infect_seized(pid_t pid,
+						   struct pstree_item *item,
 						   struct list_head *vma_area_list);
+
+extern struct parasite_tty_args *parasite_dump_tty(struct parasite_ctl *ctl, int fd);
+
+struct pstree_item;
+extern int parasite_init_threads_seized(struct parasite_ctl *ctl, struct pstree_item *item);
+extern int parasite_fini_threads_seized(struct parasite_ctl *ctl, struct pstree_item *item);
 
 #endif /* PARASITE_SYSCALL_H_ */

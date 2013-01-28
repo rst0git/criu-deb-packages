@@ -15,6 +15,7 @@ struct pstree_item;
 struct file_desc;
 struct cr_fdset;
 struct rst_info;
+struct parasite_ctl;
 
 struct fd_parms {
 	int		fd;
@@ -24,6 +25,8 @@ struct fd_parms {
 	struct stat	stat;
 	pid_t		pid;
 	FownEntry	fown;
+
+	struct parasite_ctl *ctl;
 };
 
 #define FD_PARMS_INIT			\
@@ -90,5 +93,11 @@ extern int prepare_shared_fdinfo(void);
 extern int get_filemap_fd(int pid, VmaEntry *vma_entry);
 extern int prepare_fs(int pid);
 extern int set_fd_flags(int fd, int flags);
+
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+
+#define LREMAP_PARAM	"link-remap"
 
 #endif /* FILES_H_ */

@@ -11,11 +11,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sched.h>
+#include <sys/resource.h>
 
 #include "compiler.h"
 #include "types.h"
 #include "syscall.h"
-#include "restorer-log.h"
+#include "log.h"
 #include "util.h"
 #include "image.h"
 #include "sk-inet.h"
@@ -24,28 +25,31 @@
 #include "lock.h"
 #include "restorer.h"
 
-#include "protobuf/creds.pb-c.h"
+#include "creds.pb-c.h"
 
 #define sys_prctl_safe(opcode, val1, val2, val3)			\
 	({								\
 		long __ret = sys_prctl(opcode, val1, val2, val3, 0);	\
-		if (__ret) {						\
-			write_num_n_err(__LINE__);			\
-			write_num_n_err(__ret);				\
-		}							\
+		if (__ret) 						\
+			 pr_err("prctl failed @%d with %ld\n", __LINE__, __ret);\
 		__ret;							\
 	})
 
 static struct task_entries *task_entries;
+static futex_t thread_inprogress;
 
 static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 {
-	write_num_info(siginfo->si_pid);
+	char *r;
+
 	if (siginfo->si_code & CLD_EXITED)
-		write_str_info(" exited, status=");
+		r = " exited, status=";
 	else if (siginfo->si_code & CLD_KILLED)
-		write_str_info(" killed by signal ");
-	write_num_n_info(siginfo->si_status);
+		r = " killed by signal ";
+	else
+		r = "disappeared with ";
+
+	pr_info("Task %d %s %d\n", siginfo->si_pid, r, siginfo->si_status);
 
 	futex_abort_and_wake(&task_entries->nr_in_progress);
 	/* sa_restorer may be unmaped, so we can't go back to userspace*/
@@ -62,9 +66,6 @@ static void restore_creds(CredsEntry *ce)
 	/*
 	 * We're still root here and thus can do it without failures.
 	 */
-
-	if (ce == NULL)
-		return;
 
 	/*
 	 * First -- set the SECURE_NO_SETUID_FIXUP bit not to
@@ -125,94 +126,119 @@ static void restore_creds(CredsEntry *ce)
 	sys_capset(&hdr, data);
 }
 
+static void restore_sched_info(struct rst_sched_param *p)
+{
+	struct sched_param parm;
+
+	if ((p->policy == SCHED_OTHER) && (p->nice == 0))
+		return;
+
+	pr_info("Restoring scheduler params %d.%d.%d\n",
+			p->policy, p->nice, p->prio);
+
+	sys_setpriority(PRIO_PROCESS, 0, p->nice);
+	parm.sched_priority = p->prio;
+	sys_sched_setscheduler(0, p->policy, &parm);
+}
+
+static int restore_gpregs(struct rt_sigframe *f, UserX86RegsEntry *r)
+{
+	long ret;
+	unsigned long fsgs_base;
+
+#define CPREG1(d)	f->uc.uc_mcontext.d = r->d
+#define CPREG2(d, s)	f->uc.uc_mcontext.d = r->s
+
+	CPREG1(r8);
+	CPREG1(r9);
+	CPREG1(r10);
+	CPREG1(r11);
+	CPREG1(r12);
+	CPREG1(r13);
+	CPREG1(r14);
+	CPREG1(r15);
+	CPREG2(rdi, di);
+	CPREG2(rsi, si);
+	CPREG2(rbp, bp);
+	CPREG2(rbx, bx);
+	CPREG2(rdx, dx);
+	CPREG2(rax, ax);
+	CPREG2(rcx, cx);
+	CPREG2(rsp, sp);
+	CPREG2(rip, ip);
+	CPREG2(eflags, flags);
+	CPREG1(cs);
+	CPREG1(gs);
+	CPREG1(fs);
+
+	fsgs_base = r->fs_base;
+	ret = sys_arch_prctl(ARCH_SET_FS, fsgs_base);
+	if (ret) {
+		pr_info("SET_FS fail %ld\n", ret);
+		return -1;
+	}
+
+	fsgs_base = r->gs_base;
+	ret = sys_arch_prctl(ARCH_SET_GS, fsgs_base);
+	if (ret) {
+		pr_info("SET_GS fail %ld\n", ret);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int restore_thread_common(struct rt_sigframe *sigframe,
+		struct thread_restore_args *args)
+{
+	sys_set_tid_address((int *)args->clear_tid_addr);
+
+	if (args->has_futex) {
+		if (sys_set_robust_list((void *)args->futex_rla, args->futex_rla_len)) {
+			pr_err("Robust list err\n");
+			return -1;
+		}
+	}
+
+	if (args->has_blk_sigset)
+		sigframe->uc.uc_sigmask.sig[0] = args->blk_sigset;
+
+	restore_sched_info(&args->sp);
+
+	return restore_gpregs(sigframe, &args->gpregs);
+}
+
 /*
  * Threads restoration via sigreturn. Note it's locked
  * routine and calls for unlock at the end.
  */
 long __export_restore_thread(struct thread_restore_args *args)
 {
-	long ret = -1;
 	struct rt_sigframe *rt_sigframe;
-	unsigned long new_sp, fsgs_base;
+	unsigned long new_sp;
 	int my_pid = sys_gettid();
 
 	if (my_pid != args->pid) {
-		write_num_n_err(__LINE__);
-		write_num_n_err(my_pid);
-		write_num_n_err(args->pid);
+		pr_err("Thread pid mismatch %d/%d\n", my_pid, args->pid);
 		goto core_restore_end;
-	}
-
-	sys_set_tid_address((int *)args->clear_tid_addr);
-
-	if (args->has_futex) {
-		if (sys_set_robust_list((void *)args->futex_rla, args->futex_rla_len)) {
-			write_num_n_err(__LINE__);
-			write_num_n_err(my_pid);
-			write_num_n_err(args->pid);
-			goto core_restore_end;
-		}
 	}
 
 	rt_sigframe = (void *)args->mem_zone.rt_sigframe + 8;
 
-#define CPREGT1(d)	rt_sigframe->uc.uc_mcontext.d = args->gpregs.d
-#define CPREGT2(d, s)	rt_sigframe->uc.uc_mcontext.d = args->gpregs.s
-
-	CPREGT1(r8);
-	CPREGT1(r9);
-	CPREGT1(r10);
-	CPREGT1(r11);
-	CPREGT1(r12);
-	CPREGT1(r13);
-	CPREGT1(r14);
-	CPREGT1(r15);
-	CPREGT2(rdi, di);
-	CPREGT2(rsi, si);
-	CPREGT2(rbp, bp);
-	CPREGT2(rbx, bx);
-	CPREGT2(rdx, dx);
-	CPREGT2(rax, ax);
-	CPREGT2(rcx, cx);
-	CPREGT2(rsp, sp);
-	CPREGT2(rip, ip);
-	CPREGT2(eflags, flags);
-	CPREGT1(cs);
-	CPREGT1(gs);
-	CPREGT1(fs);
-
-	fsgs_base = args->gpregs.fs_base;
-	ret = sys_arch_prctl(ARCH_SET_FS, fsgs_base);
-	if (ret) {
-		write_num_n_err(__LINE__);
-		write_num_n_err(ret);
+	if (restore_thread_common(rt_sigframe, args))
 		goto core_restore_end;
-	}
 
-	fsgs_base = args->gpregs.gs_base;
-	ret = sys_arch_prctl(ARCH_SET_GS, fsgs_base);
-	if (ret) {
-		write_num_n_err(__LINE__);
-		write_num_n_err(ret);
-		goto core_restore_end;
-	}
+	mutex_unlock(&args->ta->rst_lock);
 
-	mutex_unlock(args->rst_lock);
+	restore_creds(&args->ta->creds);
 
-	/*
-	 * FIXME -- threads do not share creds, but it looks like
-	 * nobody tries to mess with this crap. That said we should
-	 * pass the master thread creds here
-	 */
 
-	restore_creds(NULL);
-	futex_dec_and_wake(&task_entries->nr_in_progress);
+	pr_info("%ld: Restored\n", sys_gettid());
 
-	write_num_info(sys_gettid());
-	write_str_n_info(": Restored");
+	restore_finish_stage(CR_STATE_RESTORE);
+	restore_finish_stage(CR_STATE_RESTORE_SIGCHLD);
 
-	futex_wait_while(&task_entries->start, CR_STATE_RESTORE);
-	futex_dec_and_wake(&task_entries->nr_in_progress);
+	futex_dec_and_wake(&thread_inprogress);
 
 	new_sp = (long)rt_sigframe + 8;
 	asm volatile(
@@ -224,8 +250,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 		: "r"(new_sp)
 		: "rax","rsp","memory");
 core_restore_end:
-	write_num_n_err(__LINE__);
-	write_num_n_err(sys_getpid());
+	pr_err("Restorer abnormal termination for %ld\n", sys_getpid());
 	sys_exit_group(1);
 	return -1;
 }
@@ -234,7 +259,7 @@ static long restore_self_exe_late(struct task_restore_core_args *args)
 {
 	int fd = args->fd_exe_link;
 
-	write_str_info("Restoring EXE\n");
+	pr_info("Restoring EXE link\n");
 	sys_prctl_safe(PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0);
 	sys_close(fd);
 
@@ -265,6 +290,9 @@ static u64 restore_mapping(const VmaEntry *vma_entry)
 	if (vma_entry->fd == -1 || !(vma_entry->flags & MAP_SHARED))
 		prot |= PROT_WRITE;
 
+	pr_debug("\tmmap(%lx -> %lx, %x %x %d\n",
+			vma_entry->start, vma_entry->end,
+			prot, flags, (int)vma_entry->fd);
 	/*
 	 * Should map memory here. Note we map them as
 	 * writable since we're going to restore page
@@ -295,6 +323,82 @@ static void rst_tcp_socks_all(int *arr, int size)
 	sys_munmap(arr, size);
 }
 
+static int vma_remap(unsigned long src, unsigned long dst, unsigned long len)
+{
+	unsigned long guard = 0, tmp;
+
+	pr_info("Remap %lx->%lx len %lx\n", src, dst, len);
+
+	if (src - dst < len)
+		guard = dst;
+	else if (dst - src < len)
+		guard = dst + len - PAGE_SIZE;
+
+	if (src == dst)
+		return 0;
+
+	if (guard != 0) {
+		/*
+		 * mremap() returns an error if a target and source vma-s are
+		 * overlapped. In this case the source vma are remapped in
+		 * a temporary place and then remapped to the target address.
+		 * Here is one hack to find non-ovelapped temporary place.
+		 *
+		 * 1. initial placement. We need to move src -> tgt.
+		 * |       |+++++src+++++|
+		 * |-----tgt-----|       |
+		 *
+		 * 2. map a guard page at the non-ovelapped border of a target vma.
+		 * |       |+++++src+++++|
+		 * |G|----tgt----|       |
+		 *
+		 * 3. remap src to any other place.
+		 *    G prevents src from being remaped on tgt again
+		 * |       |-------------| -> |+++++src+++++|
+		 * |G|---tgt-----|                          |
+		 *
+		 * 4. remap src to tgt, no overlapping any longer
+		 * |+++++src+++++|   <----    |-------------|
+		 * |G|---tgt-----|                          |
+		 */
+
+		unsigned long addr;
+
+		/* Map guard page (step 2) */
+		tmp = sys_mmap((void *) guard, PAGE_SIZE, PROT_NONE,
+					MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+		if (tmp != guard) {
+			pr_err("Unable to map a guard page %lx (%lx)\n", guard, tmp);
+			return -1;
+		}
+
+		/* Move src to non-overlapping place (step 3) */
+		addr = sys_mmap(NULL, len, PROT_NONE,
+					MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+		if (addr == (unsigned long) MAP_FAILED) {
+			pr_err("Unable to reserve memory (%lx)\n", addr);
+			return -1;
+		}
+
+		tmp = sys_mremap(src, len, len,
+					MREMAP_MAYMOVE | MREMAP_FIXED, addr);
+		if (tmp != addr) {
+			pr_err("Unable to remap %lx -> %lx (%lx)\n", src, addr, tmp);
+			return -1;
+		}
+
+		src = addr;
+	}
+
+	tmp = sys_mremap(src, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+	if (tmp != dst) {
+		pr_err("Unable to remap %lx -> %lx\n", src, dst);
+		return -1;
+	}
+
+	return 0;
+}
+
 /*
  * The main routine to restore task via sigreturn.
  * This one is very special, we never return there
@@ -307,9 +411,10 @@ long __export_restore_task(struct task_restore_core_args *args)
 	long ret = -1;
 	VmaEntry *vma_entry;
 	u64 va;
+	unsigned long premmapped_end = args->premmapped_addr + args->premmapped_len;
 
 	struct rt_sigframe *rt_sigframe;
-	unsigned long new_sp, fsgs_base;
+	unsigned long new_sp;
 	pid_t my_pid = sys_getpid();
 	rt_sigaction_t act;
 
@@ -318,21 +423,77 @@ long __export_restore_task(struct task_restore_core_args *args)
 	act.rt_sa_handler = sigchld_handler;
 	sys_sigaction(SIGCHLD, &act, NULL, sizeof(rt_sigset_t));
 
-	restorer_set_logfd(args->logfd);
-	restorer_set_loglevel(args->loglevel);
+	log_set_fd(args->logfd);
+	log_set_loglevel(args->loglevel);
+
+	pr_info("Switched to the restorer %d\n", my_pid);
 
 	for (vma_entry = args->self_vmas; vma_entry->start != 0; vma_entry++) {
+		unsigned long addr = vma_entry->start;
+		unsigned long len;
+
 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
 			continue;
 
-		if (sys_munmap((void *)vma_entry->start, vma_entry_len(vma_entry))) {
-			write_num_n_err(__LINE__);
-			goto core_restore_end;
+		pr_debug("Examine %lx-%lx\n", vma_entry->start, vma_entry->end);
+
+		if (addr < args->premmapped_addr) {
+			if (vma_entry->end >= args->premmapped_addr)
+				len = args->premmapped_addr - addr;
+			else
+				len = vma_entry->end - vma_entry->start;
+			if (sys_munmap((void *) addr, len)) {
+				pr_err("munmap fail for %lx - %lx\n", addr, addr + len);
+				goto core_restore_end;
+			}
+		}
+
+		if (vma_entry->end > premmapped_end) {
+			if (vma_entry->start < premmapped_end)
+				addr = premmapped_end;
+			len = vma_entry->end - addr;
+			if (sys_munmap((void *) addr, len)) {
+				pr_err("munmap fail for %lx - %lx\n", addr, addr + len);
+				goto core_restore_end;
+			}
 		}
 	}
 
 	sys_munmap(args->self_vmas,
 			((void *)(vma_entry + 1) - ((void *)args->self_vmas)));
+
+	/* Shift private vma-s to the left */
+	for (vma_entry = args->tgt_vmas; vma_entry->start != 0; vma_entry++) {
+		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
+			continue;
+
+		if (!vma_priv(vma_entry))
+			continue;
+
+		if (vma_entry->start > vma_entry->shmid)
+			break;
+
+		if (vma_remap(vma_premmaped_start(vma_entry),
+				vma_entry->start, vma_entry_len(vma_entry)))
+			goto core_restore_end;
+	}
+
+	/* Shift private vma-s to the right */
+	for (vma_entry = args->tgt_vmas + args->nr_vmas -1;
+				vma_entry >= args->tgt_vmas; vma_entry--) {
+		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
+			continue;
+
+		if (!vma_priv(vma_entry))
+			continue;
+
+		if (vma_entry->start < vma_entry->shmid)
+			break;
+
+		if (vma_remap(vma_premmaped_start(vma_entry),
+				vma_entry->start, vma_entry_len(vma_entry)))
+			goto core_restore_end;
+	}
 
 	/*
 	 * OK, lets try to map new one.
@@ -341,44 +502,16 @@ long __export_restore_task(struct task_restore_core_args *args)
 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
 			continue;
 
+		if (vma_priv(vma_entry))
+			continue;
+
 		va = restore_mapping(vma_entry);
 
 		if (va != vma_entry->start) {
-			write_num_n_err(__LINE__);
-			write_hex_n_err(vma_entry->start);
-			write_hex_n_err(vma_entry->end);
-			write_hex_n_err(vma_entry->prot);
-			write_hex_n_err(vma_entry->flags);
-			write_hex_n_err(vma_entry->fd);
-			write_hex_n_err(vma_entry->pgoff);
-			write_hex_n_err(va);
+			pr_err("Can't restore %lx mapping with %lx\n", vma_entry->start, va);
 			goto core_restore_end;
 		}
 	}
-
-	/*
-	 * Read page contents.
-	 */
-	while (1) {
-		ret = sys_read(args->fd_pages, &va, sizeof(va));
-		if (!ret)
-			break;
-
-		if (ret != sizeof(va)) {
-			write_num_n_err(__LINE__);
-			write_num_n_err(ret);
-			goto core_restore_end;
-		}
-
-		ret = sys_read(args->fd_pages, (void *)va, PAGE_SIZE);
-		if (ret != PAGE_SIZE) {
-			write_num_n_err(__LINE__);
-			write_num_n_err(ret);
-			goto core_restore_end;
-		}
-	}
-
-	sys_close(args->fd_pages);
 
 	/*
 	 * Walk though all VMAs again to drop PROT_WRITE
@@ -406,17 +539,39 @@ long __export_restore_task(struct task_restore_core_args *args)
 			     vma_entry->prot);
 	}
 
+	/*
+	 * Finally restore madivse() bits
+	 */
+	for (vma_entry = args->tgt_vmas; vma_entry->start != 0; vma_entry++) {
+		unsigned long i;
+
+		if (!vma_entry->has_madv || !vma_entry->madv)
+			continue;
+		for (i = 0; i < sizeof(vma_entry->madv) * 8; i++) {
+			if (vma_entry->madv & (1ul << i)) {
+				ret = sys_madvise(vma_entry->start,
+						  vma_entry_len(vma_entry),
+						  i);
+				if (ret) {
+					pr_err("madvise(%lx, %ld, %ld) "
+					       "failed with %ld\n",
+						vma_entry->start,
+						vma_entry_len(vma_entry),
+						i, ret);
+					goto core_restore_end;
+				}
+			}
+		}
+	}
+
 	sys_munmap(args->tgt_vmas,
 			((void *)(vma_entry + 1) - ((void *)args->tgt_vmas)));
 
 	ret = sys_munmap(args->shmems, SHMEMS_SIZE);
 	if (ret < 0) {
-		write_num_n_err(__LINE__);
-		write_num_n_err(ret);
+		pr_err("Can't unmap shmem %ld\n", ret);
 		goto core_restore_end;
 	}
-
-	sys_set_tid_address((int *)args->clear_tid_addr);
 
 	/*
 	 * Tune up the task fields.
@@ -434,8 +589,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_END,	(long)args->mm.mm_arg_end, 0);
 	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_START,	(long)args->mm.mm_env_start, 0);
 	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_END,	(long)args->mm.mm_env_end, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_AUXV,	(long)args->mm_saved_auxv,
-								sizeof(args->mm_saved_auxv));
+	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_AUXV,	(long)args->mm_saved_auxv, args->mm_saved_auxv_size);
 	if (ret)
 		goto core_restore_end;
 
@@ -449,68 +603,16 @@ long __export_restore_task(struct task_restore_core_args *args)
 	if (ret)
 		goto core_restore_end;
 
-	if (args->has_futex) {
-		if (sys_set_robust_list((void *)args->futex_rla, args->futex_rla_len)) {
-			write_num_n_err(__LINE__);
-			write_num_n_err(my_pid);
-			write_num_n_err(args->pid);
-			goto core_restore_end;
-		}
-	}
-
 	/*
 	 * We need to prepare a valid sigframe here, so
 	 * after sigreturn the kernel will pick up the
 	 * registers from the frame, set them up and
 	 * finally pass execution to the new IP.
 	 */
-	rt_sigframe = (void *)args->mem_zone.rt_sigframe + 8;
+	rt_sigframe = (void *)args->t.mem_zone.rt_sigframe + 8;
 
-#define CPREG1(d)	rt_sigframe->uc.uc_mcontext.d = args->gpregs.d
-#define CPREG2(d, s)	rt_sigframe->uc.uc_mcontext.d = args->gpregs.s
-
-	CPREG1(r8);
-	CPREG1(r9);
-	CPREG1(r10);
-	CPREG1(r11);
-	CPREG1(r12);
-	CPREG1(r13);
-	CPREG1(r14);
-	CPREG1(r15);
-	CPREG2(rdi, di);
-	CPREG2(rsi, si);
-	CPREG2(rbp, bp);
-	CPREG2(rbx, bx);
-	CPREG2(rdx, dx);
-	CPREG2(rax, ax);
-	CPREG2(rcx, cx);
-	CPREG2(rsp, sp);
-	CPREG2(rip, ip);
-	CPREG2(eflags, flags);
-	CPREG1(cs);
-	CPREG1(gs);
-	CPREG1(fs);
-
-	fsgs_base = args->gpregs.fs_base;
-	ret = sys_arch_prctl(ARCH_SET_FS, fsgs_base);
-	if (ret) {
-		write_num_n_err(__LINE__);
-		write_num_n_err(ret);
+	if (restore_thread_common(rt_sigframe, &args->t))
 		goto core_restore_end;
-	}
-
-	fsgs_base = args->gpregs.gs_base;
-	ret = sys_arch_prctl(ARCH_SET_GS, fsgs_base);
-	if (ret) {
-		write_num_n_err(__LINE__);
-		write_num_n_err(ret);
-		goto core_restore_end;
-	}
-
-	/*
-	 * Blocked signals.
-	 */
-	rt_sigframe->uc.uc_sigmask.sig[0] = args->blk_sigset;
 
 	/*
 	 * Threads restoration. This requires some more comments. This
@@ -540,23 +642,21 @@ long __export_restore_task(struct task_restore_core_args *args)
 
 		fd = sys_open(LAST_PID_PATH, O_RDWR, LAST_PID_PERM);
 		if (fd < 0) {
-			write_num_n_err(__LINE__);
-			write_num_n_err(fd);
+			pr_err("Can't open last_pid %d\n", fd);
 			goto core_restore_end;
 		}
 
 		ret = sys_flock(fd, LOCK_EX);
 		if (ret) {
-			write_num_n_err(__LINE__);
-			write_num_n_err(ret);
+			pr_err("Can't lock last_pid %d\n", fd);
 			goto core_restore_end;
 		}
 
 		for (i = 0; i < args->nr_threads; i++) {
-			char last_pid_buf[16];
+			char last_pid_buf[16], *s;
 
 			/* skip self */
-			if (thread_args[i].pid == args->pid)
+			if (thread_args[i].pid == args->t.pid)
 				continue;
 
 			mutex_lock(&args->rst_lock);
@@ -565,12 +665,10 @@ long __export_restore_task(struct task_restore_core_args *args)
 				RESTORE_ALIGN_STACK((long)thread_args[i].mem_zone.stack,
 						    sizeof(thread_args[i].mem_zone.stack));
 
-			last_pid_len = vprint_num(last_pid_buf, thread_args[i].pid - 1);
-			ret = sys_write(fd, last_pid_buf, last_pid_len - 1);
+			last_pid_len = vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
+			ret = sys_write(fd, s, last_pid_len);
 			if (ret < 0) {
-				write_num_n_err(__LINE__);
-				write_num_n_err(ret);
-				write_str_n_err(last_pid_buf);
+				pr_err("Can't set last_pid %ld/%s\n", ret, last_pid_buf);
 				goto core_restore_end;
 			}
 
@@ -619,37 +717,36 @@ long __export_restore_task(struct task_restore_core_args *args)
 
 		ret = sys_flock(fd, LOCK_UN);
 		if (ret) {
-			write_num_n_err(__LINE__);
-			write_num_n_err(ret);
+			pr_err("Can't unlock last_pid %ld\n", ret);
 			goto core_restore_end;
 		}
 
 		sys_close(fd);
 	}
 
-	/*
-	 * Restore creds late to avoid potential problems with
-	 * insufficient caps for restoring this or that before
+	/* 
+	 * Writing to last-pid is CAP_SYS_ADMIN protected, thus restore
+	 * creds _after_ all threads creation.
 	 */
 
 	restore_creds(&args->creds);
 
-	futex_dec_and_wake(&args->task_entries->nr_in_progress);
+	pr_info("%ld: Restored\n", sys_getpid());
 
-	write_num_info(sys_getpid());
-	write_str_n_info(": Restored");
-
-	futex_wait_while(&args->task_entries->start, CR_STATE_RESTORE);
+	restore_finish_stage(CR_STATE_RESTORE);
 
 	sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(rt_sigset_t));
 
-	futex_dec_and_wake(&args->task_entries->nr_in_progress);
+	futex_set_and_wake(&thread_inprogress, args->nr_threads);
 
-	futex_wait_while(&args->task_entries->start, CR_STATE_RESTORE_SIGCHLD);
+	restore_finish_stage(CR_STATE_RESTORE_SIGCHLD);
+
+	/* Wait until children stop to use args->task_entries */
+	futex_wait_while_gt(&thread_inprogress, 1);
 
 	rst_tcp_socks_all(args->rst_tcp_socks, args->rst_tcp_socks_size);
 
-	sys_close(args->logfd);
+	log_set_fd(-1);
 
 	/*
 	 * The code that prepared the itimers makes shure the
@@ -693,8 +790,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 		: "rax","rsp","memory");
 
 core_restore_end:
-	write_num_n_err(__LINE__);
-	write_num_n_err(sys_getpid());
+	pr_err("Restorer fail %ld\n", sys_getpid());
 	sys_exit_group(1);
 	return -1;
 
@@ -705,6 +801,6 @@ core_restore_failed:
 		"jmp *%%rax				\n"
 		:
 		: "r"(ret)
-		: );
+		: "memory");
 	return ret;
 }

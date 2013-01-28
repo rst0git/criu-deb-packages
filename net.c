@@ -109,15 +109,13 @@ static int dump_one_link(struct nlmsghdr *hdr, void *arg)
 	return ret;
 }
 
-static int dump_links(struct cr_fdset *fds)
+static int do_dump_links(int (*cb)(struct nlmsghdr *h, void *), void *arg)
 {
 	int sk, ret;
 	struct {
 		struct nlmsghdr nlh;
 		struct rtgenmsg g;
 	} req;
-
-	pr_info("Dumping netns links\n");
 
 	ret = sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (sk < 0) {
@@ -133,10 +131,17 @@ static int dump_links(struct cr_fdset *fds)
 	req.nlh.nlmsg_seq = CR_NLMSG_SEQ;
 	req.g.rtgen_family = AF_PACKET;
 
-	ret = do_rtnl_req(sk, &req, sizeof(req), dump_one_link, fds);
+	ret = do_rtnl_req(sk, &req, sizeof(req), cb, arg);
 	close(sk);
 out:
 	return ret;
+}
+
+static int dump_links(struct cr_fdset *fds)
+{
+	pr_info("Dumping netns links\n");
+
+	return do_dump_links(dump_one_link, fds);
 }
 
 static int restore_link_cb(struct nlmsghdr *hdr, void *arg)
@@ -256,6 +261,7 @@ static int restore_links(int pid)
 	nlsk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (nlsk < 0) {
 		pr_perror("Can't create nlk socket");
+		close_safe(&fd);
 		return -1;
 	}
 
@@ -277,55 +283,19 @@ static int restore_links(int pid)
 
 static int run_ip_tool(char *arg1, char *arg2, int fdin, int fdout)
 {
-	int pid, ret, status;
+	char *ip_tool_cmd;
+	int ret;
 
 	pr_debug("\tRunning ip %s %s\n", arg1, arg2);
 
-	pid = fork();
-	if (pid < 0) {
-		pr_perror("Can't forn IP tool");
-		return -1;
-	}
+	ip_tool_cmd = getenv("CR_IP_TOOL");
+	if (!ip_tool_cmd)
+		ip_tool_cmd = "ip";
 
-	if (!pid) {
-		char *ip_tool_cmd;
-
-		ip_tool_cmd = getenv("CR_IP_TOOL");
-		if (!ip_tool_cmd)
-			ip_tool_cmd = "ip";
-
-		if (fdin < 0)
-			close(0);
-		else if (fdin != 0) {
-			dup2(fdin, 0);
-			close(fdin);
-		}
-
-		if (fdout < 0)
-			close(1);
-		else if (fdout != 1) {
-			dup2(fdout, 1);
-			close(fdout);
-		}
-
-		if (log_get_fd() != 2) {
-			dup2(log_get_fd(), 2);
-			close(log_get_fd());
-		}
-
-		execlp(ip_tool_cmd, "ip", arg1, arg2, NULL);
-		exit(-1);
-	}
-
-	ret = waitpid(pid, &status, 0);
-	if (ret < 0) {
-		pr_perror("Can't wait IP tool");
-		return -1;
-	}
-
-	if (!(WIFEXITED(status) && !WEXITSTATUS(status))) {
-		pr_err("IP tool failed on %s %s with %d (%d)\n", arg1, arg2,
-				status, WEXITSTATUS(status));
+	ret = cr_system(fdin, fdout, -1, ip_tool_cmd,
+				(char *[]) { "ip", arg1, arg2, NULL });
+	if (ret) {
+		pr_err("IP tool failed on %s %s\n", arg1, arg2);
 		return -1;
 	}
 

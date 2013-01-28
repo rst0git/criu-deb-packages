@@ -4,6 +4,11 @@
 #include <sys/wait.h>
 #include <sys/mman.h>
 
+#include "protobuf.h"
+#include "protobuf/sa.pb-c.h"
+#include "protobuf/itimer.pb-c.h"
+#include "protobuf/creds.pb-c.h"
+
 #include "syscall.h"
 #include "ptrace.h"
 #include "processor-flags.h"
@@ -12,10 +17,7 @@
 #include "parasite.h"
 #include "crtools.h"
 #include "namespaces.h"
-
-#include "protobuf.h"
-#include "protobuf/sa.pb-c.h"
-#include "protobuf/itimer.pb-c.h"
+#include "pstree.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -183,52 +185,29 @@ retry_signal:
 	}
 
 	/*
-	 * Our code is done.
+	 * We've reached this point iif int3 is triggered inside our
+	 * parasite code. So we're done.
 	 */
-	if (ptrace(PTRACE_INTERRUPT, pid, NULL, NULL)) {
-		pr_err("Can't interrupt (pid: %d)\n", pid);
-		goto err;
-	}
-
-	if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
-		pr_err("Can't continue (pid: %d)\n", pid);
-		goto err;
-	}
-
-	if (wait4(pid, &status, __WALL, NULL) != pid) {
-		pr_err("Waited pid mismatch (pid: %d)\n", pid);
-		goto err;
-	}
-
-	if (!WIFSTOPPED(status)) {
-		pr_err("Task is still running (pid: %d)\n", pid);
-		goto err;
-	}
-
-	if (ptrace(PTRACE_GETSIGINFO, pid, NULL, &siginfo)) {
-		pr_err("Can't get siginfo (pid: %d)\n", pid);
-		goto err;
-	}
-
-	if (SI_EVENT(siginfo.si_code) != PTRACE_EVENT_STOP) {
-		pr_err("si_code doesn't match (pid: %d si_code: %d)\n",
-			pid, siginfo.si_code);
-		goto err;
-	}
-
 	ret = 0;
 err:
 	return ret;
 }
 
-static int parasite_execute_by_pid(unsigned long cmd, struct parasite_ctl *ctl,
-			    pid_t pid,
-			    void *args, int args_size)
+static void *parasite_args_s(struct parasite_ctl *ctl, int args_size)
+{
+	BUG_ON(args_size > PARASITE_ARG_SIZE);
+	return ctl->addr_args;
+}
+
+#define parasite_args(ctl, type) ({				\
+		BUILD_BUG_ON(sizeof(type) > PARASITE_ARG_SIZE);	\
+		ctl->addr_args;					\
+	})
+
+static int parasite_execute_by_pid(unsigned int cmd, struct parasite_ctl *ctl, pid_t pid)
 {
 	int ret;
 	user_regs_struct_t regs_orig, regs;
-
-	BUG_ON(args_size > PARASITE_ARG_SIZE);
 
 	if (ctl->pid == pid)
 		regs = ctl->regs_orig;
@@ -240,18 +219,13 @@ static int parasite_execute_by_pid(unsigned long cmd, struct parasite_ctl *ctl,
 		regs = regs_orig;
 	}
 
-	memcpy(ctl->addr_cmd, &cmd, sizeof(cmd));
-	if (args)
-		memcpy(ctl->addr_args, args, args_size);
+	*ctl->addr_cmd = cmd;
 
 	parasite_setup_regs(ctl->parasite_ip, &regs);
 
 	ret = __parasite_execute(ctl, pid, &regs);
 	if (ret == 0)
-		ret = -(int)regs.ax;
-
-	if (args)
-		memcpy(args, ctl->addr_args, args_size);
+		ret = (int)regs.ax;
 
 	if (ret)
 		pr_err("Parasite exited with %d\n", ret);
@@ -265,10 +239,9 @@ static int parasite_execute_by_pid(unsigned long cmd, struct parasite_ctl *ctl,
 	return ret;
 }
 
-static int parasite_execute(unsigned long cmd, struct parasite_ctl *ctl,
-			    void *args, int args_size)
+static int parasite_execute(unsigned int cmd, struct parasite_ctl *ctl)
 {
-	return parasite_execute_by_pid(cmd, ctl, ctl->pid, args, args_size);
+	return parasite_execute_by_pid(cmd, ctl, ctl->pid);
 }
 
 static void *mmap_seized(struct parasite_ctl *ctl,
@@ -359,26 +332,33 @@ static int parasite_prep_file(int fd, struct parasite_ctl *ctl)
 static int parasite_set_logfd(struct parasite_ctl *ctl, pid_t pid)
 {
 	int ret;
+	struct parasite_log_args *a;
 
 	ret = parasite_send_fd(ctl, log_get_fd());
 	if (ret)
 		return ret;
 
-	ret = parasite_execute(PARASITE_CMD_SET_LOGFD, ctl, NULL, 0);
+	a = parasite_args(ctl, struct parasite_log_args);
+	a->log_level = log_get_loglevel();
+
+	ret = parasite_execute(PARASITE_CMD_CFG_LOG, ctl);
 	if (ret < 0)
 		return ret;
 
 	return 0;
 }
 
-static int parasite_init(struct parasite_ctl *ctl, pid_t pid)
+static int parasite_init(struct parasite_ctl *ctl, pid_t pid, int nr_threads)
 {
-	struct parasite_init_args args = { };
+	struct parasite_init_args *args;
 	static int sock = -1;
 
+	args = parasite_args(ctl, struct parasite_init_args);
+
 	pr_info("Putting tsock into pid %d\n", pid);
-	args.h_addr_len = gen_parasite_saddr(&args.h_addr, 0);
-	args.p_addr_len = gen_parasite_saddr(&args.p_addr, pid);
+	args->h_addr_len = gen_parasite_saddr(&args->h_addr, 0);
+	args->p_addr_len = gen_parasite_saddr(&args->p_addr, pid);
+	args->nr_threads = nr_threads;
 
 	if (sock == -1) {
 		int rst = -1;
@@ -396,7 +376,7 @@ static int parasite_init(struct parasite_ctl *ctl, pid_t pid)
 			return -1;
 		}
 
-		if (bind(sock, (struct sockaddr *)&args.h_addr, args.h_addr_len) < 0) {
+		if (bind(sock, (struct sockaddr *)&args->h_addr, args->h_addr_len) < 0) {
 			pr_perror("Can't bind socket");
 			goto err;
 		}
@@ -419,12 +399,12 @@ static int parasite_init(struct parasite_ctl *ctl, pid_t pid)
 		}
 	}
 
-	if (parasite_execute(PARASITE_CMD_INIT, ctl, &args, sizeof(args)) < 0) {
+	if (parasite_execute(PARASITE_CMD_INIT, ctl) < 0) {
 		pr_err("Can't init parasite\n");
 		goto err;
 	}
 
-	if (connect(sock, (struct sockaddr *)&args.p_addr, args.p_addr_len) < 0) {
+	if (connect(sock, (struct sockaddr *)&args->p_addr, args->p_addr_len) < 0) {
 		pr_perror("Can't connect a transport socket");
 		goto err;
 	}
@@ -437,40 +417,47 @@ err:
 }
 
 int parasite_dump_thread_seized(struct parasite_ctl *ctl, pid_t pid,
-					unsigned int **tid_addr, pid_t *tid)
+					unsigned int **tid_addr, pid_t *tid,
+					void *blocked)
 {
-	struct parasite_dump_tid_info args = { };
+	struct parasite_dump_thread *args;
 	int ret;
 
-	ret = parasite_execute_by_pid(PARASITE_CMD_DUMP_TID_ADDR, ctl, pid,
-			&args, sizeof(args));
+	args = parasite_args(ctl, struct parasite_dump_thread);
 
-	*tid_addr = args.tid_addr;
-	*tid = args.tid;
+	ret = parasite_execute_by_pid(PARASITE_CMD_DUMP_THREAD, ctl, pid);
+
+	memcpy(blocked, &args->blocked, sizeof(args->blocked));
+	*tid_addr = args->tid_addr;
+	*tid = args->tid;
 
 	return ret;
 }
 
 int parasite_dump_sigacts_seized(struct parasite_ctl *ctl, struct cr_fdset *cr_fdset)
 {
-	struct parasite_dump_sa_args args;
-	int ret, i, fd;
+	struct parasite_dump_sa_args *args;
+	int ret, sig, fd;
 	SaEntry se = SA_ENTRY__INIT;
 
-	ret = parasite_execute(PARASITE_CMD_DUMP_SIGACTS, ctl, &args, sizeof(args));
+	args = parasite_args(ctl, struct parasite_dump_sa_args);
+
+	ret = parasite_execute(PARASITE_CMD_DUMP_SIGACTS, ctl);
 	if (ret < 0)
 		return ret;
 
 	fd = fdset_fd(cr_fdset, CR_FD_SIGACT);
 
-	for (i = 1; i < SIGMAX; i++) {
-		if (i == SIGSTOP || i == SIGKILL)
+	for (sig = 1; sig <= SIGMAX; sig++) {
+		int i = sig - 1;
+
+		if (sig == SIGSTOP || sig == SIGKILL)
 			continue;
 
-		ASSIGN_TYPED(se.sigaction, args.sas[i].rt_sa_handler);
-		ASSIGN_TYPED(se.flags, args.sas[i].rt_sa_flags);
-		ASSIGN_TYPED(se.restorer, args.sas[i].rt_sa_restorer);
-		ASSIGN_TYPED(se.mask, args.sas[i].rt_sa_mask.sig[0]);
+		ASSIGN_TYPED(se.sigaction, args->sas[i].rt_sa_handler);
+		ASSIGN_TYPED(se.flags, args->sas[i].rt_sa_flags);
+		ASSIGN_TYPED(se.restorer, args->sas[i].rt_sa_restorer);
+		ASSIGN_TYPED(se.mask, args->sas[i].rt_sa_mask.sig[0]);
 
 		if (pb_write_one(fd, &se, PB_SIGACT) < 0)
 			return -1;
@@ -493,28 +480,71 @@ static int dump_one_timer(struct itimerval *v, int fd)
 
 int parasite_dump_itimers_seized(struct parasite_ctl *ctl, struct cr_fdset *cr_fdset)
 {
-	struct parasite_dump_itimers_args args;
+	struct parasite_dump_itimers_args *args;
 	int ret, fd;
 
-	ret = parasite_execute(PARASITE_CMD_DUMP_ITIMERS, ctl, &args, sizeof(args));
+	args = parasite_args(ctl, struct parasite_dump_itimers_args);
+
+	ret = parasite_execute(PARASITE_CMD_DUMP_ITIMERS, ctl);
 	if (ret < 0)
 		return ret;
 
 	fd = fdset_fd(cr_fdset, CR_FD_ITIMERS);
 
-	ret = dump_one_timer(&args.real, fd);
+	ret = dump_one_timer(&args->real, fd);
 	if (!ret)
-		ret = dump_one_timer(&args.virt, fd);
+		ret = dump_one_timer(&args->virt, fd);
 	if (!ret)
-		ret = dump_one_timer(&args.prof, fd);
+		ret = dump_one_timer(&args->prof, fd);
 
 	return ret;
 }
 
 int parasite_dump_misc_seized(struct parasite_ctl *ctl, struct parasite_dump_misc *misc)
 {
-	return parasite_execute(PARASITE_CMD_DUMP_MISC, ctl,
-				misc, sizeof(struct parasite_dump_misc));
+	struct parasite_dump_misc *ma;
+
+	ma = parasite_args(ctl, struct parasite_dump_misc);
+	if (parasite_execute(PARASITE_CMD_DUMP_MISC, ctl) < 0)
+		return -1;
+
+	*misc = *ma;
+	return 0;
+}
+
+struct parasite_tty_args *parasite_dump_tty(struct parasite_ctl *ctl, int fd)
+{
+	struct parasite_tty_args *p;
+
+	p = parasite_args(ctl, struct parasite_tty_args);
+	p->fd = fd;
+
+	if (parasite_execute(PARASITE_CMD_DUMP_TTY, ctl) < 0)
+		return NULL;
+
+	return p;
+}
+
+int parasite_dump_creds(struct parasite_ctl *ctl, CredsEntry *ce)
+{
+	struct parasite_dump_creds *pc;
+
+	pc = parasite_args(ctl, struct parasite_dump_creds);
+	if (parasite_execute(PARASITE_CMD_DUMP_CREDS, ctl) < 0)
+		return -1;
+
+	ce->secbits = pc->secbits;
+	ce->n_groups = pc->ngroups;
+
+	/*
+	 * Achtung! We leak the parasite args pointer to the caller.
+	 * It's not safe in general, but in our case is OK, since the
+	 * latter doesn't go to parasite before using the data in it.
+	 */
+
+	BUILD_BUG_ON(sizeof(ce->groups[0]) != sizeof(pc->groups[0]));
+	ce->groups = pc->groups;
+	return 0;
 }
 
 /*
@@ -524,7 +554,7 @@ int parasite_dump_misc_seized(struct parasite_ctl *ctl, struct parasite_dump_mis
 int parasite_dump_pages_seized(struct parasite_ctl *ctl, struct list_head *vma_area_list,
 			       struct cr_fdset *cr_fdset)
 {
-	struct parasite_dump_pages_args parasite_dumppages = { };
+	struct parasite_dump_pages_args *parasite_dumppages;
 	unsigned long nrpages_dumped = 0, nrpages_skipped = 0, nrpages_total = 0;
 	struct vma_area *vma_area;
 	int ret = -1;
@@ -537,11 +567,13 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl, struct list_head *vma_a
 	if (ret < 0)
 		goto out;
 
-	ret = parasite_execute(PARASITE_CMD_DUMPPAGES_INIT, ctl, NULL, 0);
+	ret = parasite_execute(PARASITE_CMD_DUMPPAGES_INIT, ctl);
 	if (ret < 0) {
 		pr_err("Dumping pages failed with %i\n", ret);
 		goto out;
 	}
+
+	parasite_dumppages = parasite_args(ctl, struct parasite_dump_pages_args);
 
 	list_for_each_entry(vma_area, vma_area_list, list) {
 
@@ -562,7 +594,7 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl, struct list_head *vma_a
 		if (vma_area_is(vma_area, VMA_ANON_SHARED))
 			continue;
 
-		parasite_dumppages.vma_entry = vma_area->vma;
+		parasite_dumppages->vma_entry = vma_area->vma;
 
 		if (!vma_area_is(vma_area, VMA_ANON_PRIVATE) &&
 		    !vma_area_is(vma_area, VMA_FILE_PRIVATE)) {
@@ -570,32 +602,30 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl, struct list_head *vma_a
 			continue;
 		}
 
-		ret = parasite_execute(PARASITE_CMD_DUMPPAGES, ctl,
-				       &parasite_dumppages,
-				       sizeof(parasite_dumppages));
+		ret = parasite_execute(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret) {
 			pr_err("Dumping pages failed with %d\n", ret);
-			goto out;
+			goto out_fini;
 		}
 
 		pr_info("vma %lx-%lx  dumped: %lu pages %lu skipped %lu total\n",
 				vma_area->vma.start, vma_area->vma.end,
-				parasite_dumppages.nrpages_dumped,
-				parasite_dumppages.nrpages_skipped,
-				parasite_dumppages.nrpages_total);
+				parasite_dumppages->nrpages_dumped,
+				parasite_dumppages->nrpages_skipped,
+				parasite_dumppages->nrpages_total);
 
-		nrpages_dumped += parasite_dumppages.nrpages_dumped;
-		nrpages_skipped += parasite_dumppages.nrpages_skipped;
-		nrpages_total += parasite_dumppages.nrpages_total;
+		nrpages_dumped += parasite_dumppages->nrpages_dumped;
+		nrpages_skipped += parasite_dumppages->nrpages_skipped;
+		nrpages_total += parasite_dumppages->nrpages_total;
 	}
-
-	parasite_execute(PARASITE_CMD_DUMPPAGES_FINI, ctl, NULL, 0);
 
 	pr_info("\n");
 	pr_info("Summary: %lu dumped %lu skipped %lu total\n",
 			nrpages_dumped, nrpages_skipped, nrpages_total);
 	ret = 0;
 
+out_fini:
+	parasite_execute(PARASITE_CMD_DUMPPAGES_FINI, ctl);
 out:
 	fchmod(fdset_fd(cr_fdset, CR_FD_PAGES), CR_FD_PERM);
 	pr_info("----------------------------------------\n");
@@ -606,10 +636,14 @@ out:
 int parasite_drain_fds_seized(struct parasite_ctl *ctl,
 		struct parasite_drain_fd *dfds, int *lfds, struct fd_opts *opts)
 {
-	int ret = -1;
+	int ret = -1, size;
+	struct parasite_drain_fd *args;
 
-	ret = parasite_execute(PARASITE_CMD_DRAIN_FDS, ctl,
-			dfds, drain_fds_size(dfds));
+	size = drain_fds_size(dfds);
+	args = parasite_args_s(ctl, size);
+	memcpy(args, dfds, size);
+
+	ret = parasite_execute(PARASITE_CMD_DRAIN_FDS, ctl);
 	if (ret) {
 		pr_err("Parasite failed to drain descriptors\n");
 		goto err;
@@ -629,7 +663,7 @@ int parasite_get_proc_fd_seized(struct parasite_ctl *ctl)
 {
 	int ret = -1, fd;
 
-	ret = parasite_execute(PARASITE_CMD_GET_PROC_FD, ctl, NULL, 0);
+	ret = parasite_execute(PARASITE_CMD_GET_PROC_FD, ctl);
 	if (ret) {
 		pr_err("Parasite failed to get proc fd\n");
 		return ret;
@@ -644,7 +678,59 @@ int parasite_get_proc_fd_seized(struct parasite_ctl *ctl)
 	return fd;
 }
 
-int parasite_cure_seized(struct parasite_ctl *ctl)
+int parasite_init_threads_seized(struct parasite_ctl *ctl, struct pstree_item *item)
+{
+	int ret = 0, i;
+
+	for (i = 0; i < item->nr_threads; i++) {
+		if (item->pid.real == item->threads[i].real)
+			continue;
+
+		ret = parasite_execute_by_pid(PARASITE_CMD_INIT_THREAD, ctl,
+					      item->threads[i].real);
+		if (ret) {
+			pr_err("Can't init thread in parasite %d\n",
+			       item->threads[i].real);
+			break;
+		}
+	}
+
+	return ret;
+}
+
+int parasite_fini_threads_seized(struct parasite_ctl *ctl, struct pstree_item *item)
+{
+	int ret = 0, i;
+
+	for (i = 0; i < item->nr_threads; i++) {
+		if (item->pid.real == item->threads[i].real)
+			continue;
+
+		ret = parasite_execute_by_pid(PARASITE_CMD_FINI_THREAD, ctl,
+					      item->threads[i].real);
+		/*
+		 * Note the thread's fini() can be called even when not
+		 * all threads were init()'ed, say we're rolling back from
+		 * error happened while we were init()'ing some thread, thus
+		 * -ENOENT will be returned but we should continie for the
+		 * rest of threads set.
+		 *
+		 * Strictly speaking we always init() threads in sequence thus
+		 * we could simply break the loop once first -ENOENT returned
+		 * but I prefer to be on a safe side even if some future changes
+		 * would change the code logic.
+		 */
+		if (ret && ret != -ENOENT) {
+			pr_err("Can't fini thread in parasite %d\n",
+			       item->threads[i].real);
+			break;
+		}
+	}
+
+	return ret;
+}
+
+int parasite_cure_seized(struct parasite_ctl *ctl, struct pstree_item *item)
 {
 	int ret = 0;
 
@@ -652,7 +738,8 @@ int parasite_cure_seized(struct parasite_ctl *ctl)
 
 	if (ctl->parasite_ip) {
 		ctl->signals_blocked = 0;
-		parasite_execute(PARASITE_CMD_FINI, ctl, NULL, 0);
+		parasite_fini_threads_seized(ctl, item);
+		parasite_execute(PARASITE_CMD_FINI, ctl);
 	}
 
 	if (ctl->remote_map) {
@@ -684,7 +771,7 @@ int parasite_cure_seized(struct parasite_ctl *ctl)
 	return ret;
 }
 
-struct parasite_ctl *parasite_infect_seized(pid_t pid, struct list_head *vma_area_list)
+struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item, struct list_head *vma_area_list)
 {
 	struct parasite_ctl *ctl = NULL;
 	struct vma_area *vma_area;
@@ -765,11 +852,11 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct list_head *vma_are
 	memcpy(ctl->local_map, parasite_blob, sizeof(parasite_blob));
 
 	/* Setup the rest of a control block */
-	ctl->parasite_ip	= PARASITE_HEAD_ADDR((unsigned long)ctl->remote_map);
-	ctl->addr_cmd		= (void *)PARASITE_CMD_ADDR((unsigned long)ctl->local_map);
-	ctl->addr_args		= (void *)PARASITE_ARGS_ADDR((unsigned long)ctl->local_map);
+	ctl->parasite_ip	= (unsigned long)parasite_sym(ctl->remote_map, __export_parasite_head_start);
+	ctl->addr_cmd		= parasite_sym(ctl->local_map, __export_parasite_cmd);
+	ctl->addr_args		= parasite_sym(ctl->local_map, __export_parasite_args);
 
-	ret = parasite_init(ctl, pid);
+	ret = parasite_init(ctl, pid, item->nr_threads);
 	if (ret) {
 		pr_err("%d: Can't create a transport socket\n", pid);
 		goto err_restore;
@@ -783,10 +870,14 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct list_head *vma_are
 		goto err_restore;
 	}
 
+	ret = parasite_init_threads_seized(ctl, item);
+	if (ret)
+		goto err_restore;
+
 	return ctl;
 
 err_restore:
-	parasite_cure_seized(ctl);
+	parasite_cure_seized(ctl, item);
 	return NULL;
 
 err:

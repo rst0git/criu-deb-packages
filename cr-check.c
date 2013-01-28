@@ -7,6 +7,7 @@
 #include <sys/signalfd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <linux/if.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 
@@ -297,7 +298,7 @@ static int check_fdinfo_eventpoll(void)
 	close(pfd[1]);
 
 	if (ret) {
-		pr_err("Error parsing proc fdinfo");
+		pr_err("Error parsing proc fdinfo\n");
 		return -1;
 	}
 
@@ -381,9 +382,54 @@ static int check_unaligned_vmsplice(void)
 	return 0;
 }
 
+#ifndef SO_GET_FILTER
+#define SO_GET_FILTER           SO_ATTACH_FILTER
+#endif
+
+static int check_so_gets(void)
+{
+	int sk;
+	socklen_t len;
+	char name[IFNAMSIZ];
+
+	sk = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (sk < 0) {
+		pr_perror("No socket");
+		return 1;
+	}
+
+	len = 0;
+	if (getsockopt(sk, SOL_SOCKET, SO_GET_FILTER, NULL, &len)) {
+		pr_perror("Can't get socket filter");
+		return 1;
+	}
+
+	len = sizeof(name);
+	if (getsockopt(sk, SOL_SOCKET, SO_BINDTODEVICE, name, &len)) {
+		pr_perror("Can't get socket bound dev");
+		return 1;
+	}
+
+	return 0;
+}
+
+static int check_ipc(void)
+{
+	int ret;
+
+	ret = access("/proc/sys/kernel/sem_next_id", R_OK | W_OK);
+	if (!ret)
+		return 0;
+
+	pr_msg("/proc/sys/kernel/sem_next_id sysctl is missing.\n");
+	return -1;
+}
+
 int cr_check(void)
 {
 	int ret = 0;
+
+	log_set_loglevel(LOG_ERROR);
 
 	if (mntns_collect_root(getpid())) {
 		pr_err("Can't collect root mount point\n");
@@ -402,6 +448,8 @@ int cr_check(void)
 	ret |= check_fdinfo_ext();
 	ret |= check_unaligned_vmsplice();
 	ret |= check_tty();
+	ret |= check_so_gets();
+	ret |= check_ipc();
 
 	if (!ret)
 		pr_msg("Looks good.\n");

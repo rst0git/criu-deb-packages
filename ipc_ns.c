@@ -25,32 +25,12 @@
 #define KEY key
 #endif
 
-#ifndef IPC_PRESET
-#define IPC_PRESET		00040000
-#endif
-
-#ifndef SHM_SET
-#define SHM_SET			15
-#endif
-
 #ifndef MSGMAX
 #define MSGMAX			8192
 #endif
 
 #ifndef MSG_COPY
 #define MSG_COPY		040000
-#endif
-
-#ifndef MSG_SET
-#define MSG_SET			13
-#endif
-
-#ifndef MSG_SET_COPY
-#define MSG_SET_COPY		14
-#endif
-
-#ifndef SEM_SET
-#define SEM_SET			20
 #endif
 
 static void pr_ipc_desc_entry(unsigned int loglevel, const IpcDescEntry *desc)
@@ -492,12 +472,7 @@ void show_ipc_sem(int fd, struct cr_options *o)
 static void ipc_msg_data_handler(int fd, void *obj, int show_pages_content)
 {
 	IpcMsg *e = obj;
-
-	if (show_pages_content) {
-		pr_msg("\n");
-		print_image_data(fd, round_up(e->msize, sizeof(u64)));
-	} else
-		lseek(fd, round_up(e->msize, sizeof(u64)), SEEK_CUR);
+	print_image_data(fd, round_up(e->msize, sizeof(u64)), show_pages_content);
 }
 
 static void ipc_msg_handler(int fd, void *obj, int show_pages_content)
@@ -520,12 +495,7 @@ void show_ipc_msg(int fd, struct cr_options *o)
 static void ipc_shm_handler(int fd, void *obj, int show_pages_content)
 {
 	IpcShmEntry *e = obj;
-
-	if (show_pages_content) {
-		pr_msg("\n");
-		print_image_data(fd, round_up(e->size, sizeof(u64)));
-	} else
-		lseek(fd, round_up(e->size, sizeof(u32)), SEEK_CUR);
+	print_image_data(fd, round_up(e->size, sizeof(u32)), show_pages_content);
 }
 
 void show_ipc_shm(int fd, struct cr_options *o)
@@ -574,33 +544,30 @@ out:
 static int prepare_ipc_sem_desc(int fd, const IpcSemEntry *entry)
 {
 	int ret, id;
-	struct semid_ds ds;
+	struct sysctl_req req[] = {
+		{ "kernel/sem_next_id", &entry->desc->id, CTL_U32 },
+		{ },
+	};
 
-	id = semget(entry->desc->id, entry->nsems,
-		     entry->desc->mode | IPC_CREAT | IPC_EXCL | IPC_PRESET);
+	ret = sysctl_op(req, CTL_WRITE);
+	if (ret < 0) {
+		pr_err("Failed to set desired IPC sem ID\n");
+		return ret;
+	}
+
+	id = semget(entry->desc->key, entry->nsems,
+		     entry->desc->mode | IPC_CREAT | IPC_EXCL);
 	if (id == -1) {
 		pr_perror("Failed to create sem set");
 		return -errno;
 	}
 
 	if (id != entry->desc->id) {
-		pr_err("Failed to preset id (%d instead of %d)\n",
+		pr_err("Failed to restore sem id (%d instead of %d)\n",
 							id, entry->desc->id);
 		return -EFAULT;
 	}
 
-	ret = semctl(id, 0, SEM_STAT, &ds);
-	if (ret < 0) {
-		pr_perror("Failed to stat sem set");
-		return -errno;
-	}
-
-	ds.sem_perm.KEY = entry->desc->key;
-	ret = semctl(id, 0, SEM_SET, &ds);
-	if (ret < 0) {
-		pr_perror("Failed to update sem key");
-		return -errno;
-	}
 	ret = prepare_ipc_sem_values(fd, entry);
 	if (ret < 0) {
 		pr_err("Failed to update sem pages\n");
@@ -611,7 +578,7 @@ static int prepare_ipc_sem_desc(int fd, const IpcSemEntry *entry)
 
 static int prepare_ipc_sem(int pid)
 {
-	int fd;
+	int fd, ret;
 
 	pr_info("Restoring IPC semaphores sets\n");
 	fd = open_image_ro(CR_FD_IPCNS_SEM, pid);
@@ -619,12 +586,13 @@ static int prepare_ipc_sem(int pid)
 		return -1;
 
 	while (1) {
-		int ret;
 		IpcSemEntry *entry;
 
 		ret = pb_read_one_eof(fd, &entry, PB_IPCNS_SEM);
-		if (ret < 0)
-			return -EIO;
+		if (ret < 0) {
+			ret = -EIO;
+			goto err;
+		}
 		if (ret == 0)
 			break;
 
@@ -635,10 +603,14 @@ static int prepare_ipc_sem(int pid)
 
 		if (ret < 0) {
 			pr_err("Failed to prepare semaphores set\n");
-			return ret;
+			goto err;
 		}
 	}
+
 	return close_safe(&fd);
+err:
+	close_safe(&fd);
+	return ret;
 }
 
 static int prepare_ipc_msg_queue_messages(int fd, const IpcMsgEntry *entry)
@@ -690,34 +662,29 @@ static int prepare_ipc_msg_queue_messages(int fd, const IpcMsgEntry *entry)
 static int prepare_ipc_msg_queue(int fd, const IpcMsgEntry *entry)
 {
 	int ret, id;
-	struct msqid_ds ds;
+	struct sysctl_req req[] = {
+		{ "kernel/msg_next_id", &entry->desc->id, CTL_U32 },
+		{ },
+	};
 
-	id = msgget(entry->desc->id,
-		     entry->desc->mode | IPC_CREAT | IPC_EXCL | IPC_PRESET);
+	ret = sysctl_op(req, CTL_WRITE);
+	if (ret < 0) {
+		pr_err("Failed to set desired IPC msg ID\n");
+		return ret;
+	}
+
+	id = msgget(entry->desc->key, entry->desc->mode | IPC_CREAT | IPC_EXCL);
 	if (id == -1) {
-		pr_perror("Failed to create message queue");
+		pr_perror("Failed to create msg set");
 		return -errno;
 	}
 
 	if (id != entry->desc->id) {
-		pr_err("Failed to preset id (%d instead of %d)\n",
+		pr_err("Failed to restore msg id (%d instead of %d)\n",
 							id, entry->desc->id);
 		return -EFAULT;
 	}
 
-	ret = msgctl(id, MSG_STAT, &ds);
-	if (ret < 0) {
-		pr_perror("Failed to stat message queue");
-		return -errno;
-	}
-
-	ds.msg_perm.KEY = entry->desc->key;
-	ds.msg_qbytes = entry->qbytes;
-	ret = msgctl(id, MSG_SET, &ds);
-	if (ret < 0) {
-		pr_perror("Failed to update message key");
-		return -errno;
-	}
 	ret = prepare_ipc_msg_queue_messages(fd, entry);
 	if (ret < 0) {
 		pr_err("Failed to update message queue messages\n");
@@ -728,7 +695,7 @@ static int prepare_ipc_msg_queue(int fd, const IpcMsgEntry *entry)
 
 static int prepare_ipc_msg(int pid)
 {
-	int fd;
+	int fd, ret;
 
 	pr_info("Restoring IPC message queues\n");
 	fd = open_image_ro(CR_FD_IPCNS_MSG, pid);
@@ -736,13 +703,13 @@ static int prepare_ipc_msg(int pid)
 		return -1;
 
 	while (1) {
-		int ret;
 		IpcMsgEntry *entry;
 
 		ret = pb_read_one_eof(fd, &entry, PB_IPCNS_MSG_ENT);
 		if (ret < 0) {
 			pr_err("Failed to read IPC messages queue\n");
-			return -EIO;
+			ret = -EIO;
+			goto err;
 		}
 		if (ret == 0)
 			break;
@@ -754,10 +721,13 @@ static int prepare_ipc_msg(int pid)
 
 		if (ret < 0) {
 			pr_err("Failed to prepare messages queue\n");
-			return ret;
+			goto err;
 		}
 	}
 	return close_safe(&fd);
+err:
+	close_safe(&fd);
+	return ret;
 }
 
 static int prepare_ipc_shm_pages(int fd, const IpcShmEntry *shm)
@@ -785,33 +755,30 @@ static int prepare_ipc_shm_pages(int fd, const IpcShmEntry *shm)
 static int prepare_ipc_shm_seg(int fd, const IpcShmEntry *shm)
 {
 	int ret, id;
-	struct shmid_ds ds;
+	struct sysctl_req req[] = {
+		{ "kernel/shm_next_id", &shm->desc->id, CTL_U32 },
+		{ },
+	};
 
-	id = shmget(shm->desc->id, shm->size,
-		     shm->desc->mode | IPC_CREAT | IPC_EXCL | IPC_PRESET);
+	ret = sysctl_op(req, CTL_WRITE);
+	if (ret < 0) {
+		pr_err("Failed to set desired IPC shm ID\n");
+		return ret;
+	}
+
+	id = shmget(shm->desc->key, shm->size,
+		    shm->desc->mode | IPC_CREAT | IPC_EXCL);
 	if (id == -1) {
-		pr_perror("Failed to create shm segment");
+		pr_perror("Failed to create shm set");
 		return -errno;
 	}
 
 	if (id != shm->desc->id) {
-		pr_err("Failed to preset id (%d instead of %d)\n",
+		pr_err("Failed to restore shm id (%d instead of %d)\n",
 							id, shm->desc->id);
 		return -EFAULT;
 	}
 
-	ret = shmctl(id, SHM_STAT, &ds);
-	if (ret < 0) {
-		pr_perror("Failed to stat shm segment");
-		return -errno;
-	}
-
-	ds.shm_perm.KEY = shm->desc->key;
-	ret = shmctl(id, SHM_SET, &ds);
-	if (ret < 0) {
-		pr_perror("Failed to update shm key");
-		return -errno;
-	}
 	ret = prepare_ipc_shm_pages(fd, shm);
 	if (ret < 0) {
 		pr_err("Failed to update shm pages\n");
@@ -822,7 +789,7 @@ static int prepare_ipc_shm_seg(int fd, const IpcShmEntry *shm)
 
 static int prepare_ipc_shm(int pid)
 {
-	int fd;
+	int fd, ret;
 
 	pr_info("Restoring IPC shared memory\n");
 	fd = open_image_ro(CR_FD_IPCNS_SHM, pid);
@@ -830,13 +797,13 @@ static int prepare_ipc_shm(int pid)
 		return -1;
 
 	while (1) {
-		int ret;
 		IpcShmEntry *shm;
 
 		ret = pb_read_one_eof(fd, &shm, PB_IPCNS_SHM);
 		if (ret < 0) {
 			pr_err("Failed to read IPC shared memory segment\n");
-			return -EIO;
+			ret = -EIO;
+			goto err;
 		}
 		if (ret == 0)
 			break;
@@ -848,10 +815,13 @@ static int prepare_ipc_shm(int pid)
 
 		if (ret < 0) {
 			pr_err("Failed to prepare shm segment\n");
-			return ret;
+			goto err;
 		}
 	}
 	return close_safe(&fd);
+err:
+	close_safe(&fd);
+	return ret;
 }
 
 static int prepare_ipc_var(int pid)
@@ -865,6 +835,7 @@ static int prepare_ipc_var(int pid)
 		return -1;
 
 	ret = pb_read_one(fd, &var, PB_IPCNS_VAR);
+	close_safe(&fd);
 	if (ret <= 0) {
 		pr_err("Failed to read IPC namespace variables\n");
 		return -EFAULT;
@@ -879,7 +850,8 @@ static int prepare_ipc_var(int pid)
 		pr_err("Failed to prepare IPC namespace variables\n");
 		return -EFAULT;
 	}
-	return close_safe(&fd);
+
+	return 0;
 }
 
 int prepare_ipc_ns(int pid)

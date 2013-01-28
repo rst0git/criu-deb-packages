@@ -32,8 +32,12 @@ extern void test_waitsig(void);
 
 /* generate data with crc32 at the end of the buffer */
 extern void datagen(uint8_t *buffer, unsigned length, uint32_t *crc);
+/* generate data without crc32 at the end of the buffer */
+extern void datagen2(uint8_t *buffer, unsigned length, uint32_t *crc);
 /* check the data buffer against its crc32 */
 extern int datachk(const uint8_t *buffer, unsigned length, uint32_t *crc);
+/* calculate crc for the data buffer*/
+extern int datasum(const uint8_t *buffer, unsigned length, uint32_t *crc);
 
 /* streaming helpers */
 extern int set_nonblock(int fd, int on);
@@ -87,10 +91,10 @@ extern int parse_opt_string(char *param, void *arg);
 extern void setup_outfile(void);
 extern int test_log_init(const char *outfile, const char *suffix);
 #define err(format, arg...)	\
-	test_msg("ERR: %s:%d: " format " (errno = %d)\n", \
+	test_msg("ERR: %s:%d: " format " (errno = %d (%m))\n", \
 		__FILE__, __LINE__, ## arg, errno)
 #define fail(format, arg...)	\
-	test_msg("FAIL: %s:%d: " format " (errno = %d)\n", \
+	test_msg("FAIL: %s:%d: " format " (errno = %d (%m))\n", \
 		 __FILE__, __LINE__, ## arg, errno)
 #define skip(format, arg...)	\
 	test_msg("SKIP: %s:%d: " format "\n", \
@@ -107,8 +111,8 @@ extern void task_waiter_fini(task_waiter_t *t);
 extern void task_waiter_wait4(task_waiter_t *t, unsigned int lockid);
 extern void task_waiter_complete(task_waiter_t *t, unsigned int lockid);
 extern void task_waiter_complete_current(task_waiter_t *t);
-extern int tcp_init_server(int *port);
+extern int tcp_init_server(int family, int *port);
 extern int tcp_accept_server(int sock);
-extern int tcp_init_client(char *servIP, unsigned short servPort);
+extern int tcp_init_client(int family, char *servIP, unsigned short servPort);
 
 #endif /* _VIMITESU_H_ */

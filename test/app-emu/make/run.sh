@@ -1,5 +1,7 @@
 #!/bin/bash
 
+source ../../functions.sh || exit 1
+
 crtools="../../../crtools"
 
 cleanup_wd() {
@@ -30,14 +32,16 @@ pid=${!}
 echo Lanuched make in $pid background
 sleep 2
 
-${crtools} dump -D dump -o dump.log -v 4  -t ${pid} || {
+${crtools} dump --shell-job -D dump -o dump.log -v 4  -t ${pid} || {
 	echo "Dump failed"
 	exit 1
 }
 
+wait_tasks dump
+
 echo "Dumped, restoring and waiting for completion"
 
-${crtools} restore -D dump -o restore.log -v 4 -t ${pid} || {
+${crtools} restore --shell-job -D dump -o restore.log -v 4 -t ${pid} || {
 	echo "Restore failed"
 	exit 1
 }

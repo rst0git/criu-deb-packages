@@ -113,7 +113,7 @@ void cr_pb_init(void)
 	CR_PB_DESC(IPCNS_VAR,		IpcVar,		ipc_var);
 	CR_PB_DESC(IPCNS_SHM,		IpcShm,		ipc_shm);
 	/* There's no _entry suffix in this one :( */
-	CR_PB_MDESC_INIT(cr_pb_descs[PB_IPCNS_MSG], 	IpcMsg, ipc_msg);
+	CR_PB_MDESC_INIT(cr_pb_descs[PB_IPCNS_MSG],	IpcMsg, ipc_msg);
 	CR_PB_DESC(IPCNS_MSG_ENT,	IpcMsg,		ipc_msg);
 	CR_PB_DESC(IPCNS_SEM,		IpcSem,		ipc_sem);
 	CR_PB_DESC(FS,			Fs,		fs);
@@ -341,7 +341,7 @@ static int pb_field_show_pretty(pb_pr_ctl_t *ctl)
 	char cookie[32];
 	const char *ptr;
 
-	if (!ctl->pretty_fmt)
+	if (!ctl->pretty_fmt || field->depth)
 		return 0;
 
 	sprintf(cookie, " %d:", field->number);
@@ -404,6 +404,11 @@ static void pb_show_repeated(pb_pr_ctl_t *ctl, int nr_fields, pb_pr_show_t show,
 	pb_pr_field_t *field = &ctl->cur;
 	unsigned long counter;
 	int done;
+
+	if (nr_fields == 0) {
+		pr_msg("<empty>");
+		return;
+	}
 
 	field->count = nr_fields;
 	done = show(field);
@@ -570,6 +575,7 @@ int do_pb_read_one(int fd, void **pobj, int type, bool eof)
 		goto err;
 	} else if (ret != size) {
 		pr_perror("Read %d bytes while %d expected", ret, size);
+		ret = -1;
 		goto err;
 	}
 
@@ -604,7 +610,7 @@ int pb_write_one(int fd, void *obj, int type)
 	int ret = -1;
 
 	if (!cr_pb_descs[type].pb_desc) {
-		pr_err("Wron object requested %d\n", type);
+		pr_err("Wrong object requested %d\n", type);
 		return -1;
 	}
 

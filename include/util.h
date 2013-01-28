@@ -7,7 +7,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <errno.h>
-
+#include <string.h>
 #include <sys/types.h>
 #include <sys/statfs.h>
 #include <dirent.h>
@@ -38,9 +38,7 @@
 #define BUG_ON_HANDLER(condition)					\
 	do {								\
 		if ((condition)) {					\
-			write_str_err("BUG at " __FILE__ ": ");		\
-			write_num_err(__LINE__);			\
-			write_str_err("\n");				\
+			pr_err("BUG at %s:%d\n", __FILE__, __LINE__);	\
 			*(volatile unsigned long *)NULL = 0xdead0000 + __LINE__;	\
 		}							\
 	} while (0)
@@ -324,5 +322,12 @@ static inline int read_img_str(int fd, char **pstr, int size)
 extern void *shmalloc(size_t bytes);
 extern void shfree_last(void *ptr);
 extern int run_scripts(char *action);
+
+extern int cr_system(int in, int out, int err, char *cmd, char *const argv[]);
+
+static inline bool dir_dots(struct dirent *de)
+{
+	return !strcmp(de->d_name, ".") || !strcmp(de->d_name, "..");
+}
 
 #endif /* UTIL_H_ */

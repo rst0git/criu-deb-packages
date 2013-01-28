@@ -51,6 +51,42 @@ static int tcp_repair_on(int fd)
 	return ret;
 }
 
+static int refresh_inet_sk(struct inet_sk_desc *sk)
+{
+	int size;
+	struct tcp_info info;
+
+	if (dump_opt(sk->rfd, SOL_TCP, TCP_INFO, &info)) {
+		pr_perror("Failt to obtain TCP_INFO");
+		return -1;
+	}
+
+	switch (info.tcpi_state) {
+	case TCP_ESTABLISHED:
+	case TCP_CLOSE:
+		break;
+	default:
+		pr_err("Unknown state %d\n", sk->state);
+		return -1;
+	}
+
+	if (ioctl(sk->rfd, SIOCOUTQ, &size) == -1) {
+		pr_perror("Unable to get size of snd queue");
+		return -1;
+	}
+
+	sk->wqlen = size;
+
+	if (ioctl(sk->rfd, SIOCINQ, &size) == -1) {
+		pr_perror("Unable to get size of recv queue");
+		return -1;
+	}
+
+	sk->rqlen = size;
+
+	return 0;
+}
+
 static int tcp_repair_establised(int fd, struct inet_sk_desc *sk)
 {
 	int ret;
@@ -78,6 +114,11 @@ static int tcp_repair_establised(int fd, struct inet_sk_desc *sk)
 		goto err3;
 
 	list_add_tail(&sk->rlist, &cpt_tcp_repair_sockets);
+
+	ret = refresh_inet_sk(sk);
+	if (ret < 0)
+		goto err1;
+
 	return 0;
 
 err3:
@@ -298,6 +339,9 @@ err_in:
 
 int dump_one_tcp(int fd, struct inet_sk_desc *sk)
 {
+	if (sk->state != TCP_ESTABLISHED)
+		return 0;
+
 	pr_info("Dumping TCP connection\n");
 
 	if (tcp_repair_establised(fd, sk))
@@ -376,6 +420,9 @@ static int send_tcp_queue(int sk, int queue, u32 len, int imgfd)
 
 static int restore_tcp_queues(int sk, TcpStreamEntry *tse, int fd)
 {
+	if (restore_prepare_socket(sk))
+		return -1;
+
 	if (tse->inq_len &&
 			send_tcp_queue(sk, TCP_RECV_QUEUE, tse->inq_len, fd))
 		return -1;

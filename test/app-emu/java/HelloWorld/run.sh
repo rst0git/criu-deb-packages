@@ -1,5 +1,7 @@
 #!/bin/bash
 
+source ../../../functions.sh || exit 1
+
 crtools="../../../../crtools"
 
 cleanup_class() {
@@ -19,14 +21,16 @@ pid=${!}
 
 echo Lanuched java application with pid $pid in background
 
-${crtools} dump -D dump -o dump.log -v 4  -t ${pid} || {
+${crtools} dump -D dump -o dump.log -v 4 --shell-job -t ${pid} || {
 	echo "Dump failed"
 	exit 1
 }
 
+wait_tasks dump
+
 echo "Dumped, restoring and waiting for completion"
 
-${crtools} restore -D dump -o restore.log -v 4 -t ${pid} || {
+${crtools} restore -D dump -o restore.log -v 4 --shell-job -t ${pid} || {
 	echo "Restore failed"
 	exit 1
 }

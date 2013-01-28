@@ -2,6 +2,7 @@
 #define CR_SOCKETS_H__
 
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <stdbool.h>
 
@@ -28,7 +29,8 @@ struct socket_desc {
 extern int dump_socket(struct fd_parms *p, int lfd, const struct cr_fdset *cr_fdset);
 extern int dump_socket_opts(int sk, SkOptsEntry *soe);
 extern int restore_socket_opts(int sk, SkOptsEntry *soe);
-extern void show_socket_opts(SkOptsEntry *soe);
+extern void release_skopts(SkOptsEntry *);
+extern int restore_prepare_socket(int sk);
 
 extern int sk_collect_one(int ino, int family, struct socket_desc *d);
 extern int collect_sockets(int pid);
@@ -60,5 +62,20 @@ extern int do_dump_opt(int sk, int level, int name, void *val, int len);
 extern int do_restore_opt(int sk, int level, int name, void *val, int len);
 #define restore_opt(s, l, n, f)	do_restore_opt(s, l, n, f, sizeof(*f))
 
+#define sk_encode_shutdown(img, mask) do {			\
+		/* 						\
+		 * protobuf SK_SHUTDOWN__ bits match those	\
+		 * reported by kernel				\
+		 */ 						\
+		(img)->shutdown = mask;				\
+		if ((img)->shutdown != SK_SHUTDOWN__NONE)	\
+			(img)->has_shutdown = true;		\
+	} while (0)
+
+static inline int sk_decode_shutdown(int val)
+{
+	static const int hows[] = {-1, SHUT_RD, SHUT_WR, SHUT_RDWR};
+	return hows[val];
+}
 
 #endif /* CR_SOCKETS_H__ */

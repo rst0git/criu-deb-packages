@@ -18,7 +18,17 @@
 #include <sys/sendfile.h>
 #include <sys/mman.h>
 
+#include <sched.h>
+#include <sys/resource.h>
+
 #include <linux/major.h>
+
+#include "protobuf.h"
+#include "protobuf/fdinfo.pb-c.h"
+#include "protobuf/fs.pb-c.h"
+#include "protobuf/mm.pb-c.h"
+#include "protobuf/creds.pb-c.h"
+#include "protobuf/core.pb-c.h"
 
 #include "types.h"
 #include "list.h"
@@ -49,13 +59,7 @@
 #include "mount.h"
 #include "tty.h"
 #include "net.h"
-
-#include "protobuf.h"
-#include "protobuf/fdinfo.pb-c.h"
-#include "protobuf/fs.pb-c.h"
-#include "protobuf/mm.pb-c.h"
-#include "protobuf/creds.pb-c.h"
-#include "protobuf/core.pb-c.h"
+#include "sk-packet.h"
 
 #ifndef CONFIG_X86_64
 # error No x86-32 support yet
@@ -98,6 +102,54 @@ err:
 	return ret;
 }
 
+static int dump_sched_info(int pid, ThreadCoreEntry *tc)
+{
+	int ret;
+	struct sched_param sp;
+
+	BUILD_BUG_ON(SCHED_OTHER != 0); /* default in proto message */
+
+	ret = sched_getscheduler(pid);
+	if (ret < 0) {
+		pr_perror("Can't get sched policy for %d", pid);
+		return -1;
+	}
+
+	pr_info("%d has %d sched policy\n", pid, ret);
+	tc->has_sched_policy = true;
+	tc->sched_policy = ret;
+
+	if ((ret == SCHED_RR) || (ret == SCHED_FIFO)) {
+		ret = sched_getparam(pid, &sp);
+		if (ret < 0) {
+			pr_perror("Can't get sched param for %d", pid);
+			return -1;
+		}
+
+		pr_info("\tdumping %d prio for %d\n", sp.sched_priority, pid);
+		tc->has_sched_prio = true;
+		tc->sched_prio = sp.sched_priority;
+	}
+
+	/*
+	 * The nice is ignored for RT sched policies, but is stored
+	 * in kernel. Thus we have to take it with us in the image.
+	 */
+
+	errno = 0;
+	ret = getpriority(PRIO_PROCESS, pid);
+	if (errno) {
+		pr_perror("Can't get nice for %d", pid);
+		return -1;
+	}
+
+	pr_info("\tdumping %d nice for %d\n", ret, pid);
+	tc->has_sched_nice = true;
+	tc->sched_nice = ret;
+
+	return 0;
+}
+
 struct cr_fdset *glob_fdset;
 
 static int collect_fds(pid_t pid, struct parasite_drain_fd *dfds)
@@ -116,9 +168,7 @@ static int collect_fds(pid_t pid, struct parasite_drain_fd *dfds)
 
 	n = 0;
 	while ((de = readdir(fd_dir))) {
-		if (!strcmp(de->d_name, "."))
-			continue;
-		if (!strcmp(de->d_name, ".."))
+		if (dir_dots(de))
 			continue;
 
 		if (n > PARASITE_MAX_FDS - 1)
@@ -187,7 +237,7 @@ static int dump_task_exe_link(pid_t pid, MmEntry *mm)
 	return ret;
 }
 
-static int fill_fd_params(pid_t pid, int fd, int lfd,
+static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 				struct fd_opts *opts, struct fd_parms *p)
 {
 	if (fstat(lfd, &p->stat) < 0) {
@@ -195,16 +245,17 @@ static int fill_fd_params(pid_t pid, int fd, int lfd,
 		return -1;
 	}
 
+	p->ctl		= ctl;
 	p->fd		= fd;
 	p->pos		= lseek(lfd, 0, SEEK_CUR);
 	p->flags	= fcntl(lfd, F_GETFL);
-	p->pid		= pid;
+	p->pid		= ctl->pid;
 	p->fd_flags	= opts->flags;
 
 	fown_entry__init(&p->fown);
 
 	pr_info("%d fdinfo %d: pos: 0x%16lx flags: %16o/%#x\n",
-		pid, fd, p->pos, p->flags, (int)p->fd_flags);
+		ctl->pid, fd, p->pos, p->flags, (int)p->fd_flags);
 
 	p->fown.signum = fcntl(lfd, F_GETSIG, 0);
 	if (p->fown.signum < 0) {
@@ -250,13 +301,13 @@ static int dump_chrdev(struct fd_parms *p, int lfd, const struct cr_fdset *set)
 #define PIPEFS_MAGIC	0x50495045
 #endif
 
-static int dump_one_file(pid_t pid, int fd, int lfd, struct fd_opts *opts,
+static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_opts *opts,
 		       const struct cr_fdset *cr_fdset)
 {
 	struct fd_parms p;
 	struct statfs statfs;
 
-	if (fill_fd_params(pid, fd, lfd, opts, &p) < 0) {
+	if (fill_fd_params(ctl, fd, lfd, opts, &p) < 0) {
 		pr_perror("Can't get stat on %d", fd);
 		return -1;
 	}
@@ -322,7 +373,7 @@ static int dump_task_files_seized(struct parasite_ctl *ctl, const struct cr_fdse
 		goto err2;
 
 	for (i = 0; i < dfds->nr_fds; i++) {
-		ret = dump_one_file(ctl->pid, dfds->fds[i], lfds[i], opts + i, cr_fdset);
+		ret = dump_one_file(ctl, dfds->fds[i], lfds[i], opts + i, cr_fdset);
 		close(lfds[i]);
 		if (ret)
 			goto err2;
@@ -427,6 +478,8 @@ static int dump_task_mappings(pid_t pid, const struct list_head *vma_area_list,
 		else if (vma_entry_is(vma, VMA_FILE_PRIVATE) ||
 				vma_entry_is(vma, VMA_FILE_SHARED))
 			ret = dump_filemap(pid, vma, vma_area->vm_file_fd, cr_fdset);
+		else if (vma_entry_is(vma, VMA_AREA_SOCKET))
+			ret = dump_socket_map(vma_area);
 		else
 			ret = 0;
 
@@ -442,18 +495,17 @@ err:
 	return ret;
 }
 
-static int dump_task_creds(pid_t pid, const struct parasite_dump_misc *misc,
-			   const struct cr_fdset *fds)
+static int dump_task_creds(struct parasite_ctl *ctl, const struct cr_fdset *fds)
 {
 	int ret;
 	struct proc_status_creds cr;
 	CredsEntry ce = CREDS_ENTRY__INIT;
 
 	pr_info("\n");
-	pr_info("Dumping creds for %d)\n", pid);
+	pr_info("Dumping creds for %d)\n", ctl->pid);
 	pr_info("----------------------------------------\n");
 
-	ret = parse_pid_status(pid, &cr);
+	ret = parse_pid_status(ctl->pid, &cr);
 	if (ret < 0)
 		return ret;
 
@@ -477,7 +529,8 @@ static int dump_task_creds(pid_t pid, const struct parasite_dump_misc *misc,
 	ce.n_cap_bnd = CR_CAP_SIZE;
 	ce.cap_bnd = cr.cap_bnd;
 
-	ce.secbits = misc->secbits;
+	if (parasite_dump_creds(ctl, &ce) < 0)
+		return -1;
 
 	return pb_write_one(fdset_fd(fds, CR_FD_CREDS), &ce, PB_CREDS);
 }
@@ -485,7 +538,7 @@ static int dump_task_creds(pid_t pid, const struct parasite_dump_misc *misc,
 #define assign_reg(dst, src, e)		do { dst->e = (__typeof__(dst->e))src.e; } while (0)
 #define assign_array(dst, src, e)	memcpy(dst->e, &src.e, sizeof(src.e))
 
-static int get_task_auxv(pid_t pid, MmEntry *mm)
+static int get_task_auxv(pid_t pid, MmEntry *mm, size_t *size)
 {
 	int fd, ret, i;
 
@@ -508,6 +561,7 @@ static int get_task_auxv(pid_t pid, MmEntry *mm)
 		}
 	}
 
+	*size = i;
 	ret = 0;
 err:
 	close_safe(&fd);
@@ -539,7 +593,7 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
 	if (!mme.mm_saved_auxv)
 		goto out;
 
-	if (get_task_auxv(pid, &mme))
+	if (get_task_auxv(pid, &mme, &mme.n_mm_saved_auxv))
 		goto out;
 	pr_info("OK\n");
 
@@ -879,6 +933,10 @@ static int dump_task_core_all(pid_t pid, const struct proc_pid_stat *stat,
 	core->tc->task_state = TASK_ALIVE;
 	core->tc->exit_code = 0;
 
+	ret = dump_sched_info(pid, core->thread_core);
+	if (ret)
+		goto err_free;
+
 	ret = pb_write_one(fd_core, core, PB_CORE);
 	if (ret < 0) {
 		pr_info("ERROR\n");
@@ -969,9 +1027,7 @@ static int parse_children(pid_t pid, pid_t **_c, int *_n)
 		return -1;
 
 	while ((de = readdir(dir))) {
-		if (!strcmp(de->d_name, "."))
-			continue;
-		if (!strcmp(de->d_name, ".."))
+		if (dir_dots(de))
 			continue;
 
 		file = fopen_proc(pid, "task/%s/children", de->d_name);
@@ -1025,7 +1081,7 @@ static int get_children(struct pstree_item *item)
 		}
 		c->pid.real = ch[i];
 		c->parent = item;
-		list_add_tail(&c->list, &item->children);
+		list_add_tail(&c->sibling, &item->children);
 	}
 free:
 	xfree(ch);
@@ -1160,7 +1216,7 @@ static int check_subtree(const struct pstree_item *item)
 		return ret;
 
 	i = 0;
-	list_for_each_entry(child, &item->children, list) {
+	list_for_each_entry(child, &item->children, sibling) {
 		if (child->pid.real != ch[i])
 			break;
 		i++;
@@ -1188,7 +1244,7 @@ static int collect_subtree(struct pstree_item *item)
 	if (ret)
 		return -1;
 
-	list_for_each_entry(child, &item->children, list) {
+	list_for_each_entry(child, &item->children, sibling) {
 		ret = collect_subtree(child);
 		if (ret < 0)
 			return -1;
@@ -1210,7 +1266,6 @@ static int collect_pstree(pid_t pid, const struct cr_options *opts)
 			return -1;
 
 		root_item->pid.real = pid;
-		INIT_LIST_HEAD(&root_item->list);
 
 		ret = collect_subtree(root_item);
 		if (ret == 0) {
@@ -1268,14 +1323,21 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, struct pid *tid)
 	if (ret)
 		goto err_free;
 
-	ret = parasite_dump_thread_seized(parasite_ctl, pid, &taddr, &tid->virt);
+	ret = parasite_dump_thread_seized(parasite_ctl, pid, &taddr,
+					  &tid->virt, &core->thread_core->blk_sigset);
 	if (ret) {
-		pr_err("Can't dump tid address for pid %d", pid);
+		pr_err("Can't dump thread for pid %d\n", pid);
 		goto err_free;
 	}
+	core->thread_core->has_blk_sigset = true;
 
-	pr_info("%d: tid_address=%p\n", pid, taddr);
+	pr_info("%d: virt_pid=%d tid_address=%p sig_blocked=0x%lx\n", pid,
+			tid->virt, taddr, core->thread_core->blk_sigset);
 	core->thread_info->clear_tid_addr = (u64) taddr;
+
+	ret = dump_sched_info(pid, core->thread_core);
+	if (ret)
+		goto err_free;
 
 	pr_info("OK\n");
 
@@ -1348,7 +1410,7 @@ static int fill_zombies_pids(struct pstree_item *item)
 	if (parse_children(item->pid.virt, &ch, &nr) < 0)
 		return -1;
 
-	list_for_each_entry(child, &item->children, list) {
+	list_for_each_entry(child, &item->children, sibling) {
 		if (child->pid.virt < 0)
 			continue;
 		for (i = 0; i < nr; i++) {
@@ -1360,7 +1422,7 @@ static int fill_zombies_pids(struct pstree_item *item)
 	}
 
 	i = 0;
-	list_for_each_entry(child, &item->children, list) {
+	list_for_each_entry(child, &item->children, sibling) {
 		if (child->pid.virt > 0)
 			continue;
 		for (; i < nr; i++) {
@@ -1466,7 +1528,7 @@ static int dump_one_task(struct pstree_item *item)
 	}
 
 	ret = -1;
-	parasite_ctl = parasite_infect_seized(pid, &vma_area_list);
+	parasite_ctl = parasite_infect_seized(pid, item, &vma_area_list);
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
 		goto err;
@@ -1489,6 +1551,9 @@ static int dump_one_task(struct pstree_item *item)
 	item->pid.virt = misc.pid;
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;
+
+	pr_info("sid=%d pgid=%d pid=%d\n",
+		item->sid, item->pgid, item->pid.virt);
 
 	ret = -1;
 	cr_fdset = cr_task_fdset_open(item->pid.virt, O_DUMP);
@@ -1532,7 +1597,13 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure;
 	}
 
-	ret = parasite_cure_seized(parasite_ctl);
+	ret = dump_task_creds(parasite_ctl, cr_fdset);
+	if (ret) {
+		pr_err("Dump creds (pid: %d) failed with %d\n", pid, ret);
+		goto err;
+	}
+
+	ret = parasite_cure_seized(parasite_ctl, item);
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
@@ -1541,12 +1612,6 @@ static int dump_one_task(struct pstree_item *item)
 	ret = dump_task_mappings(pid, &vma_area_list, cr_fdset);
 	if (ret) {
 		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
-		goto err;
-	}
-
-	ret = dump_task_creds(pid, &misc, cr_fdset);
-	if (ret) {
-		pr_err("Dump creds (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
 
@@ -1567,7 +1632,7 @@ err_free:
 err_cure:
 	close_cr_fdset(&cr_fdset);
 err_cure_fdset:
-	parasite_cure_seized(parasite_ctl);
+	parasite_cure_seized(parasite_ctl, item);
 	goto err;
 }
 
@@ -1611,6 +1676,9 @@ int cr_dump_tasks(pid_t pid, const struct cr_options *opts)
 		if (dump_one_task(item))
 			goto err;
 	}
+
+	if (dump_verify_tty_sids())
+		goto err;
 
 	if (dump_zombies())
 		goto err;

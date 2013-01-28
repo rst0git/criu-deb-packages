@@ -498,18 +498,31 @@ static int open_fdinfos(int pid, struct list_head *list, int state)
 
 static int close_old_fds(struct pstree_item *me)
 {
-	/*
-	 * FIXME -- The existing test_init implementation uses system()
-	 * which in turn doesn't work when all fds are closed
-	 */
-	if (me->pid.virt == 1)
-		return 0;
+	DIR *dir;
+	struct dirent *de;
+	int fd, ret;
 
-	/* FIXME -- wait for nextfd syscall (or read proc) */
-	close(0);
-	close(1);
-	close(2);
-	close(255); /* bash */
+	dir = opendir_proc(getpid(), "fd");
+	if (dir == NULL)
+		return -1;
+
+	while ((de = readdir(dir))) {
+		if (dir_dots(de))
+			continue;
+
+		ret = sscanf(de->d_name, "%d", &fd);
+		if (ret != 1) {
+			pr_err("Can't parse %s\n", de->d_name);
+			return -1;
+		}
+
+		if ((!is_any_service_fd(fd)) && (dirfd(dir) != fd))
+			close_safe(&fd);
+	}
+
+	closedir(dir);
+	close_pid_proc();
+
 	return 0;
 }
 
@@ -520,7 +533,7 @@ int prepare_fds(struct pstree_item *me)
 
 	ret = close_old_fds(me);
 	if (ret)
-		return ret;
+		goto err;
 
 	pr_info("Opening fdinfo-s\n");
 
@@ -547,6 +560,8 @@ int prepare_fds(struct pstree_item *me)
 			break;
 	}
 
+err:
+	tty_fini_fds();
 	return ret;
 }
 
@@ -559,20 +574,21 @@ int prepare_fs(int pid)
 	if (ifd < 0)
 		return -1;
 
-	if (pb_read_one(ifd, &fe, PB_FS) < 0)
+	if (pb_read_one(ifd, &fe, PB_FS) < 0) {
+		close_safe(&ifd);
 		return -1;
+	}
 
 	cwd = open_reg_by_id(fe->cwd_id);
-	if (cwd < 0)
-		goto err;
-
-	if (fchdir(cwd) < 0) {
-		pr_perror("Can't change root");
+	if (cwd < 0) {
+		close_safe(&ifd);
 		goto err;
 	}
 
-	close(cwd);
-	close(ifd);
+	if (fchdir(cwd) < 0) {
+		pr_perror("Can't change root");
+		goto close;
+	}
 
 	/*
 	 * FIXME: restore task's root. Don't want to do it now, since
@@ -584,6 +600,9 @@ int prepare_fs(int pid)
 	 */
 
 	ret = 0;
+close:
+	close_safe(&cwd);
+	close_safe(&ifd);
 err:
 	fs_entry__free_unpacked(fe, NULL);
 	return ret;

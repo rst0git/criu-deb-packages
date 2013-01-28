@@ -1,3 +1,11 @@
+crtools (0.3-1) unstable; urgency=low
+
+  * Merging upstream version 0.3.
+  * Updating years in copyright file.
+  * Dropping dpkg-source compression levels.
+
+ -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Mon, 28 Jan 2013 06:35:54 +0100
+
 crtools (0.2-2) unstable; urgency=low
 
   * Recommending iproute instead of iproute2 (Closes: #689050).

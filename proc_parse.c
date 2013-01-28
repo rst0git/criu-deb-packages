@@ -49,6 +49,92 @@ static bool is_vma_range_fmt(char *line)
 	return true;
 }
 
+static int parse_vmflags(char *buf, struct vma_area *vma_area)
+{
+	char *tok;
+
+	if (!buf[0])
+		return 0;
+
+	tok = strtok(buf, " \n");
+	if (!tok)
+		return 0;
+
+#define _vmflag_match(_t, _s) (_t[0] == _s[0] && _t[1] == _s[1])
+
+	do {
+		/* mmap() block */
+		if (_vmflag_match(tok, "gd"))
+			vma_area->vma.flags |= MAP_GROWSDOWN;
+		else if (_vmflag_match(tok, "lo"))
+			vma_area->vma.flags |= MAP_LOCKED;
+		else if (_vmflag_match(tok, "nr"))
+			vma_area->vma.flags |= MAP_NORESERVE;
+		else if (_vmflag_match(tok, "ht"))
+			vma_area->vma.flags |= MAP_HUGETLB;
+
+		/* madvise() block */
+		if (_vmflag_match(tok, "sr"))
+			vma_area->vma.madv |= (1ul << MADV_SEQUENTIAL);
+		else if (_vmflag_match(tok, "rr"))
+			vma_area->vma.madv |= (1ul << MADV_RANDOM);
+		else if (_vmflag_match(tok, "dc"))
+			vma_area->vma.madv |= (1ul << MADV_DONTFORK);
+		else if (_vmflag_match(tok, "dd"))
+			vma_area->vma.madv |= (1ul << MADV_DONTDUMP);
+		else if (_vmflag_match(tok, "mg"))
+			vma_area->vma.madv |= (1ul << MADV_MERGEABLE);
+		else if (_vmflag_match(tok, "hg"))
+			vma_area->vma.madv |= (1ul << MADV_HUGEPAGE);
+		else if (_vmflag_match(tok, "nh"))
+			vma_area->vma.madv |= (1ul << MADV_NOHUGEPAGE);
+
+		/*
+		 * Anything else is just ignored.
+		 */
+	} while ((tok = strtok(NULL, " \n")));
+
+#undef _vmflag_match
+
+	if (vma_area->vma.madv)
+		vma_area->vma.has_madv = true;
+
+	return 0;
+}
+
+static int is_anon_shmem_map(dev_t dev)
+{
+	static dev_t shmem_dev = 0;
+
+	if (!shmem_dev) {
+		void *map;
+		char maps[128];
+		struct stat buf;
+
+		map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+				MAP_SHARED | MAP_ANONYMOUS, 0, 0);
+		if (map == MAP_FAILED) {
+			pr_perror("Can't mmap piggie");
+			return -1;
+		}
+
+		sprintf(maps, "/proc/%d/map_files/%lx-%lx",
+				getpid(), (unsigned long)map,
+				(unsigned long)map + PAGE_SIZE);
+		if (stat(maps, &buf) < 0) {
+			pr_perror("Can't stat piggie");
+			return -1;
+		}
+
+		munmap(map, PAGE_SIZE);
+
+		shmem_dev = buf.st_dev;
+		pr_info("Found anon-shmem piggie at %lx\n", shmem_dev);
+	}
+
+	return shmem_dev == dev;
+}
+
 int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 {
 	struct vma_area *vma_area = NULL;
@@ -86,6 +172,11 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 				 */
 				vma_area = NULL;
 				goto err;
+			} else if (!strncmp(buf, "VmFlags: ", 9)) {
+				BUG_ON(!vma_area);
+				if (parse_vmflags(&buf[9], vma_area))
+					goto err;
+				continue;
 			} else
 				continue;
 		}
@@ -99,7 +190,7 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 			     &start, &end, &r, &w, &x, &s, &pgoff, &dev_maj,
 			     &dev_min, &ino, file_path);
 		if (num < 10) {
-			pr_err("Can't parse: %s", buf);
+			pr_err("Can't parse: %s\n", buf);
 			goto err;
 		}
 
@@ -116,10 +207,20 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 			 */
 			vma_area->vm_file_fd = openat(dirfd(map_files_dir), path, O_RDONLY);
 			if (vma_area->vm_file_fd < 0) {
-				if (errno != ENOENT) {
-					pr_perror("Can't open %d's map %lu", pid, start);
-					goto err;
-				}
+				if (errno == ENXIO) {
+					struct stat buf;
+
+					if (fstatat(dirfd(map_files_dir), path, &buf, 0))
+						goto err_bogus_mapfile;
+
+					if (!S_ISSOCK(buf.st_mode))
+						goto err_bogus_mapfile;
+
+					pr_info("Found socket %lu mapping @%lx\n", buf.st_ino, start);
+					vma_area->vma.status |= VMA_AREA_SOCKET | VMA_AREA_REGULAR;
+					vma_area->vm_socket_id = buf.st_ino;
+				} else if (errno != ENOENT)
+					goto err_bogus_mapfile;
 			}
 		}
 
@@ -144,7 +245,9 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 			goto err;
 		}
 
-		if (strstr(buf, "[vsyscall]")) {
+		if (vma_area->vma.status != 0) {
+			goto done;
+		} else if (strstr(buf, "[vsyscall]")) {
 			vma_area->vma.status |= VMA_AREA_VSYSCALL;
 		} else if (strstr(buf, "[vdso]")) {
 			vma_area->vma.status |= VMA_AREA_REGULAR | VMA_AREA_VDSO;
@@ -174,7 +277,7 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 			 * /dev/zero stands for anon-shared mapping
 			 * otherwise it's some file mapping.
 			 */
-			if (MAJOR(st_buf.st_dev) == 0) {
+			if (is_anon_shmem_map(st_buf.st_dev)) {
 				if (!(vma_area->vma.flags & MAP_SHARED))
 					goto err_bogus_mapping;
 				vma_area->vma.flags  |= MAP_ANONYMOUS;
@@ -203,7 +306,7 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 			}
 			vma_area->vma.flags  |= MAP_ANONYMOUS;
 		}
-
+done:
 		list_add_tail(&vma_area->list, vma_area_list);
 		nr++;
 	}
@@ -225,6 +328,10 @@ err_bogus_mapping:
 	pr_err("Bogus mapping 0x%lx-0x%lx (flags: %#x vm_file_fd: %d)\n",
 	       vma_area->vma.start, vma_area->vma.end,
 	       vma_area->vma.flags, vma_area->vm_file_fd);
+	goto err;
+
+err_bogus_mapfile:
+	pr_perror("Can't open %d's mapfile link %lx", pid, start);
 	goto err;
 }
 
@@ -556,7 +663,7 @@ static int parse_mnt_opt(char *str, struct mount_info *mi, int *off)
 	while (1) {
 		end = strchr(str, ' ');
 		if (!end) {
-			pr_err("Error parsing mount options");
+			pr_err("Error parsing mount options\n");
 			return -1;
 		}
 
@@ -793,9 +900,9 @@ int parse_fdinfo(int fd, int type,
 			if (type != FD_TYPES__INOTIFY)
 				goto parse_err;
 			ret = sscanf(str,
-					"inotify wd: %8d ino: %16lx sdev: %8x "
-					"mask: %8x ignored_mask: %8x "
-					"fhandle-bytes: %8x fhandle-type: %8x "
+					"inotify wd:%x ino:%lx sdev:%x "
+					"mask:%x ignored_mask:%x "
+					"fhandle-bytes:%x fhandle-type:%x "
 					"f_handle: %n",
 					&entry.ify.wd, &entry.ify.i_ino, &entry.ify.s_dev,
 					&entry.ify.mask, &entry.ify.ignored_mask,
@@ -828,10 +935,10 @@ int parse_fdinfo(int fd, int type,
 	if (entry_met)
 		return 0;
 	/*
-	 * An eventpoll file may have no target fds set thus
+	 * An eventpoll/inotify file may have no target fds set thus
 	 * resulting in no tfd: lines in proc. This is normal.
 	 */
-	if (type == FD_TYPES__EVENTPOLL)
+	if (type == FD_TYPES__EVENTPOLL || type == FD_TYPES__INOTIFY)
 		return 0;
 
 	pr_err("No records of type %d found in fdinfo file\n", type);
