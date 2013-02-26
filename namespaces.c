@@ -10,13 +10,13 @@
 #include "namespaces.h"
 #include "net.h"
 
-int switch_ns(int pid, int type, char *ns, int *rst)
+int switch_ns(int pid, struct ns_desc *nd, int *rst)
 {
 	char buf[32];
 	int nsfd;
 	int ret = -1;
 
-	snprintf(buf, sizeof(buf), "/proc/%d/ns/%s", pid, ns);
+	snprintf(buf, sizeof(buf), "/proc/%d/ns/%s", pid, nd->str);
 	nsfd = open(buf, O_RDONLY);
 	if (nsfd < 0) {
 		pr_perror("Can't open ipcns file");
@@ -24,7 +24,7 @@ int switch_ns(int pid, int type, char *ns, int *rst)
 	}
 
 	if (rst) {
-		snprintf(buf, sizeof(buf), "/proc/self/ns/%s", ns);
+		snprintf(buf, sizeof(buf), "/proc/self/ns/%s", nd->str);
 		*rst = open(buf, O_RDONLY);
 		if (*rst < 0) {
 			pr_perror("Can't open ns file");
@@ -32,9 +32,9 @@ int switch_ns(int pid, int type, char *ns, int *rst)
 		}
 	}
 
-	ret = setns(nsfd, type);
+	ret = setns(nsfd, nd->cflag);
 	if (ret < 0) {
-		pr_perror("Can't setns %d/%s", pid, ns);
+		pr_perror("Can't setns %d/%s", pid, nd->str);
 		goto err_set;
 	}
 
@@ -50,15 +50,126 @@ err_ns:
 	return -1;
 }
 
-int restore_ns(int rst, int type)
+int restore_ns(int rst, struct ns_desc *nd)
 {
 	int ret;
 
-	ret = setns(rst, type);
+	ret = setns(rst, nd->cflag);
 	if (ret < 0)
 		pr_perror("Can't restore ns back");
 
 	return ret;
+}
+
+struct ns_id {
+	unsigned int kid;
+	unsigned int id;
+	struct ns_desc *nd;
+	struct ns_id *next;
+};
+
+static struct ns_id *ns_ids;
+static unsigned int ns_next_id = 1;
+unsigned long current_ns_mask = 0;
+
+static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd)
+{
+	struct ns_id *nsid;
+
+	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next)
+		if (nsid->kid == kid && nsid->nd == nd)
+			return nsid->id;
+
+	if (pid != getpid()) {
+		if (pid == root_item->pid.real) {
+			BUG_ON(current_ns_mask & nd->cflag);
+			pr_info("Will take %s namespace in the image\n", nd->str);
+			current_ns_mask |= nd->cflag;
+		} else {
+			pr_err("Can't dump nested %s namespace for %d\n",
+					nd->str, pid);
+			return 0;
+		}
+	}
+
+	nsid = xmalloc(sizeof(*nsid));
+	if (!nsid)
+		return 0;
+
+	nsid->id = ns_next_id++;
+	nsid->kid = kid;
+	nsid->nd = nd;
+	nsid->next = ns_ids;
+	ns_ids = nsid;
+
+	pr_info("Collected %u.%s namespace\n", nsid->id, nd->str);
+
+	return nsid->id;
+}
+
+static unsigned int get_ns_id(int pid, struct ns_desc *nd)
+{
+	int proc_dir, ret;
+	unsigned int kid;
+	char ns_path[10], ns_id[32], *end;
+
+	proc_dir = open_pid_proc(pid);
+	if (proc_dir < 0)
+		return 0;
+
+	sprintf(ns_path, "ns/%s", nd->str);
+	ret = readlinkat(proc_dir, ns_path, ns_id, sizeof(ns_id));
+	if (ret < 0) {
+		pr_perror("Can't readlink ns link");
+		return 0;
+	}
+
+	/* XXX: Does it make sence to validate kernel links to <name>:[<id>]? */
+	kid = strtoul(ns_id + strlen(nd->str) + 2, &end, 10);
+	return generate_ns_id(pid, kid, nd);
+}
+
+int dump_task_ns_ids(struct pstree_item *item)
+{
+	int pid = item->pid.real;
+	TaskKobjIdsEntry *ids = item->ids;
+
+	ids->has_pid_ns_id = true;
+	ids->pid_ns_id = get_ns_id(pid, &pid_ns_desc);
+	if (!ids->pid_ns_id) {
+		pr_err("Can't make pidns id\n");
+		return -1;
+	}
+
+	ids->has_net_ns_id = true;
+	ids->net_ns_id = get_ns_id(pid, &net_ns_desc);
+	if (!ids->net_ns_id) {
+		pr_err("Can't make netns id\n");
+		return -1;
+	}
+
+	ids->has_ipc_ns_id = true;
+	ids->ipc_ns_id = get_ns_id(pid, &ipc_ns_desc);
+	if (!ids->ipc_ns_id) {
+		pr_err("Can't make ipcns id\n");
+		return -1;
+	}
+
+	ids->has_uts_ns_id = true;
+	ids->uts_ns_id = get_ns_id(pid, &uts_ns_desc);
+	if (!ids->uts_ns_id) {
+		pr_err("Can't make utsns id\n");
+		return -1;
+	}
+
+	ids->has_mnt_ns_id = true;
+	ids->mnt_ns_id = get_ns_id(pid, &mnt_ns_desc);
+	if (!ids->mnt_ns_id) {
+		pr_err("Can't make mntns id\n");
+		return -1;
+	}
+
+	return 0;
 }
 
 static int do_dump_namespaces(struct pid *ns_pid, unsigned int ns_flags)
@@ -118,7 +229,7 @@ int dump_namespaces(struct pid *ns_pid, unsigned int ns_flags)
 
 	pr_info("Dumping %d(%d)'s namespaces\n", ns_pid->virt, ns_pid->real);
 
-	if ((opts.namespaces_flags & CLONE_NEWPID) && ns_pid->virt != 1) {
+	if ((ns_flags & CLONE_NEWPID) && ns_pid->virt != 1) {
 		pr_err("Can't dump a pid namespace without the process init\n");
 		return -1;
 	}
@@ -197,3 +308,8 @@ int try_show_namespaces(int ns_pid, struct cr_options *o)
 	close_cr_fdset(&fdset);
 	return 0;
 }
+
+struct ns_desc pid_ns_desc = {
+	.cflag = CLONE_NEWPID,
+	.str = "pid",
+};

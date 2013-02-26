@@ -1,3 +1,14 @@
+crtools (0.4-1) unstable; urgency=low
+
+  * Merging upstream version 0.4.
+  * Including upstreams credits file as documentation.
+  * Adding asciidoc and xmlto to build-depends.
+  * Adding patch to remove non-working echo entries from documentation
+    makefile.
+  * Building and including crtools manpage.
+
+ -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Tue, 26 Feb 2013 13:11:20 +0100
+
 crtools (0.3-1) unstable; urgency=low
 
   * Merging upstream version 0.3.

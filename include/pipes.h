@@ -1,12 +1,12 @@
 #ifndef __CR_PIPES_H__
 #define __CR_PIPES_H__
 
-#include "../protobuf/pipe-data.pb-c.h"
+#include "protobuf/pipe-data.pb-c.h"
 
 extern int collect_pipes(void);
 extern void mark_pipe_master(void);
 int dump_pipe(struct fd_parms *p, int lfd,
-			     const struct cr_fdset *cr_fdset);
+			     const int fdinfo);
 
 static inline u32 pipe_id(const struct fd_parms *p)
 {
@@ -36,4 +36,4 @@ struct pipe_data_rst {
 extern int collect_pipe_data(int img_type, struct pipe_data_rst **hash);
 extern int restore_pipe_data(int img_type, int pfd, u32 id, struct pipe_data_rst **hash);
 
-#endif
+#endif /* __CR_PIPES_H__ */

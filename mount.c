@@ -13,13 +13,13 @@
 #include <sys/wait.h>
 
 #include "crtools.h"
-#include "types.h"
+#include "asm/types.h"
 #include "util.h"
 #include "log.h"
 #include "mount.h"
 #include "proc_parse.h"
 #include "image.h"
-
+#include "namespaces.h"
 #include "protobuf.h"
 #include "protobuf/mnt.pb-c.h"
 
@@ -50,12 +50,28 @@ int collect_mount_info(void)
 	return 0;
 }
 
-static struct mount_info *mnt_find_by_id(struct mount_info *list, int id)
+static struct mount_info *__lookup_mnt_id(struct mount_info *list, int id)
 {
 	struct mount_info *m;
 
 	for (m = list; m != NULL; m = m->next)
 		if (m->mnt_id == id)
+			return m;
+
+	return NULL;
+}
+
+struct mount_info *lookup_mnt_id(unsigned int id)
+{
+	return __lookup_mnt_id(mntinfo, id);
+}
+
+struct mount_info *lookup_mnt_sdev(unsigned int s_dev)
+{
+	struct mount_info *m;
+
+	for (m = mntinfo; m != NULL; m = m->next)
+		if (m->s_dev == s_dev)
 			return m;
 
 	return NULL;
@@ -74,7 +90,7 @@ static struct mount_info *mnt_build_ids_tree(struct mount_info *list)
 		struct mount_info *p;
 
 		pr_debug("\t\tWorking on %d->%d\n", m->mnt_id, m->parent_mnt_id);
-		p = mnt_find_by_id(list, m->parent_mnt_id);
+		p = __lookup_mnt_id(list, m->parent_mnt_id);
 		if (!p) {
 			/* This should be / */
 			if (root == NULL && !strcmp(m->mountpoint, "/")) {
@@ -688,6 +704,8 @@ int prepare_mnt_ns(int ns_pid)
 
 	pr_info("Restoring mount namespace\n");
 
+	close_proc();
+
 	/*
 	 * The new mount namespace is filled with the mountpoint
 	 * clones from the original one. We have to umount them
@@ -745,3 +763,8 @@ int mntns_collect_root(pid_t pid)
 
 	return 0;
 }
+
+struct ns_desc mnt_ns_desc = {
+	.cflag = CLONE_NEWNS,
+	.str = "mnt",
+};

@@ -5,6 +5,16 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=-all
 %:
 	dh ${@}
 
+override_dh_auto_build:
+	dh_auto_build
+
+	$(MAKE) -C Documentation
+
+override_dh_auto_clean:
+	dh_auto_clean
+
+	$(MAKE) -C Documentation clean
+
 override_dh_auto_test:
 	# disabled: doesn't work yet
 

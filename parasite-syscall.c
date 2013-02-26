@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <inttypes.h>
 
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -8,25 +9,25 @@
 #include "protobuf/sa.pb-c.h"
 #include "protobuf/itimer.pb-c.h"
 #include "protobuf/creds.pb-c.h"
+#include "protobuf/core.pb-c.h"
 
 #include "syscall.h"
 #include "ptrace.h"
-#include "processor-flags.h"
+#include "asm/processor-flags.h"
 #include "parasite-syscall.h"
 #include "parasite-blob.h"
 #include "parasite.h"
 #include "crtools.h"
 #include "namespaces.h"
 #include "pstree.h"
+#include "net.h"
 
 #include <string.h>
 #include <stdlib.h>
 
-#ifdef CONFIG_X86_64
-static const char code_syscall[] = {0x0f, 0x05, 0xcc, 0xcc,
-				    0xcc, 0xcc, 0xcc, 0xcc};
+#include "asm/parasite-syscall.h"
+#include "asm/dump.h"
 
-#define code_syscall_size	(round_up(sizeof(code_syscall), sizeof(long)))
 #define parasite_size		(round_up(sizeof(parasite_blob), sizeof(long)))
 
 static int can_run_syscall(unsigned long ip, unsigned long start, unsigned long end)
@@ -46,7 +47,7 @@ static struct vma_area *get_vma_by_ip(struct list_head *vma_area_list, unsigned 
 	struct vma_area *vma_area;
 
 	list_for_each_entry(vma_area, vma_area_list, list) {
-		if (!in_vma_area(vma_area, ip))
+		if (vma_area->vma.start >= TASK_SIZE)
 			continue;
 		if (!(vma_area->vma.prot & PROT_EXEC))
 			continue;
@@ -57,20 +58,8 @@ static struct vma_area *get_vma_by_ip(struct list_head *vma_area_list, unsigned 
 	return NULL;
 }
 
-/* Note it's destructive on @regs */
-static void parasite_setup_regs(unsigned long new_ip, user_regs_struct_t *regs)
-{
-	regs->ip = new_ip;
-
-	/* Avoid end of syscall processing */
-	regs->orig_ax = -1;
-
-	/* Make sure flags are in known state */
-	regs->flags &= ~(X86_EFLAGS_TF | X86_EFLAGS_DF | X86_EFLAGS_IF);
-}
-
 /* we run at @regs->ip */
-static int __parasite_execute(struct parasite_ctl *ctl, pid_t pid, user_regs_struct_t *regs)
+int __parasite_execute(struct parasite_ctl *ctl, pid_t pid, user_regs_struct_t *regs)
 {
 	siginfo_t siginfo;
 	int status;
@@ -112,7 +101,7 @@ again:
 			goto err;
 	}
 
-	if (WSTOPSIG(status) != SIGTRAP || siginfo.si_code != SI_KERNEL) {
+	if (WSTOPSIG(status) != SIGTRAP || siginfo.si_code != ARCH_SI_TRAP) {
 retry_signal:
 		pr_debug("** delivering signal %d si_code=%d\n",
 			 siginfo.si_signo, siginfo.si_code);
@@ -225,7 +214,7 @@ static int parasite_execute_by_pid(unsigned int cmd, struct parasite_ctl *ctl, p
 
 	ret = __parasite_execute(ctl, pid, &regs);
 	if (ret == 0)
-		ret = (int)regs.ax;
+		ret = (int)REG_RES(regs);
 
 	if (ret)
 		pr_err("Parasite exited with %d\n", ret);
@@ -244,50 +233,12 @@ static int parasite_execute(unsigned int cmd, struct parasite_ctl *ctl)
 	return parasite_execute_by_pid(cmd, ctl, ctl->pid);
 }
 
-static void *mmap_seized(struct parasite_ctl *ctl,
-			 void *addr, size_t length, int prot,
-			 int flags, int fd, off_t offset)
-{
-	user_regs_struct_t regs = ctl->regs_orig;
-	void *map = NULL;
-	int ret;
-
-	regs.ax  = (unsigned long)__NR_mmap;	/* mmap		*/
-	regs.di  = (unsigned long)addr;		/* @addr	*/
-	regs.si  = (unsigned long)length;	/* @length	*/
-	regs.dx  = (unsigned long)prot;		/* @prot	*/
-	regs.r10 = (unsigned long)flags;	/* @flags	*/
-	regs.r8  = (unsigned long)fd;		/* @fd		*/
-	regs.r9  = (unsigned long)offset;	/* @offset	*/
-
-	parasite_setup_regs(ctl->syscall_ip, &regs);
-
-	ret = __parasite_execute(ctl, ctl->pid, &regs);
-	if (ret)
-		goto err;
-
-	if ((long)regs.ax > 0)
-		map = (void *)regs.ax;
-err:
-	return map;
-}
-
 static int munmap_seized(struct parasite_ctl *ctl, void *addr, size_t length)
 {
-	user_regs_struct_t regs = ctl->regs_orig;
-	int ret;
+	unsigned long x;
 
-	regs.ax = (unsigned long)__NR_munmap;	/* mmap		*/
-	regs.di = (unsigned long)addr;		/* @addr	*/
-	regs.si = (unsigned long)length;	/* @length	*/
-
-	parasite_setup_regs(ctl->syscall_ip, &regs);
-
-	ret = __parasite_execute(ctl, ctl->pid, &regs);
-	if (!ret)
-		ret = (int)regs.ax;
-
-	return ret;
+	return syscall_seized(ctl, __NR_munmap, &x,
+			(unsigned long)addr, length, 0, 0, 0, 0);
 }
 
 static int gen_parasite_saddr(struct sockaddr_un *saddr, int key)
@@ -310,22 +261,6 @@ static int parasite_send_fd(struct parasite_ctl *ctl, int fd)
 		pr_perror("Can't send file descriptor");
 		return -1;
 	}
-	return 0;
-}
-
-static int parasite_prep_file(int fd, struct parasite_ctl *ctl)
-{
-	int ret;
-
-	if (fchmod(fd, CR_FD_PERM_DUMP)) {
-		pr_perror("Can't change permissions on file");
-		return -1;
-	}
-
-	ret = parasite_send_fd(ctl, fd);
-	if (ret)
-		return ret;
-
 	return 0;
 }
 
@@ -356,17 +291,17 @@ static int parasite_init(struct parasite_ctl *ctl, pid_t pid, int nr_threads)
 	args = parasite_args(ctl, struct parasite_init_args);
 
 	pr_info("Putting tsock into pid %d\n", pid);
-	args->h_addr_len = gen_parasite_saddr(&args->h_addr, 0);
+	args->h_addr_len = gen_parasite_saddr(&args->h_addr, getpid());
 	args->p_addr_len = gen_parasite_saddr(&args->p_addr, pid);
 	args->nr_threads = nr_threads;
 
 	if (sock == -1) {
 		int rst = -1;
 
-		if (opts.namespaces_flags & CLONE_NEWNET) {
+		if (current_ns_mask & CLONE_NEWNET) {
 			pr_info("Switching to %d's net for tsock creation\n", pid);
 
-			if (switch_ns(pid, CLONE_NEWNET, "net", &rst))
+			if (switch_ns(pid, &net_ns_desc, &rst))
 				return -1;
 		}
 
@@ -381,7 +316,7 @@ static int parasite_init(struct parasite_ctl *ctl, pid_t pid, int nr_threads)
 			goto err;
 		}
 
-		if (rst > 0 && restore_ns(rst, CLONE_NEWNET) < 0)
+		if (rst > 0 && restore_ns(rst, &net_ns_desc) < 0)
 			goto err;
 	} else {
 		struct sockaddr addr = { .sa_family = AF_UNSPEC, };
@@ -416,20 +351,20 @@ err:
 	return -1;
 }
 
-int parasite_dump_thread_seized(struct parasite_ctl *ctl, pid_t pid,
-					unsigned int **tid_addr, pid_t *tid,
-					void *blocked)
+int parasite_dump_thread_seized(struct parasite_ctl *ctl, struct pid *tid,
+		CoreEntry *core)
 {
 	struct parasite_dump_thread *args;
 	int ret;
 
 	args = parasite_args(ctl, struct parasite_dump_thread);
 
-	ret = parasite_execute_by_pid(PARASITE_CMD_DUMP_THREAD, ctl, pid);
+	ret = parasite_execute_by_pid(PARASITE_CMD_DUMP_THREAD, ctl, tid->real);
 
-	memcpy(blocked, &args->blocked, sizeof(args->blocked));
-	*tid_addr = args->tid_addr;
-	*tid = args->tid;
+	memcpy(&core->thread_core->blk_sigset, &args->blocked, sizeof(args->blocked));
+	CORE_THREAD_ARCH_INFO(core)->clear_tid_addr = encode_pointer(args->tid_addr);
+	tid->virt = args->tid;
+	core_put_tls(core, args->tls);
 
 	return ret;
 }
@@ -454,9 +389,9 @@ int parasite_dump_sigacts_seized(struct parasite_ctl *ctl, struct cr_fdset *cr_f
 		if (sig == SIGSTOP || sig == SIGKILL)
 			continue;
 
-		ASSIGN_TYPED(se.sigaction, args->sas[i].rt_sa_handler);
+		ASSIGN_TYPED(se.sigaction, encode_pointer(args->sas[i].rt_sa_handler));
 		ASSIGN_TYPED(se.flags, args->sas[i].rt_sa_flags);
-		ASSIGN_TYPED(se.restorer, args->sas[i].rt_sa_restorer);
+		ASSIGN_TYPED(se.restorer, encode_pointer(args->sas[i].rt_sa_restorer));
 		ASSIGN_TYPED(se.mask, args->sas[i].rt_sa_mask.sig[0]);
 
 		if (pb_write_one(fd, &se, PB_SIGACT) < 0)
@@ -563,7 +498,7 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl, struct list_head *vma_a
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, ctl->pid);
 	pr_info("----------------------------------------\n");
 
-	ret = parasite_prep_file(fdset_fd(cr_fdset, CR_FD_PAGES), ctl);
+	ret = parasite_send_fd(ctl, fdset_fd(cr_fdset, CR_FD_PAGES));
 	if (ret < 0)
 		goto out;
 
@@ -602,13 +537,16 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl, struct list_head *vma_a
 			continue;
 		}
 
+		if (vma_area->vma.end > TASK_SIZE)
+			continue;
+
 		ret = parasite_execute(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret) {
 			pr_err("Dumping pages failed with %d\n", ret);
 			goto out_fini;
 		}
 
-		pr_info("vma %lx-%lx  dumped: %lu pages %lu skipped %lu total\n",
+		pr_info("vma %"PRIx64"-%"PRIx64"  dumped: %lu pages %lu skipped %lu total\n",
 				vma_area->vma.start, vma_area->vma.end,
 				parasite_dumppages->nrpages_dumped,
 				parasite_dumppages->nrpages_skipped,
@@ -627,7 +565,6 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl, struct list_head *vma_a
 out_fini:
 	parasite_execute(PARASITE_CMD_DUMPPAGES_FINI, ctl);
 out:
-	fchmod(fdset_fd(cr_fdset, CR_FD_PAGES), CR_FD_PERM);
 	pr_info("----------------------------------------\n");
 
 	return ret;
@@ -750,7 +687,7 @@ int parasite_cure_seized(struct parasite_ctl *ctl, struct pstree_item *item)
 	}
 
 	if (ctl->local_map) {
-		if (munmap(ctl->local_map, parasite_size)) {
+		if (munmap(ctl->local_map, ctl->map_length)) {
 			pr_err("munmap failed (pid: %d)\n", ctl->pid);
 			ret = -1;
 		}
@@ -771,11 +708,15 @@ int parasite_cure_seized(struct parasite_ctl *ctl, struct pstree_item *item)
 	return ret;
 }
 
-struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item, struct list_head *vma_area_list)
+struct parasite_ctl *parasite_prep_ctl(pid_t pid, struct list_head *vma_area_list)
 {
 	struct parasite_ctl *ctl = NULL;
 	struct vma_area *vma_area;
-	int ret, fd;
+
+	if (task_in_compat_mode(pid)) {
+		pr_err("Can't checkpoint task running in compat mode\n");
+		goto err;
+	}
 
 	/*
 	 * Control block early setup.
@@ -793,7 +734,7 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 		goto err;
 	}
 
-	vma_area = get_vma_by_ip(vma_area_list, ctl->regs_orig.ip);
+	vma_area = get_vma_by_ip(vma_area_list, REG_IP(ctl->regs_orig));
 	if (!vma_area) {
 		pr_err("No suitable VMA found to run parasite "
 		       "bootstrap code (pid: %d)\n", pid);
@@ -807,9 +748,6 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	 * Inject syscall instruction and remember original code,
 	 * we will need it to restore original program content.
 	 */
-	BUILD_BUG_ON(sizeof(code_syscall) != sizeof(ctl->code_orig));
-	BUILD_BUG_ON(!is_log2(sizeof(code_syscall)));
-
 	memcpy(ctl->code_orig, code_syscall, sizeof(ctl->code_orig));
 	if (ptrace_swap_area(ctl->pid, (void *)ctl->syscall_ip,
 			     (void *)ctl->code_orig, sizeof(ctl->code_orig))) {
@@ -817,36 +755,64 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 		goto err;
 	}
 
-	/*
-	 * Inject a parasite engine. Ie allocate memory inside alien
-	 * space and copy engine code there. Then re-map the engine
-	 * locally, so we will get an easy way to access engine memory
-	 * without using ptrace at all.
-	 */
-	ctl->remote_map = mmap_seized(ctl, NULL, (size_t)parasite_size,
+	return ctl;
+
+err:
+	xfree(ctl);
+	return NULL;
+}
+
+int parasite_map_exchange(struct parasite_ctl *ctl, unsigned long size)
+{
+	int fd;
+
+	ctl->remote_map = mmap_seized(ctl, NULL, size,
 				      PROT_READ | PROT_WRITE | PROT_EXEC,
 				      MAP_ANONYMOUS | MAP_SHARED, -1, 0);
 	if (!ctl->remote_map) {
-		pr_err("Can't allocate memory for parasite blob (pid: %d)\n", pid);
-		goto err_restore;
+		pr_err("Can't allocate memory for parasite blob (pid: %d)\n", ctl->pid);
+		return -1;
 	}
 
-	ctl->map_length = round_up(parasite_size, PAGE_SIZE);
+	ctl->map_length = round_up(size, PAGE_SIZE);
 
-	fd = open_proc_rw(pid, "map_files/%p-%p",
+	fd = open_proc_rw(ctl->pid, "map_files/%p-%p",
 		 ctl->remote_map, ctl->remote_map + ctl->map_length);
 	if (fd < 0)
-		goto err_restore;
+		return -1;
 
-	ctl->local_map = mmap(NULL, parasite_size, PROT_READ | PROT_WRITE,
+	ctl->local_map = mmap(NULL, size, PROT_READ | PROT_WRITE,
 			      MAP_SHARED | MAP_FILE, fd, 0);
 	close(fd);
 
 	if (ctl->local_map == MAP_FAILED) {
 		ctl->local_map = NULL;
 		pr_perror("Can't map remote parasite map");
-		goto err_restore;
+		return -1;
 	}
+
+	return 0;
+}
+
+struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item, struct list_head *vma_area_list)
+{
+	int ret;
+	struct parasite_ctl *ctl;
+
+	ctl = parasite_prep_ctl(pid, vma_area_list);
+	if (!ctl)
+		return NULL;
+
+	/*
+	 * Inject a parasite engine. Ie allocate memory inside alien
+	 * space and copy engine code there. Then re-map the engine
+	 * locally, so we will get an easy way to access engine memory
+	 * without using ptrace at all.
+	 */
+
+	ret = parasite_map_exchange(ctl, parasite_size);
+	if (ret)
+		goto err_restore;
 
 	pr_info("Putting parasite blob into %p->%p\n", ctl->local_map, ctl->remote_map);
 	memcpy(ctl->local_map, parasite_blob, sizeof(parasite_blob));
@@ -879,12 +845,5 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 err_restore:
 	parasite_cure_seized(ctl, item);
 	return NULL;
-
-err:
-	xfree(ctl);
-	return NULL;
 }
 
-#else /* CONFIG_X86_64 */
-# error x86-32 is not yet implemented
-#endif /* CONFIG_X86_64 */

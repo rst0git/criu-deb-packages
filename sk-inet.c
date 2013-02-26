@@ -9,7 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "types.h"
+#include "asm/types.h"
 #include "libnetlink.h"
 #include "crtools.h"
 #include "inet_diag.h"
@@ -315,9 +315,9 @@ static const struct fdtype_ops inet_dump_ops = {
 	.dump		= dump_one_inet_fd,
 };
 
-int dump_one_inet(struct fd_parms *p, int lfd, const struct cr_fdset *set)
+int dump_one_inet(struct fd_parms *p, int lfd, const int fdinfo)
 {
-	return do_dump_gen_file(p, lfd, &inet_dump_ops, set);
+	return do_dump_gen_file(p, lfd, &inet_dump_ops, fdinfo);
 }
 
 static int dump_one_inet6_fd(int lfd, u32 id, const struct fd_parms *p)
@@ -330,9 +330,9 @@ static const struct fdtype_ops inet6_dump_ops = {
 	.dump		= dump_one_inet6_fd,
 };
 
-int dump_one_inet6(struct fd_parms *p, int lfd, const struct cr_fdset *set)
+int dump_one_inet6(struct fd_parms *p, int lfd, const int fdinfo)
 {
-	return do_dump_gen_file(p, lfd, &inet6_dump_ops, set);
+	return do_dump_gen_file(p, lfd, &inet6_dump_ops, fdinfo);
 }
 
 int inet_collect_one(struct nlmsghdr *h, int family, int type, int proto)
@@ -425,7 +425,7 @@ static int inet_validate_address(InetSkEntry *ie)
 			(ie->n_dst_addr == PB_ALEN_INET6))
 		return 0;
 
-	pr_err("Addr len mismatch f %d ss %lu ds %lu\n", ie->family,
+	pr_err("Addr len mismatch f %d ss %zu ds %zu\n", ie->family,
 			pb_repeated_size(ie, src_addr),
 			pb_repeated_size(ie, dst_addr));
 
@@ -439,15 +439,18 @@ static int post_open_inet_sk(struct file_desc *d, int sk)
 
 	ii = container_of(d, struct inet_sk_info, d);
 
+	/*
+	 * TCP sockets are handled at the last moment
+	 * after unlocking connections.
+	 */
+	if (tcp_connection(ii->ie))
+		return 0;
+
 	/* SO_REUSEADDR is set for all sockets */
-	if (!tcp_connection(ii->ie) && ii->ie->opts->reuseaddr)
+	if (ii->ie->opts->reuseaddr)
 		return 0;
 
 	futex_wait_until(&ii->port->users, 0);
-
-	/* Disabling repair mode drops SO_REUSEADDR */
-	if (tcp_connection(ii->ie))
-		tcp_repair_off(sk);
 
 	val = ii->ie->opts->reuseaddr;
 	if (restore_opt(sk, SOL_SOCKET, SO_REUSEADDR, &val))

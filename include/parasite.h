@@ -1,5 +1,5 @@
-#ifndef CR_PARASITE_H_
-#define CR_PARASITE_H_
+#ifndef __CR_PARASITE_H__
+#define __CR_PARASITE_H__
 
 #define PARASITE_STACK_SIZE	(16 << 10)
 #define PARASITE_ARG_SIZE	8196
@@ -13,7 +13,7 @@
 #include "image.h"
 #include "util-net.h"
 
-#include "../protobuf/vma.pb-c.h"
+#include "protobuf/vma.pb-c.h"
 
 #define __head __used __section(.head.text)
 
@@ -83,6 +83,8 @@ struct parasite_dump_misc {
 	u32 pid;
 	u32 sid;
 	u32 pgid;
+	u32 tls;
+	u32 umask;
 };
 
 #define PARASITE_MAX_GROUPS	(PAGE_SIZE / sizeof(unsigned int))
@@ -97,6 +99,7 @@ struct parasite_dump_thread {
 	unsigned int		*tid_addr;
 	pid_t			tid;
 	k_rtsigset_t		blocked;
+	u32			tls;
 };
 
 #define PARASITE_MAX_FDS	(PAGE_SIZE / sizeof(int))
@@ -127,4 +130,5 @@ struct parasite_tty_args {
 #define parasite_sym(pblob, name) ((void *)(pblob) + parasite_blob_offset__##name)
 
 #endif /* !__ASSEMBLY__ */
-#endif /* CR_PARASITE_H_ */
+
+#endif /* __CR_PARASITE_H__ */

@@ -13,7 +13,7 @@
 #include <sys/epoll.h>
 
 #include "compiler.h"
-#include "types.h"
+#include "asm/types.h"
 #include "eventpoll.h"
 #include "proc_parse.h"
 #include "crtools.h"
@@ -47,7 +47,7 @@ int is_eventpoll_link(int lfd)
 
 static void pr_info_eventpoll_tfd(char *action, EventpollTfdEntry *e)
 {
-	pr_info("%seventpoll-tfd: id %#08x tfd %#08x events %#08x data %#016lx\n",
+	pr_info("%seventpoll-tfd: id %#08x tfd %#08x events %#08x data %#016"PRIx64"\n",
 		action, e->id, e->tfd, e->events, e->data);
 }
 
@@ -97,9 +97,9 @@ static const struct fdtype_ops eventpoll_ops = {
 	.dump		= dump_one_eventpoll,
 };
 
-int dump_eventpoll(struct fd_parms *p, int lfd, const struct cr_fdset *set)
+int dump_eventpoll(struct fd_parms *p, int lfd, const int fdinfo)
 {
-	return do_dump_gen_file(p, lfd, &eventpoll_ops, set);
+	return do_dump_gen_file(p, lfd, &eventpoll_ops, fdinfo);
 }
 
 static int eventpoll_open(struct file_desc *d)

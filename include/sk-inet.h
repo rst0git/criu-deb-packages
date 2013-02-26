@@ -7,7 +7,7 @@
 #include "files.h"
 #include "list.h"
 #include "protobuf.h"
-#include "../protobuf/sk-inet.pb-c.h"
+#include "protobuf/sk-inet.pb-c.h"
 
 #define INET_ADDR_LEN		40
 #ifndef TCP_REPAIR
@@ -45,6 +45,11 @@ struct inet_sk_info {
 int inet_bind(int sk, struct inet_sk_info *);
 int inet_connect(int sk, struct inet_sk_info *);
 
+struct rst_tcp_sock {
+	int	sk;
+	bool	reuseaddr;
+};
+
 static inline void tcp_repair_off(int fd)
 {
 	int aux = 0;
@@ -65,8 +70,9 @@ int restore_one_tcp(int sk, struct inet_sk_info *si);
 struct cr_options;
 void show_tcp_stream(int fd, struct cr_options *);
 
-int check_tcp_repair(void);
+int check_tcp(void);
 
 extern int rst_tcp_socks_size;
 extern int rst_tcp_socks_remap(void *addr);
-#endif
+
+#endif /* __CR_SK_INET_H__ */

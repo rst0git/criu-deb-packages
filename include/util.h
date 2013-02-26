@@ -1,5 +1,5 @@
-#ifndef UTIL_H_
-#define UTIL_H_
+#ifndef __CR_UTIL_H__
+#define __CR_UTIL_H__
 
 /*
  * Some bits are stolen from perf and kvm tools
@@ -13,10 +13,10 @@
 #include <dirent.h>
 
 #include "compiler.h"
-#include "types.h"
+#include "asm/types.h"
 #include "log.h"
 
-#include "../protobuf/vma.pb-c.h"
+#include "protobuf/vma.pb-c.h"
 
 #define PREF_SHIFT_OP(pref, op, size)	((size) op (pref ##BYTES_SHIFT))
 #define KBYTES_SHIFT	10
@@ -263,6 +263,8 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
 #define pr_img_head(type, ...)	pr_msg("\n"#type __VA_ARGS__ "\n----------------\n")
 #define pr_img_tail(type)	pr_msg("----------------\n")
 
+#define DEVZERO		(makedev(1, 5))
+
 #define KDEV_MINORBITS	20
 #define KDEV_MINORMASK	((1UL << KDEV_MINORBITS) - 1)
 #define MKKDEV(ma, mi)	(((ma) << KDEV_MINORBITS) | (mi))
@@ -330,4 +332,4 @@ static inline bool dir_dots(struct dirent *de)
 	return !strcmp(de->d_name, ".") || !strcmp(de->d_name, "..");
 }
 
-#endif /* UTIL_H_ */
+#endif /* __CR_UTIL_H__ */

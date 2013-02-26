@@ -1,3 +1,5 @@
+include ../../Makefile.inc
+
 LIBDIR	= ../../lib
 LIB	= $(LIBDIR)/libzdtmtst.a
 override CPPFLAGS += -I$(LIBDIR)
@@ -11,6 +13,7 @@ TST_NOFILE	=				\
 		wait00				\
 		zombie00			\
 		fpu00				\
+		fpu01				\
 		futex				\
 		futex-rl			\
 		mmx00				\
@@ -41,10 +44,8 @@ TST_NOFILE	=				\
 		vdso00				\
 		utsname				\
 		pstree				\
-		sockets00			\
 		sockets01			\
 		sockets_spair			\
-		sockets_dgram			\
 		socket_queues			\
 		socket_queues02			\
 		socket-tcp			\
@@ -59,14 +60,17 @@ TST_NOFILE	=				\
 		sem				\
 		maps01				\
 		maps02				\
+		maps03				\
 		xids00				\
 		groups				\
 		file_fown			\
 		eventfs00			\
 		signalfd00			\
 		inotify00			\
+		fanotify00			\
 		uptime_grow			\
 		session00			\
+		rlimits00			\
 		pty00				\
 		pty01				\
 		pty02				\
@@ -108,6 +112,11 @@ TST_FILE	=				\
 		unlink_fifo_wronly		\
 		file_shared			\
 		cow01				\
+		fdt_shared			\
+		sockets00			\
+		sockets_dgram			\
+		file_locks00			\
+		file_locks01			\
 
 TST_DIR		=				\
 		cwd00				\
@@ -220,13 +229,16 @@ $(LIB):	force
 	$(MAKE) -C $(LIBDIR)
 
 clean:
-	$(RM) $(OBJ) $(TST) *~
+	$(RM) -f $(OBJ) $(TST) *~
 
 cleandep:	clean
-	$(RM) $(DEP)
+	$(RM) -f $(DEP)
 
 cleanout:
-	$(RM) -r *.pid *.out* *.test* *.state
+	$(RM) -f -r *.pid *.out* *.test* *.state
+
+%.cleanout: %
+	$(RM) -f -r $<.pid $<.out* $<.test* $<.*.test $<.state
 
 realclean:	cleandep cleanout
 

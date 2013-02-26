@@ -13,7 +13,7 @@
 #include <sys/eventfd.h>
 
 #include "compiler.h"
-#include "types.h"
+#include "asm/types.h"
 #include "eventfd.h"
 #include "proc_parse.h"
 #include "crtools.h"
@@ -40,7 +40,7 @@ int is_eventfd_link(int lfd)
 
 static void pr_info_eventfd(char *action, EventfdFileEntry *efe)
 {
-	pr_info("%s: id %#08x flags %#04x counter %#016lx\n",
+	pr_info("%s: id %#08x flags %#04x counter %#016"PRIx64"\n",
 		action, efe->id, efe->flags, efe->counter);
 }
 
@@ -85,9 +85,9 @@ static const struct fdtype_ops eventfd_ops = {
 	.dump		= dump_one_eventfd,
 };
 
-int dump_eventfd(struct fd_parms *p, int lfd, const struct cr_fdset *set)
+int dump_eventfd(struct fd_parms *p, int lfd, const int fdinfo)
 {
-	return do_dump_gen_file(p, lfd, &eventfd_ops, set);
+	return do_dump_gen_file(p, lfd, &eventfd_ops, fdinfo);
 }
 
 static int eventfd_open(struct file_desc *d)

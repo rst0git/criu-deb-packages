@@ -5,18 +5,14 @@
  * Anything else should go to plain type.h
  */
 
-#ifndef SYSCALL_TYPES_H__
-#define SYSCALL_TYPES_H__
+#ifndef __CR_SYSCALL_TYPES_H__
+#define __CR_SYSCALL_TYPES_H__
 
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <sched.h>
 
-#include "types.h"
-
-#ifndef CONFIG_X86_64
-# error x86-32 bit mode not yet implemented
-#endif
+#include "asm/types.h"
 
 struct cap_header {
 	u32 version;
@@ -59,6 +55,15 @@ struct robust_list_head;
 #define CLONE_NEWNET	0x40000000
 #endif
 
+#define CLONE_ALLNS	(CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNS)
+
 #define setns	sys_setns
 
-#endif /* SYSCALL_TYPES_H__ */
+struct rlimit;
+
+struct krlimit {
+	unsigned long rlim_cur;
+	unsigned long rlim_max;
+};
+
+#endif /* __CR_SYSCALL_TYPES_H__ */

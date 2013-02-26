@@ -1,56 +1,51 @@
-CFLAGS		+= -c -I$(SRC_DIR)/protobuf/ -I$(SRC_DIR)/syscall/
-CFLAGS		+=  -fpie  -Wa,--noexecstack -fno-strict-aliasing
+targets			+= parasite
+targets 		+= restorer
 
-GEN-OFFSETS	:= gen-offsets.sh
+obj-y			+= log-simple.o
+obj-y			+= util-net.o
 
-PASM-OBJS	+= parasite-head-x86-64.o
+parasite-obj-y		+= parasite.o
+parasite-asm-e		+= $(ARCH_DIR)/parasite-head.o
+parasite-libs-e		+= $(SYSCALL-LIB)
 
-PARASITE	+= parasite.bin.o parasite.bin
-RESTORER	:= restorer.bin.o restorer.bin
-BLOBS		:= parasite-blob.h restorer-blob.h
-PIELDS		:= pie.lds.S
-ASMFLAGS	:= -D__ASSEMBLY__
+restorer-obj-y		+= restorer.o
+restorer-obj-e		+= $(ARCH_DIR)/restorer.o
+restorer-libs-e		+= $(SYSCALL-LIB)
 
-.DEFAULT_GOAL	:= pie
+CFLAGS			+= -fpie  -Wa,--noexecstack -fno-strict-aliasing
+ASMFLAGS		+= -D__ASSEMBLY__
 
-LIB-OBJS	= log-simple.o blob-util-net.o $(SYSCALL-LIB)
+GEN-OFFSETS		:= gen-offsets.sh
+BLOBS			:= $(obj)/parasite-blob.h $(obj)/restorer-blob.h
 
-$(PARASITE): $(LIB-OBJS) $(PASM-OBJS) $(PIELDS)
-$(RESTORER): $(LIB-OBJS) $(PIELDS)
+PIELDS			:= pie.lds.S
 
-blob-util-net.o: $(SRC_DIR)/util-net.c
-	$(E) "  CC      " $@
-	$(Q) $(CC) $(CFLAGS) $< -o $@
-
-%.o: %.S
-	$(E) "  CC      " $@
-	$(Q) $(CC) $(ASMFLAGS) $(CFLAGS) $< -o $@
-
-%.o: %.c
-	$(E) "  CC      " $@
-	$(Q) $(CC) $(CFLAGS) $< -o $@
-
-%.bin.o: %.o
-	$(E) "  GEN     " $@
-	$(Q) $(LD) --oformat=elf64-x86-64 -T $(PIELDS) -o $@ $(^:$(PIELDS)=)
-
-%.bin: %.o
-	$(E) "  GEN     " $@
-	$(Q) $(LD) --oformat=binary -T $(PIELDS) -o $@ $(^:$(PIELDS)=)
-
-%-blob.h: %.bin %.bin.o $(GEN-OFFSETS)
-	$(E) "  GEN     " $@
-	$(Q) $(SH) $(GEN-OFFSETS) $(@:-blob.h=) > $@ || rm -f $@
-
-pie: $(BLOBS)
-
-clean:
-	$(E) "  CLEAN PIE"
-	$(Q) $(RM) -f ./*-blob.h
-	$(Q) $(RM) -f ./*.o
-	$(Q) $(RM) -f ./*.d
-	$(Q) $(RM) -f ./*.bin
-	$(Q) $(RM) -f ./*.bin.o
-
-.PHONY: clean pie
 .SECONDARY:
+
+$(obj)/$(PIELDS): $(obj)/$(PIELDS).in
+	$(E) "  GEN     " $@
+	$(Q) $(SH) -c "echo 'OUTPUT_ARCH($(LDARCH))'	 > $(obj)/$(PIELDS)"
+	$(Q) $(SH) -c "cat $(obj)/$(PIELDS).in		>> $(obj)/$(PIELDS)"
+
+$(obj)/%.built-in.bin.o: $(obj)/%.built-in.o $(obj)/$(PIELDS)
+	$(E) "  GEN     " $@
+	$(Q) $(LD) -T $(obj)/$(PIELDS) -o $@ $<
+
+$(obj)/%.built-in.bin: $(obj)/%.built-in.bin.o
+	$(E) "  GEN     " $@
+	$(Q) $(OBJCOPY) -O binary $^ $@
+
+$(obj)/%-blob.h: $(obj)/%.built-in.bin $(obj)/$(GEN-OFFSETS)
+	$(E) "  GEN     " $@
+	$(Q) $(SH) $(obj)/$(GEN-OFFSETS) $(@:-blob.h=) $(notdir $(@:-blob.h=)) > $@
+
+$(BLOBS): $(obj)/$(PIELDS)
+_all += $(BLOBS)
+
+cleanup-y += $(obj)/$(PIELDS)
+cleanup-y += $(obj)/*.bin
+cleanup-y += $(BLOBS)
+
+ifneq ($(MAKECMDGOALS),clean)
+incdeps := y
+endif

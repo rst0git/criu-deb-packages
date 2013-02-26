@@ -1,5 +1,5 @@
-#ifndef __KCMP_IDS_H__
-#define __KCMP_IDS_H__
+#ifndef __CR_KCMP_IDS_H__
+#define __CR_KCMP_IDS_H__
 
 struct kid_tree {
 	struct rb_root root;
@@ -25,4 +25,4 @@ u32 kid_generate_gen(struct kid_tree *tree,
 		struct kid_elem *elem, int *new_id);
 void kid_show_tree(struct kid_tree *tree);
 
-#endif
+#endif /* __CR_KCMP_IDS_H__ */

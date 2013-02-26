@@ -12,7 +12,7 @@
 #include "image.h"
 #include "list.h"
 #include "util.h"
-#include "atomic.h"
+#include "asm/atomic.h"
 
 #include "protobuf.h"
 #include "protobuf/regfile.pb-c.h"
@@ -288,7 +288,7 @@ static int dump_ghost_remap(char *path, const struct stat *st, int lfd, u32 id)
 	pr_info("Dumping ghost file for fd %d id %#x\n", lfd, id);
 
 	if (st->st_size > MAX_GHOST_FILE_SIZE) {
-		pr_err("Can't dump ghost file %s of %lu size\n",
+		pr_err("Can't dump ghost file %s of %"PRIu64" size\n",
 				path, st->st_size);
 		return -1;
 	}
@@ -469,9 +469,9 @@ static const struct fdtype_ops regfile_ops = {
 };
 
 int dump_reg_file(struct fd_parms *p, int lfd,
-			     const struct cr_fdset *cr_fdset)
+			     const int fdinfo)
 {
-	return do_dump_gen_file(p, lfd, &regfile_ops, cr_fdset);
+	return do_dump_gen_file(p, lfd, &regfile_ops, fdinfo);
 }
 
 static int open_path(struct file_desc *d,

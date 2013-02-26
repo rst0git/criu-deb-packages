@@ -4,7 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "types.h"
+#include "asm/types.h"
 #include "sysctl.h"
 #include "util.h"
 
@@ -134,14 +134,14 @@ GEN_SYSCTL_READ_FUNC(u32, strtoul);
 GEN_SYSCTL_READ_FUNC(u64, strtoull);
 
 GEN_SYSCTL_WRITE_FUNC(u32, "%u ");
-GEN_SYSCTL_WRITE_FUNC(u64, "%lu ");
+GEN_SYSCTL_WRITE_FUNC(u64, "%"PRIu64" ");
 
 GEN_SYSCTL_PRINT_FUNC(u32, "%u ");
-GEN_SYSCTL_PRINT_FUNC(u64, "%lu ");
+GEN_SYSCTL_PRINT_FUNC(u64, "%"PRIu64" ");
 GEN_SYSCTL_PRINT_FUNC(char, "%c");
 
 GEN_SYSCTL_SHOW_FUNC(u32, "%u ");
-GEN_SYSCTL_SHOW_FUNC(u64, "%lu ");
+GEN_SYSCTL_SHOW_FUNC(u64, "%"PRIu64" ");
 GEN_SYSCTL_SHOW_FUNC(char, "%c");
 
 static int
@@ -177,7 +177,7 @@ static int __sysctl_op(int dir, struct sysctl_req *req, int op)
 	int ret = -1;
 	int nr = 1;
 
-	if (dir > 0) {
+	if (dir >= 0) {
 		int flags;
 
 		if (op == CTL_READ)

@@ -1,0 +1,18 @@
+Author: Daniel Baumann <daniel.baumann@progress-technologies.net>
+Description: Remove non-working echo entries from documentation makefile.
+
+diff -Naurp crtools.orig/Documentation/Makefile crtools/Documentation/Makefile
+--- crtools.orig/Documentation/Makefile
++++ crtools/Documentation/Makefile
+@@ -11,11 +11,9 @@ MANS		:= $(patsubst %.txt,%.1,$(SRC))
+ all: $(MANS)
+ 
+ %.1: %.txt
+-	$(E) "  GEN     " $@
+ 	$(Q) $(ASCIIDOC) -b docbook -d manpage -o $(patsubst %.1,%.xml,$@) $<
+ 	$(Q) $(XMLTO) man --skip-validation $(patsubst %.1,%.xml,$@) 2>/dev/null
+ 
+ clean:
+-	$(E) "  CLEAN   "
+ 	$(Q) rm -f ./*.xml
+ 	$(Q) rm -f ./*.1

@@ -30,6 +30,7 @@ static/xids00
 static/groups
 static/pthread00
 static/pthread01
+static/umask00
 streaming/pipe_loop00
 streaming/pipe_shared00
 transition/file_read
@@ -65,6 +66,7 @@ static/fifo-ghost
 static/fifo
 static/fifo_wronly
 static/zombie00
+static/rlimits00
 transition/fork
 static/pty00
 static/pty01
@@ -72,6 +74,14 @@ static/pty04
 static/tty02
 static/child_opened_proc
 static/cow01
+static/fpu00
+static/fpu01
+static/mmx00
+static/sse00
+static/sse20
+static/fdt_shared
+static/file_locks00
+static/file_locks01
 "
 # Duplicate list with ns/ prefix
 TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#ns/#')
@@ -112,21 +122,16 @@ transition/ipc
 "
 
 TEST_CR_KERNEL="
-static/sock_opts01
-static/sockets01
-static/sock_filter
-static/socket-tcp6
-streaming/socket-tcp6
-static/socket-tcpbuf6
-static/eventfs00
-static/signalfd00
-static/inotify00
-$IPC_TEST_LIST
 "
 
-CRTOOLS=`pwd`/`dirname $0`/../crtools
-TINIT=`pwd`/`dirname $0`/zdtm/lib/test_init
-test -x $CRTOOLS || exit 1
+CRTOOLS=$(readlink -f `dirname $0`/../crtools)
+CRTOOLS_CPT=$CRTOOLS
+TMP_TREE=""
+
+test -x $CRTOOLS || {
+	echo "$CRTOOLS is unavailable"
+	exit 1
+}
 
 ARGS=""
 
@@ -154,9 +159,9 @@ EOF
 	ver_arr=(`echo ${ver_str//./ }`)
 
 	[ "${ver_arr[0]}" -gt 3 ] && return 0
-	[[ "${ver_arr[0]}" -eq 3 && "${ver_arr[1]}" -ge 7 ]] && return 0
+	[[ "${ver_arr[0]}" -eq 3 && "${ver_arr[1]}" -ge 8 ]] && return 0
 
-	echo "A version of kernel should be greater or equal to 3.7"
+	echo "A version of kernel should be greater or equal to 3.8"
 
 	return 1;
 }
@@ -173,15 +178,18 @@ construct_root()
 {
 	local root=$1
 	local test_path=$2
-	local libdir=$root/lib64
+	local libdir=$root/lib
+	local libdir2=$root/lib64
 
-	mkdir $libdir
+	mkdir $libdir $libdir2
 	for i in `ldd $test_path | awk '{ print $1 }' | grep -v vdso`; do
 		local lib=`basename $i`
 		[ -f $libdir/$lib ] && continue ||
-		[ -f $i ] && cp $i $libdir && continue ||
-		[ -f /lib64/$i ] && cp /lib64/$i $libdir && continue ||
-		[ -f /usr/lib64/$i ] && cp /usr/lib64/$i $libdir || return 1
+		[ -f $i ] && cp $i $libdir && cp $i $libdir2 && continue ||
+		[ -f /lib64/$i ] && cp /lib64/$i $libdir && cp /lib64/$i $libdir2 && continue ||
+		[ -f /usr/lib64/$i ] && cp /usr/lib64/$i $libdir && cp /usr/lib64/$i $libdir2 && continue ||
+		[ -f /lib/x86_64-linux-gnu/$i ] && cp /lib/x86_64-linux-gnu/$i $libdir && cp /lib/x86_64-linux-gnu/$i $libdir2 && continue ||
+		[ -f /lib/arm-linux-gnueabi/$i ] && cp /lib/arm-linux-gnueabi/$i $libdir && cp /lib/arm-linux-gnueabi/$i $libdir2 && continue || echo "Failed at " $i && return 1
 	done
 }
 
@@ -193,7 +201,7 @@ start_test()
 	TPID=`readlink -f $tdir`/$tname.init.pid
 
 	killall -9 $tname > /dev/null 2>&1
-	make -C $tdir cleanout
+	make -C $tdir $tname.cleanout
 
 	if [ -z "$PIDNS" ]; then
 		make -C $tdir $tname.pid
@@ -205,6 +213,7 @@ start_test()
 			ZDTM_ROOT=`readlink -f $ZDTM_ROOT`
 			mount --bind . $ZDTM_ROOT || return 1
 		fi
+		make -C $tdir $tname
 		construct_root $ZDTM_ROOT $tdir/$tname || return 1
 	(	export ZDTM_NEWNS=1
 		export ZDTM_PIDFILE=$TPID
@@ -223,14 +232,7 @@ start_test()
 
 stop_test()
 {
-	local tdir=$1
-	local tname=$2
-
-	if [ -z "$PIDNS" ]; then
-		make -C $tdir $tname.out
-	else
-		kill `cat "$TPID"`
-	fi
+	kill $PID
 }
 
 save_fds()
@@ -253,6 +255,13 @@ diff_fds()
 run_test()
 {
 	local test=$1
+	local linkremap=
+
+	#
+	# add option for unlinked files test
+	if [[ $1 =~ "unlink_" ]]; then
+		linkremap="--link-remap"
+	fi
 
 	[ -n "$MAINSTREAM_KERNEL" ] && echo $TEST_CR_KERNEL | grep -q ${test#ns/} && {
 		echo "Skip $test"
@@ -299,14 +308,20 @@ EOF
 	mkdir -p $ddump
 
 	save_fds $PID  $ddump/dump.fd
-	setsid $CRTOOLS dump --tcp-established --link-remap -x --evasive-devices -D $ddump -o dump.log -v 4 -t $PID $args $ARGS || {
+	setsid $CRTOOLS_CPT dump $opts --file-locks --tcp-established $linkremap \
+		-x --evasive-devices -D $ddump -o dump.log -v 4 -t $PID $args $ARGS || {
 		echo WARNING: process $tname is left running for your debugging needs
 		return 1
 	}
+
 	if expr " $ARGS" : ' -s' > /dev/null; then
 		save_fds $PID  $ddump/dump.fd.after
 		diff_fds $ddump/dump.fd $ddump/dump.fd.after || return 1
 		killall -CONT $tname
+		if [[ $linkremap ]]; then
+			echo "remove ./$tdir/link_remap.*"
+			rm -f ./$tdir/link_remap.*
+		fi
 	else
 		# Wait while tasks are dying, otherwise PIDs would be busy.
 		for i in $ddump/core-*.img; do
@@ -323,7 +338,7 @@ EOF
 		done
 
 		echo Restore $PID
-		setsid $CRTOOLS restore --tcp-established -x -D $ddump -o restore.log -v 4 -d -t $PID $args || return 2
+		setsid $CRTOOLS restore --file-locks --tcp-established -x -D $ddump -o restore.log -v 4 -d -t $PID $args || return 2
 
 		for i in `seq 5`; do
 			save_fds $PID  $ddump/restore.fd
@@ -369,7 +384,18 @@ case_error()
 	fi
 	[ -e "$test_log" ] &&
 		echo "Output file: $test_log"
+	[ -n "$HEAD" ] &&
+		echo "The initial HEAD was $HEAD"
 	exit 1
+}
+
+checkout()
+{
+	local commit=`git describe $1` &&
+	TMP_TREE=`dirname $CRTOOLS`/crtools.$commit &&
+	mkdir -p $TMP_TREE &&
+	git --git-dir `dirname $CRTOOLS`/.git archive $commit . | tar -x -C $TMP_TREE &&
+	make -C $TMP_TREE -j 32
 }
 
 cd `dirname $0` || exit 1
@@ -385,6 +411,20 @@ while :; do
 		ITERATIONS=$1
 		shift
 		continue
+	fi
+	if [ "$1" = "-b" ]; then
+		shift
+		checkout $1 || exit 1
+		CRTOOLS_CPT=$TMP_TREE/crtools
+		shift
+		continue
+	fi
+	if [ "$1" = "-c" ]; then
+		shift
+		checkout $1 || exit 1
+		shift
+		$TMP_TREE/test/zdtm.sh "$@"
+		exit
 	fi
 	break;
 done
@@ -417,7 +457,10 @@ Options:
 	-l : Show list of tests.
 	-d : Dump a test process and check that this process can continue working.
 	-i : Number of ITERATIONS of dump/restore
+	-b <commit> : Check backward compatibility
 EOF
+elif [ "${1:0:1}" = '-' ]; then
+	echo "unrecognized option $1"
 else
 	if echo $UTS_TEST_LIST | fgrep -qw $1; then
 		run_test $1 -n uts || case_error $1
@@ -425,7 +468,11 @@ else
 		run_test $1 -n mnt || case_error $1
 	elif echo $IPC_TEST_LIST | fgrep -qw $1; then
 		run_test $1 -n ipc || case_error $1
+	elif echo $FILE_LOCK_TEST_LIST | fgrep -qw $1; then
+		run_test $1 -l || case_error $1
 	else
 		run_test $1 || case_error $1
 	fi
 fi
+
+[ -n "$TMP_TREE" ] && rm -rf $TMP_TREE || exit 0

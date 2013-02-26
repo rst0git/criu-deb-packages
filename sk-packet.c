@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <string.h>
 #include "crtools.h"
-#include "types.h"
+#include "asm/types.h"
 #include "files.h"
 #include "sockets.h"
 #include "libnetlink.h"
@@ -208,9 +208,9 @@ static const struct fdtype_ops packet_dump_ops = {
 	.dump		= dump_one_packet_fd,
 };
 
-int dump_one_packet_sk(struct fd_parms *p, int lfd, const struct cr_fdset *fds)
+int dump_one_packet_sk(struct fd_parms *p, int lfd, const int fdinfo)
 {
-	return do_dump_gen_file(p, lfd, &packet_dump_ops, fds);
+	return do_dump_gen_file(p, lfd, &packet_dump_ops, fdinfo);
 }
 
 int dump_socket_map(struct vma_area *vma)
@@ -228,7 +228,7 @@ int dump_socket_map(struct vma_area *vma)
 		return -1;
 	}
 
-	pr_info("Dumping socket map %x -> %lx\n", sd->file_id, vma->vma.start);
+	pr_info("Dumping socket map %x -> %"PRIx64"\n", sd->file_id, vma->vma.start);
 	vma->vma.shmid = sd->file_id;
 	return 0;
 }
@@ -344,7 +344,7 @@ static int restore_mreqs(int sk, PacketSockEntry *pse)
 		pr_info("Restoring mreq type %d\n", ml->type);
 
 		if (ml->addr.len > sizeof(mreq.mr_address)) {
-			pr_err("To big mcaddr %lu\n", ml->addr.len);
+			pr_err("To big mcaddr %zu\n", ml->addr.len);
 			return -1;
 		}
 
@@ -497,6 +497,11 @@ static int collect_one_packet_sk(void *o, ProtobufCMessage *base)
 
 int collect_packet_sockets(void)
 {
-	return collect_image(CR_FD_PACKETSK, PB_PACKETSK,
+	int ret = collect_image(CR_FD_PACKETSK, PB_PACKETSK,
 			sizeof(struct packet_sock_info), collect_one_packet_sk);
+
+	if (ret < 0 && errno == ENOENT)
+		return 0;
+
+	return ret;
 }

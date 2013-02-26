@@ -1,12 +1,12 @@
-#ifndef FILES_REG_H__
-#define FILES_REG_H__
+#ifndef __CR_FILES_REG_H__
+#define __CR_FILES_REG_H__
 
-#include "types.h"
+#include "asm/types.h"
 #include "files.h"
 #include "image.h"
 
-#include "../protobuf/regfile.pb-c.h"
-#include "../protobuf/ghost-file.pb-c.h"
+#include "protobuf/regfile.pb-c.h"
+#include "protobuf/ghost-file.pb-c.h"
 
 struct cr_fdset;
 struct fd_parms;
@@ -30,10 +30,10 @@ extern int collect_reg_files(void);
 
 extern int prepare_shared_reg_files(void);
 
-extern int dump_reg_file(struct fd_parms *p, int lfd, const struct cr_fdset *cr_fdset);
+extern int dump_reg_file(struct fd_parms *p, int lfd, const int fdinfo);
 extern int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p);
 
 extern struct file_remap *lookup_ghost_remap(u32 dev, u32 ino);
 extern void remap_put(struct file_remap *remap);
 
-#endif /* FILES_REG_H__ */
+#endif /* __CR_FILES_REG_H__ */

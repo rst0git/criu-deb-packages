@@ -1,15 +1,15 @@
-#ifndef CR_SOCKETS_H__
-#define CR_SOCKETS_H__
+#ifndef __CR_SOCKETS_H__
+#define __CR_SOCKETS_H__
 
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <stdbool.h>
 
-#include "types.h"
+#include "asm/types.h"
 
 #include "protobuf.h"
-#include "../protobuf/sk-opts.pb-c.h"
+#include "protobuf/sk-opts.pb-c.h"
 
 struct fdinfo_list_entry;
 struct sk_opts_entry;
@@ -26,7 +26,7 @@ struct socket_desc {
 	int			already_dumped;
 };
 
-extern int dump_socket(struct fd_parms *p, int lfd, const struct cr_fdset *cr_fdset);
+extern int dump_socket(struct fd_parms *p, int lfd, const int fdinfo);
 extern int dump_socket_opts(int sk, SkOptsEntry *soe);
 extern int restore_socket_opts(int sk, SkOptsEntry *soe);
 extern void release_skopts(SkOptsEntry *);
@@ -50,9 +50,9 @@ extern char *skstate2s(u32 state);
 
 extern struct socket_desc *lookup_socket(int ino, int family);
 
-extern int dump_one_inet(struct fd_parms *p, int lfd, const struct cr_fdset *set);
-extern int dump_one_inet6(struct fd_parms *p, int lfd, const struct cr_fdset *set);
-extern int dump_one_unix(struct fd_parms *p, int lfd, const struct cr_fdset *set);
+extern int dump_one_inet(struct fd_parms *p, int lfd, const int fdinfo);
+extern int dump_one_inet6(struct fd_parms *p, int lfd, const int fdinfo);
+extern int dump_one_unix(struct fd_parms *p, int lfd, const int fdinfo);
 
 extern int inet_collect_one(struct nlmsghdr *h, int family, int type, int proto);
 extern int unix_receive_one(struct nlmsghdr *h, void *);
@@ -78,4 +78,4 @@ static inline int sk_decode_shutdown(int val)
 	return hows[val];
 }
 
-#endif /* CR_SOCKETS_H__ */
+#endif /* __CR_SOCKETS_H__ */

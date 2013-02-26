@@ -1,5 +1,5 @@
-#ifndef LIBNETLINK_H__
-#define LIBNETLINK_H__
+#ifndef __CR_LIBNETLINK_H__
+#define __CR_LIBNETLINK_H__
 
 #define CR_NLMSG_SEQ		24680	/* arbitrary chosen */
 
@@ -16,4 +16,4 @@ extern int addattr_l(struct nlmsghdr *n, int maxlen, int type,
 	((struct rtattr *) (((void *) (nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
 
 
-#endif /* LIBNETLINK_H__ */
+#endif /* __CR_LIBNETLINK_H__ */
