@@ -1,3 +1,9 @@
+crtools (0.4-2) unstable; urgency=low
+
+  * Removing all references to my old email address.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Sun, 10 Mar 2013 20:23:54 +0100
+
 crtools (0.4-1) unstable; urgency=low
 
   * Merging upstream version 0.4.
@@ -7,7 +13,7 @@ crtools (0.4-1) unstable; urgency=low
     makefile.
   * Building and including crtools manpage.
 
- -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Tue, 26 Feb 2013 13:11:20 +0100
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Tue, 26 Feb 2013 13:11:20 +0100
 
 crtools (0.3-1) unstable; urgency=low
 
@@ -15,13 +21,13 @@ crtools (0.3-1) unstable; urgency=low
   * Updating years in copyright file.
   * Dropping dpkg-source compression levels.
 
- -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Mon, 28 Jan 2013 06:35:54 +0100
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Mon, 28 Jan 2013 06:35:54 +0100
 
 crtools (0.2-2) unstable; urgency=low
 
   * Recommending iproute instead of iproute2 (Closes: #689050).
 
- -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Sun, 07 Oct 2012 11:30:39 +0200
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Sun, 07 Oct 2012 11:30:39 +0200
 
 crtools (0.2-1) unstable; urgency=low
 
@@ -29,16 +35,16 @@ crtools (0.2-1) unstable; urgency=low
   * Updating standards version to 3.9.4.
   * Adding iproute to recommends.
 
- -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Mon, 24 Sep 2012 22:34:24 +0200
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Mon, 24 Sep 2012 22:34:24 +0200
 
 crtools (0.1-2) unstable; urgency=low
 
   * Restricting architectures to linux on amd64 only (Closes: #683416).
 
- -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Tue, 31 Jul 2012 19:56:38 +0200
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Tue, 31 Jul 2012 19:56:38 +0200
 
 crtools (0.1-1) unstable; urgency=low
 
   * Initial release.
 
- -- Daniel Baumann <daniel.baumann@progress-technologies.net>  Wed, 25 Jul 2012 21:25:51 +0200
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Wed, 25 Jul 2012 21:25:51 +0200
