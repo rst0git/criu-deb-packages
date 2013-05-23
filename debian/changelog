@@ -1,3 +1,10 @@
+criu (0.5+20130521-2) experimental; urgency=low
+
+  * Update packaging for upstreams rename of crtools to criu.
+  * Adding transitional package for crtools.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Thu, 23 May 2013 11:01:32 +0200
+
 crtools (0.5+20130521-1) experimental; urgency=low
 
   * Merging upstream version 0.5+20130521:

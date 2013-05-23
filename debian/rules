@@ -16,7 +16,7 @@ override_dh_auto_clean:
 	$(MAKE) -C Documentation clean
 
 override_dh_auto_install:
-	dh_auto_install -- DESTDIR="$(CURDIR)/debian/crtools" PREFIX="/usr"
+	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr"
 
 override_dh_auto_test:
 	# disabled: doesn't work yet
@@ -25,4 +25,4 @@ override_dh_builddeb:
 	dh_builddeb -- -Zxz
 
 override_dh_strip:
-	dh_strip --dbg-package=crtools-dbg
+	dh_strip --dbg-package=criu-dbg

@@ -1,9 +1,9 @@
 Author: Daniel Baumann <mail@daniel-baumann.ch>
 Description: Remove non-working echo entries from documentation makefile.
 
-diff -Naurp crtools.orig/Documentation/Makefile crtools/Documentation/Makefile
---- crtools.orig/Documentation/Makefile
-+++ crtools/Documentation/Makefile
+diff -Naurp criu.orig/Documentation/Makefile criu/Documentation/Makefile
+--- criu.orig/Documentation/Makefile
++++ criu/Documentation/Makefile
 @@ -11,17 +11,14 @@ MAN8DIR		:= $(MANDIR)/man8
  all: $(MANS)
  
