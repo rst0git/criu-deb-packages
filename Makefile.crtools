@@ -1,4 +1,5 @@
 obj-y	+= parasite-syscall.o
+obj-y	+= mem.o
 obj-y	+= cr-restore.o
 obj-y	+= crtools.o
 obj-y	+= image.o
@@ -19,6 +20,7 @@ obj-y	+= sk-inet.o
 obj-y	+= sk-tcp.o
 obj-y	+= sk-unix.o
 obj-y	+= sk-packet.o
+obj-y	+= sk-netlink.o
 obj-y	+= sk-queue.o
 obj-y	+= files.o
 obj-y	+= files-reg.o
@@ -40,6 +42,11 @@ obj-y	+= protobuf.o
 obj-y	+= tty.o
 obj-y	+= cr-exec.o
 obj-y	+= file-lock.o
+obj-y	+= page-pipe.o
+obj-y	+= page-xfer.o
+obj-y	+= page-read.o
+obj-y	+= kerndat.o
+obj-y	+= stats.o
 
 ifneq ($(MAKECMDGOALS),clean)
 incdeps := y

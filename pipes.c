@@ -28,7 +28,8 @@ struct pipe_info {
 						 * This is pure circular list without head */
 	struct list_head	list;		/* list head for fdinfo_list_entry-s */
 	struct file_desc	d;
-	int			create;
+	unsigned int		create : 1,
+				reopen : 1;
 };
 
 static LIST_HEAD(pipes);
@@ -73,7 +74,7 @@ int collect_pipe_data(int img_type, struct pipe_data_rst **hash)
 	int fd, ret;
 	struct pipe_data_rst *r = NULL;
 
-	fd = open_image_ro(img_type);
+	fd = open_image(img_type, O_RSTR);
 	if (fd < 0)
 		return -1;
 
@@ -117,6 +118,7 @@ void mark_pipe_master(void)
 	while (1) {
 		struct fdinfo_list_entry *fle;
 		struct pipe_info *pi, *pic, *p;
+		struct pipe_info *pr = NULL, *pw = NULL;
 
 		if (list_empty(&pipes))
 			break;
@@ -129,6 +131,15 @@ void mark_pipe_master(void)
 
 		fle = file_master(&pi->d);
 		p = pi;
+		if (!(pi->pe->flags & O_LARGEFILE)) {
+			if (pi->pe->flags & O_WRONLY) {
+				if (pw == NULL)
+					pw = pi;
+			} else {
+				if (pr == NULL)
+					pr = pi;
+			}
+		}
 
 		list_for_each_entry(pic, &pi->pipe_list, pipe_list) {
 			struct fdinfo_list_entry *f;
@@ -140,9 +151,23 @@ void mark_pipe_master(void)
 				fle = f;
 			}
 
+			if (!(pic->pe->flags & O_LARGEFILE)) {
+				if (pic->pe->flags & O_WRONLY) {
+					if (pw == NULL)
+						pw = pic;
+				} else {
+					if (pr == NULL)
+						pr = pic;
+				}
+			}
+
 			show_saved_pipe_fds(pic);
 		}
 		p->create = 1;
+		if (pr)
+			pr->reopen = 0;
+		if (pw)
+			pw->reopen = 0;
 		pr_info("    by %#x\n", p->pe->id);
 	}
 
@@ -222,10 +247,23 @@ err:
 	return ret;
 }
 
+static int reopen_pipe(int fd, int flags)
+{
+	int ret;
+	char path[32];
+
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+	ret = open(path, flags);
+	if (ret < 0)
+		pr_perror("Unable to reopen the pipe %s", path);
+	close(fd);
+
+	return ret;
+}
+
 static int recv_pipe_fd(struct pipe_info *pi)
 {
 	struct fdinfo_list_entry *fle;
-	char path[32];
 	int tmp, fd;
 
 	fle = file_master(&pi->d);
@@ -240,12 +278,12 @@ static int recv_pipe_fd(struct pipe_info *pi)
 	}
 	close(fd);
 
-	snprintf(path, sizeof(path), "/proc/self/fd/%d", tmp);
-	fd = open(path, pi->pe->flags);
-	close(tmp);
-
+	if (pi->reopen)
+		fd = reopen_pipe(tmp, pi->pe->flags);
+	else
+		fd = tmp;
 	if (fd >= 0) {
-		if (restore_fown(fd, pi->pe->fown)) {
+		if (rst_file_params(fd, pi->pe->fown, pi->pe->flags)) {
 			close(fd);
 			return -1;
 		}
@@ -302,8 +340,12 @@ static int open_pipe(struct file_desc *d)
 	close(pfd[!(pi->pe->flags & O_WRONLY)]);
 	tmp = pfd[pi->pe->flags & O_WRONLY];
 
-	if (rst_file_params(tmp, pi->pe->fown, pi->pe->flags))
-		return -1;
+	if (pi->reopen)
+		tmp = reopen_pipe(tmp, pi->pe->flags);
+
+	if (tmp >= 0)
+		if (rst_file_params(tmp, pi->pe->fown, pi->pe->flags))
+			return -1;
 
 	return tmp;
 }
@@ -329,6 +371,7 @@ static int collect_one_pipe(void *o, ProtobufCMessage *base)
 	pi->pe = pb_msg(base, PipeEntry);
 
 	pi->create = 0;
+	pi->reopen = 1;
 	pr_info("Collected pipe entry ID %#x PIPE ID %#x\n",
 			pi->pe->id, pi->pe->pipe_id);
 
@@ -447,6 +490,11 @@ static int dump_one_pipe(int lfd, u32 id, const struct fd_parms *p)
 
 	pr_info("Dumping pipe %d with id %#x pipe_id %#x\n",
 			lfd, id, pipe_id(p));
+
+	if (p->flags & O_DIRECT) {
+		pr_err("The packetized mode for pipes is not supported yet\n");
+		return -1;
+	}
 
 	pe.id		= id;
 	pe.pipe_id	= pipe_id(p);

@@ -15,6 +15,9 @@ override_dh_auto_clean:
 
 	$(MAKE) -C Documentation clean
 
+override_dh_auto_install:
+	dh_auto_install -- DESTDIR="$(CURDIR)/debian/crtools" PREFIX="/usr"
+
 override_dh_auto_test:
 	# disabled: doesn't work yet
 

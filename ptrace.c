@@ -22,7 +22,7 @@
 
 int unseize_task(pid_t pid, int st)
 {
-	pr_debug("\tUnseizeing %d into %d\n", pid, st);
+	pr_debug("\tUnseizing %d into %d\n", pid, st);
 
 	if (st == TASK_DEAD)
 		kill(pid, SIGKILL);
@@ -39,7 +39,7 @@ int unseize_task(pid_t pid, int st)
 /*
  * This routine seizes task putting it into a special
  * state where we can manipulate the task via ptrace
- * inteface, and finally we can detach ptrace out of
+ * interface, and finally we can detach ptrace out of
  * of it so the task would not know if it was saddled
  * up with someone else.
  */
@@ -48,10 +48,11 @@ int seize_task(pid_t pid, pid_t ppid, pid_t *pgid, pid_t *sid)
 {
 	siginfo_t si;
 	int status;
-	int ret, ret2;
+	int ret, ret2, ptrace_errno;
 	struct proc_pid_stat_small ps;
 
 	ret = ptrace(PTRACE_SEIZE, pid, NULL, 0);
+	ptrace_errno = errno;
 
 	/*
 	 * It's ugly, but the ptrace API doesn't allow to distinguish
@@ -71,8 +72,11 @@ int seize_task(pid_t pid, pid_t ppid, pid_t *pgid, pid_t *sid)
 
 	if (ret < 0) {
 		if (ps.state != 'Z') {
-			pr_err("Unseizeable non-zombie %d found, state %c\n",
-					pid, ps.state);
+			if (pid == getpid())
+				pr_err("The criu itself is within dumped tree.\n");
+			else
+				pr_err("Unseizable non-zombie %d found, state %c, err %d/%d\n",
+						pid, ps.state, ret, ptrace_errno);
 			return -1;
 		}
 
@@ -84,13 +88,14 @@ int seize_task(pid_t pid, pid_t ppid, pid_t *pgid, pid_t *sid)
 				pid, ppid, ps.ppid);
 		goto err;
 	}
-try_again:
+
 	ret = ptrace(PTRACE_INTERRUPT, pid, NULL, NULL);
 	if (ret < 0) {
 		pr_perror("SEIZE %d: can't interrupt task", pid);
 		goto err;
 	}
 
+try_again:
 	ret = wait4(pid, &status, __WALL, NULL);
 	if (ret < 0) {
 		pr_perror("SEIZE %d: can't wait task", pid);

@@ -39,7 +39,7 @@ struct eventpoll_tfd_file_info {
 
 static LIST_HEAD(eventpoll_tfds);
 
-/* Checks if file desciptor @lfd is eventfd */
+/* Checks if file descriptor @lfd is eventfd */
 int is_eventpoll_link(int lfd)
 {
 	return is_anon_link_type(lfd, "[eventpoll]");
@@ -56,12 +56,12 @@ static void pr_info_eventpoll(char *action, EventpollFileEntry *e)
 	pr_info("%seventpoll: id %#08x flags %#04x\n", action, e->id, e->flags);
 }
 
-void show_eventpoll_tfd(int fd, struct cr_options *o)
+void show_eventpoll_tfd(int fd)
 {
 	pb_show_plain(fd, PB_EVENTPOLL_TFD);
 }
 
-void show_eventpoll(int fd, struct cr_options *o)
+void show_eventpoll(int fd)
 {
 	pb_show_plain(fd, PB_EVENTPOLL);
 }

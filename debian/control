@@ -8,7 +8,7 @@ Standards-Version: 3.9.4
 Homepage: http://www.criu.org/
 
 Package: crtools
-Architecture: amd64
+Architecture: armhf amd64
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Recommends: iproute
 Description: checkpoint and restore in userspace
@@ -18,7 +18,7 @@ Description: checkpoint and restore in userspace
 Package: crtools-dbg
 Section: debug
 Priority: extra
-Architecture: amd64
+Architecture: armhf amd64
 Depends: ${misc:Depends}, crtools (= ${binary:Version})
 Description: checkpoint and restore in userspace (debug)
  crtools contains the utilities to checkpoint and restore processes in

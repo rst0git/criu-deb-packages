@@ -115,8 +115,8 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 	SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
 	FilePermsEntry perms = FILE_PERMS_ENTRY__INIT;
 
-	sk = (struct unix_sk_desc *)lookup_socket(p->stat.st_ino, PF_UNIX);
-	if (!sk)
+	sk = (struct unix_sk_desc *)lookup_socket(p->stat.st_ino, PF_UNIX, 0);
+	if (IS_ERR_OR_NULL(sk))
 		goto err;
 
 	if (!can_dump_unix_sk(sk))
@@ -151,8 +151,8 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 	if (ue.peer) {
 		struct unix_sk_desc *peer;
 
-		peer = (struct unix_sk_desc *)lookup_socket(ue.peer, PF_UNIX);
-		if (!peer) {
+		peer = (struct unix_sk_desc *)lookup_socket(ue.peer, PF_UNIX, 0);
+		if (IS_ERR_OR_NULL(peer)) {
 			pr_err("Unix socket %#x without peer %#x\n",
 					ue.ino, ue.peer);
 			goto err;
@@ -168,15 +168,15 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 				       ue.ino, ue.peer, peer->peer_ino, peer->name);
 				goto err;
 			}
+		}
 
-			/*
-			 * It can be external socket, so we defer dumping
-			 * until all sockets the program owns are processed.
-			 */
-			if (!peer->sd.already_dumped && list_empty(&peer->list)) {
-				show_one_unix("Add a peer", peer);
-				list_add_tail(&peer->list, &unix_sockets);
-			}
+		/*
+		 * It can be external socket, so we defer dumping
+		 * until all sockets the program owns are processed.
+		 */
+		if (!peer->sd.already_dumped && list_empty(&peer->list)) {
+			show_one_unix("Add a peer", peer);
+			list_add_tail(&peer->list, &unix_sockets);
 		}
 
 		if ((ue.type != SOCK_DGRAM) && (
@@ -330,7 +330,7 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 						(int)uv->udiag_vfs_ino);
 				/*
 				 * When a socket is bound to unlinked file, we
-				 * just drop his name, since noone will access
+				 * just drop his name, since no one will access
 				 * it via one.
 				 */
 				xfree(name);
@@ -433,11 +433,14 @@ int fix_external_unix_sockets(void)
 
 		if (!opts.ext_unix_sk) {
 			show_one_unix("Runaway socket", sk);
+			pr_err("External socket is used. "
+					"Consider using --" USK_EXT_PARAM " option.\n");
 			goto err;
 		}
 
 		if (sk->type != SOCK_DGRAM) {
 			show_one_unix("Ext stream not supported", sk);
+			pr_err("Can't dump half of stream unix connection.\n");
 			goto err;
 		}
 
@@ -488,7 +491,7 @@ static struct unix_sk_info *find_unix_sk_by_ino(int ino)
 	return NULL;
 }
 
-void show_unixsk(int fd, struct cr_options *o)
+void show_unixsk(int fd)
 {
 	pb_show_plain_pretty(fd, PB_UNIXSK, "1:%#x 2:%#x 3:%d 4:%d 5:%d 6:%d 7:%d 8:%#x 11:S");
 }
@@ -803,7 +806,7 @@ int collect_unix_sockets(void)
 	if (!ret)
 		ret = read_sk_queues();
 
-	return 0;
+	return ret;
 }
 
 int resolve_unix_peers(void)
@@ -819,18 +822,21 @@ int resolve_unix_peers(void)
 
 		peer = find_unix_sk_by_ino(ui->ue->peer);
 
+		if (!peer) {
+			pr_err("FATAL: Peer %#x unresolved for %#x\n",
+					ui->ue->peer, ui->ue->ino);
+			return -1;
+		}
+
 		/*
 		 * Connect to external sockets requires
 		 * special option to be passed.
 		 */
-		if (peer &&
-		    (peer->ue->uflags & USK_EXTERN) &&
-		    !(opts.ext_unix_sk))
-			peer = NULL;
-
-		if (!peer) {
-			pr_err("FATAL: Peer %#x unresolved for %#x\n",
-					ui->ue->peer, ui->ue->ino);
+		if ((peer->ue->uflags & USK_EXTERN) &&
+				!(opts.ext_unix_sk)) {
+			pr_err("External socket found in image. "
+					"Consider using the --" USK_EXT_PARAM " option "
+					"to allow restoring it.\n");
 			return -1;
 		}
 

@@ -36,26 +36,6 @@
 
 #include "crtools.h"
 
-/* /proc/PID/maps can contain not up to date information about stack */
-void mark_stack_vma(unsigned long sp, struct list_head *vma_area_list)
-{
-	struct vma_area *vma_area;
-	list_for_each_entry(vma_area, vma_area_list, list) {
-		if (in_vma_area(vma_area, sp)) {
-			vma_area->vma.status |= VMA_AREA_STACK;
-			vma_area->vma.flags  |= MAP_GROWSDOWN;
-
-			/*
-			 * The kernel doesn't show stack guard pages on
-			 * proc output, so add pages here by hands.
-			 */
-			vma_area->vma.start -= PAGE_SIZE;
-			return;
-		}
-	}
-	BUG();
-}
-
 #define VMA_OPT_LEN	128
 
 static void vma_opt_str(const struct vma_area *v, char *opt)
@@ -274,7 +254,7 @@ int init_service_fd(void)
 	struct rlimit rlimit;
 
 	/*
-	 * Service FDs are thouse that most likely won't
+	 * Service FDs are those that most likely won't
 	 * conflict with any 'real-life' ones
 	 */
 
@@ -295,6 +275,16 @@ static int __get_service_fd(enum sfd_type type, int service_fd_id)
 }
 
 static DECLARE_BITMAP(sfd_map, SERVICE_FD_MAX);
+
+int reserve_service_fd(enum sfd_type type)
+{
+	int sfd = __get_service_fd(type, service_fd_id);
+
+	BUG_ON((int)type <= SERVICE_FD_MIN || (int)type >= SERVICE_FD_MAX);
+
+	set_bit(type, sfd_map);
+	return sfd;
+}
 
 int install_service_fd(enum sfd_type type, int fd)
 {
@@ -351,7 +341,7 @@ int clone_service_fd(int id)
 		if (ret == -1) {
 			if (errno == EBADF)
 				continue;
-			pr_perror("Unalbe to clone %d->%d\n", old, new);
+			pr_perror("Unable to clone %d->%d", old, new);
 		}
 	}
 
@@ -410,18 +400,32 @@ bool is_anon_inode(struct statfs *statfs)
 	return statfs->f_type == ANON_INODE_FS_MAGIC;
 }
 
+int read_fd_link(int lfd, char *buf, size_t size)
+{
+	char t[32];
+	ssize_t ret;
+
+	snprintf(t, sizeof(t), "/proc/self/fd/%d", lfd);
+	ret = readlink(t, buf, size);
+	if (ret < 0) {
+		pr_perror("Can't read link of fd %d", lfd);
+		return -1;
+	} else if ((size_t)ret == size) {
+		pr_err("Buffer for read link of fd %d is too small\n", lfd);
+		return -1;
+	}
+	buf[ret] = 0;
+
+	return ret;
+}
+
 int is_anon_link_type(int lfd, char *type)
 {
 	char link[32], aux[32];
-	ssize_t ret;
 
-	snprintf(aux, sizeof(aux), "/proc/self/fd/%d", lfd);
-	ret = readlink(aux, link, sizeof(link));
-	if (ret < 0) {
-		pr_perror("Can't read link of fd %d\n", lfd);
-		return 0;
-	}
-	link[ret] = 0;
+	if (read_fd_link(lfd, link, sizeof(link)) < 0)
+		return -1;
+
 	snprintf(aux, sizeof(aux), "anon_inode:%s", type);
 	return !strcmp(link, aux);
 }
@@ -474,7 +478,7 @@ int run_scripts(char *action)
 	int ret = 0;
 
 	if (setenv("CRTOOLS_SCRIPT_ACTION", action, 1)) {
-		pr_perror("Can't set CRTOOL_SCRIPT_ACTION=%s\n", action);
+		pr_perror("Can't set CRTOOLS_SCRIPT_ACTION=%s", action);
 		return -1;
 	}
 
@@ -515,7 +519,7 @@ int cr_system(int in, int out, int err, char *cmd, char *const argv[])
 
 	pid = fork();
 	if (pid == -1) {
-		pr_perror("fork() failed\n");
+		pr_perror("fork() failed");
 		goto out;
 	} else if (pid == 0) {
 		if (out < 0)

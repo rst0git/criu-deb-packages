@@ -5,6 +5,8 @@
 #include <sys/epoll.h>
 #include <sys/inotify.h>
 #include <sys/signalfd.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <linux/if.h>
@@ -22,6 +24,8 @@
 #include "proc_parse.h"
 #include "mount.h"
 #include "tty.h"
+#include "ptrace.h"
+#include "kerndat.h"
 
 static int check_tty(void)
 {
@@ -85,11 +89,14 @@ static int check_sock_diag(void)
 {
 	int ret;
 
-	ret = collect_sockets(getpid());
+	ret = collect_sockets(0);
 	if (!ret)
 		return 0;
 
-	pr_msg("sock diag infrastructure is incomplete.\n");
+	pr_msg("The sock diag infrastructure is incomplete.\n");
+	pr_msg("Make sure you have:\n");
+	pr_msg(" 1. *_DIAG kernel config options turned on;\n");
+	pr_msg(" 2. *_diag.ko modules loaded (if compiled as modules).\n");
 	return -1;
 }
 
@@ -270,7 +277,7 @@ static int check_one_epoll(union fdinfo_entries *e, void *arg)
 
 static int check_fdinfo_eventpoll(void)
 {
-	int efd, pfd[2], proc_fd = 0, ret;
+	int efd, pfd[2], proc_fd = 0, ret = -1;
 	struct epoll_event ev;
 
 	if (pipe(pfd)) {
@@ -281,7 +288,7 @@ static int check_fdinfo_eventpoll(void)
 	efd = epoll_create(1);
 	if (efd < 0) {
 		pr_perror("Can't make epoll fd");
-		return -1;
+		goto pipe_err;
 	}
 
 	memset(&ev, 0, sizeof(ev));
@@ -289,27 +296,31 @@ static int check_fdinfo_eventpoll(void)
 
 	if (epoll_ctl(efd, EPOLL_CTL_ADD, pfd[0], &ev)) {
 		pr_perror("Can't add epoll tfd");
-		return -1;
+		goto epoll_err;
 	}
 
 	ret = parse_fdinfo(efd, FD_TYPES__EVENTPOLL, check_one_epoll, &proc_fd);
-	close(efd);
-	close(pfd[0]);
-	close(pfd[1]);
-
 	if (ret) {
 		pr_err("Error parsing proc fdinfo\n");
-		return -1;
+		goto epoll_err;
 	}
 
 	if (pfd[0] != proc_fd) {
 		pr_err("TFD mismatch (or not met) %d want %d\n",
 				proc_fd, pfd[0]);
-		return -1;
+		ret = -1;
+		goto epoll_err;
 	}
 
 	pr_info("Epoll fdinfo works OK (%d vs %d)\n", pfd[0], proc_fd);
-	return 0;
+
+epoll_err:
+	close(efd);
+pipe_err:
+	close(pfd[0]);
+	close(pfd[1]);
+
+	return ret;
 }
 
 static int check_one_inotify(union fdinfo_entries *e, void *arg)
@@ -331,6 +342,7 @@ static int check_fdinfo_inotify(void)
 	wd = inotify_add_watch(ifd, ".", IN_ALL_EVENTS);
 	if (wd < 0) {
 		pr_perror("Can't add watch");
+		close(ifd);
 		return -1;
 	}
 
@@ -369,17 +381,26 @@ static int check_unaligned_vmsplice(void)
 	char buf; /* :) */
 	struct iovec iov;
 
-	pipe(p);
+	ret = pipe(p);
+	if (ret < 0) {
+		pr_perror("Can't create pipe");
+		return ret;
+	}
 	iov.iov_base = &buf;
 	iov.iov_len = sizeof(buf);
 	ret = vmsplice(p[1], &iov, 1, SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
 	if (ret < 0) {
 		pr_perror("Unaligned vmsplice doesn't work");
-		return -1;
+		goto err;
 	}
 
 	pr_info("Unaligned vmsplice works OK\n");
-	return 0;
+	ret = 0;
+err:
+	close(p[0]);
+	close(p[1]);
+
+	return ret;
 }
 
 #ifndef SO_GET_FILTER
@@ -388,29 +409,32 @@ static int check_unaligned_vmsplice(void)
 
 static int check_so_gets(void)
 {
-	int sk;
+	int sk, ret = -1;
 	socklen_t len;
 	char name[IFNAMSIZ];
 
 	sk = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (sk < 0) {
 		pr_perror("No socket");
-		return 1;
+		return -1;
 	}
 
 	len = 0;
 	if (getsockopt(sk, SOL_SOCKET, SO_GET_FILTER, NULL, &len)) {
 		pr_perror("Can't get socket filter");
-		return 1;
+		goto err;
 	}
 
 	len = sizeof(name);
 	if (getsockopt(sk, SOL_SOCKET, SO_BINDTODEVICE, name, &len)) {
 		pr_perror("Can't get socket bound dev");
-		return 1;
+		goto err;
 	}
 
-	return 0;
+	ret = 0;
+err:
+	close(sk);
+	return ret;
 }
 
 static int check_ipc(void)
@@ -425,11 +449,79 @@ static int check_ipc(void)
 	return -1;
 }
 
+int check_sigqueuinfo()
+{
+	siginfo_t info = { .si_code = 1 };
+
+	signal(SIGUSR1, SIG_IGN);
+
+	if (sys_rt_sigqueueinfo(getpid(), SIGUSR1, &info)) {
+		pr_perror("Unable to send siginfo with positive si_code to itself");
+		return -1;
+	}
+
+	return 0;
+}
+
+int check_ptrace_peeksiginfo()
+{
+	struct ptrace_peeksiginfo_args arg;
+	siginfo_t siginfo;
+	pid_t pid, ret = 0;
+
+	if (opts.check_ms_kernel) {
+		pr_warn("Skipping peeking siginfos check (not yet merged)\n");
+		return 0;
+	}
+
+	pid = fork();
+	if (pid < 0)
+		pr_perror("fork");
+	else if (pid == 0) {
+		while (1)
+			sleep(1000);
+		exit(1);
+	}
+
+	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1)
+		return -1;
+
+	waitpid(pid, NULL, 0);
+
+	arg.flags = 0;
+	arg.off = 0;
+	arg.nr = 1;
+
+	if (ptrace(PTRACE_PEEKSIGINFO, pid, &arg, &siginfo) != 0) {
+		pr_perror("Unable to dump pending signals");
+		ret = -1;
+	}
+
+	ptrace(PTRACE_KILL, pid, NULL, NULL);
+
+	return ret;
+}
+
+static int check_mem_dirty_track(void)
+{
+	if (opts.check_ms_kernel) {
+		pr_warn("Skipping dirty tracking check (not yet merged)\n");
+		return 0;
+	}
+
+	if (kerndat_get_dirty_track() < 0)
+		return -1;
+
+	if (!kerndat_has_dirty_track)
+		pr_warn("Dirty tracking is OFF. Memory snapshot will not work.\n");
+	return 0;
+}
+
 int cr_check(void)
 {
 	int ret = 0;
 
-	log_set_loglevel(LOG_ERROR);
+	log_set_loglevel(LOG_WARN);
 
 	if (mntns_collect_root(getpid())) {
 		pr_err("Can't collect root mount point\n");
@@ -450,6 +542,9 @@ int cr_check(void)
 	ret |= check_tty();
 	ret |= check_so_gets();
 	ret |= check_ipc();
+	ret |= check_sigqueuinfo();
+	ret |= check_ptrace_peeksiginfo();
+	ret |= check_mem_dirty_track();
 
 	if (!ret)
 		pr_msg("Looks good.\n");

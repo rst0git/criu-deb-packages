@@ -12,6 +12,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "asm/types.h"
 
 #include "compiler.h"
@@ -22,6 +26,9 @@
 #include "sk-inet.h"
 #include "net.h"
 #include "version.h"
+#include "page-xfer.h"
+#include "tty.h"
+#include "file-lock.h"
 
 struct cr_options opts;
 
@@ -55,13 +62,11 @@ bad_ns:
 
 int main(int argc, char *argv[])
 {
-	pid_t pid = 0;
+	pid_t pid = 0, tree_id = 0;
 	int ret = -1;
 	int opt, idx;
 	int log_inited = 0;
 	int log_level = 0;
-
-	static const char short_opts[] = "dsf:t:hcD:o:n:vxVr:jl";
 
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 
@@ -79,17 +84,21 @@ int main(int argc, char *argv[])
 		return -1;
 
 	while (1) {
+		static const char short_opts[] = "dsRf:t:p:hcD:o:n:vxVr:jl";
 		static struct option long_opts[] = {
 			{ "tree", required_argument, 0, 't' },
+			{ "pid", required_argument, 0, 'p' },
 			{ "leave-stopped", no_argument, 0, 's' },
+			{ "leave-running", no_argument, 0, 'R' },
 			{ "restore-detached", no_argument, 0, 'd' },
+			{ "daemon", no_argument, 0, 'd' },
 			{ "contents", no_argument, 0, 'c' },
 			{ "file", required_argument, 0, 'f' },
 			{ "images-dir", required_argument, 0, 'D' },
 			{ "log-file", required_argument, 0, 'o' },
 			{ "namespaces", required_argument, 0, 'n' },
 			{ "root", required_argument, 0, 'r' },
-			{ "ext-unix-sk", no_argument, 0, 'x' },
+			{ USK_EXT_PARAM, no_argument, 0, 'x' },
 			{ "help", no_argument, 0, 'h' },
 			{ SK_EST_PARAM, no_argument, 0, 42 },
 			{ "close", required_argument, 0, 43 },
@@ -100,8 +109,14 @@ int main(int argc, char *argv[])
 			{ "veth-pair", required_argument, 0, 47},
 			{ "action-script", required_argument, 0, 49},
 			{ LREMAP_PARAM, no_argument, 0, 41},
-			{ "shell-job", no_argument, 0, 'j'},
-			{ "file-locks", no_argument, 0, 'l'},
+			{ OPT_SHELL_JOB, no_argument, 0, 'j'},
+			{ OPT_FILE_LOCKS, no_argument, 0, 'l'},
+			{ "page-server", no_argument, 0, 50},
+			{ "address", required_argument, 0, 51},
+			{ "port", required_argument, 0, 52},
+			{ "prev-images-dir", required_argument, 0, 53},
+			{ "ms", no_argument, 0, 54},
+			{ "track-mem", no_argument, 0, 55},
 			{ },
 		};
 
@@ -113,11 +128,17 @@ int main(int argc, char *argv[])
 		case 's':
 			opts.final_state = TASK_STOPPED;
 			break;
+		case 'R':
+			opts.final_state = TASK_ALIVE;
+			break;
 		case 'x':
 			opts.ext_unix_sk = true;
 			break;
-		case 't':
+		case 'p':
 			pid = atoi(optarg);
+			break;
+		case 't':
+			tree_id = atoi(optarg);
 			break;
 		case 'c':
 			opts.show_pages_content	= true;
@@ -199,7 +220,7 @@ int main(int argc, char *argv[])
 				n->outside = strchr(optarg, '=');
 				if (n->outside == NULL) {
 					xfree(n);
-					pr_err("Invalid agument for --veth-pair\n");
+					pr_err("Invalid argument for --veth-pair\n");
 					goto usage;
 				}
 
@@ -220,11 +241,36 @@ int main(int argc, char *argv[])
 				list_add(&script->node, &opts.scripts);
 			}
 			break;
+		case 50:
+			opts.use_page_server = true;
+			break;
+		case 51:
+			if (!inet_aton(optarg, &opts.ps_addr.sin_addr)) {
+				pr_perror("Bad address");
+				return -1;
+			}
+			break;
+		case 52:
+			opts.ps_addr.sin_port = htons(atoi(optarg));
+			if (!opts.ps_addr.sin_port) {
+				pr_err("Bad port\n");
+				return -1;
+			}
+			break;
 		case 'j':
 			opts.shell_job = true;
 			break;
 		case 'l':
 			opts.handle_file_locks = true;
+			break;
+		case 53:
+			opts.img_parent = optarg;
+			break;
+		case 55:
+			opts.track_mem = true;
+			break;
+		case 54:
+			opts.check_ms_kernel = true;
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", version);
@@ -245,121 +291,144 @@ int main(int argc, char *argv[])
 			return ret;
 	}
 
+	if (opts.img_parent)
+		pr_info("Will do snapshot from %s\n", opts.img_parent);
+
 	ret = open_image_dir();
 	if (ret < 0) {
-		pr_perror("can't open currect directory");
+		pr_perror("can't open current directory");
 		return -1;
 	}
 
 	if (optind >= argc)
 		goto usage;
 
-	if (strcmp(argv[optind], "dump") &&
-	    strcmp(argv[optind], "restore") &&
-	    strcmp(argv[optind], "show") &&
-	    strcmp(argv[optind], "check") &&
-	    strcmp(argv[optind], "exec")) {
-		pr_err("Unknown command %s\n", argv[optind]);
-		goto usage;
+	if (!strcmp(argv[optind], "dump")) {
+		if (!tree_id)
+			goto opt_pid_missing;
+		return cr_dump_tasks(tree_id);
 	}
 
-	switch (argv[optind][0]) {
-	case 'd':
-		if (!pid)
+	if (!strcmp(argv[optind], "pre-dump")) {
+		if (!tree_id)
 			goto opt_pid_missing;
-		ret = cr_dump_tasks(pid, &opts);
-		break;
-	case 'r':
-		if (!pid)
-			goto opt_pid_missing;
-		ret = cr_restore_tasks(pid, &opts);
-		break;
-	case 's':
-		ret = cr_show(&opts);
-		break;
-	case 'c':
-		ret = cr_check();
-		break;
-	case 'e':
-		if (!pid)
-			goto opt_pid_missing;
-		ret = cr_exec(pid, argv + optind + 1);
-		break;
-	default:
-		goto usage;
-		break;
+
+		if (!opts.track_mem) {
+			pr_info("Enforcing memory tracking for pre-dump.\n");
+			opts.track_mem = true;
+		}
+
+		if (opts.final_state == TASK_DEAD) {
+			pr_info("Enforcing tasks run after pre-dump.\n");
+			opts.final_state = TASK_ALIVE;
+		}
+
+		return cr_pre_dump_tasks(tree_id);
 	}
 
-	return ret;
+	if (!strcmp(argv[optind], "restore")) {
+		if (tree_id)
+			pr_warn("Using -t with criu restore is obsoleted\n");
+		return cr_restore_tasks(&opts);
+	}
 
+	if (!strcmp(argv[optind], "show"))
+		return cr_show(&opts, pid);
+
+	if (!strcmp(argv[optind], "check"))
+		return cr_check();
+
+	if (!strcmp(argv[optind], "exec")) {
+		if (!pid)
+			pid = tree_id; /* old usage */
+		if (!pid)
+			goto opt_pid_missing;
+		return cr_exec(pid, argv + optind + 1);
+	}
+
+	if (!strcmp(argv[optind], "page-server"))
+		return cr_page_server(opts.restore_detach);
+
+	pr_msg("Unknown command \"%s\"\n", argv[optind]);
 usage:
-	pr_msg("\nUsage:\n");
-	pr_msg("  %s dump -t pid [<options>]\n", argv[0]);
-	pr_msg("  %s restore -t pid [<options>]\n", argv[0]);
-	pr_msg("  %s show (-D dir)|(-f file) [<options>]\n", argv[0]);
-	pr_msg("  %s check\n", argv[0]);
-	pr_msg("  %s exec -t pid <syscall-string>\n", argv[0]);
-
-	pr_msg("\nCommands:\n");
-	pr_msg("  dump           checkpoint a process/tree identified by pid\n");
-	pr_msg("  restore        restore a process/tree identified by pid\n");
-	pr_msg("  show           show dump file(s) contents\n");
-	pr_msg("  check          checks whether the kernel support is up-to-date\n");
-	pr_msg("  exec           execute a system call by other task\n");
+	pr_msg("\n"
+"Usage:\n"
+"  criu dump|pre-dump -t PID [<options>]\n"
+"  criu restore [<options>]\n"
+"  criu show (-D DIR)|(-f FILE) [<options>]\n"
+"  criu check [--ms]\n"
+"  criu exec -p PID <syscall-string>\n"
+"  criu page-server\n"
+"\n"
+"Commands:\n"
+"  dump           checkpoint a process/tree identified by pid\n"
+"  pre-dump       pre-dump task(s) minimizing their frozen time\n"
+"  restore        restore a process/tree\n"
+"  show           show dump file(s) contents\n"
+"  check          checks whether the kernel support is up-to-date\n"
+"  exec           execute a system call by other task\n"
+"  page-server    launch page server\n"
+	);
 
 	if (argc < 2) {
 		pr_msg("\nTry -h|--help for more info\n");
 		return -1;
 	}
 
-	pr_msg("\nDump/Restore options:\n");
-
-	pr_msg("\n* Generic:\n");
-	pr_msg("  -t|--tree             checkpoint/restore the whole process tree identified by pid\n");
-	pr_msg("  -d|--restore-detached detach after restore\n");
-	pr_msg("  -s|--leave-stopped    leave tasks in stopped state after checkpoint instead of killing them\n");
-	pr_msg("  -D|--images-dir       directory where to put images to\n");
-	pr_msg("     --pidfile [FILE]	write a pid of a root task in this file\n");
-
-	pr_msg("\n* Special resources support:\n");
-	pr_msg("  -n|--namespaces       checkpoint/restore namespaces - values must be separated by comma\n");
-	pr_msg("                        supported: uts, ipc, mnt, pid, net\n");
-	pr_msg("  -x|--ext-unix-sk      allow external unix connections\n");
-	pr_msg("     --%s  checkpoint/restore established TCP connections\n", SK_EST_PARAM);
-	pr_msg("  -r|--root [PATH]	change the root filesystem (when run in mount namespace)\n");
-	pr_msg("  --evasive-devices	use any path to a device file if the original one is inaccessible\n");
-	pr_msg("  --veth-pair [IN=OUT]	correspondence between outside and inside names of veth devices\n");
-	pr_msg("  --link-remap          allow to link unlinked files back when possible (modifies FS till restore)\n");
-	pr_msg("  --action-script [SCR]	add an external action script\n");
-	pr_msg("			The environment variable CRTOOL_SCRIPT_ACTION contains one of the actions:\n");
-	pr_msg("			* network-lock - lock network in a target network namespace\n");
-	pr_msg("			* network-unlock - unlock network in a target network namespace\n");
-	pr_msg("  -j|--shell-job        allow to dump and restore shell jobs\n");
-	pr_msg("  -l|--file-locks	handle file locks, for safety, only used for container\n");
-
-	pr_msg("\n* Logging:\n");
-	pr_msg("  -o|--log-file [NAME]  log file name (relative path is relative to --images-dir)\n");
-	pr_msg("     --log-pid		if the -o option is in effect, each restored processes is\n");
-	pr_msg("			written to the [NAME].pid file\n");
-	pr_msg("  -v [num]              set logging level\n");
-	pr_msg("                          0 - messages regardless of log level\n");
-	pr_msg("                          1 - errors, when we are in trouble\n");
-	pr_msg("                          2 - warnings (default)\n");
-	pr_msg("                          3 - informative, everything is fine\n");
-	pr_msg("                          4 - debug only\n");
-	pr_msg("  -v             same as -v 1\n");
-	pr_msg("  -vv            same as -v 2\n");
-	pr_msg("  -vvv           same as -v 3\n");
-	pr_msg("  -vvvv          same as -v 4\n");
-
-	pr_msg("\nShow options:\n");
-	pr_msg("  -f|--file             show contents of a checkpoint file\n");
-	pr_msg("  -D|--images-dir       directory where to get images from\n");
-	pr_msg("  -c|--contents         show contents of pages dumped in hexdump format\n");
-
-	pr_msg("\nOther options:\n");
-	pr_msg("  -h|--help             show this text\n");
-	pr_msg("  -V|--version          show version\n");
+	pr_msg("\n"
+"Dump/Restore options:\n"
+"\n"
+"* Generic:\n"
+"  -t|--tree PID         checkpoint a process tree identified by PID\n"
+"  -d|--restore-detached detach after restore\n"
+"  -s|--leave-stopped    leave tasks in stopped state after checkpoint\n"
+"  -R|--leave-running    leave tasks in running state after checkpoint\n"
+"  -D|--images-dir DIR   directory for image files\n"
+"     --pidfile FILE     write a pid of a root task to this file\n"
+"\n"
+"* Special resources support:\n"
+"  -x|--" USK_EXT_PARAM "      allow external unix connections\n"
+"     --" SK_EST_PARAM "  checkpoint/restore established TCP connections\n"
+"  -r|--root PATH        change the root filesystem (when run in mount namespace)\n"
+"  --evasive-devices     use any path to a device file if the original one\n"
+"                        is inaccessible\n"
+"  --veth-pair IN=OUT    map inside veth device name to outside one\n"
+"  --link-remap          allow to link unlinked files back when possible\n"
+"  --action-script FILE  add an external action script\n"
+"  -j|--" OPT_SHELL_JOB "        allow to dump and restore shell jobs\n"
+"  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
+"\n"
+"* Logging:\n"
+"  -o|--log-file FILE    log file name (path is relative to --images-dir)\n"
+"     --log-pid          enable per-process logging to separate FILE.pid files\n"
+"  -v [NUM]              set logging level:\n"
+"                          -v 0        - messages regardless of log level\n"
+"                          -v 1, -v    - errors, when we are in trouble\n"
+"                          -v 2, -vv   - warnings (default)\n"
+"                          -v 3, -vvv  - informative, everything is fine\n"
+"                          -v 4, -vvvv - debug only\n"
+"\n"
+"* Memory dumping options:\n"
+"  --track-mem           turn on memory changes tracker in kernel\n"
+"  --prev-images-dir DIR path to images from previous dump (relative to -D)\n"
+"  --page-server         send pages to page server (see options below as well)\n"
+"\n"
+"Page server options\n"
+"  --address ADDR        address of page server\n"
+"  --port PORT           port of page server\n"
+"  -d|--daemon           run in the background after creating socket\n"
+"\n"
+"Show options:\n"
+"  -f|--file FILE        show contents of a checkpoint file\n"
+"  -D|--images-dir DIR   directory where to get images from\n"
+"  -c|--contents         show contents of pages dumped in hexdump format\n"
+"  -p|--pid PID          show files relevant to PID (filter -D flood)\n"
+"\n"
+"Other options:\n"
+"  -h|--help             show this text\n"
+"  -V|--version          show version\n"
+"     --ms               don't check not yet merged kernel features\n"
+	);
 
 	return -1;
 

@@ -45,7 +45,7 @@ int prepare_utsns(int pid)
 		{ },
 	};
 
-	fd = open_image_ro(CR_FD_UTSNS, pid);
+	fd = open_image(CR_FD_UTSNS, O_RSTR, pid);
 	if (fd < 0)
 		return -1;
 
@@ -65,12 +65,9 @@ out:
 	return ret;
 }
 
-void show_utsns(int fd, struct cr_options *o)
+void show_utsns(int fd)
 {
 	pb_show_vertical(fd, PB_UTSNS);
 }
 
-struct ns_desc uts_ns_desc = {
-	.cflag = CLONE_NEWUTS,
-	.str = "uts",
-};
+struct ns_desc uts_ns_desc = NS_DESC_ENTRY(CLONE_NEWUTS, "uts");

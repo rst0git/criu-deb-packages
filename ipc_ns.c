@@ -296,13 +296,28 @@ static int ipc_sysctl_req(IpcVarEntry *e, int op)
 		{ "kernel/shmall",		&e->shm_ctlall,		CTL_U64 },
 		{ "kernel/shmmni",		&e->shm_ctlmni,		CTL_U32 },
 		{ "kernel/shm_rmid_forced",	&e->shm_rmid_forced,	CTL_U32 },
+		{ },
+	};
+
+	struct sysctl_req req_mq[] = {
 		{ "fs/mqueue/queues_max",	&e->mq_queues_max,	CTL_U32 },
 		{ "fs/mqueue/msg_max",		&e->mq_msg_max,		CTL_U32 },
 		{ "fs/mqueue/msgsize_max",	&e->mq_msgsize_max,	CTL_U32 },
 		{ },
 	};
 
-	return sysctl_op(req, op);
+	int ret;
+
+	ret = sysctl_op(req, op);
+	if (ret)
+		return ret;
+
+	if (access("/proc/sys/fs/mqueue", X_OK)) {
+		pr_info("Mqueue sysctls are missing\n");
+		return 0;
+	}
+
+	return sysctl_op(req_mq, op);
 }
 
 /*
@@ -449,7 +464,7 @@ int dump_ipc_ns(int ns_pid, const struct cr_fdset *fdset)
 	return 0;
 }
 
-static void ipc_sem_handler(int fd, void *obj, int show_pages_content)
+static void ipc_sem_handler(int fd, void *obj)
 {
 	IpcSemEntry *e = obj;
 	u16 *values;
@@ -460,52 +475,52 @@ static void ipc_sem_handler(int fd, void *obj, int show_pages_content)
 	values = xmalloc(size);
 	if (values == NULL)
 		return;
-	if (read_img_buf(fd, values, round_up(size, sizeof(u64))) <= 0)
+	if (read_img_buf(fd, values, round_up(size, sizeof(u64))) <= 0) {
+		xfree(values);
 		return;
+	}
 	pr_msg_ipc_sem_array(e->nsems, values);
 }
 
-void show_ipc_sem(int fd, struct cr_options *o)
+void show_ipc_sem(int fd)
 {
-	pb_show_plain_payload(fd, PB_IPCNS_SEM, ipc_sem_handler, 0);
+	pb_show_plain_payload(fd, PB_IPCNS_SEM, ipc_sem_handler);
 }
 
-static void ipc_msg_data_handler(int fd, void *obj, int show_pages_content)
+static void ipc_msg_data_handler(int fd, void *obj)
 {
 	IpcMsg *e = obj;
-	print_image_data(fd, round_up(e->msize, sizeof(u64)), show_pages_content);
+	print_image_data(fd, round_up(e->msize, sizeof(u64)), opts.show_pages_content);
 }
 
-static void ipc_msg_handler(int fd, void *obj, int show_pages_content)
+static void ipc_msg_handler(int fd, void *obj)
 {
 	IpcMsgEntry *e = obj;
 	int msg_nr = 0;
 
 	pr_msg("\n");
 	while (msg_nr++ < e->qnum)
-		pb_show_plain_payload(fd, PB_IPCNS_MSG, ipc_msg_data_handler,
-					show_pages_content);
+		pb_show_plain_payload(fd, PB_IPCNS_MSG, ipc_msg_data_handler);
 
 }
 
-void show_ipc_msg(int fd, struct cr_options *o)
+void show_ipc_msg(int fd)
 {
-	pb_show_plain_payload(fd, PB_IPCNS_MSG_ENT, ipc_msg_handler, o->show_pages_content);
+	pb_show_plain_payload(fd, PB_IPCNS_MSG_ENT, ipc_msg_handler);
 }
 
-static void ipc_shm_handler(int fd, void *obj, int show_pages_content)
+static void ipc_shm_handler(int fd, void *obj)
 {
 	IpcShmEntry *e = obj;
-	print_image_data(fd, round_up(e->size, sizeof(u32)), show_pages_content);
+	print_image_data(fd, round_up(e->size, sizeof(u32)), opts.show_pages_content);
 }
 
-void show_ipc_shm(int fd, struct cr_options *o)
+void show_ipc_shm(int fd)
 {
-	pb_show_plain_payload(fd, PB_IPCNS_SHM, ipc_shm_handler,
-				o->show_pages_content);
+	pb_show_plain_payload(fd, PB_IPCNS_SHM, ipc_shm_handler);
 }
 
-void show_ipc_var(int fd, struct cr_options *o)
+void show_ipc_var(int fd)
 {
 	pb_show_vertical(fd, PB_IPCNS_VAR);
 }
@@ -515,7 +530,7 @@ static int prepare_ipc_sem_values(int fd, const IpcSemEntry *sem)
 	int ret, size;
 	u16 *values;
 
-	size = sizeof(u16) * sem->nsems;
+	size = round_up(sizeof(u16) * sem->nsems, sizeof(u64));
 	values = xmalloc(size);
 	if (values == NULL) {
 		pr_err("Failed to allocate memory for semaphores set values\n");
@@ -523,7 +538,7 @@ static int prepare_ipc_sem_values(int fd, const IpcSemEntry *sem)
 		goto out;
 	}
 
-	ret = read_img_buf(fd, values, round_up(size, sizeof(u64)));
+	ret = read_img_buf(fd, values, size);
 	if (ret < 0) {
 		pr_err("Failed to allocate memory for semaphores set values\n");
 		ret = -ENOMEM;
@@ -598,7 +613,7 @@ static int prepare_ipc_sem(int pid)
 	int fd, ret;
 
 	pr_info("Restoring IPC semaphores sets\n");
-	fd = open_image_ro(CR_FD_IPCNS_SEM, pid);
+	fd = open_image(CR_FD_IPCNS_SEM, O_RSTR, pid);
 	if (fd < 0)
 		return -1;
 
@@ -731,7 +746,7 @@ static int prepare_ipc_msg(int pid)
 	int fd, ret;
 
 	pr_info("Restoring IPC message queues\n");
-	fd = open_image_ro(CR_FD_IPCNS_MSG, pid);
+	fd = open_image(CR_FD_IPCNS_MSG, O_RSTR, pid);
 	if (fd < 0)
 		return -1;
 
@@ -841,7 +856,7 @@ static int prepare_ipc_shm(int pid)
 	int fd, ret;
 
 	pr_info("Restoring IPC shared memory\n");
-	fd = open_image_ro(CR_FD_IPCNS_SHM, pid);
+	fd = open_image(CR_FD_IPCNS_SHM, O_RSTR, pid);
 	if (fd < 0)
 		return -1;
 
@@ -879,7 +894,7 @@ static int prepare_ipc_var(int pid)
 	IpcVarEntry *var;
 
 	pr_info("Restoring IPC variables\n");
-	fd = open_image_ro(CR_FD_IPCNS_VAR, pid);
+	fd = open_image(CR_FD_IPCNS_VAR, O_RSTR, pid);
 	if (fd < 0)
 		return -1;
 
@@ -923,7 +938,4 @@ int prepare_ipc_ns(int pid)
 	return 0;
 }
 
-struct ns_desc ipc_ns_desc = {
-	.cflag = CLONE_NEWIPC,
-	.str = "ipc",
-};
+struct ns_desc ipc_ns_desc = NS_DESC_ENTRY(CLONE_NEWIPC, "ipc");

@@ -38,7 +38,7 @@ int read_sk_queues(void)
 
 	pr_info("Trying to read socket queues image\n");
 
-	fd = open_image_ro(CR_FD_SK_QUEUES);
+	fd = open_image(CR_FD_SK_QUEUES, O_RSTR);
 	if (fd < 0)
 		return -1;
 
@@ -81,7 +81,7 @@ int dump_sk_queue(int sock_fd, int sock_id)
 	orig_peek_off = 0;
 	ret = getsockopt(sock_fd, SOL_SOCKET, SO_PEEK_OFF, &orig_peek_off, &tmp);
 	if (ret < 0) {
-		pr_perror("getsockopt failed\n");
+		pr_perror("getsockopt failed");
 		return ret;
 	}
 	/*
@@ -91,7 +91,7 @@ int dump_sk_queue(int sock_fd, int sock_id)
 	size = 0;
 	ret = getsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, &size, &tmp);
 	if (ret < 0) {
-		pr_perror("getsockopt failed\n");
+		pr_perror("getsockopt failed");
 		return ret;
 	}
 
@@ -99,7 +99,7 @@ int dump_sk_queue(int sock_fd, int sock_id)
 	size -= 32;
 
 	/*
-	 * Allocate data for a streem.
+	 * Allocate data for a stream.
 	 */
 	data = xmalloc(size);
 	if (!data)
@@ -110,7 +110,7 @@ int dump_sk_queue(int sock_fd, int sock_id)
 	 */
 	ret = setsockopt(sock_fd, SOL_SOCKET, SO_PEEK_OFF, &ret, sizeof(int));
 	if (ret < 0) {
-		pr_perror("setsockopt fail\n");
+		pr_perror("setsockopt fail");
 		goto err_brk;
 	}
 
@@ -130,12 +130,12 @@ int dump_sk_queue(int sock_fd, int sock_id)
 		if (ret < 0) {
 			if (errno == EAGAIN)
 				break; /* we're done */
-			pr_perror("recvmsg fail: error\n");
+			pr_perror("recvmsg fail: error");
 			goto err_set_sock;
 		}
 		if (msg.msg_flags & MSG_TRUNC) {
 			/*
-			 * DGRAM thuncated. This should not happen. But we have
+			 * DGRAM truncated. This should not happen. But we have
 			 * to check...
 			 */
 			pr_err("sys_recvmsg failed: truncated\n");
@@ -162,7 +162,7 @@ err_set_sock:
 	 * Restore original peek offset.
 	 */
 	if (setsockopt(sock_fd, SOL_SOCKET, SO_PEEK_OFF, &orig_peek_off, sizeof(int))) {
-		pr_perror("setsockopt failed on restore\n");
+		pr_perror("setsockopt failed on restore");
 		ret = -1;
 	}
 err_brk:
@@ -170,16 +170,15 @@ err_brk:
 	return ret;
 }
 
-static void sk_queue_data_handler(int fd, void *obj, int show_pages_content)
+static void sk_queue_data_handler(int fd, void *obj)
 {
 	SkPacketEntry *e = obj;
-	print_image_data(fd, e->length, show_pages_content);
+	print_image_data(fd, e->length, opts.show_pages_content);
 }
 
-void show_sk_queues(int fd, struct cr_options *o)
+void show_sk_queues(int fd)
 {
-	pb_show_plain_payload(fd, PB_SK_QUEUES,
-			sk_queue_data_handler, o->show_pages_content);
+	pb_show_plain_payload(fd, PB_SK_QUEUES, sk_queue_data_handler);
 }
 
 int restore_sk_queue(int fd, unsigned int peer_id)
@@ -192,7 +191,7 @@ int restore_sk_queue(int fd, unsigned int peer_id)
 	if (restore_prepare_socket(fd))
 		return -1;
 
-	img_fd = open_image_ro(CR_FD_SK_QUEUES);
+	img_fd = open_image(CR_FD_SK_QUEUES, O_RSTR);
 	if (img_fd < 0)
 		return -1;
 
@@ -208,9 +207,9 @@ int restore_sk_queue(int fd, unsigned int peer_id)
 
 		/*
 		 * Don't try to use sendfile here, because it use sendpage() and
-		 * all data are splitted on pages and a new skb is allocated for
+		 * all data are split on pages and a new skb is allocated for
 		 * each page. It creates a big overhead on SNDBUF.
-		 * sendfile() isn't suatable for DGRAM sockets, because message
+		 * sendfile() isn't suitable for DGRAM sockets, because message
 		 * boundaries messages should be saved.
 		 */
 

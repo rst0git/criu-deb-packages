@@ -2,7 +2,7 @@
 #define __CR_PARASITE_H__
 
 #define PARASITE_STACK_SIZE	(16 << 10)
-#define PARASITE_ARG_SIZE	8196
+#define PARASITE_ARG_SIZE_MIN	( 1 << 12)
 
 #define PARASITE_MAX_SIZE	(64 << 10)
 
@@ -24,9 +24,8 @@ enum {
 	PARASITE_CMD_FINI,
 	PARASITE_CMD_FINI_THREAD,
 
-	PARASITE_CMD_DUMPPAGES_INIT,
+	PARASITE_CMD_MPROTECT_VMAS,
 	PARASITE_CMD_DUMPPAGES,
-	PARASITE_CMD_DUMPPAGES_FINI,
 
 	PARASITE_CMD_DUMP_SIGACTS,
 	PARASITE_CMD_DUMP_ITIMERS,
@@ -54,12 +53,30 @@ struct parasite_log_args {
 	int log_level;
 };
 
-struct parasite_dump_pages_args {
-	VmaEntry		vma_entry;
-	unsigned long		nrpages_dumped;	/* how many pages are dumped */
-	unsigned long		nrpages_skipped;
-	unsigned long		nrpages_total;
+struct parasite_vma_entry
+{
+	unsigned long	start;
+	unsigned long	len;
+	int		prot;
 };
+
+struct parasite_dump_pages_args {
+	unsigned int	nr_vmas;
+	unsigned int	add_prot;
+	unsigned int	off;
+	unsigned int	nr_segs;
+	unsigned int	nr_pages;
+};
+
+static inline struct parasite_vma_entry *pargs_vmas(struct parasite_dump_pages_args *a)
+{
+	return (struct parasite_vma_entry *)(a + 1);
+}
+
+static inline struct iovec *pargs_iovs(struct parasite_dump_pages_args *a)
+{
+	return (struct iovec *)(pargs_vmas(a) + a->nr_vmas);
+}
 
 struct parasite_dump_sa_args {
 	rt_sigaction_t sas[SIGMAX];
@@ -87,7 +104,7 @@ struct parasite_dump_misc {
 	u32 umask;
 };
 
-#define PARASITE_MAX_GROUPS	(PAGE_SIZE / sizeof(unsigned int))
+#define PARASITE_MAX_GROUPS	(PAGE_SIZE / sizeof(unsigned int) - 2 * sizeof(unsigned))
 
 struct parasite_dump_creds {
 	unsigned int		secbits;

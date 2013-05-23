@@ -1,3 +1,13 @@
+crtools (0.5+20130521-1) experimental; urgency=low
+
+  * Merging upstream version 0.5+20130521:
+    - fixes FTBFS with eglibc 2.17 (Closes: #701265).
+  * Building package on armhf.
+  * Rediffing documentation.patch.
+  * Using upstreams install target rather than debhelper files.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Thu, 23 May 2013 09:52:14 +0200
+
 crtools (0.4-2) unstable; urgency=low
 
   * Removing all references to my old email address.

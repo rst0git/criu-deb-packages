@@ -117,16 +117,15 @@ struct mount_info {
 	struct list_head siblings;
 };
 
-static inline void mnt_entry_init(struct mount_info *pm)
-{
-	pm->parent = NULL;
-	INIT_LIST_HEAD(&pm->children);
-}
+extern struct mount_info *mnt_entry_alloc();
+extern void mnt_entry_free(struct mount_info *mi);
+
+struct vm_area_list;
 
 extern struct mount_info *parse_mountinfo(pid_t pid);
 extern int parse_pid_stat(pid_t pid, struct proc_pid_stat *s);
 extern int parse_pid_stat_small(pid_t pid, struct proc_pid_stat_small *s);
-extern int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files);
+extern int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_files);
 extern int parse_pid_status(pid_t pid, struct proc_status_creds *);
 
 union fdinfo_entries {

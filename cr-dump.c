@@ -28,6 +28,7 @@
 #include "protobuf/core.pb-c.h"
 #include "protobuf/file-lock.pb-c.h"
 #include "protobuf/rlimit.pb-c.h"
+#include "protobuf/siginfo.pb-c.h"
 
 #include "asm/types.h"
 #include "list.h"
@@ -56,26 +57,63 @@
 #include "cpu.h"
 #include "elf.h"
 #include "file-lock.h"
+#include "page-xfer.h"
+#include "kerndat.h"
+#include "stats.h"
+#include "mem.h"
+#include "page-pipe.h"
 
 #include "asm/dump.h"
 
 static char loc_buf[PAGE_SIZE];
 static int pidns_proc = -1;
 
-void free_mappings(struct list_head *vma_area_list)
+bool privately_dump_vma(struct vma_area *vma)
+{
+	/*
+	 * The special areas are not dumped.
+	 */
+	if (!(vma->vma.status & VMA_AREA_REGULAR))
+		return false;
+
+	/* No dumps for file-shared mappings */
+	if (vma->vma.status & VMA_FILE_SHARED)
+		return false;
+
+	/* No dumps for SYSV IPC mappings */
+	if (vma->vma.status & VMA_AREA_SYSVIPC)
+		return false;
+
+	if (vma_area_is(vma, VMA_ANON_SHARED))
+		return false;
+
+	if (!vma_area_is(vma, VMA_ANON_PRIVATE) &&
+			!vma_area_is(vma, VMA_FILE_PRIVATE)) {
+		pr_warn("Unexpected VMA area found\n");
+		return false;
+	}
+
+	if (vma->vma.end > TASK_SIZE)
+		return false;
+
+	return true;
+}
+
+void free_mappings(struct vm_area_list *vma_area_list)
 {
 	struct vma_area *vma_area, *p;
 
-	list_for_each_entry_safe(vma_area, p, vma_area_list, list) {
+	list_for_each_entry_safe(vma_area, p, &vma_area_list->h, list) {
 		if (vma_area->vm_file_fd > 0)
 			close(vma_area->vm_file_fd);
 		free(vma_area);
 	}
 
-	INIT_LIST_HEAD(vma_area_list);
+	INIT_LIST_HEAD(&vma_area_list->h);
+	vma_area_list->nr = 0;
 }
 
-int collect_mappings(pid_t pid, struct list_head *vma_area_list)
+int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list)
 {
 	int ret = -1;
 
@@ -87,11 +125,10 @@ int collect_mappings(pid_t pid, struct list_head *vma_area_list)
 	if (ret < 0)
 		goto err;
 
-	pr_info_vma_list(vma_area_list);
+	pr_info("Collected, longest ares %lu bytes\n", vma_area_list->longest);
+	pr_info_vma_list(&vma_area_list->h);
 
 	pr_info("----------------------------------------\n");
-	ret = 0;
-
 err:
 	return ret;
 }
@@ -232,6 +269,7 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_fd
 	if (fd < 0)
 		return -1;
 
+	p = FD_PARMS_INIT;
 	if (fstat(fd, &p.stat) < 0) {
 		pr_perror("Can't stat root");
 		return -1;
@@ -300,7 +338,17 @@ static int dump_filemap(pid_t pid, VmaEntry *vma, int file_fd,
 	return dump_one_reg_file(file_fd, vma->shmid, &p);
 }
 
-static int dump_task_mappings(pid_t pid, const struct list_head *vma_area_list,
+static int check_sysvipc_map_dump(pid_t pid, VmaEntry *vma)
+{
+	if (current_ns_mask & CLONE_NEWIPC)
+		return 0;
+
+	pr_err("Task %d with SysVIPC shmem map @%"PRIx64" doesn't live in IPC ns\n",
+			pid, vma->start);
+	return -1;
+}
+
+static int dump_task_mappings(pid_t pid, const struct vm_area_list *vma_area_list,
 			      const struct cr_fdset *cr_fdset)
 {
 	struct vma_area *vma_area;
@@ -312,14 +360,15 @@ static int dump_task_mappings(pid_t pid, const struct list_head *vma_area_list,
 
 	fd = fdset_fd(cr_fdset, CR_FD_VMAS);
 
-	list_for_each_entry(vma_area, vma_area_list, list) {
+	list_for_each_entry(vma_area, &vma_area_list->h, list) {
 		VmaEntry *vma = &vma_area->vma;
 
 		pr_info_vma(vma_area);
 
-		if (!vma_entry_is(vma, VMA_AREA_REGULAR) ||
-				vma_entry_is(vma, VMA_AREA_SYSVIPC))
+		if (!vma_entry_is(vma, VMA_AREA_REGULAR))
 			ret = 0;
+		else if (vma_entry_is(vma, VMA_AREA_SYSVIPC))
+			ret = check_sysvipc_map_dump(pid, vma);
 		else if (vma_entry_is(vma, VMA_ANON_SHARED))
 			ret = add_shmem_area(pid, vma);
 		else if (vma_entry_is(vma, VMA_FILE_PRIVATE) ||
@@ -349,10 +398,10 @@ static int dump_task_creds(struct parasite_ctl *ctl, const struct cr_fdset *fds)
 	CredsEntry ce = CREDS_ENTRY__INIT;
 
 	pr_info("\n");
-	pr_info("Dumping creds for %d)\n", ctl->pid);
+	pr_info("Dumping creds for %d)\n", ctl->pid.real);
 	pr_info("----------------------------------------\n");
 
-	ret = parse_pid_status(ctl->pid, &cr);
+	ret = parse_pid_status(ctl->pid.real, &cr);
 	if (ret < 0)
 		return ret;
 
@@ -386,7 +435,7 @@ static int get_task_auxv(pid_t pid, MmEntry *mm, size_t *size)
 {
 	int fd, ret, i;
 
-	pr_info("Obtainting task auvx ... ");
+	pr_info("Obtaining task auvx ... ");
 
 	fd = open_proc(pid, "auxv");
 	if (fd < 0)
@@ -399,7 +448,7 @@ static int get_task_auxv(pid_t pid, MmEntry *mm, size_t *size)
 			break;
 		else if (ret != sizeof(auxv_t)) {
 			ret = -1;
-			pr_perror("Error readind %d's auxv[%d]",
+			pr_perror("Error reading %d's auxv[%d]",
 				  pid, i);
 			goto err;
 		}
@@ -412,11 +461,12 @@ err:
 	return ret;
 }
 
-static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
+static int dump_task_mm(struct parasite_ctl *ctl, const struct proc_pid_stat *stat,
 		const struct parasite_dump_misc *misc, const struct cr_fdset *fdset)
 {
 	MmEntry mme = MM_ENTRY__INIT;
 	int ret = -1;
+	pid_t pid = ctl->pid.real;
 
 	mme.mm_start_code = stat->start_code;
 	mme.mm_end_code = stat->end_code;
@@ -473,7 +523,7 @@ static int get_task_personality(pid_t pid, u32 *personality)
 	FILE *file = NULL;
 	int ret = -1;
 
-	pr_info("Obtainting personality ... ");
+	pr_info("Obtaining personality ... ");
 
 	file = fopen_proc(pid, "personality");
 	if (!file)
@@ -538,6 +588,17 @@ static int dump_task_kobj_ids(struct pstree_item *item)
 	}
 
 	return 0;
+}
+
+static void core_entry_free(CoreEntry *core)
+{
+	if (core) {
+		arch_free_thread_info(core);
+		xfree(core->thread_core);
+		xfree(core->tc);
+		xfree(core->ids);
+		xfree(core);
+	}
 }
 
 static CoreEntry *core_entry_alloc(int alloc_thread_info,
@@ -607,14 +668,16 @@ static int dump_task_ids(struct pstree_item *item, const struct cr_fdset *cr_fds
 	return pb_write_one(fdset_fd(cr_fdset, CR_FD_IDS), item->ids, PB_IDS);
 }
 
-static int dump_task_core_all(pid_t pid, const struct proc_pid_stat *stat,
-		const struct parasite_dump_misc *misc, const struct parasite_ctl *ctl,
-		const struct cr_fdset *cr_fdset,
-		struct list_head *vma_area_list)
+static int dump_task_core_all(struct parasite_ctl *ctl,
+		const struct proc_pid_stat *stat,
+		const struct parasite_dump_misc *misc,
+		struct vm_area_list *vma_area_list,
+		const struct cr_fdset *cr_fdset)
 {
 	int fd_core = fdset_fd(cr_fdset, CR_FD_CORE);
 	CoreEntry *core;
 	int ret = -1;
+	pid_t pid = ctl->pid.real;
 
 	core = core_entry_alloc(1, 1);
 	if (!core)
@@ -624,15 +687,13 @@ static int dump_task_core_all(pid_t pid, const struct proc_pid_stat *stat,
 	pr_info("Dumping core (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
 
-	ret = dump_task_mm(pid, stat, misc, cr_fdset);
+	ret = dump_task_mm(ctl, stat, misc, cr_fdset);
 	if (ret)
 		goto err_free;
 
 	ret = get_task_regs(pid, core, ctl);
 	if (ret)
 		goto err_free;
-
-	mark_stack_vma(CORE_THREAD_ARCH_INFO(core)->gpregs->sp, vma_area_list);
 
 	ret = get_task_futex_robust_list(pid, core->thread_core);
 	if (ret)
@@ -983,9 +1044,11 @@ static int collect_pstree_ids(void)
 	return 0;
 }
 
-static int collect_pstree(pid_t pid, const struct cr_options *opts)
+static int collect_pstree(pid_t pid)
 {
 	int ret, attempts = 5;
+
+	timing_start(TIME_FREEZING);
 
 	while (1) {
 		root_item = alloc_pstree_item();
@@ -1013,8 +1076,10 @@ static int collect_pstree(pid_t pid, const struct cr_options *opts)
 		 * rather than trying to chase them.
 		 */
 try_again:
-		if (attempts == 0)
-			break;
+		if (attempts == 0) {
+			pr_err("Can't freeze the tree\n");
+			return -1;
+		}
 
 		attempts--;
 		pr_info("Trying to suspend tasks again\n");
@@ -1023,15 +1088,18 @@ try_again:
 		free_pstree(root_item);
 	}
 
-	return collect_pstree_ids();
+	timing_stop(TIME_FREEZING);
+	timing_start(TIME_FROZEN);
+
+	return 0;
 }
 
-static int collect_file_locks(const struct cr_options *opts)
+static int collect_file_locks(void)
 {
 	if (parse_file_locks())
 		return -1;
 
-	if (opts->handle_file_locks)
+	if (opts.handle_file_locks)
 		/*
 		 * If the handle file locks option(-l) is set,
 		 * collect work is over.
@@ -1051,8 +1119,8 @@ static int collect_file_locks(const struct cr_options *opts)
 	 * be used by container dumping.
 	 */
 	if (!list_empty(&file_lock_list)) {
-		pr_perror("Some file locks are hold by dumping tasks!"
-			  "You can try -l to dump them.");
+		pr_err("Some file locks are hold by dumping tasks!"
+			  "You can try --" OPT_FILE_LOCKS " to dump them.\n");
 		return -1;
 	}
 
@@ -1133,6 +1201,63 @@ err:
 	return ret;
 }
 
+static int dump_signal_queue(pid_t tid, int fd, bool group)
+{
+	struct ptrace_peeksiginfo_args arg;
+	siginfo_t siginfo[32]; /* One page or all non-rt signals */
+	int ret, i = 0, j, nr;
+
+	arg.nr = sizeof(siginfo) / sizeof(siginfo_t);
+	arg.flags = 0;
+	if (group)
+		arg.flags |= PTRACE_PEEKSIGINFO_SHARED;
+
+	for (; ; ) {
+		arg.off = i;
+
+		ret = ptrace(PTRACE_PEEKSIGINFO, tid, &arg, siginfo);
+		if (ret < 0) {
+			if (errno == EIO) {
+				pr_warn("ptrace doesn't support PTRACE_PEEKSIGINFO\n");
+				ret = 0;
+			} else
+				pr_perror("ptrace");
+			break;
+		}
+
+		if (ret == 0)
+			break;
+		nr = ret;
+
+		for (j = 0; j < nr; j++) {
+			SiginfoEntry sie = SIGINFO_ENTRY__INIT;
+
+			sie.siginfo.len = sizeof(siginfo_t);
+			sie.siginfo.data = (void *) (siginfo + j);
+
+			ret = pb_write_one(fd, &sie, PB_SIGINFO);
+			if (ret < 0)
+				break;
+			i++;
+		}
+	}
+
+	return ret;
+}
+
+static int dump_thread_signals(struct pid *tid)
+{
+	int fd, ret;
+
+	fd = open_image(CR_FD_PSIGNAL, O_DUMP, tid->virt);
+	if (fd < 0)
+		return -1;
+	ret = dump_signal_queue(tid->real, fd, false);
+	close(fd);
+
+	return ret;
+}
+
 static struct proc_pid_stat pps_buf;
 
 static int dump_task_threads(struct parasite_ctl *parasite_ctl,
@@ -1142,12 +1267,14 @@ static int dump_task_threads(struct parasite_ctl *parasite_ctl,
 
 	for (i = 0; i < item->nr_threads; i++) {
 		/* Leader is already dumped */
-		if (item->pid.real == item->threads[i].real) {
+		if (item->pid.real == item->threads[i].real)
 			item->threads[i].virt = item->pid.virt;
-			continue;
+		else {
+			if (dump_task_thread(parasite_ctl, &item->threads[i]))
+				return -1;
 		}
 
-		if (dump_task_thread(parasite_ctl, &item->threads[i]))
+		if (dump_thread_signals(&item->threads[i]))
 			return -1;
 	}
 
@@ -1188,6 +1315,8 @@ static int fill_zombies_pids(struct pstree_item *item)
 		BUG_ON(i == nr);
 	}
 
+	xfree(ch);
+
 	return 0;
 }
 
@@ -1217,7 +1346,7 @@ static int dump_zombies(void)
 				goto err;
 		}
 
-		pr_info("Obtainting zombie stat ... ");
+		pr_info("Obtaining zombie stat ... ");
 		if (parse_pid_stat(item->pid.virt, &pps_buf) < 0)
 			goto err;
 
@@ -1237,10 +1366,69 @@ err:
 	return ret;
 }
 
+static int pre_dump_one_task(struct pstree_item *item, struct list_head *ctls)
+{
+	pid_t pid = item->pid.real;
+	struct vm_area_list vmas;
+	struct parasite_ctl *parasite_ctl;
+	int ret = -1;
+	struct parasite_dump_misc misc;
+
+	pr_info("========================================\n");
+	pr_info("Pre-dumping task (pid: %d)\n", pid);
+	pr_info("========================================\n");
+
+	if (item->state == TASK_STOPPED) {
+		pr_warn("Stopped tasks are not supported\n");
+		return 0;
+	}
+
+	if (item->state == TASK_DEAD)
+		return 0;
+
+	ret = collect_mappings(pid, &vmas);
+	if (ret) {
+		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
+		goto err;
+	}
+
+	ret = -1;
+	parasite_ctl = parasite_infect_seized(pid, item, &vmas, NULL);
+	if (!parasite_ctl) {
+		pr_err("Can't infect (pid: %d) with parasite\n", pid);
+		goto err_free;
+	}
+
+	ret = parasite_dump_misc_seized(parasite_ctl, &misc);
+	if (ret) {
+		pr_err("Can't dump misc (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
+	parasite_ctl->pid.virt = item->pid.virt = misc.pid;
+
+	ret = parasite_dump_pages_seized(parasite_ctl, &vmas, &parasite_ctl->mem_pp);
+	if (ret)
+		goto err_cure;
+
+	if (parasite_cure_remote(parasite_ctl, item))
+		pr_err("Can't cure (pid: %d) from parasite\n", pid);
+	list_add_tail(&parasite_ctl->pre_list, ctls);
+err_free:
+	free_mappings(&vmas);
+err:
+	return ret;
+
+err_cure:
+	if (parasite_cure_seized(parasite_ctl, item))
+		pr_err("Can't cure (pid: %d) from parasite\n", pid);
+	goto err_free;
+}
+
 static int dump_one_task(struct pstree_item *item)
 {
 	pid_t pid = item->pid.real;
-	LIST_HEAD(vma_area_list);
+	struct vm_area_list vmas;
 	struct parasite_ctl *parasite_ctl;
 	int ret = -1;
 	struct parasite_dump_misc misc;
@@ -1263,12 +1451,12 @@ static int dump_one_task(struct pstree_item *item)
 	if (!dfds)
 		goto err_free;
 
-	pr_info("Obtainting task stat ... ");
+	pr_info("Obtaining task stat ... ");
 	ret = parse_pid_stat(pid, &pps_buf);
 	if (ret < 0)
 		goto err;
 
-	ret = collect_mappings(pid, &vma_area_list);
+	ret = collect_mappings(pid, &vmas);
 	if (ret) {
 		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1281,7 +1469,7 @@ static int dump_one_task(struct pstree_item *item)
 	}
 
 	ret = -1;
-	parasite_ctl = parasite_infect_seized(pid, item, &vma_area_list);
+	parasite_ctl = parasite_infect_seized(pid, item, &vmas, dfds);
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
 		goto err;
@@ -1301,12 +1489,19 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure_fdset;
 	}
 
-	item->pid.virt = misc.pid;
+	parasite_ctl->pid.virt = item->pid.virt = misc.pid;
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;
 
 	pr_info("sid=%d pgid=%d pid=%d\n",
 		item->sid, item->pgid, item->pid.virt);
+
+	if (item->sid == 0) {
+		pr_err("A session leader of %d(%d) is outside of its pid namespace\n",
+			item->pid.real, item->pid.virt);
+		ret = -1;
+		goto err_cure;
+	}
 
 	ret = -1;
 	cr_fdset = cr_task_fdset_open(item->pid.virt, O_DUMP);
@@ -1336,11 +1531,9 @@ static int dump_one_task(struct pstree_item *item)
 		}
 	}
 
-	ret = parasite_dump_pages_seized(parasite_ctl, &vma_area_list, cr_fdset);
-	if (ret) {
-		pr_err("Can't dump pages (pid: %d) with parasite\n", pid);
+	ret = parasite_dump_pages_seized(parasite_ctl, &vmas, NULL);
+	if (ret)
 		goto err_cure;
-	}
 
 	ret = parasite_dump_sigacts_seized(parasite_ctl, cr_fdset);
 	if (ret) {
@@ -1354,8 +1547,7 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure;
 	}
 
-	ret = dump_task_core_all(pid, &pps_buf, &misc,
-					parasite_ctl, cr_fdset, &vma_area_list);
+	ret = dump_task_core_all(parasite_ctl, &pps_buf, &misc, &vmas, cr_fdset);
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
@@ -1379,7 +1571,7 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
-	ret = dump_task_mappings(pid, &vma_area_list, cr_fdset);
+	ret = dump_task_mappings(pid, &vmas, cr_fdset);
 	if (ret) {
 		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1397,11 +1589,17 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
+	ret = dump_signal_queue(pid, fdset_fd(cr_fdset, CR_FD_SIGNAL), true);
+	if (ret) {
+		pr_err("Can't dump pending signals (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
 	close_cr_fdset(&cr_fdset);
 err:
 	close_pid_proc();
 err_free:
-	free_mappings(&vma_area_list);
+	free_mappings(&vmas);
 	xfree(dfds);
 	return ret;
 
@@ -1412,7 +1610,65 @@ err_cure_fdset:
 	goto err;
 }
 
-int cr_dump_tasks(pid_t pid, const struct cr_options *opts)
+int cr_pre_dump_tasks(pid_t pid)
+{
+	struct pstree_item *item;
+	int ret = -1;
+	LIST_HEAD(ctls);
+	struct parasite_ctl *ctl, *n;
+
+	if (kerndat_init())
+		goto err;
+
+	if (connect_to_page_server())
+		goto err;
+
+	if (collect_pstree(pid))
+		goto err;
+
+	for_each_pstree_item(item)
+		if (pre_dump_one_task(item, &ctls))
+			goto err;
+
+	ret = 0;
+err:
+	pstree_switch_state(root_item,
+			ret ? TASK_ALIVE : opts.final_state);
+	free_pstree(root_item);
+
+	timing_stop(TIME_FROZEN);
+
+	pr_info("Pre-dumping tasks' memory\n");
+	list_for_each_entry_safe(ctl, n, &ctls, pre_list) {
+		struct page_xfer xfer;
+
+		pr_info("\tPre-dumping %d\n", ctl->pid.virt);
+		timing_start(TIME_MEMWRITE);
+		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, ctl->pid.virt);
+		if (ret < 0)
+			break;
+
+		ret = page_xfer_dump_pages(&xfer, ctl->mem_pp, 0);
+
+		xfer.close(&xfer);
+		timing_stop(TIME_MEMWRITE);
+
+		destroy_page_pipe(ctl->mem_pp);
+		list_del(&ctl->pre_list);
+		parasite_cure_local(ctl);
+	}
+
+	if (ret)
+		pr_err("Pre-dumping FAILED.\n");
+	else {
+		write_stats(DUMP_STATS);
+		pr_info("Pre-dumping finished successfully\n");
+	}
+
+	return ret;
+}
+
+int cr_dump_tasks(pid_t pid)
 {
 	struct pstree_item *item;
 	int ret = -1;
@@ -1421,22 +1677,31 @@ int cr_dump_tasks(pid_t pid, const struct cr_options *opts)
 	pr_info("Dumping processes (pid: %d)\n", pid);
 	pr_info("========================================\n");
 
+	if (kerndat_init())
+		goto err;
+
 	if (cpu_init())
 		goto err;
 
 	if (write_img_inventory())
 		goto err;
 
-	if (collect_pstree(pid, opts))
+	if (connect_to_page_server())
+		goto err;
+
+	if (collect_pstree(pid))
+		goto err;
+
+	if (collect_pstree_ids())
 		goto err;
 
 	if (network_lock())
 		goto err;
 
-	if (collect_file_locks(opts))
+	if (collect_file_locks())
 		goto err;
 
-	if (collect_mount_info())
+	if (collect_mount_info(pid))
 		goto err;
 
 	if (mntns_collect_root(root_item->pid.real))
@@ -1491,11 +1756,20 @@ err:
 	if (ret)
 		network_unlock();
 	pstree_switch_state(root_item,
-			ret ? TASK_ALIVE : opts->final_state);
+			ret ? TASK_ALIVE : opts.final_state);
+	timing_stop(TIME_FROZEN);
 	free_pstree(root_item);
 	free_file_locks();
 
 	close_safe(&pidns_proc);
+
+	if (ret) {
+		kill_inventory();
+		pr_err("Dumping FAILED.\n");
+	} else {
+		write_stats(DUMP_STATS);
+		pr_info("Dumping finished successfully\n");
+	}
 
 	return ret;
 }

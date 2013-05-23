@@ -18,7 +18,7 @@
 
 static int ns_fd = -1;
 
-void show_netdevices(int fd, struct cr_options *opt)
+void show_netdevices(int fd)
 {
 	pb_show_plain_pretty(fd, PB_NETDEV, "2:%d");
 }
@@ -146,7 +146,7 @@ static int dump_links(struct cr_fdset *fds)
 
 static int restore_link_cb(struct nlmsghdr *hdr, void *arg)
 {
-	pr_info("Got responce on SETLINK =)\n");
+	pr_info("Got response on SETLINK =)\n");
 	return 0;
 }
 
@@ -256,7 +256,7 @@ static int restore_links(int pid)
 	int fd, nlsk, ret;
 	NetDeviceEntry *nde;
 
-	fd = open_image_ro(CR_FD_NETDEV, pid);
+	fd = open_image(CR_FD_NETDEV, O_RSTR, pid);
 	if (fd < 0)
 		return -1;
 
@@ -318,7 +318,7 @@ static int restore_ip_dump(int type, int pid, char *cmd)
 {
 	int fd, ret;
 
-	ret = fd = open_image_ro(type, pid);
+	ret = fd = open_image(type, O_RSTR, pid);
 	if (fd >= 0) {
 		ret = run_ip_tool(cmd, "restore", fd, -1);
 		close(fd);
@@ -404,7 +404,4 @@ void network_unlock(void)
 	run_scripts("network-unlock");
 }
 
-struct ns_desc net_ns_desc = {
-	.cflag = CLONE_NEWNET,
-	.str = "net",
-};
+struct ns_desc net_ns_desc = NS_DESC_ENTRY(CLONE_NEWNET, "net");

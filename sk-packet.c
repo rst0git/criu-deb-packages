@@ -42,7 +42,7 @@ struct packet_sock_desc {
 
 #define NO_FANOUT	((unsigned int)-1)
 
-void show_packetsk(int fd, struct cr_options *o)
+void show_packetsk(int fd)
 {
 	pb_show_plain_pretty(fd, PB_PACKETSK, "5:%d");
 }
@@ -151,9 +151,11 @@ static int dump_one_packet_fd(int lfd, u32 id, const struct fd_parms *p)
 	struct packet_sock_desc *sd;
 	int i, ret;
 
-	sd = (struct packet_sock_desc *)lookup_socket(p->stat.st_ino, PF_PACKET);
-	if (sd < 0)
+	sd = (struct packet_sock_desc *)lookup_socket(p->stat.st_ino, PF_PACKET, 0);
+	if (IS_ERR_OR_NULL(sd)) {
+		pr_err("Can't find packet socket %"PRIu64"\n", p->stat.st_ino);
 		return -1;
+	}
 
 	pr_info("Dumping packet socket fd %d id %#x\n", lfd, id);
 	BUG_ON(sd->sd.already_dumped);
@@ -217,8 +219,8 @@ int dump_socket_map(struct vma_area *vma)
 {
 	struct packet_sock_desc *sd;
 
-	sd = (struct packet_sock_desc *)lookup_socket(vma->vm_socket_id, PF_PACKET);
-	if (!sd) {
+	sd = (struct packet_sock_desc *)lookup_socket(vma->vm_socket_id, PF_PACKET, 0);
+	if (IS_ERR_OR_NULL(sd)) {
 		pr_err("Can't find packet socket %u to mmap\n", vma->vm_socket_id);
 		return -1;
 	}
@@ -273,10 +275,12 @@ int packet_receive_one(struct nlmsghdr *hdr, void *arg)
 	sd->file_id = 0;
 	sd->type = m->pdiag_type;
 	sd->proto = htons(m->pdiag_num);
+	sd->rx = NULL;
+	sd->tx = NULL;
 	memcpy(&sd->nli, RTA_DATA(tb[PACKET_DIAG_INFO]), sizeof(sd->nli));
 
 	if (packet_save_mreqs(sd, tb[PACKET_DIAG_MCLIST]))
-		return -1;
+		goto err;
 
 	if (tb[PACKET_DIAG_FANOUT])
 		sd->fanout = *(__u32 *)RTA_DATA(tb[PACKET_DIAG_FANOUT]);
@@ -285,17 +289,24 @@ int packet_receive_one(struct nlmsghdr *hdr, void *arg)
 
 	if (tb[PACKET_DIAG_RX_RING]) {
 		sd->rx = xmalloc(sizeof(*sd->rx));
+		if (sd->rx == NULL)
+			goto err;
 		memcpy(sd->rx, RTA_DATA(tb[PACKET_DIAG_RX_RING]), sizeof(*sd->rx));
-	} else
-		sd->rx = NULL;
+	}
 
 	if (tb[PACKET_DIAG_TX_RING]) {
 		sd->tx = xmalloc(sizeof(*sd->tx));
+		if (sd->tx == NULL)
+			goto err;
 		memcpy(sd->tx, RTA_DATA(tb[PACKET_DIAG_TX_RING]), sizeof(*sd->tx));
-	} else
-		sd->tx = NULL;
+	}
 
 	return sk_collect_one(m->pdiag_ino, PF_PACKET, &sd->sd);
+err:
+	xfree(sd->tx);
+	xfree(sd->rx);
+	xfree(sd);
+	return -1;
 }
 
 int get_socket_fd(int pid, VmaEntry *vma)

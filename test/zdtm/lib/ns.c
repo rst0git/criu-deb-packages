@@ -42,6 +42,12 @@ static int prepare_mntns()
 			fprintf(stderr, "mkdir(old) failed: %m\n");
 			return -1;
 		}
+
+		if (mount("none", "/", "none", MS_REC|MS_PRIVATE, NULL)) {
+			fprintf(stderr, "Can't remount root with MS_PRIVATE: %m\n");
+			return -1;
+		}
+
 		if (pivot_root(".", "./old")) {
 			fprintf(stderr, "pivot_root(., ./old) failed: %m\n");
 			return -1;
@@ -66,6 +72,7 @@ static int prepare_mntns()
 			fprintf(stderr, "mknod(/dev/ptmx) failed: %m\n");
 			return -1;
 		}
+		chmod("/dev/ptmx", 0666);
 		if (mkdir("/dev/pts", 0755) && errno != EEXIST) {
 			fprintf(stderr, "mkdir(/dev/pts) failed: %m\n");
 			return -1;
@@ -82,6 +89,7 @@ static int prepare_mntns()
 
 	mkdir("/dev", 0777);
 	mknod("/dev/null", 0777 | S_IFCHR, makedev(1, 3));
+	chmod("/dev/null", 0777);
 	return 0;
 }
 
@@ -103,7 +111,7 @@ static void ns_sig_hand(int signo)
 	char buf[128] = "";
 
 	if (signo == SIGTERM) {
-		sig_received = signo;
+		futex_set_and_wake(&sig_received, signo);
 		len = snprintf(buf, sizeof(buf), "Time to stop and check\n");
 		goto write_out;
 	}
@@ -114,9 +122,9 @@ static void ns_sig_hand(int signo)
 			return;
 		if (pid == -1) {
 			if (errno == ECHILD) {
-				if (sig_received)
+				if (futex_get(&sig_received))
 					return;
-				sig_received = signo;
+				futex_set_and_wake(&sig_received, signo);
 				len = snprintf(buf, sizeof(buf),
 						"All test processes exited\n");
 			} else {
@@ -204,6 +212,15 @@ int ns_init(int argc, char **argv)
 	ret = 1;
 	waitpid(pid, &ret, 0);
 
+
+	pid = fork();
+	if (pid == 0) {
+		execl("/bin/ps", "ps", "axf", "-o", "pid,sid,comm", NULL);
+		fprintf(stderr, "Unable to execute ps: %m\n");
+		exit(1);
+	} else if (pid > 0)
+		waitpid(pid, NULL, 0);
+
 	/* Daemonize */
 	write(status_pipe, &ret, sizeof(ret));
 	close(status_pipe);
@@ -212,6 +229,14 @@ int ns_init(int argc, char **argv)
 
 	/* suspend/resume */
 	test_waitsig();
+
+	pid = fork();
+	if (pid == 0) {
+		execl("/bin/ps", "ps", "axf", "-o", "pid,sid,comm", NULL);
+		fprintf(stderr, "Unable to execute ps: %m\n");
+		exit(1);
+	} else if (pid > 0)
+		waitpid(pid, NULL, 0);
 
 	fd = open(pidfile, O_RDONLY);
 	if (fd == -1) {

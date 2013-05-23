@@ -1,11 +1,11 @@
 #ifndef __CR_ASM_TYPES_H__
 #define __CR_ASM_TYPES_H__
 
-#include <stdint.h>
 #include <stdbool.h>
 #include <signal.h>
 
 #include "asm/bitops.h"
+#include "asm/int.h"
 
 #include "protobuf/core.pb-c.h"
 
@@ -71,37 +71,17 @@
 #define ERESTARTNOHAND		514
 #define ERESTART_RESTARTBLOCK	516
 
-typedef uint64_t		u64;
-typedef int64_t			s64;
-typedef unsigned int		u32;
-typedef signed int		s32;
-typedef unsigned short		u16;
-typedef signed short		s16;
-typedef unsigned char		u8;
-typedef signed char		s8;
-
 #define MAJOR(dev)		((dev)>>8)
 #define MINOR(dev)		((dev) & 0xff)
 
 #define _LINUX_CAPABILITY_VERSION_3	0x20080522
 #define _LINUX_CAPABILITY_U32S_3	2
 
-typedef struct {
-	unsigned long sig[1];
-} rt_sigset_t;
-
 typedef void rt_signalfn_t(int, siginfo_t *, void *);
 typedef rt_signalfn_t *rt_sighandler_t;
 
 typedef void rt_restorefn_t(void);
 typedef rt_restorefn_t *rt_sigrestore_t;
-
-typedef struct {
-	rt_sighandler_t	rt_sa_handler;
-	unsigned long	rt_sa_flags;
-	rt_sigrestore_t	rt_sa_restorer;
-	rt_sigset_t	rt_sa_mask;
-} rt_sigaction_t;
 
 #define _KNSIG           64
 # define _NSIG_BPW      64
@@ -118,6 +98,15 @@ static inline void ksigfillset(k_rtsigset_t *set)
 	for (i = 0; i < _KNSIG_WORDS; i++)
 		set->sig[i] = (unsigned long)-1;
 }
+
+#define SA_RESTORER	0x04000000
+
+typedef struct {
+	rt_sighandler_t	rt_sa_handler;
+	unsigned long	rt_sa_flags;
+	rt_sigrestore_t	rt_sa_restorer;
+	k_rtsigset_t	rt_sa_mask;
+} rt_sigaction_t;
 
 typedef struct {
 	unsigned int	entry_number;
@@ -259,8 +248,6 @@ typedef uint64_t auxv_t;
 #define CORE_THREAD_ARCH_INFO(core) core->thread_info
 
 typedef UserX86RegsEntry UserRegsEntry;
-
-#define BITS_PER_ULONG 64
 
 static inline uint64_t encode_pointer(void *p) { return (uint64_t)p; }
 static inline void *decode_pointer(uint64_t v) { return (void*)v; }

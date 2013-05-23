@@ -1,4 +1,3 @@
-#define CR_NOGLIBC
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -12,6 +11,7 @@
 #include <unistd.h>
 #include <sched.h>
 #include <sys/resource.h>
+#include <signal.h>
 
 #include "compiler.h"
 #include "asm/types.h"
@@ -39,10 +39,26 @@
 
 static struct task_entries *task_entries;
 static futex_t thread_inprogress;
+static futex_t zombies_inprogress;
+static int cap_last_cap;
+
+extern void cr_restore_rt (void) asm ("__cr_restore_rt")
+			__attribute__ ((visibility ("hidden")));
 
 static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 {
 	char *r;
+
+	if (futex_get(&task_entries->start) == CR_STATE_RESTORE_SIGCHLD) {
+		pr_debug("%ld: Collect a zombie with (pid %d, %d)\n",
+			sys_getpid(), siginfo->si_pid, siginfo->si_pid);
+		futex_dec_and_wake(&task_entries->nr_in_progress);
+		futex_dec_and_wake(&zombies_inprogress);
+		task_entries->nr_threads--;
+		task_entries->nr_tasks--;
+		mutex_unlock(&task_entries->zombie_lock);
+		return;
+	}
 
 	if (siginfo->si_code & CLD_EXITED)
 		r = " exited, status=";
@@ -59,9 +75,9 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 	sys_exit_group(1);
 }
 
-static void restore_creds(CredsEntry *ce)
+static int restore_creds(CredsEntry *ce)
 {
-	int b, i;
+	int b, i, ret;
 	struct cap_header hdr;
 	struct cap_data data[_LINUX_CAPABILITY_U32S_3];
 
@@ -74,7 +90,11 @@ static void restore_creds(CredsEntry *ce)
 	 * lose caps bits when changing xids.
 	 */
 
-	sys_prctl(PR_SET_SECUREBITS, 1 << SECURE_NO_SETUID_FIXUP, 0, 0, 0);
+	ret = sys_prctl(PR_SET_SECUREBITS, 1 << SECURE_NO_SETUID_FIXUP, 0, 0, 0);
+	if (ret) {
+		pr_err("Unable to set SECURE_NO_SETUID_FIXUP: %d\n", ret);
+		return -1;
+	}
 
 	/*
 	 * Second -- restore xids. Since we still have the CAP_SETUID
@@ -82,17 +102,40 @@ static void restore_creds(CredsEntry *ce)
 	 * to override the setresXid settings.
 	 */
 
-	sys_setresuid(ce->uid, ce->euid, ce->suid);
+	ret = sys_setresuid(ce->uid, ce->euid, ce->suid);
+	if (ret) {
+		pr_err("Unable to set real, effective and saved user ID: %d\n", ret);
+		return -1;
+	}
+
 	sys_setfsuid(ce->fsuid);
-	sys_setresgid(ce->gid, ce->egid, ce->sgid);
+	if (sys_setfsuid(-1) != ce->fsuid) {
+		pr_err("Unable to set fsuid\n");
+		return -1;
+	}
+
+	ret = sys_setresgid(ce->gid, ce->egid, ce->sgid);
+	if (ret) {
+		pr_err("Unable to set real, effective and saved group ID: %d\n", ret);
+		return -1;
+	}
+
 	sys_setfsgid(ce->fsgid);
+	if (sys_setfsgid(-1) != ce->fsgid) {
+		pr_err("Unable to set fsgid\n");
+		return -1;
+	}
 
 	/*
 	 * Third -- restore securebits. We don't need them in any
 	 * special state any longer.
 	 */
 
-	sys_prctl(PR_SET_SECUREBITS, ce->secbits, 0, 0, 0);
+	ret = sys_prctl(PR_SET_SECUREBITS, ce->secbits, 0, 0, 0);
+	if (ret) {
+		pr_err("Unable to set PR_SET_SECUREBITS: %d\n", ret);
+		return -1;
+	}
 
 	/*
 	 * Fourth -- trim bset. This can only be done while
@@ -101,11 +144,17 @@ static void restore_creds(CredsEntry *ce)
 
 	for (b = 0; b < CR_CAP_SIZE; b++) {
 		for (i = 0; i < 32; i++) {
+			if (b * 32 + i > cap_last_cap)
+				break;
 			if (ce->cap_bnd[b] & (1 << i))
 				/* already set */
 				continue;
-
-			sys_prctl(PR_CAPBSET_DROP, i + b * 32, 0, 0, 0);
+			ret = sys_prctl(PR_CAPBSET_DROP, i + b * 32, 0, 0, 0);
+			if (ret) {
+				pr_err("Unable to drop capability %d: %d\n",
+								i + b * 32, ret);
+				return -1;
+			}
 		}
 	}
 
@@ -125,7 +174,13 @@ static void restore_creds(CredsEntry *ce)
 		data[i].inh = ce->cap_inh[i];
 	}
 
-	sys_capset(&hdr, data);
+	ret = sys_capset(&hdr, data);
+	if (ret) {
+		pr_err("Unable to restore capabilities: %d\n", ret);
+		return -1;
+	}
+
+	return 0;
 }
 
 static void restore_sched_info(struct rst_sched_param *p)
@@ -156,20 +211,55 @@ static void restore_rlims(struct task_restore_core_args *ta)
 	}
 }
 
+static int restore_signals(siginfo_t *ptr, int nr, bool group)
+{
+	int ret, i;
+	k_rtsigset_t to_block;
+
+	ksigfillset(&to_block);
+	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
+	if (ret) {
+		pr_err("Unable to block signals %d", ret);
+		return -1;
+	}
+
+	for (i = 0; i < nr; i++) {
+		siginfo_t *info = ptr + i;
+
+		pr_info("Restore signal %d group %d\n", info->si_signo, group);
+		if (group)
+			ret = sys_rt_sigqueueinfo(sys_getpid(), info->si_signo, info);
+		else
+			ret = sys_rt_tgsigqueueinfo(sys_getpid(),
+						sys_gettid(), info->si_signo, info);
+		if (ret) {
+			pr_err("Unable to send siginfo %d %x with code %d\n",
+					info->si_signo, info->si_code, ret);
+			return -1;;
+		}
+	}
+
+	return 0;
+}
+
 static int restore_thread_common(struct rt_sigframe *sigframe,
 		struct thread_restore_args *args)
 {
 	sys_set_tid_address((int *)decode_pointer(args->clear_tid_addr));
 
-	if (args->has_futex) {
-		if (sys_set_robust_list(decode_pointer(args->futex_rla), args->futex_rla_len)) {
-			pr_err("Robust list err\n");
+	if (args->has_futex && args->futex_rla_len) {
+		int ret;
+
+		ret = sys_set_robust_list(decode_pointer(args->futex_rla),
+					  args->futex_rla_len);
+		if (ret) {
+			pr_err("Failed to recover futex robust list: %d\n", ret);
 			return -1;
 		}
 	}
 
 	if (args->has_blk_sigset)
-		RT_SIGFRAME_UC(sigframe).uc_sigmask.sig[0] = args->blk_sigset;
+		RT_SIGFRAME_UC(sigframe).uc_sigmask = args->blk_sigset;
 
 	restore_sched_info(&args->sp);
 	if (restore_fpu(sigframe, args))
@@ -192,6 +282,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 	struct rt_sigframe *rt_sigframe;
 	unsigned long new_sp;
 	int my_pid = sys_gettid();
+	int ret;
 
 	if (my_pid != args->pid) {
 		pr_err("Thread pid mismatch %d/%d\n", my_pid, args->pid);
@@ -205,14 +296,19 @@ long __export_restore_thread(struct thread_restore_args *args)
 
 	mutex_unlock(&args->ta->rst_lock);
 
-	restore_creds(&args->ta->creds);
-
+	ret = restore_creds(&args->ta->creds);
+	if (ret)
+		goto core_restore_end;
 
 	pr_info("%ld: Restored\n", sys_gettid());
 
 	restore_finish_stage(CR_STATE_RESTORE);
-	restore_finish_stage(CR_STATE_RESTORE_SIGCHLD);
 
+	if (restore_signals(args->siginfo, args->siginfo_nr, false))
+		goto core_restore_end;
+
+	restore_finish_stage(CR_STATE_RESTORE_SIGCHLD);
+	restore_finish_stage(CR_STATE_RESTORE_CREDS);
 	futex_dec_and_wake(&thread_inprogress);
 
 	new_sp = (long)rt_sigframe + SIGFRAME_OFFSET;
@@ -220,6 +316,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 
 core_restore_end:
 	pr_err("Restorer abnormal termination for %ld\n", sys_getpid());
+	futex_abort_and_wake(&task_entries->nr_in_progress);
 	sys_exit_group(1);
 	return -1;
 }
@@ -281,13 +378,15 @@ static u64 restore_mapping(const VmaEntry *vma_entry)
 
 static void rst_tcp_repair_off(struct rst_tcp_sock *rts)
 {
-	int aux;
-
-	tcp_repair_off(rts->sk);
+	int aux, ret;
 
 	aux = rts->reuseaddr;
-	if (sys_setsockopt(rts->sk, SOL_SOCKET, SO_REUSEADDR, &aux, sizeof(aux)) < 0)
-		pr_perror("Failed to restore of SO_REUSEADDR on socket");
+	pr_debug("pie: Turning repair off for %d (reuse %d)\n", rts->sk, aux);
+	tcp_repair_off(rts->sk);
+
+	ret = sys_setsockopt(rts->sk, SOL_SOCKET, SO_REUSEADDR, &aux, sizeof(aux));
+	if (ret < 0)
+		pr_perror("Failed to restore of SO_REUSEADDR on socket (%d)", ret);
 }
 
 static void rst_tcp_socks_all(struct rst_tcp_sock *arr, int size)
@@ -399,12 +498,17 @@ long __export_restore_task(struct task_restore_core_args *args)
 	rt_sigaction_t act;
 
 	task_entries = args->task_entries;
-	sys_sigaction(SIGCHLD, NULL, &act, sizeof(rt_sigset_t));
+
+	ksigfillset(&act.rt_sa_mask);
 	act.rt_sa_handler = sigchld_handler;
-	sys_sigaction(SIGCHLD, &act, NULL, sizeof(rt_sigset_t));
+	act.rt_sa_flags = SA_SIGINFO | SA_RESTORER | SA_RESTART;
+	act.rt_sa_restorer = cr_restore_rt;
+	sys_sigaction(SIGCHLD, &act, NULL, sizeof(k_rtsigset_t));
 
 	log_set_fd(args->logfd);
 	log_set_loglevel(args->loglevel);
+
+	cap_last_cap = args->cap_last_cap;
 
 	pr_info("Switched to the restorer %d\n", my_pid);
 
@@ -682,27 +786,53 @@ long __export_restore_task(struct task_restore_core_args *args)
 
 	restore_rlims(args);
 
-	/* 
-	 * Writing to last-pid is CAP_SYS_ADMIN protected, thus restore
-	 * creds _after_ all threads creation.
-	 */
-
-	restore_creds(&args->creds);
-
 	pr_info("%ld: Restored\n", sys_getpid());
+
+	futex_set(&zombies_inprogress, args->nr_zombies);
 
 	restore_finish_stage(CR_STATE_RESTORE);
 
-	sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(rt_sigset_t));
+	futex_wait_while_gt(&zombies_inprogress, 0);
 
-	futex_set_and_wake(&thread_inprogress, args->nr_threads);
+	sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(k_rtsigset_t));
+
+	ret = restore_signals(args->siginfo, args->siginfo_nr, true);
+	if (ret)
+		goto core_restore_end;
+
+	ret = restore_signals(args->t->siginfo, args->t->siginfo_nr, false);
+	if (ret)
+		goto core_restore_end;
 
 	restore_finish_stage(CR_STATE_RESTORE_SIGCHLD);
 
-	/* Wait until children stop to use args->task_entries */
-	futex_wait_while_gt(&thread_inprogress, 1);
+	if (args->siginfo_size) {
+		ret = sys_munmap(args->siginfo, args->siginfo_size);
+		if (ret < 0) {
+			pr_err("Can't unmap signals %ld\n", ret);
+			goto core_restore_failed;
+		}
+	}
 
 	rst_tcp_socks_all(args->rst_tcp_socks, args->rst_tcp_socks_size);
+
+	/* 
+	 * Writing to last-pid is CAP_SYS_ADMIN protected,
+	 * turning off TCP repair is CAP_SYS_NED_ADMIN protected,
+	 * thus restore* creds _after_ all of the above.
+	 */
+
+	ret = restore_creds(&args->creds);
+
+	futex_set_and_wake(&thread_inprogress, args->nr_threads);
+
+	restore_finish_stage(CR_STATE_RESTORE_CREDS);
+
+	if (ret)
+		BUG();
+
+	/* Wait until children stop to use args->task_entries */
+	futex_wait_while_gt(&thread_inprogress, 1);
 
 	log_set_fd(-1);
 
@@ -741,6 +871,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 	ARCH_RT_SIGRETURN(new_sp);
 
 core_restore_end:
+	futex_abort_and_wake(&task_entries->nr_in_progress);
 	pr_err("Restorer fail %ld\n", sys_getpid());
 	sys_exit_group(1);
 	return -1;

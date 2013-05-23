@@ -72,7 +72,7 @@ struct thread_restore_args {
 	u32				futex_rla_len;
 
 	bool				has_blk_sigset;
-	u64				blk_sigset;
+	k_rtsigset_t			blk_sigset;
 
 	struct rst_sched_param		sp;
 
@@ -82,6 +82,9 @@ struct thread_restore_args {
 	fpu_state_t			fpu_state;
 
 	u32				tls;
+
+	siginfo_t			*siginfo;
+	unsigned int			siginfo_nr;
 } __aligned(sizeof(long));
 
 struct task_restore_core_args {
@@ -95,12 +98,16 @@ struct task_restore_core_args {
 
 	/* threads restoration */
 	int				nr_threads;		/* number of threads */
+	int				nr_zombies;
 	thread_restore_fcall_t		clone_restore_fn;	/* helper address for clone() call */
 	struct thread_restore_args	*thread_args;		/* array of thread arguments */
 	struct shmems			*shmems;
 	struct task_entries		*task_entries;
 	VmaEntry			*self_vmas;
 	VmaEntry			*tgt_vmas;
+	siginfo_t			*siginfo;
+	unsigned int			siginfo_nr;
+	unsigned long			siginfo_size;
 	unsigned int			nr_vmas;
 	unsigned long			premmapped_addr;
 	unsigned long			premmapped_len;
@@ -113,6 +120,7 @@ struct task_restore_core_args {
 	uint32_t			cap_prm[CR_CAP_SIZE];
 	uint32_t			cap_eff[CR_CAP_SIZE];
 	uint32_t			cap_bnd[CR_CAP_SIZE];
+	uint32_t			cap_last_cap;
 
 	MmEntry				mm;
 	auxv_t				mm_saved_auxv[AT_VECTOR_SIZE];
@@ -157,6 +165,13 @@ enum {
 	CR_STATE_RESTORE_PGID,
 	CR_STATE_RESTORE,
 	CR_STATE_RESTORE_SIGCHLD,
+	/*
+	 * For security reason processes can be resumed only when all
+	 * credentials are restored. Otherwise someone can attach to a
+	 * process, which are not restored credentials yet and execute
+	 * some code.
+	 */
+	CR_STATE_RESTORE_CREDS,
 	CR_STATE_COMPLETE
 };
 
@@ -164,6 +179,7 @@ struct task_entries {
 	int nr_threads, nr_tasks, nr_helpers;
 	futex_t nr_in_progress;
 	futex_t start;
+	mutex_t	zombie_lock;
 };
 
 static always_inline struct shmem_info *

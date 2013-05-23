@@ -13,45 +13,47 @@
 #include "mount.h"
 #include "net.h"
 #include "pstree.h"
+#include "stats.h"
 #include "protobuf.h"
 #include "protobuf/inventory.pb-c.h"
+#include "protobuf/pagemap.pb-c.h"
 
 bool fdinfo_per_id = false;
 TaskKobjIdsEntry *root_ids;
 
 int check_img_inventory(void)
 {
-	int fd, ret;
+	int fd, ret = -1;
 	InventoryEntry *he;
 
-	fd = open_image_ro(CR_FD_INVENTORY);
+	fd = open_image(CR_FD_INVENTORY, O_RSTR);
 	if (fd < 0)
 		return -1;
 
-	ret = pb_read_one(fd, &he, PB_INVENTORY);
-	close(fd);
-	if (ret < 0)
-		return ret;
+	if (pb_read_one(fd, &he, PB_INVENTORY) < 0)
+		goto out_close;
 
 	fdinfo_per_id = he->has_fdinfo_per_id ?  he->fdinfo_per_id : false;
-
-	ret = he->img_version;
 
 	if (he->root_ids) {
 		root_ids = xmalloc(sizeof(*root_ids));
 		if (!root_ids)
-			return -1;
+			goto out_err;
 
 		memcpy(root_ids, he->root_ids, sizeof(*root_ids));
-		inventory_entry__free_unpacked(he, NULL);
 	}
 
-	if (ret != CRTOOLS_IMAGES_V1) {
-		pr_err("Not supported images version %u\n", ret);
-		return -1;
+	if (he->img_version != CRTOOLS_IMAGES_V1) {
+		pr_err("Not supported images version %u\n", he->img_version);
+		goto out_err;
 	}
+	ret = 0;
 
-	return 0;
+out_err:
+	inventory_entry__free_unpacked(he, NULL);
+out_close:
+	close(fd);
+	return ret;
 }
 
 int write_img_inventory(void)
@@ -70,9 +72,12 @@ int write_img_inventory(void)
 	he.fdinfo_per_id = true;
 	he.has_fdinfo_per_id = true;
 
+	crt.state = TASK_ALIVE;
 	crt.pid.real = getpid();
-	if (get_task_ids(&crt))
+	if (get_task_ids(&crt)){
+		close(fd);
 		return -1;
+	}
 
 	he.root_ids = crt.ids;
 
@@ -84,7 +89,13 @@ int write_img_inventory(void)
 	return 0;
 }
 
-static void show_inventory(int fd, struct cr_options *o)
+void kill_inventory(void)
+{
+	unlinkat(get_service_fd(IMG_FD_OFF),
+			fdset_template[CR_FD_INVENTORY].fmt, 0);
+}
+
+static void show_inventory(int fd)
 {
 	pb_show_vertical(fd, PB_INVENTORY);
 }
@@ -103,14 +114,15 @@ static void show_inventory(int fd, struct cr_options *o)
 		.show	= _show,		\
 	}
 
-static void show_raw_image(int fd, struct cr_options *opt) {};
+static void show_raw_image(int fd) {};
 
 struct cr_fd_desc_tmpl fdset_template[CR_FD_MAX] = {
 	FD_ENTRY(INVENTORY,	"inventory",	 show_inventory),
 	FD_ENTRY(FDINFO,	"fdinfo-%d",	 show_files),
-	FD_ENTRY(PAGES,		"pages-%d",	 show_pages),
-	FD_ENTRY(SHMEM_PAGES,	"pages-shmem-%ld", show_pages),
+	FD_ENTRY(PAGEMAP,	"pagemap-%ld",	 show_pagemap),
+	FD_ENTRY(SHMEM_PAGEMAP,	"pagemap-shmem-%ld", show_pagemap),
 	FD_ENTRY(REG_FILES,	"reg-files",	 show_reg_files),
+	FD_ENTRY(NS_FILES,	"ns-files",	 show_ns_files),
 	FD_ENTRY(EVENTFD,	"eventfd",	 show_eventfds),
 	FD_ENTRY(EVENTPOLL,	"eventpoll",	 show_eventpoll),
 	FD_ENTRY(EVENTPOLL_TFD,	"eventpoll-tfd", show_eventpoll_tfd),
@@ -132,6 +144,7 @@ struct cr_fd_desc_tmpl fdset_template[CR_FD_MAX] = {
 	FD_ENTRY(UNIXSK,	"unixsk",	 show_unixsk),
 	FD_ENTRY(INETSK,	"inetsk",	 show_inetsk),
 	FD_ENTRY(PACKETSK,	"packetsk",	 show_packetsk),
+	FD_ENTRY(NETLINKSK,	"netlinksk",	 show_netlinksk),
 	FD_ENTRY(SK_QUEUES,	"sk-queues",	 show_sk_queues),
 	FD_ENTRY(ITIMERS,	"itimers-%d",	 show_itimers),
 	FD_ENTRY(CREDS,		"creds-%d",	 show_creds),
@@ -152,7 +165,18 @@ struct cr_fd_desc_tmpl fdset_template[CR_FD_MAX] = {
 	FD_ENTRY(TTY,		"tty",		 show_tty),
 	FD_ENTRY(TTY_INFO,	"tty-info",	 show_tty_info),
 	FD_ENTRY(FILE_LOCKS,	"filelocks-%d",	 show_file_locks),
-	FD_ENTRY(RLIMIT,	"rlimit",	 show_rlimit),
+	FD_ENTRY(RLIMIT,	"rlimit-%d",	 show_rlimit),
+	FD_ENTRY(PAGES,		"pages-%u",	 NULL),
+	FD_ENTRY(PAGES_OLD,	"pages-%d",	 NULL),
+	FD_ENTRY(SHM_PAGES_OLD, "pages-shmem-%ld", NULL),
+	FD_ENTRY(SIGNAL,	"signal-s-%d",	 show_siginfo), /* shared signals */
+	FD_ENTRY(PSIGNAL,	"signal-p-%d",	 show_siginfo), /* private signals */
+
+	[CR_FD_STATS] = {
+		.fmt = "stats-%s",
+		.magic = STATS_MAGIC,
+		.show = show_stats,
+	},
 };
 
 static struct cr_fdset *alloc_cr_fdset(int nr)
@@ -250,9 +274,8 @@ struct cr_fdset *cr_glob_fdset_open(int mode)
 	return cr_fdset_open(-1 /* ignored */, _CR_FD_GLOB_FROM, _CR_FD_GLOB_TO, mode);
 }
 
-int open_image(int type, unsigned long flags, ...)
+int open_image_at(int dfd, int type, unsigned long flags, ...)
 {
-	int dfd = get_service_fd(IMG_FD_OFF);
 	char path[PATH_MAX];
 	va_list args;
 	int ret;
@@ -312,10 +335,73 @@ int open_image_dir(void)
 
 	close(fd);
 
+	if (opts.img_parent) {
+		ret = symlink(opts.img_parent, CR_PARENT_LINK);
+		if (ret < 0) {
+			pr_perror("Can't link parent snapshot.");
+			goto err;
+		}
+
+		fd = open(CR_PARENT_LINK, O_RDONLY);
+		if (fd < 0) {
+			pr_perror("Can't open parent snapshot.");
+			goto err;
+		}
+
+		ret = install_service_fd(PARENT_FD_OFF, fd);
+
+		close(fd);
+	}
+
 	return ret;
+
+err:
+	close_image_dir();
+	return -1;
 }
 
 void close_image_dir(void)
 {
 	close_service_fd(IMG_FD_OFF);
+}
+
+static unsigned long page_ids = 1;
+
+void up_page_ids_base(void)
+{
+	/*
+	 * When page server and criu dump work on
+	 * the same dir, the shmem pagemaps and regular
+	 * pagemaps may have IDs conflicts. Fix this by
+	 * making page server produce page images with
+	 * higher IDs.
+	 */
+
+	BUG_ON(page_ids != 1);
+	page_ids += 0x10000;
+}
+
+int open_pages_image_at(int dfd, unsigned long flags, int pm_fd)
+{
+	unsigned id;
+
+	if (flags == O_RDONLY) {
+		PagemapHead *h;
+		if (pb_read_one(pm_fd, &h, PB_PAGEMAP_HEAD) < 0)
+			return -1;
+		id = h->pages_id;
+		pagemap_head__free_unpacked(h, NULL);
+	} else {
+		PagemapHead h = PAGEMAP_HEAD__INIT;
+		id = h.pages_id = page_ids++;
+		if (pb_write_one(pm_fd, &h, PB_PAGEMAP_HEAD) < 0)
+			return -1;
+	}
+
+	return open_image_at(dfd, CR_FD_PAGES, flags, id);
+}
+
+int open_pages_image(unsigned long flags, int pm_fd)
+{
+	return open_pages_image_at(get_service_fd(IMG_FD_OFF), flags, pm_fd);
 }

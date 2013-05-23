@@ -18,7 +18,9 @@
 
 #include "protobuf.h"
 #include "protobuf/inventory.pb-c.h"
+#include "protobuf/stats.pb-c.h"
 #include "protobuf/regfile.pb-c.h"
+#include "protobuf/ns.pb-c.h"
 #include "protobuf/eventfd.pb-c.h"
 #include "protobuf/eventpoll.pb-c.h"
 #include "protobuf/signalfd.pb-c.h"
@@ -51,6 +53,9 @@
 #include "protobuf/tty.pb-c.h"
 #include "protobuf/file-lock.pb-c.h"
 #include "protobuf/rlimit.pb-c.h"
+#include "protobuf/pagemap.pb-c.h"
+#include "protobuf/siginfo.pb-c.h"
+#include "protobuf/sk-netlink.pb-c.h"
 
 typedef size_t (*pb_getpksize_t)(void *obj);
 typedef size_t (*pb_pack_t)(void *obj, void *where);
@@ -90,8 +95,10 @@ static struct cr_pb_message_desc cr_pb_descs[PB_MAX];
 void cr_pb_init(void)
 {
 	CR_PB_DESC(INVENTORY,		Inventory,	inventory);
+	CR_PB_DESC(STATS,		Stats,		stats);
 	CR_PB_DESC(FDINFO,		Fdinfo,		fdinfo);
 	CR_PB_DESC(REG_FILES,		RegFile,	reg_file);
+	CR_PB_DESC(NS_FILES,		NsFile,		ns_file);
 	CR_PB_DESC(EVENTFD,		EventfdFile,	eventfd_file);
 	CR_PB_DESC(EVENTPOLL,		EventpollFile,	eventpoll_file);
 	CR_PB_DESC(EVENTPOLL_TFD,	EventpollTfd,	eventpoll_tfd);
@@ -132,6 +139,10 @@ void cr_pb_init(void)
 	CR_PB_DESC(TTY_INFO,		TtyInfo,	tty_info);
 	CR_PB_DESC(FILE_LOCK,		FileLock,	file_lock);
 	CR_PB_DESC(RLIMIT,		Rlimit,		rlimit);
+	CR_PB_MDESC_INIT(cr_pb_descs[PB_PAGEMAP_HEAD],	PagemapHead,	pagemap_head);
+	CR_PB_DESC(PAGEMAP,		Pagemap,	pagemap);
+	CR_PB_DESC(SIGINFO,		Siginfo,	siginfo);
+	CR_PB_DESC(NETLINKSK,		NetlinkSk,	netlink_sk);
 }
 
 /*
@@ -341,27 +352,73 @@ static int pb_show_pretty(pb_pr_field_t *field)
 	return 0;
 }
 
-static int pb_field_show_pretty(pb_pr_ctl_t *ctl)
+static void pb_copy_fmt(const char *fmt, char *to)
 {
-	pb_pr_field_t *field = &ctl->cur;
-	int found;
-	char cookie[32];
-	const char *ptr;
+	while (*fmt != ' ' && *fmt != '\0') {
+		*to = *fmt;
+		to++;
+		fmt++;
+	}
 
-	if (!ctl->pretty_fmt || field->depth)
-		return 0;
+	*to = '\0';
+}
 
-	sprintf(cookie, " %d:", field->number);
-	if (!strncmp(ctl->pretty_fmt, &cookie[1], strlen(&cookie[1])))
-		ptr = ctl->pretty_fmt;
-	else {
-		ptr = strstr(ctl->pretty_fmt, cookie);
-		if (!ptr)
+static const char *pb_next_pretty(const char *pfmt)
+{
+	pfmt = strchr(pfmt, ' ');
+	if (pfmt) {
+		while (*pfmt == ' ')
+			pfmt++;
+
+		if (*pfmt == '\0')
+			pfmt = NULL;
+	}
+
+	return pfmt;
+}
+
+static int pb_find_fmt(char *what, pb_pr_ctl_t *ctl)
+{
+	int len;
+	const char *pretty = ctl->pretty_fmt;
+
+	len = strlen(what);
+	while (1) {
+		if (!strncmp(pretty, what, len)) {
+			pb_copy_fmt(pretty + len, ctl->cur.fmt);
+			return 1;
+		}
+
+		pretty = pb_next_pretty(pretty + len);
+		if (!pretty)
 			return 0;
 	}
-	found = sscanf(ptr, "%*[ 1-9:]%s", field->fmt);
-	BUG_ON(found > 1);
-	return found;
+}
+
+static int pb_field_show_pretty(const ProtobufCFieldDescriptor *fd, pb_pr_ctl_t *ctl)
+{
+	char cookie[32];
+
+	if (!ctl->pretty_fmt)
+		return 0;
+
+	sprintf(cookie, "%s:", fd->name);
+	if (pb_find_fmt(cookie, ctl))
+		return 1;
+
+	if (!ctl->cur.depth)
+		sprintf(cookie, "%d:", ctl->cur.number);
+	else
+		sprintf(cookie, "%d.%d:", ctl->cur.depth, ctl->cur.number);
+
+	if (pb_find_fmt(cookie, ctl))
+		return 1;
+
+	sprintf(cookie, "*:");
+	if (pb_find_fmt(cookie, ctl))
+		return 1;
+
+	return 0;
 }
 
 static pb_pr_show_t get_pb_show_function(int type)
@@ -398,11 +455,11 @@ static pb_pr_show_t get_pb_show_function(int type)
 	return pb_msg_unk;
 }
 
-static pb_pr_show_t get_show_function(int type, pb_pr_ctl_t *ctl)
+static pb_pr_show_t get_show_function(const ProtobufCFieldDescriptor *fd, pb_pr_ctl_t *ctl)
 {
-	if (pb_field_show_pretty(ctl))
+	if (pb_field_show_pretty(fd, ctl))
 		return pb_show_pretty;
-	return get_pb_show_function(type);
+	return get_pb_show_function(fd->type);
 }
 
 static void pb_show_repeated(pb_pr_ctl_t *ctl, int nr_fields, pb_pr_show_t show,
@@ -438,7 +495,7 @@ static void pb_show_field(const ProtobufCFieldDescriptor *fd,
 	print_tabs(ctl);
 	pr_msg("%s: ", fd->name);
 
-	show = get_show_function(fd->type, ctl);
+	show = get_show_function(fd, ctl);
 
 	pb_show_repeated(ctl, nr_fields, show, pb_show_prepare_field_context(fd, ctl));
 
@@ -498,14 +555,14 @@ static void pb_show_msg(const void *msg, pb_pr_ctl_t *ctl)
 	}
 }
 
-static inline void pb_no_payload(int fd, void *obj, int flags) { }
+static inline void pb_no_payload(int fd, void *obj) { }
 
 void do_pb_show_plain(int fd, int type, int single_entry,
-		void (*payload_hadler)(int fd, void *obj, int flags),
-		int flags, const char *pretty_fmt)
+		void (*payload_hadler)(int fd, void *obj),
+		const char *pretty_fmt)
 {
 	pb_pr_ctl_t ctl = {NULL, single_entry, pretty_fmt};
-	void (*handle_payload)(int fd, void *obj, int flags);
+	void (*handle_payload)(int fd, void *obj);
 
 	if (!cr_pb_descs[type].pb_desc) {
 		pr_err("Wrong object requested %d\n", type);
@@ -522,12 +579,21 @@ void do_pb_show_plain(int fd, int type, int single_entry,
 
 		ctl.arg = (void *)cr_pb_descs[type].pb_desc;
 		pb_show_msg(obj, &ctl);
-		handle_payload(fd, obj, flags);
+		handle_payload(fd, obj);
 		cr_pb_descs[type].free(obj, NULL);
 		if (single_entry)
 			break;
 		pr_msg("\n");
 	}
+}
+
+static char *image_name(int fd)
+{
+	static char image_path[PATH_MAX];
+
+	if (read_fd_link(fd, image_path, sizeof(image_path)) > 0)
+		return image_path;
+	return NULL;
 }
 
 /*
@@ -549,7 +615,8 @@ int do_pb_read_one(int fd, void **pobj, int type, bool eof)
 	int ret;
 
 	if (!cr_pb_descs[type].pb_desc) {
-		pr_err("Wrong object requested %d\n", type);
+		pr_err("Wrong object requested %d on %s\n",
+			type, image_name(fd));
 		return -1;
 	}
 
@@ -560,12 +627,14 @@ int do_pb_read_one(int fd, void **pobj, int type, bool eof)
 		if (eof) {
 			return 0;
 		} else {
-			pr_err("Unexpected EOF\n");
+			pr_err("Unexpected EOF on %s\n",
+			       image_name(fd));
 			return -1;
 		}
 	} else if (ret < sizeof(size)) {
-		pr_perror("Read %d bytes while %d expected",
-			  ret, (int)sizeof(size));
+		pr_perror("Read %d bytes while %d expected on %s",
+			  ret, (int)sizeof(size),
+			  image_name(fd));
 		return -1;
 	}
 
@@ -578,10 +647,12 @@ int do_pb_read_one(int fd, void **pobj, int type, bool eof)
 
 	ret = read(fd, buf, size);
 	if (ret < 0) {
-		pr_perror("Can't read %d bytes from file", size);
+		pr_perror("Can't read %d bytes from file %s",
+			  size, image_name(fd));
 		goto err;
 	} else if (ret != size) {
-		pr_perror("Read %d bytes while %d expected", ret, size);
+		pr_perror("Read %d bytes while %d expected from %s",
+			  ret, size, image_name(fd));
 		ret = -1;
 		goto err;
 	}
@@ -589,7 +660,8 @@ int do_pb_read_one(int fd, void **pobj, int type, bool eof)
 	*pobj = cr_pb_descs[type].unpack(NULL, size, buf);
 	if (!*pobj) {
 		ret = -1;
-		pr_err("Failed unpacking object %p\n", pobj);
+		pr_err("Failed unpacking object %p from %s\n",
+		       pobj, image_name(fd));
 		goto err;
 	}
 
@@ -662,7 +734,7 @@ static int __collect_image(int fd_t, int obj_t, unsigned size,
 {
 	int fd, ret;
 
-	fd = open_image_ro(fd_t);
+	fd = open_image(fd_t, O_RSTR);
 	if (fd < 0)
 		return -1;
 
