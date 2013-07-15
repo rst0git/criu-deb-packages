@@ -13,7 +13,6 @@
 
 struct fdinfo_list_entry;
 struct sk_opts_entry;
-struct cr_options;
 struct file_desc;
 struct fd_parms;
 struct cr_fdset;
@@ -55,10 +54,11 @@ extern char *skstate2s(u32 state);
 
 extern struct socket_desc *lookup_socket(int ino, int family, int proto);
 
-extern int dump_one_inet(struct fd_parms *p, int lfd, const int fdinfo);
-extern int dump_one_inet6(struct fd_parms *p, int lfd, const int fdinfo);
-extern int dump_one_unix(struct fd_parms *p, int lfd, const int fdinfo);
-extern int dump_one_netlink(struct fd_parms *p, int lfd, const int fdinfo);
+extern const struct fdtype_ops unix_dump_ops;
+extern const struct fdtype_ops inet_dump_ops;
+extern const struct fdtype_ops inet6_dump_ops;
+extern const struct fdtype_ops netlink_dump_ops;
+extern const struct fdtype_ops packet_dump_ops;
 
 extern int inet_collect_one(struct nlmsghdr *h, int family, int type);
 extern int unix_receive_one(struct nlmsghdr *h, void *);

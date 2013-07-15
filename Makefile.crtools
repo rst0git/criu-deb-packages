@@ -3,6 +3,7 @@ obj-y	+= mem.o
 obj-y	+= cr-restore.o
 obj-y	+= crtools.o
 obj-y	+= image.o
+obj-y	+= image-desc.o
 obj-y	+= net.o
 obj-y	+= proc_parse.o
 obj-y	+= cr-dump.o
@@ -39,6 +40,7 @@ obj-y	+= fsnotify.o
 obj-y	+= signalfd.o
 obj-y	+= pstree.o
 obj-y	+= protobuf.o
+obj-y	+= protobuf-desc.o
 obj-y	+= tty.o
 obj-y	+= cr-exec.o
 obj-y	+= file-lock.o
@@ -47,6 +49,8 @@ obj-y	+= page-xfer.o
 obj-y	+= page-read.o
 obj-y	+= kerndat.o
 obj-y	+= stats.o
+obj-y	+= sigframe.o
+obj-y	+= arch/$(ARCH)/vdso.o
 
 ifneq ($(MAKECMDGOALS),clean)
 incdeps := y

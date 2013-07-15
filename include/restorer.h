@@ -12,6 +12,11 @@
 #include "lock.h"
 #include "util.h"
 #include "crtools.h"
+#include "asm/restorer.h"
+
+#include "vdso.h"
+
+#include <time.h>
 
 #include "protobuf/mm.pb-c.h"
 #include "protobuf/vma.pb-c.h"
@@ -34,7 +39,8 @@ typedef long (*thread_restore_fcall_t) (struct thread_restore_args *args);
  */
 #define RESTORE_ARGS_SIZE		(512)
 #define RESTORE_STACK_REDZONE		(128)
-#define RESTORE_STACK_SIGFRAME		(KILO(16))
+/* sigframe should be aligned on 64 byte for x86 and 8 bytes for arm */
+#define RESTORE_STACK_SIGFRAME		ALIGN(sizeof(struct rt_sigframe) + SIGFRAME_OFFSET, 64)
 #define RESTORE_STACK_SIZE		(KILO(32))
 #define RESTORE_HEAP_SIZE		(KILO(16))
 
@@ -57,6 +63,20 @@ struct rst_sched_param {
 	int prio;
 };
 
+struct str_posix_timer {
+	long it_id;
+	int clock_id;
+	int si_signo;
+	int it_sigev_notify;
+	void * sival_ptr;
+};
+
+struct restore_posix_timer {
+	struct str_posix_timer spt;
+	struct itimerspec val;
+	int overrun;
+};
+
 struct task_restore_core_args;
 
 /* Make sure it's pow2 in size */
@@ -71,15 +91,9 @@ struct thread_restore_args {
 	u64				futex_rla;
 	u32				futex_rla_len;
 
-	bool				has_blk_sigset;
-	k_rtsigset_t			blk_sigset;
-
 	struct rst_sched_param		sp;
 
 	struct task_restore_core_args	*ta;
-
-	bool				has_fpu;
-	fpu_state_t			fpu_state;
 
 	u32				tls;
 
@@ -115,6 +129,10 @@ struct task_restore_core_args {
 
 	struct itimerval		itimers[3];
 
+	int 				timer_n;
+	struct restore_posix_timer 	*posix_timers;
+	unsigned long			timers_sz;
+
 	CredsEntry			creds;
 	uint32_t			cap_inh[CR_CAP_SIZE];
 	uint32_t			cap_prm[CR_CAP_SIZE];
@@ -132,6 +150,9 @@ struct task_restore_core_args {
 
 	struct rst_tcp_sock		*rst_tcp_socks;
 	int				rst_tcp_socks_size;
+
+	struct vdso_symtable		vdso_sym_rt;		/* runtime vdso symbols */
+	unsigned long			vdso_rt_parked_at;	/* safe place to keep vdso */
 } __aligned(sizeof(long));
 
 #define SHMEMS_SIZE	4096
@@ -161,6 +182,7 @@ struct shmems {
 #define TASK_ENTRIES_SIZE 4096
 
 enum {
+	CR_STATE_RESTORE_NS, /* is used for executing "setup-namespace" scripts */
 	CR_STATE_FORKING,
 	CR_STATE_RESTORE_PGID,
 	CR_STATE_RESTORE,

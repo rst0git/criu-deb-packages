@@ -25,6 +25,7 @@ static/sched_prio00
 static/sched_policy00
 static/file_shared
 static/timers
+static/posix_timers
 static/futex
 static/futex-rl
 static/xids00
@@ -147,12 +148,12 @@ fanotify00
 sk-netlink
 "
 
-CRTOOLS=$(readlink -f `dirname $0`/../crtools)
-CRTOOLS_CPT=$CRTOOLS
+CRIU=$(readlink -f `dirname $0`/../criu)
+CRIU_CPT=$CRIU
 TMP_TREE=""
 
-test -x $CRTOOLS || {
-	echo "$CRTOOLS is unavailable"
+test -x $CRIU || {
+	echo "$CRIU is unavailable"
 	exit 1
 }
 
@@ -172,7 +173,7 @@ check_mainstream()
 	local -a ver_arr
 	local ver_str=`uname -r`
 
-	$CRTOOLS check && return 0
+	$CRIU check && return 0
 	MAINSTREAM_KERNEL=1
 
 	cat >&2 <<EOF
@@ -193,13 +194,19 @@ EOF
 	return 1;
 }
 
-umount_zdtm_root()
+exit_callback()
 {
-	[ -z "$ZDTM_ROOT" ] && return;
-	umount -l "$ZDTM_ROOT"
-	rmdir "$ZDTM_ROOT"
+	echo $@
+	[ -n "$ZDTM_ROOT" ] && {
+		umount -l "$ZDTM_ROOT"
+		rmdir "$ZDTM_ROOT"
+	}
+
+	[[ -n "$ZDTM_FAILED" && -n "$DUMP_ARCHIVE" ]] && tar -czf $DUMP_ARCHIVE dump
+	[ -n "$TMPFS_DUMP" ] &&
+		umount -l "$TMPFS_DUMP"
 }
-trap umount_zdtm_root EXIT
+trap exit_callback EXIT
 
 construct_root()
 {
@@ -249,7 +256,7 @@ start_test()
 	else
 		if [ -z "$ZDTM_ROOT" ]; then
 			mkdir dump
-			ZDTM_ROOT=`mktemp -d /tmp/crtools-root.XXXXXX`
+			ZDTM_ROOT=`mktemp -d /tmp/criu-root.XXXXXX`
 			ZDTM_ROOT=`readlink -f $ZDTM_ROOT`
 			mount --bind . $ZDTM_ROOT || return 1
 		fi
@@ -296,6 +303,8 @@ run_test()
 {
 	local test=$1
 	local linkremap=
+	local snapopt=
+	local snappdir=
 
 	[ -n "$EXCLUDE_PATTERN" ] && echo $test | grep "$EXCLUDE_PATTERN" && return 0
 
@@ -344,63 +353,73 @@ EOF
 
 	for i in `seq $ITERATIONS`; do
 
-	ddump=dump/$tname/$PID/$i
-	DUMP_PATH=`pwd`/$ddump
-	echo Dump $PID
-	mkdir -p $ddump
+		ddump=dump/$tname/$PID/$i
+		DUMP_PATH=`pwd`/$ddump
+		echo Dump $PID
+		mkdir -p $ddump
 
-	if [ $PAGE_SERVER -eq 1 ]; then
-		$CRTOOLS page-server -D $ddump -o page_server.log -v 4 --port $PS_PORT --daemon
-		PS_PID=$!
-		opts="--page-server --address 127.0.0.1 --port $PS_PORT"
-	fi
-
-
-	save_fds $PID  $ddump/dump.fd
-	setsid $CRTOOLS_CPT dump $opts --file-locks --tcp-established $linkremap \
-		-x --evasive-devices -D $ddump -o dump.log -v 4 -t $PID $args $ARGS || {
-		echo WARNING: process $tname is left running for your debugging needs
-		return 1
-	}
-
-	if [ $PAGE_SERVER -eq 1 ]; then
-		wait $PS_PID
-	fi
-
-	if expr " $ARGS" : ' -s' > /dev/null; then
-		save_fds $PID  $ddump/dump.fd.after
-		diff_fds $ddump/dump.fd $ddump/dump.fd.after || return 1
-		killall -CONT $tname
-		if [[ $linkremap ]]; then
-			echo "remove ./$tdir/link_remap.*"
-			rm -f ./$tdir/link_remap.*
+		if [ $PAGE_SERVER -eq 1 ]; then
+			$CRIU page-server -D $ddump -o page_server.log -v4 --port $PS_PORT --daemon
+			PS_PID=$!
+			opts="--page-server --address 127.0.0.1 --port $PS_PORT"
 		fi
-	else
-		# Wait while tasks are dying, otherwise PIDs would be busy.
-		for i in $ddump/core-*.img; do
-			local pid
 
-			[ -n "$PIDNS" ] && break;
+		if [ -n "$SNAPSHOT" ]; then
+			snapopt=""
+			[ "$i" -ne "$ITERATIONS" ] && snapopt="$snapopt -R --track-mem"
+			[ -n "$snappdir" ] && snapopt="$snapopt --prev-images-dir=$snappdir"
+		fi
 
-			pid=`expr "$i" : '.*/core-\([0-9]*\).img'`
-			while :; do
-				kill -0 $pid > /dev/null 2>&1 || break;
-				echo Waiting the process $pid
-				sleep 0.1
+		save_fds $PID  $ddump/dump.fd
+		setsid $CRIU_CPT dump $opts --file-locks --tcp-established $linkremap \
+			-x --evasive-devices -D $ddump -o dump.log -v4 -t $PID $args $ARGS $snapopt || {
+			echo WARNING: process $tname is left running for your debugging needs
+			return 1
+		}
+
+		if [ -n "$SNAPSHOT" ]; then
+			snappdir=../`basename $ddump`
+			[ "$i" -ne "$ITERATIONS" ] && continue
+		fi
+
+		if [ $PAGE_SERVER -eq 1 ]; then
+			wait $PS_PID
+		fi
+
+		if expr " $ARGS" : ' -s' > /dev/null; then
+			save_fds $PID  $ddump/dump.fd.after
+			diff_fds $ddump/dump.fd $ddump/dump.fd.after || return 1
+			killall -CONT $tname
+			if [[ $linkremap ]]; then
+				echo "remove ./$tdir/link_remap.*"
+				rm -f ./$tdir/link_remap.*
+			fi
+		else
+			# Wait while tasks are dying, otherwise PIDs would be busy.
+			for i in $ddump/core-*.img; do
+				local pid
+
+				[ -n "$PIDNS" ] && break;
+
+				pid=`expr "$i" : '.*/core-\([0-9]*\).img'`
+				while :; do
+					kill -0 $pid > /dev/null 2>&1 || break;
+					echo Waiting the process $pid
+					sleep 0.1
+				done
 			done
-		done
 
-		echo Restore
-		setsid $CRTOOLS restore --file-locks --tcp-established -x -D $ddump -o restore.log -v 4 -d $args || return 2
+			echo Restore
+			setsid $CRIU restore --file-locks --tcp-established -x -D $ddump -o restore.log -v4 -d $args || return 2
 
-		for i in `seq 5`; do
-			save_fds $PID  $ddump/restore.fd
-			diff_fds $ddump/dump.fd $ddump/restore.fd && break
-			sleep 0.2
-		done
-		[ $i -eq 5 ] && return 2;
-		[ -n "$PIDNS" ] && PID=`cat $TPID`
-	fi
+			for i in `seq 5`; do
+				save_fds $PID  $ddump/restore.fd
+				diff_fds $ddump/dump.fd $ddump/restore.fd && break
+				sleep 0.2
+			done
+			[ $i -eq 5 ] && return 2;
+			[ -n "$PIDNS" ] && PID=`cat $TPID`
+		fi
 
 	done
 
@@ -423,6 +442,8 @@ case_error()
 {
 	test=${ZP}/${1#ns/}
 	local test_log=`pwd`/$test.out
+
+	ZDTM_FAILED=1
 
 	echo "Test: $test"
 	echo "====================== ERROR ======================"
@@ -447,9 +468,9 @@ case_error()
 checkout()
 {
 	local commit=`git describe $1` &&
-	TMP_TREE=`dirname $CRTOOLS`/crtools.$commit &&
+	TMP_TREE=`dirname $CRIU`/criu.$commit &&
 	mkdir -p $TMP_TREE &&
-	git --git-dir `dirname $CRTOOLS`/.git archive $commit . | tar -x -C $TMP_TREE &&
+	git --git-dir `dirname $CRIU`/.git archive $commit . | tar -x -C $TMP_TREE &&
 	make -C $TMP_TREE -j 32
 }
 
@@ -470,7 +491,7 @@ while :; do
 	if [ "$1" = "-b" ]; then
 		shift
 		checkout $1 || exit 1
-		CRTOOLS_CPT=$TMP_TREE/crtools
+		CRIU_CPT=$TMP_TREE/criu
 		shift
 		continue
 	fi
@@ -496,6 +517,24 @@ while :; do
 		EXCLUDE_PATTERN=$1
 		shift
 		continue;
+	fi
+	if [ "$1" = "-t" ]; then
+		shift
+		TMPFS_DUMP=dump
+		[ -d dump ] || mkdir $TMPFS_DUMP
+		mount -t tmpfs none $TMPFS_DUMP || exit 1
+		continue;
+	fi
+	if [ "$1" = "-a" ]; then
+		shift
+		DUMP_ARCHIVE=$1
+		shift
+		continue;
+	fi
+	if [ "$1" = "-s" ]; then
+		SNAPSHOT=1
+		shift
+		continue
 	fi
 	break;
 done
@@ -532,6 +571,8 @@ Options:
 	-C : Delete dump files if a test completed successfully
 	-b <commit> : Check backward compatibility
 	-x <PATTERN>: Exclude pattern
+	-t : mount tmpfs for dump files
+	-a <FILE>.tar.gz : save archive with dump files and logs
 EOF
 elif [ "${1:0:1}" = '-' ]; then
 	echo "unrecognized option $1"

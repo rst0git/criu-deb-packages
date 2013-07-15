@@ -1196,19 +1196,14 @@ static int dump_one_pty(int lfd, u32 id, const struct fd_parms *p)
 	return ret;
 }
 
-static const struct fdtype_ops tty_ops = {
+const struct fdtype_ops tty_dump_ops = {
 	.type	= FD_TYPES__TTY,
 	.dump	= dump_one_pty,
 };
 
-int dump_tty(struct fd_parms *p, int lfd, const int fdinfo)
+int tty_prep_fds(void)
 {
-	return do_dump_gen_file(p, lfd, &tty_ops, fdinfo);
-}
-
-int tty_prep_fds(struct cr_options *opts)
-{
-	if (!opts->shell_job)
+	if (!opts.shell_job)
 		return 0;
 
 	if (!isatty(STDIN_FILENO)) {

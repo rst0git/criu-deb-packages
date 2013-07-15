@@ -3,6 +3,8 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/time.h>
+#include <limits.h>
+#include <string.h>
 
 #include "zdtmtst.h"
 
@@ -16,15 +18,30 @@ sigset_t mask;
 #define FAIL_OVERRUN		4
 
 #define MAX_TIMER_DISPLACEMENT	10
+#define NO_PERIODIC
 
-static void realtime_handler(int sig, siginfo_t *si, void *uc);
-static void monotonic_handler(int sig, siginfo_t *si, void *uc);
+#ifndef NO_PERIODIC
+static void realtime_periodic_handler(int sig, siginfo_t *si, void *uc);
+static void monotonic_periodic_handler(int sig, siginfo_t *si, void *uc);
+#endif
+static void realtime_oneshot_handler(int sig, siginfo_t *si, void *uc);
+static void monotonic_oneshot_handler(int sig, siginfo_t *si, void *uc);
+
+enum {
+#ifndef NO_PERIODIC
+	REALTIME_PERIODIC_INFO,
+	MONOTONIC_PERIODIC_INFO,
+#endif
+	REALTIME_ONESHOT_INFO,
+	MONOTONIC_ONESHOT_INFO,
+};
 
 static struct posix_timers_info {
 	char clock;
 	char *name;
 	void (*handler)(int sig, siginfo_t *si, void *uc);
 	int sig;
+	int oneshot;
 	int ms_int;
 	struct sigaction sa;
 	int handler_status;
@@ -33,17 +50,26 @@ static struct posix_timers_info {
 	int overrun;
 	struct timespec start, end;
 } posix_timers[] = {
-	[CLOCK_REALTIME] = {CLOCK_REALTIME, "REALTIME", realtime_handler, SIGALRM, 1},
-	[CLOCK_MONOTONIC] = {CLOCK_MONOTONIC, "MONOTONIC", monotonic_handler, SIGINT, 3},
+#ifndef NO_PERIODIC
+	[REALTIME_PERIODIC_INFO] = {CLOCK_REALTIME, "REALTIME (periodic)",
+				realtime_periodic_handler, SIGALRM, 0, 1},
+	[MONOTONIC_PERIODIC_INFO] = {CLOCK_MONOTONIC, "MONOTONIC (periodic)",
+				monotonic_periodic_handler, SIGINT, 0, 3},
+#endif
+	[REALTIME_ONESHOT_INFO] = {CLOCK_REALTIME, "REALTIME (oneshot)",
+				realtime_oneshot_handler, SIGUSR1, 1, INT_MAX},
+	[MONOTONIC_ONESHOT_INFO] = {CLOCK_MONOTONIC, "MONOTONIC (oneshot)",
+				monotonic_oneshot_handler, SIGUSR2, 1, INT_MAX},
 	{ }
 };
 
-static int check_handler_status(struct posix_timers_info *info, int ms_passed)
+static int check_handler_status(struct posix_timers_info *info,
+				struct itimerspec *its, int ms_passed, int delta)
 {
 	int displacement;
 	int timer_ms;
 
-	if (!info->handler_cnt) {
+	if (!info->handler_cnt && !info->oneshot) {
 		fail("%s: Signal handler wasn't called\n", info->name);
 		return -EINVAL;
 	}
@@ -58,10 +84,45 @@ static int check_handler_status(struct posix_timers_info *info, int ms_passed)
 		return -1;
 	}
 
-	timer_ms = (info->overrun + info->handler_cnt) * info->ms_int;
-	displacement = abs(ms_passed - timer_ms) * 100 / ms_passed;
+	if (!info->oneshot && !its->it_value.tv_sec && !its->it_value.tv_nsec) {
+		fail("%s: timer became unset\n", info->name);
+		return -EFAULT;
+	}
+
+	if (info->oneshot && (its->it_interval.tv_sec || its->it_interval.tv_nsec)) {
+		fail("%s: timer became periodic\n", info->name);
+		return -EFAULT;
+	}
+
+	if (!info->oneshot && !its->it_interval.tv_sec && !its->it_interval.tv_nsec) {
+		fail("%s: timer became oneshot\n", info->name);
+		return -EFAULT;
+	}
+
+	if (info->oneshot) {
+		int val = its->it_value.tv_sec * 1000 + its->it_value.tv_nsec / 1000 / 1000;
+		if (info->handler_cnt) {
+			if (val != 0) {
+				fail("%s: timer continues ticking after expiration\n", info->name);
+				return -EFAULT;
+			}
+			if (info->handler_cnt > 1) {
+				fail("%s: timer expired %d times\n", info->name, info->handler_cnt);
+				return -EFAULT;
+			}
+			if (info->ms_int > ms_passed) {
+				fail("%s: timer expired too early\n", info->name);
+				return -EFAULT;
+			}
+			return 0;
+		}
+		timer_ms = info->ms_int - val;
+	} else
+		timer_ms = (info->overrun + info->handler_cnt) * info->ms_int;
+	displacement = (abs(ms_passed - timer_ms) - delta) * 100 / ms_passed;
 
 	if (displacement > MAX_TIMER_DISPLACEMENT) {
+		test_msg("%s: cpt/rst : %d msec\n", info->name, delta);
 		test_msg("%s: Time passed (ms) : %d msec\n", info->name, ms_passed);
 		test_msg("%s: Timer results    : %d msec\n", info->name, timer_ms);
 		test_msg("%s: Handler count    : %d\n", info->name, info->handler_cnt);
@@ -71,11 +132,12 @@ static int check_handler_status(struct posix_timers_info *info, int ms_passed)
 	return 0;
 }
 
-static int check_timers(void)
+static int check_timers(int delta)
 {
 	struct posix_timers_info *info = posix_timers;
 	int ms_passed;
 	int status = 0;
+	struct itimerspec val, oldval;
 
 	if (sigprocmask(SIG_UNBLOCK, &mask, NULL) == -1) {
 		fail("Failed to unlock signal\n");
@@ -83,8 +145,9 @@ static int check_timers(void)
 	}
 
 	while (info->handler) {
-		if (timer_delete(info->timerid) == -1) {
-			fail("%s: Failed to delete timer\n", info->name);
+		memset(&val, 0, sizeof(val));
+		if (timer_settime(info->timerid, 0, &val, &oldval) == -1) {
+			fail("%s: failed to reset timer\n", info->name);
 			return -errno;
 		}
 
@@ -96,7 +159,7 @@ static int check_timers(void)
 		ms_passed = (info->end.tv_sec - info->start.tv_sec) * 1000 +
 			(info->end.tv_nsec - info->start.tv_nsec) / (1000 * 1000);
 
-		if (check_handler_status(info, ms_passed))
+		if (check_handler_status(info, &oldval, ms_passed, delta))
 			status--;
 		info++;
 	}
@@ -124,18 +187,38 @@ static void generic_handler(struct posix_timers_info *info,
 	info->handler_cnt++;
 }
 
-static void monotonic_handler(int sig, siginfo_t *si, void *uc)
+#ifndef NO_PERIODIC
+static void monotonic_periodic_handler(int sig, siginfo_t *si, void *uc)
 {
-	generic_handler(si->si_value.sival_ptr, &posix_timers[CLOCK_MONOTONIC], sig);
+	generic_handler(si->si_value.sival_ptr,
+			&posix_timers[MONOTONIC_PERIODIC_INFO], sig);
+}
+#endif
+
+static void monotonic_oneshot_handler(int sig, siginfo_t *si, void *uc)
+{
+	generic_handler(si->si_value.sival_ptr,
+			&posix_timers[MONOTONIC_ONESHOT_INFO], sig);
 }
 
-static void realtime_handler(int sig, siginfo_t *si, void *uc)
+#ifndef NO_PERIODIC
+static void realtime_periodic_handler(int sig, siginfo_t *si, void *uc)
 {
-	generic_handler(si->si_value.sival_ptr, &posix_timers[CLOCK_REALTIME], sig);
+	generic_handler(si->si_value.sival_ptr,
+			&posix_timers[REALTIME_PERIODIC_INFO], sig);
+}
+#endif
+
+static void realtime_oneshot_handler(int sig, siginfo_t *si, void *uc)
+{
+	generic_handler(si->si_value.sival_ptr,
+			&posix_timers[REALTIME_ONESHOT_INFO], sig);
 }
 
 static int setup_timers(void)
 {
+	int i;
+	int ret;
 	struct posix_timers_info *info = posix_timers;
 	struct sigevent sev;
 	struct itimerspec its;
@@ -153,6 +236,21 @@ static int setup_timers(void)
 
 	info = posix_timers;
 	while(info->handler) {
+		/* Add and delete fake timers to test restoring 'with holes' */
+		timer_t timeridt;
+		for (i = 0; i < 10; i++) {
+			ret = timer_create(CLOCK_REALTIME, NULL, &timeridt);
+			if (ret < 0) {
+				err("Can't create temporary posix timer %lx\n", (long) timeridt);
+				return -errno;
+			}
+			ret = timer_delete(timeridt);
+			if (ret < 0) {
+				err("Can't remove temporaty posix timer %lx\n", (long) timeridt);
+				return -errno;
+			}
+		}
+
 		info->sa.sa_flags = SA_SIGINFO;
 		info->sa.sa_sigaction = info->handler;
 		sigemptyset(&info->sa.sa_mask);
@@ -171,10 +269,13 @@ static int setup_timers(void)
 			return -errno;
 		}
 
-		its.it_value.tv_sec = 0;
-		its.it_value.tv_nsec = info->ms_int * 1000 * 1000;
-		its.it_interval.tv_sec = its.it_value.tv_sec;
-		its.it_interval.tv_nsec = its.it_value.tv_nsec;
+		its.it_value.tv_sec = info->ms_int / 1000;
+		its.it_value.tv_nsec = info->ms_int % 1000 * 1000 * 1000;
+		if (!info->oneshot) {
+			its.it_interval.tv_sec = its.it_value.tv_sec;
+			its.it_interval.tv_nsec = its.it_value.tv_nsec;
+		} else
+			its.it_interval.tv_sec = its.it_interval.tv_nsec = 0;
 
 		if (clock_gettime(info->clock, &info->start) == -1) {
 			err("Can't get %s start time\n", info->name);
@@ -192,6 +293,7 @@ static int setup_timers(void)
 
 int main(int argc, char **argv)
 {
+	struct timespec start, end;
 	int err;
 
 	test_init(argc, argv);
@@ -203,9 +305,13 @@ int main(int argc, char **argv)
 	usleep(500 * 1000);
 
 	test_daemon();
-	test_waitsig();
 
-	err = check_timers();
+	clock_gettime(CLOCK_REALTIME, &start);
+	test_waitsig();
+	clock_gettime(CLOCK_REALTIME, &end);
+
+	err = check_timers((end.tv_sec - start.tv_sec) * 1000 +
+				(end.tv_nsec - start.tv_nsec) / 1000000);
 	if (err)
 		return err;
 

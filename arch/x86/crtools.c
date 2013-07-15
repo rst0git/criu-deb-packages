@@ -3,6 +3,7 @@
 #include <elf.h>
 
 #include "asm/processor-flags.h"
+#include "asm/restorer.h"
 #include "asm/types.h"
 #include "asm/fpu.h"
 
@@ -35,9 +36,11 @@ static inline void __check_code_syscall(void)
 	BUILD_BUG_ON(!is_log2(sizeof(code_syscall)));
 }
 
-void parasite_setup_regs(unsigned long new_ip, user_regs_struct_t *regs)
+void parasite_setup_regs(unsigned long new_ip, void *stack, user_regs_struct_t *regs)
 {
 	regs->ip = new_ip;
+	if (stack)
+		regs->sp = (unsigned long) stack;
 
 	/* Avoid end of syscall processing */
 	regs->orig_ax = -1;
@@ -97,8 +100,9 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 	regs.r8  = arg5;
 	regs.r9  = arg6;
 
-	parasite_setup_regs(ctl->syscall_ip, &regs);
-	err = __parasite_execute(ctl, ctl->pid.real, &regs);
+	parasite_setup_regs(ctl->syscall_ip, 0, &regs);
+	err = __parasite_execute_trap(ctl, ctl->pid.real, &regs,
+					&ctl->regs_orig, 0);
 	if (err)
 		return err;
 
@@ -106,24 +110,14 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 	return 0;
 }
 
-int get_task_regs(pid_t pid, CoreEntry *core, const struct parasite_ctl *ctl)
+int get_task_regs(pid_t pid, user_regs_struct_t regs, CoreEntry *core)
 {
 	struct xsave_struct xsave	= {  };
-	user_regs_struct_t regs		= {-1};
 
 	struct iovec iov;
 	int ret = -1;
 
 	pr_info("Dumping GP/FPU registers for %d\n", pid);
-
-	if (ctl)
-		regs = ctl->regs_orig;
-	else {
-		if (ptrace(PTRACE_GETREGS, pid, NULL, &regs)) {
-			pr_err("Can't obtain GP registers for %d\n", pid);
-			goto err;
-		}
-	}
 
 	/* Did we come from a system call? */
 	if ((int)regs.orig_ax >= 0) {
@@ -190,12 +184,12 @@ int get_task_regs(pid_t pid, CoreEntry *core, const struct parasite_ctl *ctl)
 		iov.iov_len = sizeof(xsave);
 
 		if (ptrace(PTRACE_GETREGSET, pid, (unsigned int)NT_X86_XSTATE, &iov) < 0) {
-			pr_err("Can't obtain FPU registers for %d\n", pid);
+			pr_perror("Can't obtain FPU registers for %d", pid);
 			goto err;
 		}
 	} else {
 		if (ptrace(PTRACE_GETFPREGS, pid, NULL, &xsave)) {
-			pr_err("Can't obtain FPU registers for %d\n", pid);
+			pr_perror("Can't obtain FPU registers for %d", pid);
 			goto err;
 		}
 	}
@@ -379,9 +373,10 @@ static void show_rt_xsave_frame(struct xsave_struct *x)
 	pr_debug("-----------------------\n");
 }
 
-int sigreturn_prep_fpu_frame(struct thread_restore_args *args, CoreEntry *core)
+int restore_fpu(struct rt_sigframe *sigframe, CoreEntry *core)
 {
-	struct xsave_struct *x = &args->fpu_state.xsave;
+	fpu_state_t *fpu_state = &sigframe->fpu_state;
+	struct xsave_struct *x = &fpu_state->xsave;
 
 	/*
 	 * If no FPU information provided -- we're restoring
@@ -389,14 +384,14 @@ int sigreturn_prep_fpu_frame(struct thread_restore_args *args, CoreEntry *core)
 	 * has no FPU support at all.
 	 */
 	if (!core->thread_info->fpregs) {
-		args->has_fpu = false;
+		fpu_state->has_fpu = false;
 		return 0;
 	}
 
 	if (!valid_xsave_frame(core))
 		return -1;
 
-	args->has_fpu = true;
+	fpu_state->has_fpu = true;
 
 #define assign_reg(dst, src, e)		do { dst.e = (__typeof__(dst.e))src->e; } while (0)
 #define assign_array(dst, src, e)	memcpy(dst.e, (src)->e, sizeof(dst.e))
@@ -428,7 +423,7 @@ int sigreturn_prep_fpu_frame(struct thread_restore_args *args, CoreEntry *core)
 		/*
 		 * This should be at the end of xsave frame.
 		 */
-		magic2 = args->fpu_state.__pad + sizeof(struct xsave_struct);
+		magic2 = fpu_state->__pad + sizeof(struct xsave_struct);
 		*(u32 *)magic2 = FP_XSTATE_MAGIC2;
 	}
 
@@ -454,3 +449,48 @@ void *mmap_seized(struct parasite_ctl *ctl,
 
 	return (void *)map;
 }
+
+int restore_gpregs(struct rt_sigframe *f, UserX86RegsEntry *r)
+{
+#define CPREG1(d)	f->uc.uc_mcontext.d = r->d
+#define CPREG2(d, s)	f->uc.uc_mcontext.d = r->s
+
+	CPREG1(r8);
+	CPREG1(r9);
+	CPREG1(r10);
+	CPREG1(r11);
+	CPREG1(r12);
+	CPREG1(r13);
+	CPREG1(r14);
+	CPREG1(r15);
+	CPREG2(rdi, di);
+	CPREG2(rsi, si);
+	CPREG2(rbp, bp);
+	CPREG2(rbx, bx);
+	CPREG2(rdx, dx);
+	CPREG2(rax, ax);
+	CPREG2(rcx, cx);
+	CPREG2(rsp, sp);
+	CPREG2(rip, ip);
+	CPREG2(eflags, flags);
+	CPREG1(cs);
+	CPREG1(gs);
+	CPREG1(fs);
+
+	return 0;
+}
+
+int sigreturn_prep_fpu_frame(struct rt_sigframe *sigframe, fpu_state_t *fpu_state)
+{
+	unsigned long addr = (unsigned long)(void *)&fpu_state->xsave;
+
+	if ((addr % 64ul) == 0ul) {
+		sigframe->uc.uc_mcontext.fpstate = &fpu_state->xsave;
+	} else {
+		pr_err("Unaligned address passed: %lx\n", addr);
+		return -1;
+	}
+
+	return 0;
+}
+
