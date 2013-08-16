@@ -1,3 +1,13 @@
+criu (0.6-2) experimental; urgency=low
+
+  * Adding vcs fields.
+  * Wrapping control fields.
+  * Updating vcs fields.
+  * Removing crtools transitional packaging now that crtools has been
+    removed (was post-wheezy introduced).
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Fri, 16 Aug 2013 11:37:17 +0200
+
 criu (0.6-1) experimental; urgency=low
 
   * Merging upstream version 0.6.

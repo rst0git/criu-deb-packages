@@ -3,15 +3,21 @@ Section: admin
 Priority: optional
 Maintainer: Daniel Baumann <mail@daniel-baumann.ch>
 Build-Depends:
- debhelper (>= 9), asciidoc, libprotobuf-c0-dev, protobuf-c-compiler, xmlto
+ debhelper (>= 9),
+ asciidoc,
+ libprotobuf-c0-dev,
+ protobuf-c-compiler,
+ xmlto,
 Standards-Version: 3.9.4
 Homepage: http://www.criu.org/
+Vcs-Browser: http://daniel-baumann.ch/gitweb/?p=debian/packages/criu.git
+Vcs-Git: git://daniel-baumann.ch/git/debian/packages/criu.git
 
 Package: criu
 Architecture: armhf amd64
-Depends: ${misc:Depends}, ${shlibs:Depends}
-Conflicts: crtools (<< 0.5+20130501)
-Replaces: crtools
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends}
 Recommends: iproute
 Description: checkpoint and restore in userspace
  criu contains the utilities to checkpoint and restore processes in
@@ -21,19 +27,11 @@ Package: criu-dbg
 Section: debug
 Priority: extra
 Architecture: armhf amd64
-Depends: ${misc:Depends}, criu (= ${binary:Version})
+Depends:
+ ${misc:Depends},
+ criu (= ${binary:Version}),
 Description: checkpoint and restore in userspace (debug)
  criu contains the utilities to checkpoint and restore processes in
  userspace.
  .
  This package contains the debugging symbols.
-
-Package: crtools
-Section: oldlibs
-Priority: extra
-Architecture: all
-Depends: ${misc:Depends}, criu
-Description: checkpoint and restore in userspace (transitional package)
- Package to ease upgrading from older crtools packages to the new criu package.
- .
- This package can be purged at anytime once the criu package has been installed.
