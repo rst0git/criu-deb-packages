@@ -6,6 +6,7 @@
 #include "lock.h"
 #include "list.h"
 #include "image.h"
+#include "crtools.h"
 
 #include "protobuf/fdinfo.pb-c.h"
 #include "protobuf/fown.pb-c.h"
@@ -35,7 +36,7 @@ struct fd_link {
 
 struct fd_parms {
 	int		fd;
-	unsigned long	pos;
+	off_t		pos;
 	unsigned int	flags;
 	char		fd_flags;
 	struct stat	stat;
@@ -69,7 +70,8 @@ struct fdinfo_list_entry {
 /* reports whether fd_a takes prio over fd_b */
 static inline int fdinfo_rst_prio(struct fdinfo_list_entry *fd_a, struct fdinfo_list_entry *fd_b)
 {
-	return (fd_a->pid < fd_b->pid) || ((fd_a->pid == fd_b->pid) && (fd_a->fe->fd < fd_b->fe->fd));
+	return pid_rst_prio(fd_a->pid, fd_b->pid) ||
+		((fd_a->pid == fd_b->pid) && (fd_a->fe->fd < fd_b->fe->fd));
 }
 
 struct file_desc_ops {
@@ -100,7 +102,7 @@ struct file_desc_ops {
 
 struct file_desc {
 	u32			id;		/* File descriptor id, unique */
-	struct list_head	hash;		/* Descriptor hashing and lookup */
+	struct hlist_node	hash;		/* Descriptor hashing and lookup */
 	struct list_head	fd_info_head;	/* Chain of fdinfo_list_entry-s with same ID and type but different pids */
 	struct file_desc_ops	*ops;		/* Associated operations */
 };
@@ -117,7 +119,7 @@ struct parasite_drain_fd;
 int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 		struct parasite_drain_fd *dfds);
 
-extern void file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops);
+extern int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops);
 extern struct fdinfo_list_entry *file_master(struct file_desc *d);
 extern struct file_desc *find_file_desc_raw(int type, u32 id);
 

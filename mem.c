@@ -64,7 +64,7 @@ int do_task_reset_dirty_track(int pid)
 	close(fd);
 
 	if (ret < 0) {
-		pr_perror("Can't reset %d's dirty memory tracker", pid);
+		pr_warn("Can't reset %d's dirty memory tracker (%d)\n", pid, errno);
 		return -1;
 	}
 
@@ -335,15 +335,9 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 	if (!map)
 		goto out_snap;
 
-	ret = pagemap = open_proc(ctl->pid.real, "pagemap2");
-	if (ret < 0) {
-		if (errno != ENOENT)
-			goto out_free;
-
-		ret = pagemap = open_proc(ctl->pid.real, "pagemap");
-		if (ret < 0)
-			goto out_free;
-	}
+	ret = pagemap = open_proc(ctl->pid.real, "pagemap");
+	if (ret < 0)
+		goto out_free;
 
 	ret = -1;
 	pp = create_page_pipe(vma_area_list->priv_size / 2, pargs_iovs(args));
@@ -376,14 +370,14 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 		pr_debug("PPB: %d pages %d segs %u pipe %d off\n",
 				args->nr_pages, args->nr_segs, ppb->pipe_size, args->off);
 
-		ret = __parasite_execute_daemon(PARASITE_CMD_DUMPPAGES, ctl, false);
+		ret = __parasite_execute_daemon(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret < 0)
 			goto out_pp;
 		ret = parasite_send_fd(ctl, ppb->p[1]);
 		if (ret)
 			goto out_pp;
 
-		ret = __parasite_execute_daemon_wait_ack(PARASITE_CMD_DUMPPAGES, ctl);
+		ret = __parasite_wait_daemon_ack(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret < 0)
 			goto out_pp;
 

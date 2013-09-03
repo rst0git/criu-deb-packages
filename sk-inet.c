@@ -288,13 +288,14 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	if (dump_socket_opts(lfd, &skopts))
 		goto err;
 
-	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_INETSK), &ie, PB_INETSK))
+	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_INETSK), &ie, PB_INET_SK))
 		goto err;
 
 	pr_info("Dumping inet socket at %d\n", p->fd);
 	show_one_inet("Dumping", sk);
 	show_one_inet_img("Dumped", &ie);
 	sk->sd.already_dumped = 1;
+	sk->cpt_reuseaddr = skopts.reuseaddr;
 
 	switch (proto) {
 	case IPPROTO_TCP:
@@ -385,7 +386,6 @@ static int collect_one_inetsk(void *o, ProtobufCMessage *base)
 	struct inet_sk_info *ii = o;
 
 	ii->ie = pb_msg(base, InetSkEntry);
-	file_desc_add(&ii->d, ii->ie->id, &inet_desc_ops);
 	if (tcp_connection(ii->ie))
 		tcp_locked_conn_add(ii);
 
@@ -398,13 +398,19 @@ static int collect_one_inetsk(void *o, ProtobufCMessage *base)
 	if (ii->port == NULL)
 		return -1;
 
-	return 0;
+	return file_desc_add(&ii->d, ii->ie->id, &inet_desc_ops);
 }
+
+struct collect_image_info inet_sk_cinfo = {
+	.fd_type = CR_FD_INETSK,
+	.pb_type = PB_INET_SK,
+	.priv_size = sizeof(struct inet_sk_info),
+	.collect = collect_one_inetsk,
+};
 
 int collect_inet_sockets(void)
 {
-	return collect_image(CR_FD_INETSK, PB_INETSK,
-			sizeof(struct inet_sk_info), collect_one_inetsk);
+	return collect_image(&inet_sk_cinfo);
 }
 
 static int inet_validate_address(InetSkEntry *ie)
@@ -484,7 +490,7 @@ static int open_inet_sk(struct file_desc *d)
 
 	sk = socket(ie->family, ie->type, ie->proto);
 	if (sk < 0) {
-		pr_perror("Can't create unix socket");
+		pr_perror("Can't create inet socket");
 		return -1;
 	}
 
@@ -614,9 +620,4 @@ int inet_connect(int sk, struct inet_sk_info *ii)
 	}
 
 	return 0;
-}
-
-void show_inetsk(int fd)
-{
-	pb_show_plain_pretty(fd, PB_INETSK, "1:%#x 2:%#x 3:%d 4:%d 5:%d 6:%d 7:%d 8:%d 9:%2x 11:A 12:A");
 }

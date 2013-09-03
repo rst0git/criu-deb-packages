@@ -5,6 +5,7 @@ obj-y	+= crtools.o
 obj-y	+= image.o
 obj-y	+= image-desc.o
 obj-y	+= net.o
+obj-y	+= tun.o
 obj-y	+= proc_parse.o
 obj-y	+= cr-dump.o
 obj-y	+= cr-show.o
@@ -49,9 +50,20 @@ obj-y	+= page-xfer.o
 obj-y	+= page-read.o
 obj-y	+= kerndat.o
 obj-y	+= stats.o
+obj-y	+= string.o
 obj-y	+= sigframe.o
 obj-y	+= arch/$(ARCH)/vdso.o
 
 ifneq ($(MAKECMDGOALS),clean)
 incdeps := y
 endif
+
+PROTOBUF_GEN := protobuf-gen.sh
+
+protobuf-desc.c: protobuf-desc-gen.h
+
+protobuf-desc-gen.h: $(PROTOBUF_GEN) include/protobuf-desc.h
+	$(E) "  GEN     " $@
+	$(Q) $(SH) $(obj)/$(PROTOBUF_GEN) > $@
+
+cleanup-y += protobuf-desc-gen.h

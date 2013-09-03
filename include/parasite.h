@@ -10,9 +10,10 @@
 
 #include <sys/un.h>
 #include <time.h>
+#include <signal.h>
 
 #include "image.h"
-#include "util-net.h"
+#include "util-pie.h"
 
 #include "protobuf/vma.pb-c.h"
 
@@ -22,18 +23,15 @@ enum {
 	PARASITE_CMD_IDLE		= 0,
 	PARASITE_CMD_ACK,
 
-	PARASITE_CMD_INIT,
-	PARASITE_CMD_INIT_THREAD,
+	PARASITE_CMD_INIT_DAEMON,
+	PARASITE_CMD_DUMP_THREAD,
 
 	/*
 	 * These two must be greater than INITs.
 	 */
-	PARASITE_CMD_DAEMONIZE,
 	PARASITE_CMD_DAEMONIZED,
 
-	PARASITE_CMD_CFG_LOG,
 	PARASITE_CMD_FINI,
-	PARASITE_CMD_FINI_THREAD,
 
 	PARASITE_CMD_MPROTECT_VMAS,
 	PARASITE_CMD_DUMPPAGES,
@@ -43,7 +41,6 @@ enum {
 	PARASITE_CMD_DUMP_POSIX_TIMERS,
 	PARASITE_CMD_DUMP_MISC,
 	PARASITE_CMD_DUMP_CREDS,
-	PARASITE_CMD_DUMP_THREAD,
 	PARASITE_CMD_DRAIN_FDS,
 	PARASITE_CMD_GET_PROC_FD,
 	PARASITE_CMD_DUMP_TTY,
@@ -68,13 +65,9 @@ struct parasite_init_args {
 	int			h_addr_len;
 	struct sockaddr_un	h_addr;
 
-	k_rtsigset_t		sig_blocked;
+	int			log_level;
 
 	struct rt_sigframe	*sigframe;
-};
-
-struct parasite_log_args {
-	int log_level;
 };
 
 struct parasite_vma_entry
@@ -135,6 +128,13 @@ static inline int posix_timers_dump_size(int timer_n)
 	return sizeof(int) + sizeof(struct posix_timer) * timer_n;
 }
 
+struct parasite_dump_thread {
+	unsigned int		*tid_addr;
+	pid_t			tid;
+	u32			tls;
+	stack_t			sas;
+};
+
 /*
  * Misc sfuff, that is too small for separate file, but cannot
  * be read w/o using parasite
@@ -146,8 +146,9 @@ struct parasite_dump_misc {
 	u32 pid;
 	u32 sid;
 	u32 pgid;
-	u32 tls;
 	u32 umask;
+
+	struct parasite_dump_thread	ti;
 };
 
 #define PARASITE_MAX_GROUPS	(PAGE_SIZE / sizeof(unsigned int) - 2 * sizeof(unsigned))
@@ -158,12 +159,12 @@ struct parasite_dump_creds {
 	unsigned int		groups[PARASITE_MAX_GROUPS];
 };
 
-struct parasite_dump_thread {
-	unsigned int		*tid_addr;
-	pid_t			tid;
-	k_rtsigset_t		blocked;
-	u32			tls;
-};
+static inline void copy_sas(ThreadSasEntry *dst, const stack_t *src)
+{
+	dst->ss_sp = encode_pointer(src->ss_sp);
+	dst->ss_size = (u64)src->ss_size;
+	dst->ss_flags = src->ss_flags;
+}
 
 #define PARASITE_MAX_FDS	(PAGE_SIZE / sizeof(int))
 

@@ -43,17 +43,22 @@ int main(int argc, char **argv)
 
 	if (!getcwd(cwd2, sizeof(cwd2))) {
 		fail("can't get cwd: %m\n");
-		goto out;
+		goto cleanup;
 	}
 
 	if (strcmp(cwd1, cwd2))
 		fail("%s != %s\n", cwd1, cwd2);
 	else
 		pass();
-out:
-	chdir(cwd0);	/* return to the initial dir before writing out results */
 cleanup:
-	chdir(cwd0);
-	rmdir(dirname);
+	/* return to the initial dir before writing out results */
+	if (chdir(cwd0)) {
+		err("can't change directory to %s: %m\n", cwd0);
+		exit(1);
+	}
+	if (rmdir(dirname)) {
+		err("can't remove directory %s: %m\n", dirname);
+		exit(1);
+	}
 	return 0;
 }

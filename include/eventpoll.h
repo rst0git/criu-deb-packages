@@ -11,8 +11,7 @@
 
 extern int is_eventpoll_link(int lfd);
 extern const struct fdtype_ops eventpoll_dump_ops;
-extern int collect_eventpoll(void);
-extern void show_eventpoll(int fd);
-extern void show_eventpoll_tfd(int fd);
+extern struct collect_image_info epoll_tfd_cinfo;
+extern struct collect_image_info epoll_cinfo;
 
 #endif /* __CR_EVENTPOLL_H__ */

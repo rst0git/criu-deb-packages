@@ -73,14 +73,10 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 	regs.ARM_r4 = arg5;
 	regs.ARM_r5 = arg6;
 
-	parasite_setup_regs(ctl->syscall_ip, 0, &regs);
-	err = __parasite_execute_trap(ctl, ctl->pid.real, &regs,
-					&ctl->regs_orig, 0);
-	if (err)
-		return err;
+	err = __parasite_execute_syscall(ctl, &regs);
 
 	*ret = regs.ARM_r0;
-	return 0;
+	return err;
 }
 
 #define assign_reg(dst, src, e)		dst->e = (__typeof__(dst->e))src.ARM_##e
@@ -154,34 +150,30 @@ int arch_alloc_thread_info(CoreEntry *core)
 	ThreadInfoArm *ti_arm;
 	UserArmRegsEntry *gpregs;
 	UserArmVfpstateEntry *fpstate;
-	ThreadCoreEntry *thread_core;
 
 	ti_arm = xmalloc(sizeof(*ti_arm));
 	if (!ti_arm)
 		goto err;
 	thread_info_arm__init(ti_arm);
+	core->ti_arm = ti_arm;
 
 	gpregs = xmalloc(sizeof(*gpregs));
 	user_arm_regs_entry__init(gpregs);
 	ti_arm->gpregs = gpregs;
 
 	fpstate = xmalloc(sizeof(*fpstate));
+	if (!fpstate)
+		goto err;
 	user_arm_vfpstate_entry__init(fpstate);
+	ti_arm->fpstate = fpstate;
 	fpstate->vfp_regs = xmalloc(32*sizeof(unsigned long long));
 	fpstate->n_vfp_regs = 32;
-	ti_arm->fpstate = fpstate;
-
-	core->ti_arm = ti_arm;
-
-
-	thread_core = xmalloc(sizeof(*thread_core));
-	if (!thread_core)
+	if (!fpstate->vfp_regs)
 		goto err;
-	thread_core_entry__init(thread_core);
-	core->thread_core = thread_core;
 
-err:
 	return 0;
+err:
+	return -1;
 }
 
 void arch_free_thread_info(CoreEntry *core)

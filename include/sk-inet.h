@@ -30,6 +30,7 @@ struct inet_sk_desc {
 	unsigned short		shutdown;
 
 	int rfd;
+	int cpt_reuseaddr;
 	struct list_head rlist;
 };
 
@@ -49,6 +50,14 @@ struct rst_tcp_sock {
 	bool	reuseaddr;
 };
 
+extern struct rst_tcp_sock *rst_tcp_socks;
+extern int rst_tcp_socks_nr;
+
+static inline unsigned long rst_tcp_socks_len(void)
+{
+	return rst_tcp_socks_nr * sizeof(struct rst_tcp_sock);
+}
+
 static inline void tcp_repair_off(int fd)
 {
 	int aux = 0, ret;
@@ -67,12 +76,7 @@ int restore_one_tcp(int sk, struct inet_sk_info *si);
 
 #define SK_EST_PARAM	"tcp-established"
 
-void show_tcp_stream(int fd);
-
 int check_tcp(void);
-
-extern int rst_tcp_socks_size;
-extern int rst_tcp_socks_remap(void *addr);
 extern int rst_tcp_socks_add(int fd, bool reuseaddr);
 
 #endif /* __CR_SK_INET_H__ */

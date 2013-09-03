@@ -1,3 +1,9 @@
+criu (0.7-1) experimental; urgency=low
+
+  * Merging upstream version 0.7.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Tue, 03 Sep 2013 15:00:44 +0200
+
 criu (0.6-2) experimental; urgency=low
 
   * Adding vcs fields.

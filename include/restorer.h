@@ -108,8 +108,6 @@ struct task_restore_core_args {
 	int				logfd;
 	unsigned int			loglevel;
 
-	mutex_t				rst_lock;
-
 	/* threads restoration */
 	int				nr_threads;		/* number of threads */
 	int				nr_zombies;
@@ -117,11 +115,12 @@ struct task_restore_core_args {
 	struct thread_restore_args	*thread_args;		/* array of thread arguments */
 	struct shmems			*shmems;
 	struct task_entries		*task_entries;
+	void				*rst_mem;
+	unsigned long			rst_mem_size;
 	VmaEntry			*self_vmas;
 	VmaEntry			*tgt_vmas;
 	siginfo_t			*siginfo;
 	unsigned int			siginfo_nr;
-	unsigned long			siginfo_size;
 	unsigned int			nr_vmas;
 	unsigned long			premmapped_addr;
 	unsigned long			premmapped_len;
@@ -131,7 +130,6 @@ struct task_restore_core_args {
 
 	int 				timer_n;
 	struct restore_posix_timer 	*posix_timers;
-	unsigned long			timers_sz;
 
 	CredsEntry			creds;
 	uint32_t			cap_inh[CR_CAP_SIZE];
@@ -146,10 +144,10 @@ struct task_restore_core_args {
 	char				comm[TASK_COMM_LEN];
 
 	int				nr_rlim;
-	struct rlimit			rlims[RLIM_NLIMITS];
+	struct rlimit			*rlims;
 
-	struct rst_tcp_sock		*rst_tcp_socks;
-	int				rst_tcp_socks_size;
+	struct rst_tcp_sock		*tcp_socks;
+	int				tcp_socks_nr;
 
 	struct vdso_symtable		vdso_sym_rt;		/* runtime vdso symbols */
 	unsigned long			vdso_rt_parked_at;	/* safe place to keep vdso */
@@ -182,7 +180,8 @@ struct shmems {
 #define TASK_ENTRIES_SIZE 4096
 
 enum {
-	CR_STATE_RESTORE_NS, /* is used for executing "setup-namespace" scripts */
+	CR_STATE_FAIL		= -1,
+	CR_STATE_RESTORE_NS	= 0, /* is used for executing "setup-namespace" scripts */
 	CR_STATE_FORKING,
 	CR_STATE_RESTORE_PGID,
 	CR_STATE_RESTORE,
@@ -219,10 +218,11 @@ find_shmem(struct shmems *shmems, unsigned long shmid)
 	return NULL;
 }
 
-#define restore_finish_stage(__stage) do {				\
+#define restore_finish_stage(__stage) ({				\
 		futex_dec_and_wake(&task_entries->nr_in_progress);	\
 		futex_wait_while(&task_entries->start, __stage);	\
-	} while (0)
+		(s32) futex_get(&task_entries->start);			\
+	})
 
 
 /* the restorer_blob_offset__ prefix is added by gen_offsets.sh */

@@ -28,7 +28,7 @@ static int kerndat_get_shmemdev(void)
 	map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
 			MAP_SHARED | MAP_ANONYMOUS, 0, 0);
 	if (map == MAP_FAILED) {
-		pr_perror("Can't mmap piggie");
+		pr_perror("Can't mmap memory for shmemdev test");
 		return -1;
 	}
 
@@ -36,19 +36,19 @@ static int kerndat_get_shmemdev(void)
 			(unsigned long)map, (unsigned long)map + PAGE_SIZE);
 	if (stat(maps, &buf) < 0) {
 		munmap(map, PAGE_SIZE);
-		pr_perror("Can't stat piggie");
+		pr_perror("Can't stat self map_files");
 		return -1;
 	}
 
 	munmap(map, PAGE_SIZE);
 
 	kerndat_shmem_dev = buf.st_dev;
-	pr_info("Found anon-shmem piggie at %"PRIx64"\n", kerndat_shmem_dev);
+	pr_info("Found anon-shmem device at %"PRIx64"\n", kerndat_shmem_dev);
 	return 0;
 }
 
 /*
- * Check whether pagemap2 reports soft dirty bit. Kernel has
+ * Check whether pagemap reports soft dirty bit. Kernel has
  * this functionality under CONFIG_MEM_SOFT_DIRTY option.
  */
 
@@ -64,28 +64,20 @@ int kerndat_get_dirty_track(void)
 	map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
 			MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	if (map == MAP_FAILED) {
-		pr_perror("Can't mmap piggie2");
+		pr_perror("Can't mmap memory for pagemap test");
 		return ret;
 	}
 
-	pm2 = open("/proc/self/pagemap2", O_RDONLY);
+	/*
+	 * Kernel shows soft-dirty bits only if this soft-dirty
+	 * was at least once re-set. (this is to be removed in
+	 * a couple of kernel releases)
+	 */
+	do_task_reset_dirty_track(getpid());
+	pm2 = open("/proc/self/pagemap", O_RDONLY);
 	if (pm2 < 0) {
-		/*
-		 * Kernel shows soft-dirty bits only if this soft-dirty
-		 * was at least once re-set. (this is to be removed in
-		 * a couple of kernel releases)
-		 */
-		do_task_reset_dirty_track(getpid());
-		pm2 = open("/proc/self/pagemap", O_RDONLY);
-	}
-	if (pm2 < 0) {
+		pr_perror("Can't open pagemap file");
 		munmap(map, PAGE_SIZE);
-		if (errno == ENOENT) {
-			pr_info("No pagemap2 file\n");
-			return 0;
-		}
-
-		pr_perror("Can't open pagemap2 file");
 		return ret;
 	}
 
@@ -93,9 +85,8 @@ int kerndat_get_dirty_track(void)
 
 	lseek(pm2, (unsigned long)map / PAGE_SIZE * sizeof(u64), SEEK_SET);
 	ret = read(pm2, &pmap, sizeof(pmap));
-	if (ret < 0){
+	if (ret < 0)
 		pr_perror("Read pmap err!");
-	}
 
 	close(pm2);
 	munmap(map, PAGE_SIZE);
@@ -104,7 +95,7 @@ int kerndat_get_dirty_track(void)
 		pr_info("Dirty track supported on kernel\n");
 		kerndat_has_dirty_track = true;
 	} else
-		pr_err("Dirty tracking support is OFF\n");
+		pr_info("Dirty tracking support is OFF\n");
 
 	return 0;
 }

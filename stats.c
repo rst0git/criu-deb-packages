@@ -10,14 +10,29 @@ struct timing {
 	struct timeval total;
 };
 
-static struct timing timings[TIME_NR_STATS];
+struct dump_stats {
+	struct timing	timings[DUMP_TIME_NR_STATS];
+	unsigned long	counts[DUMP_CNT_NR_STATS];
+};
 
-static unsigned long counts[CNT_NR_STATS];
+struct restore_stats {
+	struct timing	timings[RESTORE_TIME_NS_STATS];
+	atomic_t	counts[RESTORE_CNT_NR_STATS];
+};
+
+struct dump_stats *dstats;
+struct restore_stats *rstats;
 
 void cnt_add(int c, unsigned long val)
 {
-	BUG_ON(c >= CNT_NR_STATS);
-	counts[c] += val;
+	if (dstats != NULL) {
+		BUG_ON(c >= DUMP_CNT_NR_STATS);
+		dstats->counts[c] += val;
+	} else if (rstats != NULL) {
+		BUG_ON(c >= RESTORE_CNT_NR_STATS);
+		atomic_add(val, &rstats->counts[c]);
+	} else
+		BUG();
 }
 
 static void timeval_accumulate(const struct timeval *from, const struct timeval *to,
@@ -38,52 +53,82 @@ static void timeval_accumulate(const struct timeval *from, const struct timeval 
 	}
 }
 
+static struct timing *get_timing(int t)
+{
+	if (dstats != NULL) {
+		BUG_ON(t >= DUMP_TIME_NR_STATS);
+		return &dstats->timings[t];
+	} else if (rstats != NULL) {
+		/*
+		 * FIXME -- this does _NOT_ work when called
+		 * from different tasks.
+		 */
+		BUG_ON(t >= RESTORE_TIME_NS_STATS);
+		return &rstats->timings[t];
+	}
+
+	BUG();
+	return NULL;
+}
+
 void timing_start(int t)
 {
-	BUG_ON(t >= TIME_NR_STATS);
-	gettimeofday(&timings[t].start, NULL);
+	struct timing *tm;
+
+	tm = get_timing(t);
+	gettimeofday(&tm->start, NULL);
 }
 
 void timing_stop(int t)
 {
+	struct timing *tm;
 	struct timeval now;
 
+	tm = get_timing(t);
 	gettimeofday(&now, NULL);
-	timeval_accumulate(&timings[t].start, &now, &timings[t].total);
-}
-
-void show_stats(int fd)
-{
-	do_pb_show_plain(fd, PB_STATS, 1, NULL,
-			"1.1:%u 1.2:%u 1.3:%u 1.4:%u 1.5:%Lu 1.6:%Lu 1.7:%Lu");
+	timeval_accumulate(&tm->start, &now, &tm->total);
 }
 
 static void encode_time(int t, u_int32_t *to)
 {
-	*to = timings[t].total.tv_sec * USEC_PER_SEC + timings[t].total.tv_usec;
+	struct timing *tm;
+
+	tm = get_timing(t);
+	*to = tm->total.tv_sec * USEC_PER_SEC + tm->total.tv_usec;
 }
 
 void write_stats(int what)
 {
 	StatsEntry stats = STATS_ENTRY__INIT;
-	DumpStatsEntry dstats = DUMP_STATS_ENTRY__INIT;
+	DumpStatsEntry ds_entry = DUMP_STATS_ENTRY__INIT;
+	RestoreStatsEntry rs_entry = RESTORE_STATS_ENTRY__INIT;
 	char *name;
 	int fd;
 
 	pr_info("Writing stats\n");
 	if (what == DUMP_STATS) {
-		stats.dump = &dstats;
+		stats.dump = &ds_entry;
 
-		encode_time(TIME_FREEZING, &dstats.freezing_time);
-		encode_time(TIME_FROZEN, &dstats.frozen_time);
-		encode_time(TIME_MEMDUMP, &dstats.memdump_time);
-		encode_time(TIME_MEMWRITE, &dstats.memwrite_time);
+		encode_time(TIME_FREEZING, &ds_entry.freezing_time);
+		encode_time(TIME_FROZEN, &ds_entry.frozen_time);
+		encode_time(TIME_MEMDUMP, &ds_entry.memdump_time);
+		encode_time(TIME_MEMWRITE, &ds_entry.memwrite_time);
 
-		dstats.pages_scanned = counts[CNT_PAGES_SCANNED];
-		dstats.pages_skipped_parent = counts[CNT_PAGES_SKIPPED_PARENT];
-		dstats.pages_written = counts[CNT_PAGES_WRITTEN];
+		ds_entry.pages_scanned = dstats->counts[CNT_PAGES_SCANNED];
+		ds_entry.pages_skipped_parent = dstats->counts[CNT_PAGES_SKIPPED_PARENT];
+		ds_entry.pages_written = dstats->counts[CNT_PAGES_WRITTEN];
 
 		name = "dump";
+	} else if (what == RESTORE_STATS) {
+		stats.restore = &rs_entry;
+
+		rs_entry.pages_compared = atomic_read(&rstats->counts[CNT_PAGES_COMPARED]);
+		rs_entry.pages_skipped_cow = atomic_read(&rstats->counts[CNT_PAGES_SKIPPED_COW]);
+
+		encode_time(TIME_FORK, &rs_entry.forking_time);
+		encode_time(TIME_RESTORE, &rs_entry.restore_time);
+
+		name = "restore";
 	} else
 		return;
 
@@ -92,4 +137,15 @@ void write_stats(int what)
 		pb_write_one(fd, &stats, PB_STATS);
 		close(fd);
 	}
+}
+
+int init_stats(int what)
+{
+	if (what == DUMP_STATS) {
+		dstats = xmalloc(sizeof(*dstats));
+		return dstats ? 0 : -1;
+	}
+
+	rstats = shmalloc(sizeof(struct restore_stats));
+	return rstats ? 0 : -1;
 }

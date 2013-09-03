@@ -97,10 +97,9 @@ static int parse_vmflags(char *buf, struct vma_area *vma_area)
 
 	do {
 		/* mmap() block */
-		if (_vmflag_match(tok, "gd")) {
+		if (_vmflag_match(tok, "gd"))
 			vma_area->vma.flags |= MAP_GROWSDOWN;
-			vma_area->vma.start -= PAGE_SIZE; /* Guard page */
-		} else if (_vmflag_match(tok, "lo"))
+		else if (_vmflag_match(tok, "lo"))
 			vma_area->vma.flags |= MAP_LOCKED;
 		else if (_vmflag_match(tok, "nr"))
 			vma_area->vma.flags |= MAP_NORESERVE;
@@ -145,6 +144,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 {
 	struct vma_area *vma_area = NULL;
 	unsigned long start, end, pgoff;
+	bool prev_growsdown = false;
 	unsigned long ino;
 	char r, w, x, s;
 	int dev_maj, dev_min;
@@ -196,6 +196,11 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 		}
 
 		if (vma_area) {
+			/* If we've split the stack vma, only the lowest one has the guard page. */
+			if ((vma_area->vma.flags & MAP_GROWSDOWN) && !prev_growsdown)
+				vma_area->vma.start -= PAGE_SIZE; /* Guard page */
+			prev_growsdown = (bool)(vma_area->vma.flags & MAP_GROWSDOWN);
+
 			list_add_tail(&vma_area->list, &vma_area_list->h);
 			vma_area_list->nr++;
 			if (privately_dump_vma(vma_area)) {
@@ -1161,27 +1166,14 @@ err:
 
 int parse_posix_timers(pid_t pid, struct proc_posix_timers_stat *args)
 {
-	int i;
 	int ret = 0;
-	int get = 0;
 	int pid_t;
 
 	FILE * file;
-	char * line1 = NULL;
-	char * line2 = NULL;
-	char * line3 = NULL;
-	char * line4 = NULL;
-	size_t len1 = 0;
-	size_t len2 = 0;
-	size_t len3 = 0;
-	size_t len4 = 0;
 
-	char * siginfo;
-	char siginfo_tmp[20];
 	char sigpid[7];
 	char tidpid[4];
 
-	char str_name[10];
 	struct proc_posix_timer *timer = NULL;
 
 	INIT_LIST_HEAD(&args->timers);
@@ -1190,44 +1182,29 @@ int parse_posix_timers(pid_t pid, struct proc_posix_timers_stat *args)
 	file = fopen_proc(pid, "timers");
 	if (file == NULL) {
 		pr_perror("Can't open posix timers file!");
-		ret = -1;
-		goto end_posix;
+		return -1;
 	}
 
 	while (1) {
-		get = getline(&line1, &len1, file);
-		if (get == -1)
-			goto end_posix;
-		get = getline(&line2, &len2, file);
-		if (get == -1)
-			goto end_posix;
-		get = getline(&line3, &len3, file);
-		if (get == -1)
-			goto end_posix;
-		get = getline(&line4, &len4, file);
-		if (get == -1)
-			goto end_posix;
-
 		timer = xzalloc(sizeof(struct proc_posix_timer));
+		if (timer == NULL)
+			goto err;
 
-		ret = sscanf(line1, "%s %ld", str_name, &timer->spt.it_id);
-		if (ret != 2 || str_name[0] != 'I')
-			goto parse_err_posix;
-		ret = sscanf(line2, "%s %d%s", str_name, &timer->spt.si_signo, siginfo_tmp);
-		if (ret != 3 || str_name[0] != 's')
-			goto parse_err_posix;
-		siginfo=&siginfo_tmp[1];
-		ret = sscanf(siginfo, "%p", &timer->spt.sival_ptr);
-		if (ret != 1)
-			goto parse_err_posix;
-		for (i = 0; i<len3; i++) {
-			if (line3[i] == '/' || line3[i] == '.') {
-				line3[i] = ' ';
-			}
+		ret = fscanf(file, "ID: %ld\n"
+				   "signal: %d/%p\n"
+				   "notify: %6[a-z]/%3[a-z].%d\n"
+				   "ClockID: %d\n",
+				&timer->spt.it_id,
+				&timer->spt.si_signo, &timer->spt.sival_ptr,
+				sigpid, tidpid, &pid_t,
+				&timer->spt.clock_id);
+		if (ret != 7) {
+			ret = 0;
+			xfree(timer);
+			if (feof(file))
+				goto out;
+			goto err;
 		}
-		ret = sscanf(line3, "%s %s %s %d", str_name, sigpid, tidpid, &pid_t);
-		if (ret != 4 || str_name[0] != 'n')
-			goto parse_err_posix;
 
 		if ( tidpid[0] == 't') {
 			timer->spt.it_sigev_notify = SIGEV_THREAD_ID;
@@ -1245,14 +1222,11 @@ int parse_posix_timers(pid_t pid, struct proc_posix_timers_stat *args)
 			}
 		}
 
-		ret = sscanf(line4, "%s %d", str_name, &timer->spt.clock_id);
-		if (ret != 2 || str_name[0] != 'C')
-			goto parse_err_posix;
 		list_add(&timer->list, &args->timers);
 		timer = NULL;
 		args->timer_n++;
 	}
-parse_err_posix:
+err:
 	while (!list_empty(&args->timers)) {
 		timer = list_first_entry(&args->timers, struct proc_posix_timer, list);
 		list_del(&timer->list);
@@ -1260,20 +1234,7 @@ parse_err_posix:
 	}
 	pr_perror("Parse error in posix timers proc file!");
 	ret = -1;
-end_posix:
-	if (ferror(file)) {
-		ret = -1;
-		pr_perror("getline");
-	}
-
-	if (line1)
-		free(line1);
-	if (line2)
-		free(line2);
-	if (line3)
-		free(line3);
-
-	if (file != NULL)
-		fclose(file);
+out:
+	fclose(file);
 	return ret;
 }

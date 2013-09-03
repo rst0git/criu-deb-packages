@@ -1,5 +1,5 @@
 VERSION_MAJOR		:= 0
-VERSION_MINOR		:= 6
+VERSION_MINOR		:= 7
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -39,8 +39,6 @@ OBJCOPY		:= $(CROSS_COMPILE)objcopy
 ARCH ?= $(shell uname -m | sed		\
 		-e s/i.86/i386/		\
 		-e s/sun4u/sparc64/	\
-		-e s/arm.*/arm/		\
-		-e s/sa110/arm/		\
 		-e s/s390x/s390/	\
 		-e s/parisc64/parisc/	\
 		-e s/ppc.*/powerpc/	\
@@ -57,11 +55,19 @@ ifeq ($(ARCH),x86_64)
 	LDARCH       := i386:x86-64
 endif
 
-ifeq ($(ARCH),arm)
+ifeq ($(shell echo $(ARCH) | sed -e 's/arm.*/arm/'),arm)
+	ARMV         := $(shell echo $(ARCH) | sed -r -e 's/armv([[:digit:]]).*/\1/')
 	ARCH         := arm
-	ARCH_DEFINES := -DCONFIG_ARM
+	DEFINES      := -DCONFIG_ARM -DCONFIG_ARMV$(ARMV)
 	LDARCH       := arm
-	CFLAGS       += -march=armv7-a
+
+	ifeq ($(ARMV),6)
+		CFLAGS += -march=armv6
+	endif
+
+	ifeq ($(ARMV),7)
+		CFLAGS += -march=armv7-a
+	endif
 endif
 
 SRC_DIR		?= $(CURDIR)
@@ -95,6 +101,7 @@ endif
 CFLAGS		+= $(WARNINGS) $(DEFINES)
 SYSCALL-LIB	:= arch/$(ARCH)/syscalls.built-in.o
 ARCH-LIB	:= arch/$(ARCH)/crtools.built-in.o
+CRIU-LIB	:= lib/libcriu.so
 
 export CC MAKE CFLAGS LIBS ARCH DEFINES MAKEFLAGS
 export SRC_DIR SYSCALL-LIB SH RM ARCH_DIR OBJCOPY LDARCH LD
@@ -113,13 +120,13 @@ build-crtools := -r -R -f scripts/Makefile.build makefile=Makefile.crtools obj
 PROGRAM		:= criu
 
 .PHONY: all zdtm test rebuild clean distclean tags cscope	\
-	docs help pie protobuf arch/$(ARCH) clean-built
+	docs help pie protobuf arch/$(ARCH) clean-built lib
 
 ifeq ($(GCOV),1)
 %.o $(PROGRAM): override CFLAGS += --coverage
 endif
 
-all: config pie $(VERSION_HEADER)
+all: config pie $(VERSION_HEADER) $(CRIU-LIB)
 	$(Q) $(MAKE) $(PROGRAM)
 
 protobuf/%::
@@ -142,7 +149,13 @@ pie: arch/$(ARCH)
 built-in.o: $(VERSION_HEADER) pie
 	$(Q) $(MAKE) $(build-crtools)=. $@
 
-PROGRAM-BUILTINS	+= pie/util-net.o
+lib/%:: $(VERSION_HEADER) config built-in.o
+	$(Q) $(MAKE) $(build)=lib $@
+lib: $(VERSION_HEADER) config built-in.o
+	$(Q) $(MAKE) $(build)=lib all
+
+PROGRAM-BUILTINS	+= pie/util-fd.o
+PROGRAM-BUILTINS	+= pie/util.o
 PROGRAM-BUILTINS	+= protobuf/built-in.o
 PROGRAM-BUILTINS	+= built-in.o
 
@@ -165,6 +178,7 @@ clean-built:
 	$(Q) $(MAKE) $(build)=arch/$(ARCH) clean
 	$(Q) $(MAKE) $(build)=protobuf clean
 	$(Q) $(MAKE) $(build)=pie clean
+	$(Q) $(MAKE) $(build)=lib clean
 	$(Q) $(MAKE) $(build-crtools)=. clean
 	$(Q) $(MAKE) -C Documentation clean
 	$(Q) $(RM) ./include/config.h
@@ -184,6 +198,7 @@ clean: clean-built
 	$(Q) $(RM) -r ./gcov
 	$(Q) $(RM) -r ./test/lib/
 	$(Q) $(RM) -r ./test/lib64/
+	$(Q) $(RM) protobuf-desc-gen.h
 	$(Q) $(MAKE) -C test/zdtm cleandep clean cleanout
 
 distclean: clean

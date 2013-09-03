@@ -110,12 +110,22 @@ struct mount_info {
 	struct fstype	*fstype;
 	char		*source;
 	char		*options;
+	bool		mounted;
 	struct mount_info *next;
 
 	/* tree linkage */
 	struct mount_info *parent;
+	struct mount_info *bind;
 	struct list_head children;
 	struct list_head siblings;
+
+	struct list_head mnt_bind;	/* circular list of derivatives of one real mount */
+	struct list_head mnt_share;	/* circular list of shared mounts */
+	struct list_head mnt_slave_list;/* list of slave mounts */
+	struct list_head mnt_slave;	/* slave list entry */
+	struct mount_info *mnt_master;	/* slave is on master->mnt_slave_list */
+
+	struct list_head postpone;
 };
 
 struct proc_posix_timer {

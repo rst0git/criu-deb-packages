@@ -38,6 +38,7 @@ streaming/pipe_shared00
 transition/file_read
 static/sockets00
 static/sockets01
+static/sockets02
 static/sock_opts00
 static/sock_opts01
 static/sockets_spair
@@ -87,8 +88,11 @@ static/fdt_shared
 static/file_locks00
 static/file_locks01
 static/sigpending
+static/sigaltstack
 static/sk-netlink
 static/proc-self
+static/grow_map
+static/grow_map02
 "
 # Duplicate list with ns/ prefix
 TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#ns/#')
@@ -102,35 +106,23 @@ static/socket-tcp6
 streaming/socket-tcp
 streaming/socket-tcp6
 static/socket-tcpbuf
+static/socket-tcpbuf-local
 static/socket-tcpbuf6
 static/pty03
-"
-
-MNT_TEST_LIST="
 static/mountpoints
-"
-
-# These ones are in ns
-TEST_LIST="$TEST_LIST
 ns/static/session00
 ns/static/session01
-"
-
-UTS_TEST_LIST="
 static/utsname
-"
-
-IPC_TEST_LIST="
 static/ipc_namespace
 static/shm
 static/msgque
 static/sem
 transition/ipc
+ns/static/tun
 "
 
 TEST_CR_KERNEL="
-static/sigpending
-static/sk-netlink
+ns/static/tun
 "
 
 TEST_SUID_LIST="
@@ -146,16 +138,15 @@ cmdlinenv00
 packet_sock
 fanotify00
 sk-netlink
+tun
 "
 
-CRIU=$(readlink -f `dirname $0`/../criu)
+source $(readlink -f `dirname $0`/env.sh) || exit 1
+
 CRIU_CPT=$CRIU
 TMP_TREE=""
-
-test -x $CRIU || {
-	echo "$CRIU is unavailable"
-	exit 1
-}
+SCRIPTDIR=`dirname $CRIU`/test
+POSTDUMP="--action-script $SCRIPTDIR/post-dump.sh"
 
 ARGS=""
 
@@ -167,11 +158,26 @@ EXCLUDE_PATTERN=""
 CLEANUP=0
 PAGE_SERVER=0
 PS_PORT=12345
+COMPILE_ONLY=0
+BATCH_TEST=0
+SPECIFIED_NAME_USED=0
+
+check_criu()
+{
+	if [ ! -x $CRIU ]; then
+		echo "$CRIU is unavailable"
+		return 1
+	fi
+}
 
 check_mainstream()
 {
 	local -a ver_arr
 	local ver_str=`uname -r`
+
+	cat >&2 <<EOF
+========================== CRIU CHECK =============================
+EOF
 
 	$CRIU check && return 0
 	MAINSTREAM_KERNEL=1
@@ -187,9 +193,9 @@ EOF
 	ver_arr=(`echo ${ver_str//./ }`)
 
 	[ "${ver_arr[0]}" -gt 3 ] && return 0
-	[[ "${ver_arr[0]}" -eq 3 && "${ver_arr[1]}" -ge 8 ]] && return 0
+	[[ "${ver_arr[0]}" -eq 3 && "${ver_arr[1]}" -ge 11 ]] && return 0
 
-	echo "A version of kernel should be greater or equal to 3.8"
+	echo "A version of kernel should be greater or equal to 3.11" >&2
 
 	return 1;
 }
@@ -215,21 +221,63 @@ construct_root()
 	local ps_path=`type -P ps`
 	local libdir=$root/lib
 	local libdir2=$root/lib64
+	local tmpdir=$root/tmp
+	local lname, tname
 
-	mkdir $root/bin
+	mkdir -p $root/bin
 	cp $ps_path $root/bin
 
-	mkdir $libdir $libdir2
-	for i in `ldd $test_path $ps_path | grep -P '^\s' | awk '{ print $1 }' | grep -v vdso`; do
-		local lib=`basename $i`
-		[ -f $libdir/$lib ] && continue ||
-		[ -f $i ] && cp $i $libdir && cp $i $libdir2 && continue ||
-		[ -f /lib64/$i ] && cp /lib64/$i $libdir && cp /lib64/$i $libdir2 && continue ||
-		[ -f /usr/lib64/$i ] && cp /usr/lib64/$i $libdir && cp /usr/lib64/$i $libdir2 && continue ||
-		[ -f /lib/x86_64-linux-gnu/$i ] && cp /lib/x86_64-linux-gnu/$i $libdir && cp /lib/x86_64-linux-gnu/$i $libdir2 && continue ||
-		[ -f /lib/arm-linux-gnueabi/$i ] && cp /lib/arm-linux-gnueabi/$i $libdir && cp /lib/arm-linux-gnueabi/$i $libdir2 && continue || echo "Failed at " $i && return 1
+	mkdir -p $libdir $libdir2
+
+	# $ ldd /bin/ps test/zdtm/live/static/env00
+	# /bin/ps:
+	#	/usr/lib/arm-linux-gnueabihf/libcofi_rpi.so (0xb6f39000)
+	#	libprocps.so.0 => /lib/arm-linux-gnueabihf/libprocps.so.0 (0xb6f04000)
+	#	libgcc_s.so.1 => /lib/arm-linux-gnueabihf/libgcc_s.so.1 (0xb6edc000)
+	#	libc.so.6 => /lib/arm-linux-gnueabihf/libc.so.6 (0xb6dad000)
+	#	/lib/ld-linux-armhf.so.3 (0xb6f46000)
+	# test/zdtm/live/static/env00:
+	#	/usr/lib/arm-linux-gnueabihf/libcofi_rpi.so (0xb6efe000)
+	#	libc.so.6 => /lib/arm-linux-gnueabihf/libc.so.6 (0xb6dc5000)
+	#	/lib/ld-linux-armhf.so.3 (0xb6f0b000)
+
+	for i in `ldd $test_path $ps_path | grep -P '^\s' | grep -v vdso | sed "s/.*=> //" | awk '{ print $1 }'`; do
+		local ldir, lib=`basename $i`
+
+		[ -f $libdir2/$lib ] && continue # fast path
+
+		if [ -f $i ]; then
+			lname=$i
+		elif [ -f /lib64/$i ]; then
+			lname=/lib64/$i
+		elif [ -f /usr/lib64/$i ]; then
+			lname=/usr/lib64/$i
+		elif [ -f /lib/x86_64-linux-gnu/$i ]; then
+			lname=/lib/x86_64-linux-gnu/$i
+		elif [ -f /lib/arm-linux-gnueabi/$i ]; then
+			lname=/lib/arm-linux-gnueabi/$i
+		else 
+			echo "Failed at " $i;
+			return 1
+		fi
+
+		# When tests are executed concurrently all of them use the same root,
+		# so libraries must be copied atomically.
+
+		for ldir in "$libdir" "$libdir2"; do
+			tname=$(mktemp $ldir/lib.XXXXXX)
+			cp -pf $lname $tname &&
+			mv -n $tname $ldir/$lib || return 1
+			[ -f $tname ] && unlink $tname
+		done
 	done
+
+	# make 'tmp' dir under new root
+	mkdir -p $tmpdir
+	chmod 0777 $tmpdir
 }
+
+export MAKEFLAGS=--no-print-directory
 
 start_test()
 {
@@ -244,23 +292,23 @@ start_test()
 	unset ZDTM_UID
 	unset ZDTM_GID
 
-	echo $TEST_SUID_LIST | grep $tname || {
+	echo $TEST_SUID_LIST | grep -q $tname || {
 		export ZDTM_UID=18943
 		export ZDTM_GID=58467
 		chown $ZDTM_UID:$ZDTM_GID $tdir
 	}
 
 	if [ -z "$PIDNS" ]; then
-		make -C $tdir $tname.pid
+		make -C $tdir $tname.pid || return 1
 		PID=`cat $test.pid` || return 1
 	else
 		if [ -z "$ZDTM_ROOT" ]; then
-			mkdir dump
+			mkdir -p dump
 			ZDTM_ROOT=`mktemp -d /tmp/criu-root.XXXXXX`
 			ZDTM_ROOT=`readlink -f $ZDTM_ROOT`
 			mount --bind . $ZDTM_ROOT || return 1
 		fi
-		make -C $tdir $tname
+		make -C $tdir $tname || return 1
 		construct_root $ZDTM_ROOT $tdir/$tname || return 1
 	(	export ZDTM_NEWNS=1
 		export ZDTM_PIDFILE=$TPID
@@ -305,6 +353,7 @@ run_test()
 	local linkremap=
 	local snapopt=
 	local snappdir=
+	local ps_pid=
 
 	[ -n "$EXCLUDE_PATTERN" ] && echo $test | grep "$EXCLUDE_PATTERN" && return 0
 
@@ -314,7 +363,7 @@ run_test()
 		linkremap="--link-remap"
 	fi
 
-	[ -n "$MAINSTREAM_KERNEL" ] && echo $TEST_CR_KERNEL | grep -q ${test#ns/} && {
+	[ -n "$MAINSTREAM_KERNEL" ] && [ $COMPILE_ONLY -eq 0 ] && echo $TEST_CR_KERNEL | grep -q ${test#ns/} && {
 		echo "Skip $test"
 		return 0
 	}
@@ -327,6 +376,11 @@ run_test()
 	local tname=`basename $test`
 	local tdir=`dirname $test`
 	DUMP_PATH=""
+
+	if [ $COMPILE_ONLY -eq 1 ]; then
+		echo "Compile $test"
+		make -C $tdir $tname && return 0 || return 1
+	fi
 
 	echo "Execute $test"
 
@@ -348,34 +402,57 @@ to ip is written in \$CR_IP_TOOL.
 EOF
 			exit 1;
 		}
-		args="-n uts -n ipc -n net -n pid -n mnt --root $ZDTM_ROOT --pidfile $TPID $args"
+		args="--root $ZDTM_ROOT --pidfile $TPID $args"
 	fi
 
 	for i in `seq $ITERATIONS`; do
-
+		local dump_only=
+		local postdump=
 		ddump=dump/$tname/$PID/$i
 		DUMP_PATH=`pwd`/$ddump
 		echo Dump $PID
 		mkdir -p $ddump
 
+		[ -n "$DUMP_ONLY" ] && dump_only=1
+
 		if [ $PAGE_SERVER -eq 1 ]; then
-			$CRIU page-server -D $ddump -o page_server.log -v4 --port $PS_PORT --daemon
-			PS_PID=$!
+			$CRIU page-server -D $ddump -o page_server.log -v4 --port $PS_PORT --daemon || return 1
+			ps_pid=`lsof -s TCP:LISTEN -i :$PS_PORT -t`
+			ps -p "$ps_pid" -o cmd h | grep -q page-server || {
+				echo "Unable to determing PID of page-server"
+				return 1
+			}
 			opts="--page-server --address 127.0.0.1 --port $PS_PORT"
 		fi
 
 		if [ -n "$SNAPSHOT" ]; then
 			snapopt=""
-			[ "$i" -ne "$ITERATIONS" ] && snapopt="$snapopt -R --track-mem"
+			[ "$i" -ne "$ITERATIONS" ] && {
+				snapopt="$snapopt -R --track-mem"
+				dump_only=1
+			}
 			[ -n "$snappdir" ] && snapopt="$snapopt --prev-images-dir=$snappdir"
 		fi
 
+		[ -n "$dump_only" ] && postdump=$POSTDUMP
+
 		save_fds $PID  $ddump/dump.fd
 		setsid $CRIU_CPT dump $opts --file-locks --tcp-established $linkremap \
-			-x --evasive-devices -D $ddump -o dump.log -v4 -t $PID $args $ARGS $snapopt || {
-			echo WARNING: process $tname is left running for your debugging needs
+			-x --evasive-devices -D $ddump -o dump.log -v4 -t $PID $args $ARGS $snapopt $postdump
+		retcode=$?
+
+		#
+		# Here we may have two cases: either checkpoint is failed
+		# with some error code, or checkpoint is complete but return
+		# code is non-zero because of post dump action.
+		if [ "$retcode" -ne 0 ] && [[ "$retcode" -ne 32 || -z "$dump_only" ]]; then
+			if [ $BATCH_TEST -eq 0 ]; then
+				echo WARNING: $tname returned $retcode and left running for debug needs
+			else
+				echo WARNING: $tname failed and returned $retcode
+			fi
 			return 1
-		}
+		fi
 
 		if [ -n "$SNAPSHOT" ]; then
 			snappdir=../`basename $ddump`
@@ -383,13 +460,16 @@ EOF
 		fi
 
 		if [ $PAGE_SERVER -eq 1 ]; then
-			wait $PS_PID
+			while :; do
+				kill -0 $ps_pid > /dev/null 2>&1 || break;
+				echo Waiting the process $ps_pid
+				sleep 0.1
+			done
 		fi
 
-		if expr " $ARGS" : ' -s' > /dev/null; then
+		if [ -n "$dump_only" ]; then
 			save_fds $PID  $ddump/dump.fd.after
 			diff_fds $ddump/dump.fd $ddump/dump.fd.after || return 1
-			killall -CONT $tname
 			if [[ $linkremap ]]; then
 				echo "remove ./$tdir/link_remap.*"
 				rm -f ./$tdir/link_remap.*
@@ -424,17 +504,23 @@ EOF
 	done
 
 	echo Check results $PID
-	stop_test $tdir $tname
+	stop_test $tdir $tname || {
+		echo "Unable to stop $tname ($PID)"
+		return 2
+	}
+
 	sltime=1
 	for i in `seq 50`; do
-		test -f $test.out && break
+		kill -0 $PID > /dev/null 2>&1 || break;
 		echo Waiting...
 		sleep 0.$sltime
 		[ $sltime -lt 9 ] && sltime=$((sltime+1))
 	done
+
 	cat $test.out
 	cat $test.out | grep -q PASS || return 2
 	[ "$CLEANUP" -ne 0 ] && rm -rf `dirname $ddump`
+	echo "Test: $test, Result: PASS"
 	return 0
 }
 
@@ -443,26 +529,66 @@ case_error()
 	test=${ZP}/${1#ns/}
 	local test_log=`pwd`/$test.out
 
+	echo "Test: $test, Result: FAIL"
 	ZDTM_FAILED=1
 
-	echo "Test: $test"
-	echo "====================== ERROR ======================"
+(	exec >&2
+
+	cat <<EOF
+============================= ERROR ===============================
+EOF
+
+	echo "Test: $test, Namespace: $PIDNS"
+	cat <<EOF
+-------------------------------------------------------------------
+EOF
 
 	if [ -n "$DUMP_PATH" ]; then
 		[ -e "$DUMP_PATH/dump.log" ] && {
 			echo "Dump log   : $DUMP_PATH/dump.log"
 			cat $DUMP_PATH/dump.log* | grep Error
+			cat <<EOF
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+EOF
+			tail -n 40 $DUMP_PATH/dump.log*
+			cat <<EOF
+-------------------------------------------------------------------
+EOF
 		}
 		[ -e "$DUMP_PATH/restore.log" ] && {
 			echo "Restore log: $DUMP_PATH/restore.log"
 			cat $DUMP_PATH/restore.log* | grep Error
+			cat <<EOF
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+EOF
+			tail -n 40 $DUMP_PATH/restore.log*
+			cat <<EOF
+-------------------------------------------------------------------
+EOF
 		}
 	fi
-	[ -e "$test_log" ] &&
+	[ -e "$test_log" ] && {
 		echo "Output file: $test_log"
+		cat $test_log*
+		cat <<EOF
+-------------------------------------------------------------------
+EOF
+	}
+
 	[ -n "$HEAD" ] &&
 		echo "The initial HEAD was $HEAD"
-	exit 1
+
+	cat <<EOF
+=========================== ERROR OVER ============================
+EOF
+)
+	if [ $BATCH_TEST -eq 0 ]; then
+		exit 1
+	else
+		# kill failed test
+		local tname=`basename $test`
+		killall -9 $tname > /dev/null 2>&1
+	fi
 }
 
 checkout()
@@ -478,7 +604,7 @@ cd `dirname $0` || exit 1
 
 while :; do
 	if [ "$1" = "-d" ]; then
-		ARGS="-s"
+		DUMP_ONLY=1
 		shift
 		continue
 	fi
@@ -521,7 +647,7 @@ while :; do
 	if [ "$1" = "-t" ]; then
 		shift
 		TMPFS_DUMP=dump
-		[ -d dump ] || mkdir $TMPFS_DUMP
+		[ -d dump ] || mkdir -p $TMPFS_DUMP
 		mount -t tmpfs none $TMPFS_DUMP || exit 1
 		continue;
 	fi
@@ -536,33 +662,36 @@ while :; do
 		shift
 		continue
 	fi
+	if [ "$1" = "-g" ]; then
+		COMPILE_ONLY=1
+		shift
+		continue
+	fi
+	if [ "$1" = "-n" ]; then
+		BATCH_TEST=1
+		shift
+		continue
+	fi
+	if [ "$1" = "-r" ]; then
+		SPECIFIED_NAME_USED=1
+		shift
+		continue
+	fi
 	break;
 done
 
-if [ $# -eq 0 ]; then
+if [ $COMPILE_ONLY -eq 0 ]; then
+	check_criu || exit 1
+fi
 
-	check_mainstream || exit 1
-
-	for t in $TEST_LIST; do
-		run_test $t || case_error $t
-	done
-	for t in $UTS_TEST_LIST; do
-		run_test $t -n uts || case_error $t
-	done
-	for t in $MNT_TEST_LIST; do
-		run_test $t -n mnt || case_error $t
-	done
-	for t in $IPC_TEST_LIST; do
-		run_test $t -n ipc || case_error $t
-	done
-elif [ "$1" = "-l" ]; then
-	echo $TEST_LIST $UTS_TEST_LIST $MNT_TEST_LIST $IPC_TEST_LIST | tr ' ' '\n'
+if [ "$1" = "-l" ]; then
+	echo $TEST_LIST | tr ' ' '\n'
 elif [ "$1" = "-h" ]; then
 	cat >&2 <<EOF
 This script is used for executing unit tests.
 Usage:
 zdtm.sh [OPTIONS]
-zdtm.sh [OPTIONS] [TEST NAME]
+zdtm.sh [OPTIONS] [TEST PATTERN]
 Options:
 	-l : Show list of tests.
 	-d : Dump a test process and check that this process can continue working.
@@ -573,21 +702,41 @@ Options:
 	-x <PATTERN>: Exclude pattern
 	-t : mount tmpfs for dump files
 	-a <FILE>.tar.gz : save archive with dump files and logs
+	-g : Generate executables only
+	-n : Batch test
+	-r : Run test with specified name directly without match or check
 EOF
 elif [ "${1:0:1}" = '-' ]; then
 	echo "unrecognized option $1"
+elif [ $SPECIFIED_NAME_USED -eq 1 ]; then
+	if [ $# -eq 0 ]; then
+		echo "test name should be provided"
+		exit 1
+	fi
+	run_test $1 || case_error $1
 else
-	if echo $UTS_TEST_LIST | fgrep -qw $1; then
-		run_test $1 -n uts || case_error $1
-	elif echo $MNT_TEST_LIST | fgrep -qw $1; then
-		run_test $1 -n mnt || case_error $1
-	elif echo $IPC_TEST_LIST | fgrep -qw $1; then
-		run_test $1 -n ipc || case_error $1
-	elif echo $FILE_LOCK_TEST_LIST | fgrep -qw $1; then
-		run_test $1 -l || case_error $1
+	if [ $COMPILE_ONLY -eq 0 ]; then
+		check_mainstream || exit 1
+	fi
+
+	if [ $# -eq 0 ]; then
+		pattern='.*'
 	else
-		run_test $1 || case_error $1
+		pattern=$1
+	fi
+
+	for t in $(echo "$TEST_LIST" | grep -x "$pattern"); do
+		run_test $t || case_error $t
+	done
+
+	if [ $COMPILE_ONLY -eq 0 ]; then
+		if [ -n "$ZDTM_FAILED" ]; then
+			echo ZDTM tests FAIL.
+		else
+			echo ZDTM tests PASS.
+		fi
 	fi
 fi
 
-[ -n "$TMP_TREE" ] && rm -rf $TMP_TREE || exit 0
+[ -n "$TMP_TREE" ] && rm -rf $TMP_TREE
+[ -n "$ZDTM_FAILED" ] && exit 1 || exit 0

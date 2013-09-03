@@ -19,6 +19,7 @@
 #include <sys/file.h>
 #include <sys/shm.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 
 #include <sched.h>
 
@@ -30,6 +31,7 @@
 
 #include "image.h"
 #include "util.h"
+#include "util-pie.h"
 #include "log.h"
 #include "syscall.h"
 #include "restorer.h"
@@ -59,6 +61,8 @@
 #include "page-read.h"
 #include "sysctl.h"
 #include "vdso.h"
+#include "stats.h"
+#include "tun.h"
 
 #include "protobuf.h"
 #include "protobuf/sa.pb-c.h"
@@ -107,9 +111,31 @@ static int crtools_prepare_shared(void)
 	return 0;
 }
 
+static struct collect_image_info *cinfos[] = {
+	&reg_file_cinfo,
+	&remap_cinfo,
+	&nsfile_cinfo,
+	&pipe_cinfo,
+	&fifo_cinfo,
+	&unix_sk_cinfo,
+	&packet_sk_cinfo,
+	&netlink_sk_cinfo,
+	&eventfd_cinfo,
+	&epoll_tfd_cinfo,
+	&epoll_cinfo,
+	&signalfd_cinfo,
+	&inotify_cinfo,
+	&inotify_mark_cinfo,
+	&fanotify_cinfo,
+	&fanotify_mark_cinfo,
+	&tty_info_cinfo,
+	&tty_cinfo,
+	&tunfile_cinfo,
+};
+
 static int root_prepare_shared(void)
 {
-	int ret = 0;
+	int ret = 0, i;
 	struct pstree_item *pi;
 
 	pr_info("Preparing info about shared resources\n");
@@ -123,40 +149,20 @@ static int root_prepare_shared(void)
 	if (prepare_shared_reg_files())
 		return -1;
 
-	if (collect_reg_files())
-		return -1;
-
-	if (collect_ns_files())
-		return -1;
+	for (i = 0; i < ARRAY_SIZE(cinfos); i++) {
+		ret = collect_image(cinfos[i]);
+		if (ret)
+			return -1;
+	}
 
 	if (collect_pipes())
 		return -1;
-
 	if (collect_fifo())
 		return -1;
-
 	if (collect_unix_sockets())
 		return -1;
 
-	if (collect_packet_sockets())
-		return -1;
-
-	if (collect_netlink_sockets())
-		return -1;
-
-	if (collect_eventfd())
-		return -1;
-
-	if (collect_eventpoll())
-		return -1;
-
-	if (collect_signalfd())
-		return -1;
-
-	if (collect_inotify())
-		return -1;
-
-	if (collect_tty())
+	if (tty_verify_active_pairs())
 		return -1;
 
 	for_each_pstree_item(pi) {
@@ -201,7 +207,7 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void *tgt_addr,
 {
 	int ret;
 	void *addr, *paddr = NULL;
-	unsigned long nr_pages;
+	unsigned long nr_pages, size;
 	struct vma_area *p = *pvma;
 
 	if (vma_entry_is(&vma->vma, VMA_FILE_PRIVATE)) {
@@ -236,11 +242,26 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void *tgt_addr,
 
 	*pvma = p;
 
+	/*
+	 * A grow-down VMA has a guard page, which protect a VMA below it.
+	 * So one more page is mapped here to restore content of the first page
+	 */
+	if (vma->vma.flags & MAP_GROWSDOWN) {
+		vma->vma.start -= PAGE_SIZE;
+		if (paddr)
+			paddr -= PAGE_SIZE;
+	}
+
+	size = vma_entry_len(&vma->vma);
 	if (paddr == NULL) {
+		/*
+		 * The respective memory area was NOT found in the parent.
+		 * Map a new one.
+		 */
 		pr_info("Map 0x%016"PRIx64"-0x%016"PRIx64" 0x%016"PRIx64" vma\n",
 			vma->vma.start, vma->vma.end, vma->vma.pgoff);
 
-		addr = mmap(tgt_addr, vma_entry_len(&vma->vma),
+		addr = mmap(tgt_addr, size,
 				vma->vma.prot | PROT_WRITE,
 				vma->vma.flags | MAP_FIXED,
 				vma->vma.fd, vma->vma.pgoff);
@@ -250,9 +271,13 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void *tgt_addr,
 			return -1;
 		}
 	} else {
+		/*
+		 * This region was found in parent -- remap it to inherit physical
+		 * pages (if any) from it (and COW them later if required).
+		 */
 		vma->ppage_bitmap = p->page_bitmap;
 
-		addr = mremap(paddr, vma_area_len(vma), vma_area_len(vma),
+		addr = mremap(paddr, size, size,
 				MREMAP_FIXED | MREMAP_MAYMOVE, tgt_addr);
 		if (addr != tgt_addr) {
 			pr_perror("Unable to remap a private vma");
@@ -265,10 +290,15 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void *tgt_addr,
 	pr_debug("\tpremap 0x%016"PRIx64"-0x%016"PRIx64" -> %016lx\n",
 		vma->vma.start, vma->vma.end, (unsigned long)addr);
 
+	if (vma->vma.flags & MAP_GROWSDOWN) { /* Skip gurad page */
+		vma->vma.start += PAGE_SIZE;
+		vma_premmaped_start(&vma->vma) += PAGE_SIZE;
+	}
+
 	if (vma_entry_is(&vma->vma, VMA_FILE_PRIVATE))
 		close(vma->vma.fd);
 
-	return 0;
+	return size;
 }
 
 static int restore_priv_vma_content(pid_t pid)
@@ -329,26 +359,31 @@ static int restore_priv_vma_content(pid_t pid)
 			}
 
 			off = (va - vma->vma.start) / PAGE_SIZE;
-
-			set_bit(off, vma->page_bitmap);
-			if (vma->ppage_bitmap)
-				clear_bit(off, vma->ppage_bitmap);
-
-			ret = pr.read_page(&pr, va, buf);
-			if (ret < 0)
-				break;
-
-			va += PAGE_SIZE;
-
 			p = decode_pointer((off) * PAGE_SIZE +
 					vma_premmaped_start(&vma->vma));
 
-			if (memcmp(p, buf, PAGE_SIZE) == 0) {
-				nr_shared++;
-				continue;
+			set_bit(off, vma->page_bitmap);
+			if (vma->ppage_bitmap) { /* inherited vma */
+				clear_bit(off, vma->ppage_bitmap);
+
+				ret = pr.read_page(&pr, va, buf);
+				if (ret < 0)
+					break;
+				va += PAGE_SIZE;
+
+				if (memcmp(p, buf, PAGE_SIZE) == 0) {
+					nr_shared++; /* the page is cowed */
+					continue;
+				}
+
+				memcpy(p, buf, PAGE_SIZE);
+			} else {
+				ret = pr.read_page(&pr, va, p);
+				if (ret < 0)
+					break;
+				va += PAGE_SIZE;
 			}
 
-			memcpy(p, buf, PAGE_SIZE);
 			nr_restored++;
 		}
 
@@ -387,6 +422,9 @@ static int restore_priv_vma_content(pid_t pid)
 		}
 	}
 
+	cnt_add(CNT_PAGES_COMPARED, nr_restored + nr_shared);
+	cnt_add(CNT_PAGES_SKIPPED_COW, nr_shared);
+
 	pr_info("nr_restored_pages: %d\n", nr_restored);
 	pr_info("nr_shared_pages:   %d\n", nr_shared);
 	pr_info("nr_droped_pages:   %d\n", nr_droped);
@@ -399,19 +437,23 @@ err_addr:
 	return -1;
 }
 
-static int read_vmas(int pid)
+static int prepare_mappings(int pid)
 {
 	int fd, ret = 0;
-	LIST_HEAD(old);
+	LIST_HEAD(parent_vmas);
 	struct vma_area *pvma, *vma;
-	unsigned long priv_size = 0;
 	void *addr;
 
 	void *old_premmapped_addr = NULL;
 	unsigned long old_premmapped_len, pstart = 0;
 
 	rst_vmas.nr = 0;
-	list_replace_init(&rst_vmas.h, &old);
+	rst_vmas.priv_size = 0;
+	/*
+	 * Keep parent vmas at hands to check whether we can "inherit" them.
+	 * See comments in map_private_vma.
+	 */
+	list_replace_init(&rst_vmas.h, &parent_vmas);
 
 	/* Skip errors, because a zombie doesn't have an image of vmas */
 	fd = open_image(CR_FD_VMAS, O_RSTR, pid);
@@ -430,7 +472,7 @@ static int read_vmas(int pid)
 		if (!vma)
 			break;
 
-		ret = pb_read_one_eof(fd, &e, PB_VMAS);
+		ret = pb_read_one_eof(fd, &e, PB_VMA);
 		if (ret <= 0) {
 			xfree(vma);
 			break;
@@ -449,28 +491,30 @@ static int read_vmas(int pid)
 			break;
 		}
 
-		if (!vma_priv(&vma->vma))
-			continue;
-
-		priv_size += vma_area_len(vma);
+		if (vma_priv(&vma->vma)) {
+			rst_vmas.priv_size += vma_area_len(vma);
+			if (vma->vma.flags & MAP_GROWSDOWN)
+				rst_vmas.priv_size += PAGE_SIZE;
+		}
 	}
+	close(fd);
 
 	if (ret < 0)
 		goto out;
 
 	/* Reserve a place for mapping private vma-s one by one */
-	addr = mmap(NULL, priv_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	addr = mmap(NULL, rst_vmas.priv_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	if (addr == MAP_FAILED) {
-		pr_perror("Unable to reserve memory (%lu bytes)", priv_size);
+		pr_perror("Unable to reserve memory (%lu bytes)", rst_vmas.priv_size);
 		return -1;
 	}
 
 	old_premmapped_addr = current->rst->premmapped_addr;
 	old_premmapped_len = current->rst->premmapped_len;
 	current->rst->premmapped_addr = addr;
-	current->rst->premmapped_len = priv_size;
+	current->rst->premmapped_len = rst_vmas.priv_size;
 
-	pvma = list_entry(&old, struct vma_area, list);
+	pvma = list_entry(&parent_vmas, struct vma_area, list);
 
 	list_for_each_entry(vma, &rst_vmas.h, list) {
 		if (pstart > vma->vma.start) {
@@ -483,20 +527,19 @@ static int read_vmas(int pid)
 		if (!vma_priv(&vma->vma))
 			continue;
 
-		ret = map_private_vma(pid, vma, addr, &pvma, &old);
+		ret = map_private_vma(pid, vma, addr, &pvma, &parent_vmas);
 		if (ret < 0)
 			break;
 
-		addr += vma_area_len(vma);
+		addr += ret;
 	}
 
-	if (ret == 0)
+	if (ret >= 0)
 		ret = restore_priv_vma_content(pid);
-	close(fd);
 
 out:
-	while (!list_empty(&old)) {
-		vma = list_first_entry(&old, struct vma_area, list);
+	while (!list_empty(&parent_vmas)) {
+		vma = list_first_entry(&parent_vmas, struct vma_area, list);
 		list_del(&vma->list);
 		xfree(vma);
 	}
@@ -510,6 +553,31 @@ out:
 
 
 	return ret;
+}
+
+/*
+ * A gard page must be unmapped after restoring content and
+ * forking children to restore COW memory.
+ */
+static int unmap_guard_pages()
+{
+	struct vma_area *vma;
+
+	list_for_each_entry(vma, &rst_vmas.h, list) {
+		if (!vma_priv(&vma->vma))
+			continue;
+
+		if (vma->vma.flags & MAP_GROWSDOWN) {
+			void *addr = decode_pointer(vma_premmaped_start(&vma->vma));
+
+			if (munmap(addr - PAGE_SIZE, PAGE_SIZE)) {
+				pr_perror("Can't unmap guard page\n");
+				return -1;
+			}
+		}
+	}
+
+	return 0;
 }
 
 static int open_vmas(int pid)
@@ -714,17 +782,13 @@ static inline int sig_fatal(int sig)
 
 struct task_entries *task_entries;
 
-static int restore_one_fake(void)
+static int restore_one_zombie(int pid, CoreEntry *core)
 {
-	/* We should wait here, otherwise last_pid will be changed. */
-	futex_wait_while(&task_entries->start, CR_STATE_FORKING);
-	futex_wait_while(&task_entries->start, CR_STATE_RESTORE_PGID);
-	return 0;
-}
+	int exit_code = core->tc->exit_code;
 
-static int restore_one_zombie(int pid, int exit_code)
-{
 	pr_info("Restoring zombie with %d code\n", exit_code);
+
+	sys_prctl(PR_SET_NAME, (long)(void *)core->tc->comm, 0, 0, 0);
 
 	if (task_entries != NULL) {
 		restore_finish_stage(CR_STATE_RESTORE);
@@ -734,6 +798,10 @@ static int restore_one_zombie(int pid, int exit_code)
 
 	if (exit_code & 0x7f) {
 		int signr;
+
+		/* prevent generating core files */
+		if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0))
+			pr_perror("Can't drop the dumpable flag");
 
 		signr = exit_code & 0x7F;
 		if (!sig_fatal(signr)) {
@@ -754,7 +822,7 @@ static int restore_one_zombie(int pid, int exit_code)
 	return -1;
 }
 
-static int check_core(CoreEntry *core)
+static int check_core(CoreEntry *core, struct pstree_item *me)
 {
 	int ret = -1;
 
@@ -769,7 +837,7 @@ static int check_core(CoreEntry *core)
 	}
 
 	if (core->tc->task_state != TASK_DEAD) {
-		if (!core->ids && !current->ids) {
+		if (!core->ids && !me->ids) {
 			pr_err("Core IDS data missed for non-zombie\n");
 			goto out;
 		}
@@ -782,24 +850,19 @@ static int check_core(CoreEntry *core)
 
 	ret = 0;
 out:
-	return ret < 0 ? ret : 0;
+	return ret;
 }
 
 static int restore_one_task(int pid, CoreEntry *core)
 {
 	int ret;
 
-	if (check_core(core)) {
-		ret = -1;
-		goto out;
-	}
-
 	switch ((int)core->tc->task_state) {
 	case TASK_ALIVE:
 		ret = restore_one_alive_task(pid, core);
 		break;
 	case TASK_DEAD:
-		ret = restore_one_zombie(pid, core->tc->exit_code);
+		ret = restore_one_zombie(pid, core);
 		break;
 	default:
 		pr_err("Unknown state in code %d\n", (int)core->tc->task_state);
@@ -807,7 +870,6 @@ static int restore_one_task(int pid, CoreEntry *core)
 		break;
 	}
 
-out:
 	core_entry__free_unpacked(core, NULL);
 	return ret;
 }
@@ -853,6 +915,9 @@ static inline int fork_with_pid(struct pstree_item *item)
 		close(fd);
 
 		if (ret < 0)
+			return -1;
+
+		if (check_core(ca.core, item))
 			return -1;
 
 		if (ca.core->tc->task_state == TASK_DEAD)
@@ -937,6 +1002,8 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 		pid = waitpid(root_item->pid.real, &status, WNOHANG);
 		if (pid <= 0)
 			return;
+		exit = WIFEXITED(status);
+		status = exit ? WEXITSTATUS(status) : WTERMSIG(status);
 	}
 
 	if (!current || status)
@@ -1023,7 +1090,7 @@ static void restore_pgid(void)
 
 static int mount_proc(void)
 {
-	int ret;
+	int fd, ret;
 	char proc_mountpoint[] = "crtools-proc.XXXXXX";
 
 	if (mkdtemp(proc_mountpoint) == NULL) {
@@ -1034,30 +1101,60 @@ static int mount_proc(void)
 	pr_info("Mount procfs in %s\n", proc_mountpoint);
 	if (mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL)) {
 		pr_perror("mount failed");
-		ret = -1;
-		goto out_rmdir;
-	}
-
-	ret = set_proc_mountpoint(proc_mountpoint);
-
-	if (umount2(proc_mountpoint, MNT_DETACH) == -1) {
-		pr_perror("Can't umount %s", proc_mountpoint);
+		rmdir(proc_mountpoint);
 		return -1;
 	}
 
-out_rmdir:
-	if (rmdir(proc_mountpoint) == -1) {
-		pr_perror("Can't remove %s", proc_mountpoint);
-		return -1;
+	ret = fd = open_detach_mount(proc_mountpoint);
+	if (fd >= 0) {
+		ret = set_proc_fd(fd);
+		close(fd);
 	}
 
 	return ret;
 }
 
+/*
+ * Tasks cannot change sid (session id) arbitrary, but can either
+ * inherit one from ancestor, or create a new one with id equal to
+ * their pid. Thus sid-s restore is tied with children creation.
+ */
+
+static int create_children_and_session(void)
+{
+	int ret;
+	struct pstree_item *child;
+
+	pr_info("Restoring children in alien sessions:\n");
+	list_for_each_entry(child, &current->children, sibling) {
+		if (!restore_before_setsid(child))
+			continue;
+
+		BUG_ON(child->born_sid != -1 && getsid(getpid()) != child->born_sid);
+
+		ret = fork_with_pid(child);
+		if (ret < 0)
+			return ret;
+	}
+
+	restore_sid();
+
+	pr_info("Restoring children in our session:\n");
+	list_for_each_entry(child, &current->children, sibling) {
+		if (restore_before_setsid(child))
+			continue;
+
+		ret = fork_with_pid(child);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int restore_task_with_children(void *_arg)
 {
 	struct cr_clone_arg *ca = _arg;
-	struct pstree_item *child;
 	pid_t pid;
 	int ret;
 	sigset_t blockmask;
@@ -1099,7 +1196,8 @@ static int restore_task_with_children(void *_arg)
 		if (mount_proc())
 			exit(1);
 
-		restore_finish_stage(CR_STATE_RESTORE_NS);
+		if (restore_finish_stage(CR_STATE_RESTORE_NS) < 0)
+			exit(1);
 
 		if (root_prepare_shared())
 			exit(1);
@@ -1118,62 +1216,56 @@ static int restore_task_with_children(void *_arg)
 		exit(1);
 	}
 
-	if (read_vmas(pid))
+	if (prepare_mappings(pid))
 		exit(1);
 
-	if ( !(ca->clone_flags & CLONE_FILES)) {
+	if (!(ca->clone_flags & CLONE_FILES)) {
 		ret = close_old_fds(current);
 		if (ret)
 			exit(1);
 	}
 
-	pr_info("Restoring children:\n");
-	list_for_each_entry(child, &current->children, sibling) {
-		if (!restore_before_setsid(child))
-			continue;
+	if (create_children_and_session())
+		exit(1);
 
-		BUG_ON(child->born_sid != -1 && getsid(getpid()) != child->born_sid);
-
-		ret = fork_with_pid(child);
-		if (ret < 0)
-			exit(1);
-	}
-
-	restore_sid();
-
-	pr_info("Restoring children:\n");
-	list_for_each_entry(child, &current->children, sibling) {
-		if (restore_before_setsid(child))
-			continue;
-		ret = fork_with_pid(child);
-		if (ret < 0)
-			exit(1);
-	}
+	if (unmap_guard_pages())
+		exit(1);
+	/*
+	 * Unlike sessions, process groups (a.k.a. pgids) can be joined
+	 * by any task, provided the task with pid == pgid (group leader)
+	 * exists. Thus, in order to restore pgid we must make sure that
+	 * group leader was born (stage barrier below), created the group
+	 * (the 1st restore_pgid below) and then join one (the 2nd call
+	 * to restore_pgid).
+	 */
 
 	if (current->pgid == current->pid.virt)
 		restore_pgid();
 
-	restore_finish_stage(CR_STATE_FORKING);
+	if (restore_finish_stage(CR_STATE_FORKING) < 0)
+		exit(1);
 
 	if (current->pgid != current->pid.virt)
 		restore_pgid();
 
-	if (current->state == TASK_HELPER)
-		return restore_one_fake();
-
 	restore_finish_stage(CR_STATE_RESTORE_PGID);
+
+	if (current->state == TASK_HELPER)
+		return 0;
+
 	return restore_one_task(current->pid.virt, ca->core);
 }
 
 static inline int stage_participants(int next_stage)
 {
 	switch (next_stage) {
+	case CR_STATE_FAIL:
+		return 0;
 	case CR_STATE_RESTORE_NS:
 		return 1;
 	case CR_STATE_FORKING:
-		return task_entries->nr_tasks + task_entries->nr_helpers;
 	case CR_STATE_RESTORE_PGID:
-		return task_entries->nr_tasks;
+		return task_entries->nr_tasks + task_entries->nr_helpers;
 	case CR_STATE_RESTORE:
 	case CR_STATE_RESTORE_SIGCHLD:
 		return task_entries->nr_threads;
@@ -1198,18 +1290,17 @@ static int restore_wait_inprogress_tasks()
 	return 0;
 }
 
-static int restore_switch_stage(int next_stage)
+static void __restore_switch_stage(int next_stage)
 {
-	int ret;
-
-	ret = restore_wait_inprogress_tasks();
-	if (ret)
-		return ret;
-
 	futex_set(&task_entries->nr_in_progress,
 			stage_participants(next_stage));
 	futex_set_and_wake(&task_entries->start, next_stage);
-	return 0;
+}
+
+static int restore_switch_stage(int next_stage)
+{
+	__restore_switch_stage(next_stage);
+	return restore_wait_inprogress_tasks();
 }
 
 static int restore_root_task(struct pstree_item *init)
@@ -1270,65 +1361,77 @@ static int restore_root_task(struct pstree_item *init)
 	if (ret)
 		goto out;
 
+	timing_start(TIME_FORK);
+
 	ret = restore_switch_stage(CR_STATE_FORKING);
 	if (ret < 0)
 		goto out;
 
-	pr_info("Wait until all tasks are forked\n");
+	timing_stop(TIME_FORK);
+
 	ret = restore_switch_stage(CR_STATE_RESTORE_PGID);
 	if (ret < 0)
-		goto out;
+		goto out_kill;
 
-
-	pr_info("Wait until all tasks restored pgid\n");
 	ret = restore_switch_stage(CR_STATE_RESTORE);
 	if (ret < 0)
-		goto out;
+		goto out_kill;
 
-	pr_info("Wait until all tasks restored sigchld handlers\n");
 	ret = restore_switch_stage(CR_STATE_RESTORE_SIGCHLD);
 	if (ret < 0)
-		goto out;
-
-	pr_info("Wait until all tasks are restored\n");
-	ret = restore_switch_stage(CR_STATE_RESTORE_CREDS);
-	if (ret < 0)
-		goto out;
-
-	futex_wait_until(&task_entries->nr_in_progress, 0);
+		goto out_kill;
 
 	/* Restore SIGCHLD here to skip SIGCHLD from a network sctip */
 	ret = sigaction(SIGCHLD, &old_act, NULL);
 	if (ret < 0) {
 		pr_perror("sigaction() failed");
-		goto out;
+		goto out_kill;
 	}
 
+	/* Unlock network before disabling repair mode on sockets */
 	network_unlock();
-out:
-	if (ret < 0) {
-		struct pstree_item *pi;
 
-		if (current_ns_mask & CLONE_NEWPID) {
-			/* Kill init */
-			if (root_item->pid.real > 0)
-				kill(root_item->pid.real, SIGKILL);
-		} else {
-			for_each_pstree_item(pi)
-				if (pi->pid.virt > 0)
-					kill(pi->pid.virt, SIGKILL);
-		}
+	/*
+	 * -------------------------------------------------------------
+	 * Below this line nothing can fail, because network is unlocked
+	 */
 
-		pr_err("Restoring FAILED.\n");
-		return 1;
-	}
+	ret = restore_switch_stage(CR_STATE_RESTORE_CREDS);
+	BUG_ON(ret);
+
+	timing_stop(TIME_RESTORE);
 
 	pr_info("Restore finished successfully. Resuming tasks.\n");
 	futex_set_and_wake(&task_entries->start, CR_STATE_COMPLETE);
 
+	write_stats(RESTORE_STATS);
+
 	if (!opts.restore_detach)
 		wait(NULL);
+
 	return 0;
+
+out_kill:
+	/*
+	 * The processes can be killed only when all of them have been created,
+	 * otherwise an external proccesses can be killed.
+	 */
+	if (current_ns_mask & CLONE_NEWPID) {
+		/* Kill init */
+		if (root_item->pid.real > 0)
+			kill(root_item->pid.real, SIGKILL);
+	} else {
+		struct pstree_item *pi;
+
+		for_each_pstree_item(pi)
+			if (pi->pid.virt > 0)
+				kill(pi->pid.virt, SIGKILL);
+	}
+
+out:
+	__restore_switch_stage(CR_STATE_FAIL);
+	pr_err("Restoring FAILED.\n");
+	return 1;
 }
 
 static int prepare_task_entries()
@@ -1352,6 +1455,11 @@ int cr_restore_tasks(void)
 	if (check_img_inventory() < 0)
 		return -1;
 
+	if (init_stats(RESTORE_STATS))
+		return -1;
+
+	timing_start(TIME_RESTORE);
+
 	if (cpu_init() < 0)
 		return -1;
 
@@ -1368,6 +1476,99 @@ int cr_restore_tasks(void)
 		return -1;
 
 	return restore_root_task(root_item);
+}
+
+/*
+ * Memory allocation for restorer blob.
+ *
+ * The mem should be visible from both contexts -- restorer
+ * and crtools (current).
+ *
+ * Memory is allocated as linear array of objects, that cannot
+ * be freed. This makes things very simple.
+ *
+ * After everything is allocated memory is mremap-ed into the
+ * new position (see comment near call to restorer_get_vma_hint)
+ */
+
+/*
+ * rst_mem -- pointer to the whole buffer
+ * rst_mem_c -- pointer to current free space
+ */
+
+static void *rst_mem, *rst_mem_c;
+static unsigned long rst_mem_len;
+
+#define RST_MEM_BATCH	(2 * PAGE_SIZE)
+
+static int rst_mem_init(void)
+{
+	rst_mem = mmap(NULL, RST_MEM_BATCH, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANON, 0, 0);
+	if (rst_mem == MAP_FAILED) {
+		pr_perror("Can't create rst mem");
+		return -1;
+	}
+
+	rst_mem_c = rst_mem;
+	rst_mem_len = RST_MEM_BATCH;
+
+	return 0;
+}
+
+static void *rst_mem_alloc(unsigned long size)
+{
+	void *aux;
+
+	if (rst_mem_c + size > rst_mem + rst_mem_len) {
+		aux = mremap(rst_mem, rst_mem_len,
+				rst_mem_len + RST_MEM_BATCH, MREMAP_MAYMOVE);
+		if (aux == MAP_FAILED) {
+			pr_perror("Can't grow rst mem");
+			return NULL;
+		}
+
+		rst_mem_c += (aux - rst_mem);
+		rst_mem = aux;
+		rst_mem_len += RST_MEM_BATCH;
+	}
+
+	aux = rst_mem_c;
+	rst_mem_c += size;
+
+	return aux;
+}
+
+static int rst_mem_remap(struct task_restore_core_args *ta, void *to)
+{
+	if (!rst_mem_len)
+		return 0;
+
+	pr_info("Remap %p/%lu rstmem into %p\n", rst_mem, rst_mem_len, to);
+
+	if (mremap(rst_mem, rst_mem_len, rst_mem_len,
+				MREMAP_FIXED | MREMAP_MAYMOVE, to) != to) {
+		pr_perror("Can't move restorer mem");
+		return -1;
+	}
+
+	rst_mem_c += (to - rst_mem);
+	rst_mem = to;
+	ta->rst_mem = to;
+	ta->rst_mem_size = rst_mem_len;
+	return 0;
+}
+
+/* Current position (not addrees, as it may change after eal _alloc) */
+static inline unsigned long rst_mem_cpos(void)
+{
+	return rst_mem_c - rst_mem;
+}
+
+/* Address int memory at any given time */
+static inline void *rst_mem_addr(unsigned long pos)
+{
+	return rst_mem + pos;
 }
 
 static long restorer_get_vma_hint(pid_t pid, struct list_head *tgt_vma_list,
@@ -1470,7 +1671,7 @@ static int prepare_itimers(int pid, struct task_restore_core_args *args)
 	if (fd < 0)
 		return fd;
 
-	ret = pb_read_one(fd, &ie, PB_ITIMERS);
+	ret = pb_read_one(fd, &ie, PB_ITIMER);
 	if (ret < 0)
 		goto out;
 	ret = itimer_restore_and_fix("real", ie, &args->itimers[0]);
@@ -1478,7 +1679,7 @@ static int prepare_itimers(int pid, struct task_restore_core_args *args)
 	if (ret < 0)
 		goto out;
 
-	ret = pb_read_one(fd, &ie, PB_ITIMERS);
+	ret = pb_read_one(fd, &ie, PB_ITIMER);
 	if (ret < 0)
 		goto out;
 	ret = itimer_restore_and_fix("virt", ie, &args->itimers[1]);
@@ -1486,7 +1687,7 @@ static int prepare_itimers(int pid, struct task_restore_core_args *args)
 	if (ret < 0)
 		goto out;
 
-	ret = pb_read_one(fd, &ie, PB_ITIMERS);
+	ret = pb_read_one(fd, &ie, PB_ITIMER);
 	if (ret < 0)
 		goto out;
 	ret = itimer_restore_and_fix("prof", ie, &args->itimers[2]);
@@ -1544,12 +1745,13 @@ static int cmp_posix_timer_proc_id(const void *p1, const void *p2)
 	return ((struct restore_posix_timer *)p1)->spt.it_id - ((struct restore_posix_timer *)p2)->spt.it_id;
 }
 
-static int open_posix_timers_image(int pid, struct restore_posix_timer **rpt,
-				unsigned long *size, int *nr)
+static int open_posix_timers_image(int pid, unsigned long *rpt, int *nr)
 {
 	int fd;
 	int ret = -1;
+	struct restore_posix_timer *t;
 
+	*rpt = rst_mem_cpos();
 	fd = open_image(CR_FD_POSIX_TIMERS, O_RSTR, pid);
 	if (fd < 0)
 		return fd;
@@ -1557,29 +1759,16 @@ static int open_posix_timers_image(int pid, struct restore_posix_timer **rpt,
 	while (1) {
 		PosixTimerEntry *pte;
 
-		ret = pb_read_one_eof(fd, &pte, PB_POSIX_TIMERS);
+		ret = pb_read_one_eof(fd, &pte, PB_POSIX_TIMER);
 		if (ret <= 0) {
 			goto out;
 		}
 
-		if ((*nr + 1) * sizeof(struct restore_posix_timer) > *size) {
-			unsigned long new_size = *size + PAGE_SIZE;
+		t = rst_mem_alloc(sizeof(struct restore_posix_timer));
+		if (!t)
+			goto out;
 
-			if (*rpt == NULL)
-				*rpt = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
-					MAP_PRIVATE | MAP_ANON, 0, 0);
-			else
-				*rpt = mremap(*rpt, *size, new_size, MREMAP_MAYMOVE);
-			if (*rpt == MAP_FAILED) {
-				pr_perror("Can't allocate memory for posix timers");
-				ret = -1;
-				goto out;
-			}
-
-			*size = new_size;
-		}
-
-		ret = posix_timer_restore_and_fix(pte, *rpt + *nr);
+		ret = posix_timer_restore_and_fix(pte, t);
 		if (ret < 0)
 			goto out;
 
@@ -1587,9 +1776,10 @@ static int open_posix_timers_image(int pid, struct restore_posix_timer **rpt,
 		(*nr)++;
 	}
 out:
-	if (*nr > 0) {
-		qsort(*rpt, *nr, sizeof(struct restore_posix_timer), cmp_posix_timer_proc_id);
-	}
+	if (*nr > 0)
+		qsort(rst_mem_addr(*rpt), *nr, sizeof(struct restore_posix_timer),
+				cmp_posix_timer_proc_id);
+
 	close_safe(&fd);
 	return ret;
 }
@@ -1806,11 +1996,13 @@ static unsigned long decode_rlim(u_int64_t ival)
 	return ival == -1 ? RLIM_INFINITY : ival;
 }
 
-static int prepare_rlimits(int pid, struct task_restore_core_args *ta)
+static int prepare_rlimits(int pid, unsigned long *addr)
 {
+	struct rlimit *r;
 	int fd, ret;
+	int nr_rlim = 0;
 
-	ta->nr_rlim = 0;
+	*addr = rst_mem_cpos();
 
 	fd = open_image(CR_FD_RLIMIT, O_RSTR, pid);
 	if (fd < 0) {
@@ -1823,50 +2015,49 @@ static int prepare_rlimits(int pid, struct task_restore_core_args *ta)
 	}
 
 	while (1) {
-		int l;
 		RlimitEntry *re;
 
 		ret = pb_read_one_eof(fd, &re, PB_RLIMIT);
 		if (ret <= 0)
 			break;
 
-		l = ta->nr_rlim;
-		if (l == RLIM_NLIMITS) {
-			pr_err("Too many rlimits in image for %d\n", pid);
-			ret = -1;
-			break;
+		r = rst_mem_alloc(sizeof(*r));
+		if (!r) {
+			pr_err("Can't allocate memory for resource %d\n",
+			       nr_rlim);
+			return -1;
 		}
 
-		ta->rlims[l].rlim_cur = decode_rlim(re->cur);
-		ta->rlims[l].rlim_max = decode_rlim(re->max);
-		if (ta->rlims[l].rlim_cur > ta->rlims[l].rlim_max) {
-			pr_err("Can't restore cur > max for %d.%d\n", pid, l);
-			ta->rlims[l].rlim_cur = ta->rlims[l].rlim_max;
+		r->rlim_cur = decode_rlim(re->cur);
+		r->rlim_max = decode_rlim(re->max);
+		if (r->rlim_cur > r->rlim_max) {
+			pr_err("Can't restore cur > max for %d.%d\n", pid, nr_rlim);
+			r->rlim_cur = r->rlim_max;
 		}
 
 		rlimit_entry__free_unpacked(re, NULL);
 
-		ta->nr_rlim++;
+		nr_rlim++;
 	}
 
 	close(fd);
-	return ret;
+	return nr_rlim;
 }
 
-static int open_signal_image(int type, pid_t pid, siginfo_t **ptr,
-					unsigned long *size, int *nr)
+static int open_signal_image(int type, pid_t pid, unsigned long *ptr, int *nr)
 {
-	int fd, ret, n;
+	int fd, ret;
 
+	if (ptr)
+		*ptr = rst_mem_cpos();
 	fd = open_image(type, O_RSTR, pid);
 	if (fd < 0)
 		return -1;
 
-	n = 0;
-
+	*nr = 0;
 	while (1) {
 		SiginfoEntry *sie;
-		siginfo_t *info;
+		siginfo_t *info, *t;
 
 		ret = pb_read_one_eof(fd, &sie, PB_SIGINFO);
 		if (ret <= 0)
@@ -1877,34 +2068,21 @@ static int open_signal_image(int type, pid_t pid, siginfo_t **ptr,
 			break;
 		}
 		info = (siginfo_t *) sie->siginfo.data;
-
-		if ((*nr + 1) * sizeof(siginfo_t) > *size) {
-			unsigned long new_size = *size + PAGE_SIZE;
-
-			if (*ptr == NULL)
-				*ptr = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
-							MAP_PRIVATE | MAP_ANON, 0, 0);
-			else
-				*ptr = mremap(*ptr, *size, new_size, MREMAP_MAYMOVE);
-			if (*ptr == MAP_FAILED) {
-				pr_perror("Can't allocate memory for siginfo-s");
-				ret = -1;
-				break;
-			}
-
-			*size = new_size;
+		t = rst_mem_alloc(sizeof(siginfo_t));
+		if (!t) {
+			ret = -1;
+			break;
 		}
 
-		memcpy(*ptr + *nr, info, sizeof(*info));
+		memcpy(t, info, sizeof(*info));
 		(*nr)++;
-		n++;
 
 		siginfo_entry__free_unpacked(sie, NULL);
 	}
 
 	close(fd);
 
-	return ret ? : n;
+	return ret ? : 0;
 }
 
 extern void __gcov_flush(void) __attribute__((weak));
@@ -1925,19 +2103,22 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 	struct task_restore_core_args *task_args;
 	struct thread_restore_args *thread_args;
-	siginfo_t *siginfo_chunk = NULL;
+	unsigned long siginfo_chunk;
 	int siginfo_nr = 0;
-	int siginfo_shared_nr = 0;
 	int *siginfo_priv_nr;
-	unsigned long siginfo_size = 0;
+
+	void *tcp_socks_mem;
+	unsigned long tcp_socks;
+
+	unsigned long rlimits_rst_addr;
+	int nr_rlim;
 
 	unsigned long vdso_rt_vma_size = 0;
 	unsigned long vdso_rt_size = 0;
 	unsigned long vdso_rt_delta = 0;
 
-	struct restore_posix_timer *posix_timers_info_chunk = NULL;
+	unsigned long posix_timers_info_chunk;
 	int posix_timers_nr = 0;
-	unsigned long posix_timers_size = 0;
 
 	struct vm_area_list self_vmas;
 	int i;
@@ -1947,6 +2128,9 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	ret = parse_smaps(pid, &self_vmas, false);
 	close_proc();
 	if (ret < 0)
+		goto err;
+
+	if (rst_mem_init())
 		goto err;
 
 	self_vmas_len = round_up((self_vmas.nr + 1) * sizeof(VmaEntry), PAGE_SIZE);
@@ -1970,33 +2154,41 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	if (siginfo_priv_nr == NULL)
 		goto err;
 
-	ret = open_signal_image(CR_FD_SIGNAL, pid, &siginfo_chunk,
-					&siginfo_size, &siginfo_nr);
+	ret = open_signal_image(CR_FD_SIGNAL, pid, &siginfo_chunk, &siginfo_nr);
 	if (ret < 0) {
 		if (errno != ENOENT) /* backward compatibility */
 			goto err;
 		ret = 0;
 	}
-	siginfo_shared_nr = ret;
 
 	for (i = 0; i < current->nr_threads; i++) {
 		ret = open_signal_image(CR_FD_PSIGNAL,
-					current->threads[i].virt, &siginfo_chunk,
-					&siginfo_size, &siginfo_nr);
+				current->threads[i].virt, NULL, &siginfo_priv_nr[i]);
 		if (ret < 0) {
 			if (errno != ENOENT) /* backward compatibility */
 				goto err;
 			ret = 0;
 		}
-		siginfo_priv_nr[i] = ret;
 	}
 
-	ret = open_posix_timers_image(pid, &posix_timers_info_chunk,
-			&posix_timers_size, &posix_timers_nr);
+	ret = open_posix_timers_image(pid, &posix_timers_info_chunk, &posix_timers_nr);
 	if (ret < 0) {
 		if (errno != ENOENT) /* backward compatibility */
 			goto err;
 		ret = 0;
+	}
+
+	tcp_socks = rst_mem_cpos();
+	tcp_socks_mem = rst_mem_alloc(rst_tcp_socks_len());
+	if (!tcp_socks_mem)
+		goto err;
+
+	memcpy(tcp_socks_mem, rst_tcp_socks, rst_tcp_socks_len());
+
+	nr_rlim = prepare_rlimits(pid, &rlimits_rst_addr);
+	if (nr_rlim < 0) {
+		pr_err("Failed preparing rlimits for pid %d\n", pid);
+		goto err;
 	}
 
 	restore_bootstrap_len = restorer_len +
@@ -2004,9 +2196,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 				restore_thread_vma_len +
 				SHMEMS_SIZE + TASK_ENTRIES_SIZE +
 				self_vmas_len + vmas_len +
-				rst_tcp_socks_size +
-				siginfo_size +
-				posix_timers_size;
+				rst_mem_len;
 
 	/*
 	 * Figure out how much memory runtime vdso will need.
@@ -2067,35 +2257,6 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	task_args	= mem;
 	thread_args	= mem + restore_task_vma_len;
 
-	mem += restore_task_vma_len + restore_thread_vma_len;
-	if (siginfo_chunk) {
-		siginfo_chunk = mremap(siginfo_chunk, siginfo_size, siginfo_size,
-					MREMAP_FIXED | MREMAP_MAYMOVE, mem);
-		if (siginfo_chunk == MAP_FAILED) {
-			pr_perror("mremap");
-			goto err;
-		}
-	}
-
-	task_args->siginfo_size = siginfo_size;
-	task_args->siginfo_nr = siginfo_shared_nr;
-	task_args->siginfo = siginfo_chunk;
-	siginfo_chunk += task_args->siginfo_nr;
-
-	mem += siginfo_size;
-	if (posix_timers_info_chunk) {
-		posix_timers_info_chunk = mremap(posix_timers_info_chunk,
-			posix_timers_size, posix_timers_size,
-			MREMAP_FIXED | MREMAP_MAYMOVE, mem);
-		if (posix_timers_info_chunk == MAP_FAILED) {
-			pr_perror("mremap");
-			goto err;
-		}
-	}
-	task_args->timer_n = posix_timers_nr;
-	task_args->posix_timers = posix_timers_info_chunk;
-	task_args->timers_sz = posix_timers_size;
-
 	/*
 	 * Get a reference to shared memory area which is
 	 * used to signal if shmem restoration complete
@@ -2107,7 +2268,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	 * address.
 	 */
 
-	mem += posix_timers_size;
+	mem += restore_task_vma_len + restore_thread_vma_len;
 	ret = shmem_remap(rst_shmems, mem, SHMEMS_SIZE);
 	if (ret < 0)
 		goto err;
@@ -2133,10 +2294,17 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 		goto err;
 
 	mem += vmas_len;
-	if (rst_tcp_socks_remap(mem))
+	if (rst_mem_remap(task_args, mem))
 		goto err;
-	task_args->rst_tcp_socks = mem;
-	task_args->rst_tcp_socks_size = rst_tcp_socks_size;
+
+	task_args->timer_n = posix_timers_nr;
+	task_args->posix_timers = rst_mem_addr(posix_timers_info_chunk);
+
+	task_args->siginfo_nr = siginfo_nr;
+	task_args->siginfo = rst_mem_addr(siginfo_chunk);
+
+	task_args->tcp_socks_nr = rst_tcp_socks_nr;
+	task_args->tcp_socks = rst_mem_addr(tcp_socks);
 
 	/*
 	 * Arguments for task restoration.
@@ -2150,8 +2318,9 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 	strncpy(task_args->comm, core->tc->comm, sizeof(task_args->comm));
 
-	if (prepare_rlimits(pid, task_args))
-		goto err;
+	task_args->nr_rlim = nr_rlim;
+	if (nr_rlim)
+		task_args->rlims = rst_mem_addr(rlimits_rst_addr);
 
 	/*
 	 * Fill up per-thread data.
@@ -2163,8 +2332,9 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 		thread_args[i].pid = current->threads[i].virt;
 		thread_args[i].siginfo_nr = siginfo_priv_nr[i];
-		thread_args[i].siginfo = siginfo_chunk;
-		siginfo_chunk += thread_args[i].siginfo_nr;
+		thread_args[i].siginfo = rst_mem_addr(siginfo_chunk);
+		thread_args[i].siginfo += siginfo_nr;
+		siginfo_nr += thread_args[i].siginfo_nr;
 
 		/* skip self */
 		if (thread_args[i].pid == pid) {
@@ -2230,7 +2400,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	 * since we need it being accessible even when own
 	 * self-vmas are unmaped.
 	 */
-	mem += (unsigned long)rst_tcp_socks_size;
+	mem += rst_mem_len;
 	task_args->vdso_rt_parked_at = (unsigned long)mem + vdso_rt_delta;
 	task_args->vdso_sym_rt = vdso_sym_rt;
 
@@ -2254,8 +2424,6 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	ret = prepare_mm(pid, task_args);
 	if (ret < 0)
 		goto err;
-
-	mutex_init(&task_args->rst_lock);
 
 	/*
 	 * Now prepare run-time data for threads restore.

@@ -1,14 +1,21 @@
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/mount.h>
 
 #include <errno.h>
 
 #include "compiler.h"
 #include "asm/string.h"
 #include "asm/types.h"
-#include "syscall.h"
 
-#include "util-net.h"
+#ifdef CR_NOGLIBC
+# include "syscall.h"
+# define __sys(foo)	sys_##foo
+#else
+# define __sys(foo)	foo
+#endif
+
+#include "util-pie.h"
 
 static void scm_fdset_init_chunk(struct scm_fdset *fdset, int nr_fds)
 {
@@ -69,13 +76,13 @@ int send_fds(int sock, struct sockaddr_un *saddr, int len,
 				struct f_owner_ex owner_ex;
 				u32 v[2];
 
-				flags = sys_fcntl(fd, F_GETFD, 0);
+				flags = __sys(fcntl)(fd, F_GETFD, 0);
 				if (flags < 0)
 					return -1;
 
 				p->flags = (char)flags;
 
-				if (sys_fcntl(fd, F_GETOWN_EX, (long)&owner_ex))
+				if (__sys(fcntl)(fd, F_GETOWN_EX, (long)&owner_ex))
 					return -1;
 
 				/*
@@ -86,7 +93,7 @@ int send_fds(int sock, struct sockaddr_un *saddr, int len,
 					continue;
 				}
 
-				if (sys_fcntl(fd, F_GETOWNER_UIDS, (long)&v))
+				if (__sys(fcntl)(fd, F_GETOWNER_UIDS, (long)&v))
 					return -1;
 
 				p->fown.uid	 = v[0];
@@ -96,7 +103,7 @@ int send_fds(int sock, struct sockaddr_un *saddr, int len,
 			}
 		}
 
-		ret = sys_sendmsg(sock, &fdset.hdr, 0);
+		ret = __sys(sendmsg)(sock, &fdset.hdr, 0);
 		if (ret <= 0)
 			return ret ? : -1;
 	}
@@ -117,7 +124,7 @@ int recv_fds(int sock, int *fds, int nr_fds, struct fd_opts *opts)
 		min_fd = min(CR_SCM_MAX_FD, nr_fds - i);
 		scm_fdset_init_chunk(&fdset, min_fd);
 
-		ret = sys_recvmsg(sock, &fdset.hdr, 0);
+		ret = __sys(recvmsg)(sock, &fdset.hdr, 0);
 		if (ret <= 0)
 			return ret ? : -1;
 
@@ -148,4 +155,3 @@ int recv_fds(int sock, int *fds, int nr_fds, struct fd_opts *opts)
 
 	return 0;
 }
-

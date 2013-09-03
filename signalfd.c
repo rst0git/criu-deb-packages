@@ -31,11 +31,6 @@ struct signalfd_dump_arg {
 	bool dumped;
 };
 
-void show_signalfd(int fd)
-{
-	pb_show_plain(fd, PB_SIGNALFD);
-}
-
 static int dump_signalfd_entry(union fdinfo_entries *e, void *arg)
 {
 	struct signalfd_dump_arg *da = arg;
@@ -117,18 +112,13 @@ static int collect_one_sigfd(void *o, ProtobufCMessage *msg)
 	struct signalfd_info *info = o;
 
 	info->sfe = pb_msg(msg, SignalfdEntry);
-	file_desc_add(&info->d, info->sfe->id, &signalfd_desc_ops);
-
-	return 0;
+	return file_desc_add(&info->d, info->sfe->id, &signalfd_desc_ops);
 }
 
-int collect_signalfd(void)
-{
-	int ret = collect_image(CR_FD_SIGNALFD, PB_SIGNALFD,
-			sizeof(struct signalfd_info), collect_one_sigfd);
-
-	if (ret < 0 && errno == ENOENT)
-		return 0;
-
-	return ret;
-}
+struct collect_image_info signalfd_cinfo = {
+	.fd_type = CR_FD_SIGNALFD,
+	.pb_type = PB_SIGNALFD,
+	.priv_size = sizeof(struct signalfd_info),
+	.collect = collect_one_sigfd,
+	.flags = COLLECT_OPTIONAL,
+};

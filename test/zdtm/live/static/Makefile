@@ -47,12 +47,14 @@ TST_NOFILE	=				\
 		utsname				\
 		pstree				\
 		sockets01			\
+		sockets02			\
 		sockets_spair			\
 		socket_queues			\
 		socket_queues02			\
 		socket-tcp			\
 		socket-tcp6			\
 		socket-tcpbuf			\
+		socket-tcpbuf-local		\
 		socket-tcpbuf6			\
 		sock_opts00			\
 		sock_opts01			\
@@ -94,8 +96,12 @@ TST_NOFILE	=				\
 		child_opened_proc		\
 		posix_timers			\
 		sigpending			\
+		sigaltstack			\
 		sk-netlink			\
 		mem-touch			\
+		grow_map			\
+		grow_map02			\
+		tun				\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -228,17 +234,19 @@ inotify_system_nodel:	override CFLAGS += -DNODEL
 pthread00:		override LDLIBS += -pthread
 pthread01:		override LDLIBS += -pthread
 sigpending:		override LDLIBS += -pthread
+sigaltstack:		override LDLIBS += -pthread
 shm:			override CFLAGS += -DNEW_IPC_NS
 msgque:			override CFLAGS += -DNEW_IPC_NS
 sem:			override CFLAGS += -DNEW_IPC_NS
 posix_timers:		override LDLIBS += -lrt
 socket-tcp6: override CFLAGS += -D ZDTM_IPV6
 socket-tcpbuf6: override CFLAGS += -D ZDTM_IPV6
+socket-tcpbuf-local: override CFLAGS += -D ZDTM_TCP_LOCAL
 socket_listen6: override CFLAGS += -D ZDTM_IPV6
 sigpending:		override LDLIBS += -lrt
 
 $(LIB):	force
-	$(MAKE) -C $(LIBDIR)
+	$(Q) $(MAKE) -C $(LIBDIR)
 
 clean:
 	$(RM) -f $(OBJ) $(TST) *~
@@ -250,7 +258,7 @@ cleanout:
 	$(RM) -f -r *.pid *.out* *.test* *.state
 
 %.cleanout: %
-	$(RM) -f -r $<.pid $<.out* *$<.test* $<.*.test $<.state
+	$(Q) $(RM) -f -r $<.pid $<.out* *$<.test* $<.*.test $<.state
 
 realclean:	cleandep cleanout
 
