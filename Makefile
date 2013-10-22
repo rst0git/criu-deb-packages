@@ -1,5 +1,5 @@
 VERSION_MAJOR		:= 0
-VERSION_MINOR		:= 7
+VERSION_MINOR		:= 8
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -171,7 +171,7 @@ zdtm: all
 	$(Q) $(MAKE) -C test/zdtm all
 
 test: zdtm
-	$(Q) $(SH) test/zdtm.sh
+	$(Q) $(SH) test/zdtm.sh -C
 
 clean-built:
 	$(Q) $(RM) $(VERSION_HEADER)

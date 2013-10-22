@@ -23,6 +23,7 @@
 #include "uts_ns.h"
 #include "ipc_ns.h"
 #include "pstree.h"
+#include "cr-show.h"
 
 #include "protobuf.h"
 #include "protobuf/pstree.pb-c.h"
@@ -31,9 +32,6 @@
 
 #define DEF_PAGES_PER_LINE	6
 
-
-#define PR_SYMBOL(sym)			\
-	(isprint(sym) ? sym : '.')
 
 static LIST_HEAD(pstree_list);
 
@@ -53,6 +51,26 @@ static int nice_width_for(unsigned long addr)
 	}
 
 	return ret;
+}
+
+static inline void pr_xdigi(unsigned char *data, size_t len, int pos)
+{
+	if (pos < len)
+		pr_msg("%02x ", data[pos]);
+	else
+		pr_msg("   ");
+}
+
+static inline void pr_xsym(unsigned char *data, size_t len, int pos)
+{
+	char sym;
+
+	if (pos < len)
+		sym = data[pos];
+	else
+		sym = ' ';
+
+	pr_msg("%c", isprint(sym) ? sym : '.');
 }
 
 void print_data(unsigned long addr, unsigned char *data, size_t size)
@@ -79,17 +97,17 @@ void print_data(unsigned long addr, unsigned char *data, size_t size)
 
 		pr_msg("%#0*lx: ", addr_len, addr + i);
 		for (j = 0; j < 8; j++)
-			pr_msg("%02x ", data[i +  j]);
+			pr_xdigi(data, size, i + j);
 		pr_msg(" ");
 		for (j = 8; j < 16; j++)
-			pr_msg("%02x ", data[i +  j]);
+			pr_xdigi(data, size, i + j);
 
 		pr_msg(" |");
 		for (j = 0; j < 8; j++)
-			pr_msg("%c", PR_SYMBOL(data[i + j]));
+			pr_xsym(data, size, i + j);
 		pr_msg(" ");
 		for (j = 8; j < 16; j++)
-			pr_msg("%c", PR_SYMBOL(data[i + j]));
+			pr_xsym(data, size, i + j);
 
 		pr_msg("|\n");
 	}
@@ -275,6 +293,7 @@ static struct show_image_info show_infos[] = {
 	SHOW_VERT(IPC_VAR),
 	SHOW_VERT(FS),
 	SHOW_VERT(GHOST_FILE),
+	SHOW_VERT(MM),
 
 	SHOW_PLAINS(REG_FILE),
 	SHOW_PLAINS(NS_FILE),
@@ -299,7 +318,7 @@ static struct show_image_info show_infos[] = {
 	SHOW_PLAIN(RLIMIT),
 	SHOW_PLAIN(TUNFILE),
 
-	{ TCP_STREAM_MAGIC,	PB_TCP_STREAM,		true,	NULL, "1:%u 2:%u 3:%u 4:%u", },
+	{ TCP_STREAM_MAGIC,	PB_TCP_STREAM,		true,	show_tcp_stream, "1:%u 2:%u 3:%u 4:%u", },
 	{ STATS_MAGIC,		PB_STATS,		true,	NULL, "1.1:%u 1.2:%u 1.3:%u 1.4:%u 1.5:%Lu 1.6:%Lu 1.7:%Lu", },
 	{ FDINFO_MAGIC,		PB_FDINFO,		false,	NULL, "flags:%#o fd:%d", },
 	{ UNIXSK_MAGIC,		PB_UNIX_SK,		false,	NULL, "1:%#x 2:%#x 3:%d 4:%d 5:%d 6:%d 7:%d 8:%#x 11:S", },

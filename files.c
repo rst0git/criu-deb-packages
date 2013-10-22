@@ -83,6 +83,39 @@ static inline struct file_desc *find_file_desc(FdinfoEntry *fe)
 	return find_file_desc_raw(fe->type, fe->id);
 }
 
+/*
+ * A file may be shared between several file descriptors. E.g
+ * when doing a fork() every fd of a forker and respective fds
+ * of the child have such. Another way of getting shared files
+ * is by dup()-ing them or sending them via unix sockets in
+ * SCM_RIGHTS message.
+ *
+ * We restore this type of things in 3 steps (states[] below)
+ *
+ * 1. Prepare step.
+ *    Select which task will create the file (open() one, or
+ *    call any other syscall for than (socket, pipe, etc.). All
+ *    the others, that share one, create unix sockets under the
+ *    respective file descriptor (transport socket).
+ * 2. Open step.
+ *    The one who creates the file (the 'master') creates one,
+ *    then creates one more unix socket (transport) and sends the
+ *    created file over this socket to the other recepients.
+ * 3. Receive step.
+ *    Those, who wait for the file to appear, receive one via
+ *    the transport socket, then close the socket and dup() the
+ *    received file descriptor into its place.
+ *
+ * There's the 4th step in the states[] array -- the post_open
+ * one. This one is not about file-sharing resolving, but about
+ * doing something with a file using it's 'desired' fd. The
+ * thing is that while going the 3-step process above, the file
+ * may appear in variuos places in the task's fd table, and if
+ * we want to do something with it's _final_ descriptor value,
+ * we should wait for it to appear there. So the post_open is
+ * called when the file is finally set into its place.
+ */
+
 struct fdinfo_list_entry *file_master(struct file_desc *d)
 {
 	if (list_empty(&d->fd_info_head)) {
@@ -109,6 +142,14 @@ void show_saved_files(void)
 				pr_info("   `- FD %d pid %d\n", le->fe->fd, le->pid);
 		}
 }
+
+/*
+ * The gen_id thing is used to optimize the comparison of shared files.
+ * If two files have different gen_ids, then they are different for sure.
+ * If it matches, we don't know it and have to call sys_kcmp(). 
+ *
+ * The kcmp-ids.c engine does this trick, see comments in it for more info.
+ */
 
 static u32 make_gen_id(const struct fd_parms *p)
 {
@@ -892,44 +933,70 @@ int prepare_fds(struct pstree_item *me)
 	if (me->rst->fdt)
 		futex_inc_and_wake(&me->rst->fdt->fdt_lock);
 out:
+	close_service_fd(CR_PROC_FD_OFF);
 	tty_fini_fds();
 	return ret;
 }
 
+static int fchroot(int fd)
+{
+	char fd_path[PSFDS];
+
+	/*
+	 * There's no such thing in syscalls. We can emulate
+	 * it using the /proc/self/fd/ :)
+	 */
+
+	sprintf(fd_path, "/proc/self/fd/%d", fd);
+	pr_debug("Going to chroot into %s\n", fd_path);
+	return chroot(fd_path);
+}
+
 int prepare_fs(int pid)
 {
-	int ifd, cwd, ret = -1;
+	int ifd, dd, ret = -1;
 	FsEntry *fe;
 
 	ifd = open_image(CR_FD_FS, O_RSTR, pid);
 	if (ifd < 0)
-		return -1;
+		goto out;
 
-	if (pb_read_one(ifd, &fe, PB_FS) < 0) {
-		close_safe(&ifd);
-		return -1;
-	}
+	if (pb_read_one(ifd, &fe, PB_FS) < 0)
+		goto out_i;
 
-	cwd = open_reg_by_id(fe->cwd_id);
-	if (cwd < 0) {
-		pr_err("Can't open root %#x\n", fe->cwd_id);
-		close_safe(&ifd);
+	/*
+	 * Restore CWD
+	 */
+
+	dd = open_reg_by_id(fe->cwd_id);
+	if (dd < 0) {
+		pr_err("Can't open cwd %#x\n", fe->cwd_id);
 		goto err;
 	}
 
-	if (fchdir(cwd) < 0) {
-		pr_perror("Can't change root");
-		goto close;
+	ret = fchdir(dd);
+	close(dd);
+	if (ret < 0) {
+		pr_perror("Can't change cwd");
+		goto err;
 	}
 
 	/*
-	 * FIXME: restore task's root. Don't want to do it now, since
-	 * it's not yet clean how we're going to resolve tasks' paths
-	 * relative to the dumper/restorer and all this logic is likely
-	 * to be hidden in a couple of calls (open_fe_fd is one od them)
-	 * but for chroot there's no fchroot call, we have to chroot
-	 * by path thus exposing this (yet unclean) logic here.
+	 * Restore root
 	 */
+
+	dd = open_reg_by_id(fe->root_id);
+	if (dd < 0) {
+		pr_err("Can't open root %#x\n", fe->root_id);
+		goto err;
+	}
+
+	ret = fchroot(dd);
+	close(dd);
+	if (ret < 0) {
+		pr_perror("Can't change root");
+		goto err;
+	}
 
 	if (fe->has_umask) {
 		pr_info("Restoring umask to %o\n", fe->umask);
@@ -937,11 +1004,11 @@ int prepare_fs(int pid)
 	}
 
 	ret = 0;
-close:
-	close_safe(&cwd);
-	close_safe(&ifd);
 err:
 	fs_entry__free_unpacked(fe, NULL);
+out_i:
+	close_safe(&ifd);
+out:
 	return ret;
 }
 

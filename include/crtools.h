@@ -54,11 +54,14 @@ enum sfd_type {
 	LOG_FD_OFF,
 	LOG_DIR_FD_OFF,
 	IMG_FD_OFF,
-	SELF_EXE_FD_OFF,
-	PROC_FD_OFF,
+	PROC_FD_OFF,	/* fd with /proc for all proc_ calls */
 	CTL_TTY_OFF,
 	SELF_STDIN_OFF,
 	PARENT_FD_OFF,
+	CR_PROC_FD_OFF, /* some other's proc fd.
+			 *  For dump -- target ns' proc
+			 *  For restore -- CRIU ns' proc
+			 */
 
 	SERVICE_FD_MAX
 };
@@ -92,7 +95,6 @@ int open_pages_image_at(int dfd, unsigned long flags, int pm_fd);
 void up_page_ids_base(void);
 
 #define LAST_PID_PATH		"/proc/sys/kernel/ns_last_pid"
-#define LAST_PID_PERM		0666
 
 struct cr_fdset {
 	int fd_off;
@@ -125,7 +127,10 @@ int cr_exec(int pid, char **opts);
 #define O_RSTR	(O_RDONLY)
 
 struct cr_fdset *cr_task_fdset_open(int pid, int mode);
-struct cr_fdset *cr_ns_fdset_open(int pid, int mode);
+struct cr_fdset *cr_fdset_open_range(int pid, int from, int to,
+			       unsigned long flags);
+#define cr_fdset_open(pid, type, flags) cr_fdset_open_range(pid, \
+		_CR_FD_##type##_FROM, _CR_FD_##type##_TO, flags)
 struct cr_fdset *cr_glob_fdset_open(int mode);
 
 void close_cr_fdset(struct cr_fdset **cr_fdset);
@@ -177,10 +182,17 @@ struct rst_info {
 	unsigned long		premmapped_len;
 	unsigned long		clone_flags;
 
+	void			*munmap_restorer;
+
 	int			nr_zombies;
 
 	int service_fd_id;
 	struct fdt		*fdt;
+
+	union {
+		struct pstree_item	*pgrp_leader;
+		futex_t			pgrp_set;
+	};
 };
 
 static inline int in_vma_area(struct vma_area *vma, unsigned long addr)
@@ -198,5 +210,11 @@ static inline bool pid_rst_prio(unsigned pid_a, unsigned pid_b)
 {
 	return pid_a < pid_b;
 }
+
+void restrict_uid(unsigned int uid, unsigned int gid);
+struct proc_status_creds;
+bool may_dump(struct proc_status_creds *);
+struct _CredsEntry;
+bool may_restore(struct _CredsEntry *);
 
 #endif /* __CR_CRTOOLS_H__ */

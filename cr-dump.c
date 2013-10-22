@@ -64,11 +64,11 @@
 #include "vdso.h"
 #include "page-pipe.h"
 #include "vdso.h"
+#include "cr-service.h"
 
 #include "asm/dump.h"
 
 static char loc_buf[PAGE_SIZE];
-static int pidns_proc = -1;
 
 bool privately_dump_vma(struct vma_area *vma)
 {
@@ -393,39 +393,35 @@ err:
 	return ret;
 }
 
-static int dump_task_creds(struct parasite_ctl *ctl, const struct cr_fdset *fds)
+static int dump_task_creds(struct parasite_ctl *ctl,
+			   const struct cr_fdset *fds,
+			   struct proc_status_creds *cr)
 {
-	int ret;
-	struct proc_status_creds cr;
 	CredsEntry ce = CREDS_ENTRY__INIT;
 
 	pr_info("\n");
 	pr_info("Dumping creds for %d)\n", ctl->pid.real);
 	pr_info("----------------------------------------\n");
 
-	ret = parse_pid_status(ctl->pid.real, &cr);
-	if (ret < 0)
-		return ret;
-
-	ce.uid   = cr.uids[0];
-	ce.gid   = cr.gids[0];
-	ce.euid  = cr.uids[1];
-	ce.egid  = cr.gids[1];
-	ce.suid  = cr.uids[2];
-	ce.sgid  = cr.gids[2];
-	ce.fsuid = cr.uids[3];
-	ce.fsgid = cr.gids[3];
+	ce.uid   = cr->uids[0];
+	ce.gid   = cr->gids[0];
+	ce.euid  = cr->uids[1];
+	ce.egid  = cr->gids[1];
+	ce.suid  = cr->uids[2];
+	ce.sgid  = cr->gids[2];
+	ce.fsuid = cr->uids[3];
+	ce.fsgid = cr->gids[3];
 
 	BUILD_BUG_ON(CR_CAP_SIZE != PROC_CAP_SIZE);
 
 	ce.n_cap_inh = CR_CAP_SIZE;
-	ce.cap_inh = cr.cap_inh;
+	ce.cap_inh = cr->cap_inh;
 	ce.n_cap_prm = CR_CAP_SIZE;
-	ce.cap_prm = cr.cap_prm;
+	ce.cap_prm = cr->cap_prm;
 	ce.n_cap_eff = CR_CAP_SIZE;
-	ce.cap_eff = cr.cap_eff;
+	ce.cap_eff = cr->cap_eff;
 	ce.n_cap_bnd = CR_CAP_SIZE;
-	ce.cap_bnd = cr.cap_bnd;
+	ce.cap_bnd = cr->cap_bnd;
 
 	if (parasite_dump_creds(ctl, &ce) < 0)
 		return -1;
@@ -643,12 +639,14 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 	return ret;
 }
 
-static int dump_task_core_all(pid_t pid, CoreEntry *core,
+static int dump_task_core_all(struct pstree_item *item,
 		const struct proc_pid_stat *stat,
 		const struct parasite_dump_misc *misc,
 		const struct cr_fdset *cr_fdset)
 {
 	int fd_core = fdset_fd(cr_fdset, CR_FD_CORE);
+	CoreEntry *core = item->core[0];
+	pid_t pid = item->pid.real;
 	int ret = -1;
 
 	pr_info("\n");
@@ -661,7 +659,7 @@ static int dump_task_core_all(pid_t pid, CoreEntry *core,
 
 	strncpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
 	core->tc->flags = stat->flags;
-	core->tc->task_state = TASK_ALIVE;
+	core->tc->task_state = item->state;
 	core->tc->exit_code = 0;
 
 	ret = dump_thread_core(pid, core, &misc->ti);
@@ -678,54 +676,17 @@ err:
 	return ret;
 }
 
-static int parse_threads(const struct pstree_item *item, struct pid **_t, int *_n)
-{
-	struct dirent *de;
-	DIR *dir;
-	struct pid *t = NULL;
-	int nr = 1;
-
-	dir = opendir_proc(item->pid.real, "task");
-	if (!dir)
-		return -1;
-
-	while ((de = readdir(dir))) {
-		struct pid *tmp;
-
-		/* We expect numbers only here */
-		if (de->d_name[0] == '.')
-			continue;
-
-		tmp = xrealloc(t, nr * sizeof(struct pid));
-		if (!tmp) {
-			xfree(t);
-			return -1;
-		}
-		t = tmp;
-		t[nr - 1].real = atoi(de->d_name);
-		t[nr - 1].virt = -1;
-		nr++;
-	}
-
-	closedir(dir);
-
-	*_t = t;
-	*_n = nr - 1;
-
-	return 0;
-}
-
 static int get_threads(struct pstree_item *item)
 {
-	return parse_threads(item, &item->threads, &item->nr_threads);
+	return parse_threads(item->pid.real, &item->threads, &item->nr_threads);
 }
 
 static int check_threads(const struct pstree_item *item)
 {
-	struct pid *t;
+	struct pid *t = NULL;
 	int nr, ret;
 
-	ret = parse_threads(item, &t, &nr);
+	ret = parse_threads(item->pid.real, &t, &nr);
 	if (ret)
 		return ret;
 
@@ -976,6 +937,12 @@ static int collect_subtree(struct pstree_item *item)
 		if (ret < 0)
 			return -1;
 	}
+
+	/*
+	 * Tasks may clone() with the CLONE_PARENT flag while we collect
+	 * them, making more kids to their parent. So before proceeding
+	 * check that the parent we're working on has no more kids born.
+	 */
 
 	if (check_subtree(item))
 		return -1;
@@ -1232,6 +1199,16 @@ static int dump_task_threads(struct parasite_ctl *parasite_ctl,
 	return 0;
 }
 
+/*
+ * What this routine does is just reads pid-s of dead
+ * tasks in item's children list from item's ns proc.
+ *
+ * It does *not* find wihch real pid corresponds to
+ * which virtual one, but it's not required -- all we
+ * need to dump for zombie can be found in the same
+ * ns proc.
+ */
+
 static int fill_zombies_pids(struct pstree_item *item)
 {
 	struct pstree_item *child;
@@ -1277,8 +1254,14 @@ static int dump_zombies(void)
 	int ret = -1;
 	int pidns = current_ns_mask & CLONE_NEWPID;
 
-	if (pidns && set_proc_fd(pidns_proc))
+	if (pidns && set_proc_fd(get_service_fd(CR_PROC_FD_OFF)))
 		return -1;
+
+	/*
+	 * We dump zombies separately becase for pid-ns case
+	 * we'd have to resolve their pids w/o parasite via
+	 * target ns' proc.
+	 */
 
 	for_each_pstree_item(item) {
 		if (item->state != TASK_DEAD)
@@ -1321,6 +1304,9 @@ static int pre_dump_one_task(struct pstree_item *item, struct list_head *ctls)
 	struct parasite_ctl *parasite_ctl;
 	int ret = -1;
 	struct parasite_dump_misc misc;
+
+	INIT_LIST_HEAD(&vmas.h);
+	vmas.nr = 0;
 
 	pr_info("========================================\n");
 	pr_info("Pre-dumping task (pid: %d)\n", pid);
@@ -1383,17 +1369,19 @@ static int dump_one_task(struct pstree_item *item)
 	struct cr_fdset *cr_fdset = NULL;
 	struct parasite_drain_fd *dfds;
 	struct proc_posix_timers_stat proc_args;
+	struct proc_status_creds cr;
+
+	INIT_LIST_HEAD(&vmas.h);
+	vmas.nr = 0;
 
 	pr_info("========================================\n");
 	pr_info("Dumping task (pid: %d)\n", pid);
 	pr_info("========================================\n");
 
-	if (item->state == TASK_STOPPED) {
-		pr_err("Stopped tasks are not supported\n");
-		return -1;
-	}
-
 	if (item->state == TASK_DEAD)
+		/*
+		 * zombies are dumped separately in dump_zombies()
+		 */
 		return 0;
 
 	dfds = xmalloc(sizeof(*dfds));
@@ -1404,6 +1392,16 @@ static int dump_one_task(struct pstree_item *item)
 	ret = parse_pid_stat(pid, &pps_buf);
 	if (ret < 0)
 		goto err;
+
+	ret = parse_pid_status(pid, &cr);
+	if (ret)
+		goto err;
+
+	if (!may_dump(&cr)) {
+		ret = -1;
+		pr_err("Check uid (pid: %d) failed\n", pid);
+		goto err;
+	}
 
 	ret = collect_mappings(pid, &vmas);
 	if (ret) {
@@ -1431,11 +1429,18 @@ static int dump_one_task(struct pstree_item *item)
 	}
 
 	if (current_ns_mask & CLONE_NEWPID && root_item == item) {
-		pidns_proc = parasite_get_proc_fd_seized(parasite_ctl);
-		if (pidns_proc < 0) {
+		int pfd;
+
+		pfd = parasite_get_proc_fd_seized(parasite_ctl);
+		if (pfd < 0) {
 			pr_err("Can't get proc fd (pid: %d)\n", pid);
 			goto err_cure_fdset;
 		}
+
+		if (install_service_fd(CR_PROC_FD_OFF, pfd) < 0)
+			goto err_cure_fdset;
+
+		close(pfd);
 	}
 
 	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
@@ -1520,7 +1525,7 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure;
 	}
 
-	ret = dump_task_core_all(pid, item->core[0], &pps_buf, &misc, cr_fdset);
+	ret = dump_task_core_all(item, &pps_buf, &misc, cr_fdset);
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
@@ -1532,7 +1537,7 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure;
 	}
 
-	ret = dump_task_creds(parasite_ctl, cr_fdset);
+	ret = dump_task_creds(parasite_ctl, cr_fdset, &cr);
 	if (ret) {
 		pr_err("Dump creds (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1608,9 +1613,6 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	ret = 0;
 err:
-	if (disconnect_from_page_server())
-		ret = -1;
-
 	pstree_switch_state(root_item,
 			ret ? TASK_ALIVE : opts.final_state);
 	free_pstree(root_item);
@@ -1636,6 +1638,9 @@ err:
 		list_del(&ctl->pre_list);
 		parasite_cure_local(ctl);
 	}
+
+	if (disconnect_from_page_server())
+		ret = -1;
 
 	if (ret)
 		pr_err("Pre-dumping FAILED.\n");
@@ -1674,6 +1679,12 @@ int cr_dump_tasks(pid_t pid)
 
 	if (connect_to_page_server())
 		goto err;
+
+	/*
+	 * The collect_pstree will also stop (PTRACE_SEIZE) the tasks
+	 * thus ensuring that they don't modify anything we collect
+	 * afterwards.
+	 */
 
 	if (collect_pstree(pid))
 		goto err;
@@ -1715,7 +1726,7 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	if (current_ns_mask)
-		if (dump_namespaces(&root_item->pid, current_ns_mask) < 0)
+		if (dump_namespaces(root_item, current_ns_mask) < 0)
 			goto err;
 
 	ret = cr_dump_shmem();
@@ -1769,7 +1780,7 @@ err:
 	free_pstree(root_item);
 	free_file_locks();
 
-	close_safe(&pidns_proc);
+	close_service_fd(CR_PROC_FD_OFF);
 
 	if (ret) {
 		kill_inventory();

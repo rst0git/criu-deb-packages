@@ -117,7 +117,6 @@ struct task_restore_core_args {
 	struct task_entries		*task_entries;
 	void				*rst_mem;
 	unsigned long			rst_mem_size;
-	VmaEntry			*self_vmas;
 	VmaEntry			*tgt_vmas;
 	siginfo_t			*siginfo;
 	unsigned int			siginfo_nr;
@@ -125,6 +124,9 @@ struct task_restore_core_args {
 	unsigned long			premmapped_addr;
 	unsigned long			premmapped_len;
 	rt_sigaction_t			sigchld_act;
+
+	void				*bootstrap_start;
+	unsigned long			bootstrap_len;
 
 	struct itimerval		itimers[3];
 
@@ -148,6 +150,8 @@ struct task_restore_core_args {
 
 	struct rst_tcp_sock		*tcp_socks;
 	int				tcp_socks_nr;
+
+	int				fd_last_pid; /* sys.ns_last_pid for threads rst */
 
 	struct vdso_symtable		vdso_sym_rt;		/* runtime vdso symbols */
 	unsigned long			vdso_rt_parked_at;	/* safe place to keep vdso */
@@ -183,7 +187,6 @@ enum {
 	CR_STATE_FAIL		= -1,
 	CR_STATE_RESTORE_NS	= 0, /* is used for executing "setup-namespace" scripts */
 	CR_STATE_FORKING,
-	CR_STATE_RESTORE_PGID,
 	CR_STATE_RESTORE,
 	CR_STATE_RESTORE_SIGCHLD,
 	/*

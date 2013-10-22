@@ -17,7 +17,7 @@ Package: criu
 Architecture: armhf amd64
 Depends:
  ${misc:Depends},
- ${shlibs:Depends}
+ ${shlibs:Depends},
 Recommends: iproute
 Description: checkpoint and restore in userspace
  criu contains the utilities to checkpoint and restore processes in

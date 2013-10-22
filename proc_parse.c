@@ -220,7 +220,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 			goto err;
 
 		memset(file_path, 0, 6);
-		num = sscanf(buf, "%lx-%lx %c%c%c%c %lx %02x:%02x %lu %5s",
+		num = sscanf(buf, "%lx-%lx %c%c%c%c %lx %x:%x %lu %5s",
 			     &start, &end, &r, &w, &x, &s, &pgoff, &dev_maj,
 			     &dev_min, &ino, file_path);
 		if (num < 10) {
@@ -281,7 +281,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 
 		if (vma_area->vma.status != 0) {
 			continue;
-		} else if (strstr(buf, "[vsyscall]")) {
+		} else if (strstr(buf, "[vsyscall]") || strstr(buf, "[vectors]")) {
 			vma_area->vma.status |= VMA_AREA_VSYSCALL;
 		} else if (strstr(buf, "[vdso]")) {
 			vma_area->vma.status |= VMA_AREA_REGULAR;
@@ -1077,19 +1077,19 @@ static int parse_file_lock_buf(char *buf, struct file_lock *fl,
 	int  num;
 
 	if (is_blocked) {
-		num = sscanf(buf, "%lld: -> %s %s %s %d %02x:%02x:%ld %lld %s",
+		num = sscanf(buf, "%lld: -> %s %s %s %d %x:%x:%ld %lld %s",
 			&fl->fl_id, fl->fl_flag, fl->fl_type, fl->fl_option,
 			&fl->fl_owner, &fl->maj, &fl->min, &fl->i_no,
 			&fl->start, fl->end);
 	} else {
-		num = sscanf(buf, "%lld:%s %s %s %d %02x:%02x:%ld %lld %s",
+		num = sscanf(buf, "%lld:%s %s %s %d %x:%x:%ld %lld %s",
 			&fl->fl_id, fl->fl_flag, fl->fl_type, fl->fl_option,
 			&fl->fl_owner, &fl->maj, &fl->min, &fl->i_no,
 			&fl->start, fl->end);
 	}
 
 	if (num < 10) {
-		pr_perror("Invalid file lock info: %s", buf);
+		pr_err("Invalid file lock info (%d): %s", num, buf);
 		return -1;
 	}
 
@@ -1237,4 +1237,49 @@ err:
 out:
 	fclose(file);
 	return ret;
+}
+
+int parse_threads(int pid, struct pid **_t, int *_n)
+{
+	struct dirent *de;
+	DIR *dir;
+	struct pid *t = NULL;
+	int nr = 1;
+
+	if (*_t)
+		t = *_t;
+
+	dir = opendir_proc(pid, "task");
+	if (!dir)
+		return -1;
+
+	while ((de = readdir(dir))) {
+		struct pid *tmp;
+
+		/* We expect numbers only here */
+		if (de->d_name[0] == '.')
+			continue;
+
+		if (*_t == NULL) {
+			tmp = xrealloc(t, nr * sizeof(struct pid));
+			if (!tmp) {
+				xfree(t);
+				return -1;
+			}
+			t = tmp;
+			t[nr - 1].virt = -1;
+		}
+		t[nr - 1].real = atoi(de->d_name);
+		nr++;
+	}
+
+	closedir(dir);
+
+	if (*_t == NULL) {
+		*_t = t;
+		*_n = nr - 1;
+	} else
+		BUG_ON(nr - 1 != *_n);
+
+	return 0;
 }

@@ -19,6 +19,7 @@
 #include "protobuf/pagemap.pb-c.h"
 
 bool fdinfo_per_id = false;
+bool ns_per_id = false;
 TaskKobjIdsEntry *root_ids;
 
 int check_img_inventory(void)
@@ -34,6 +35,7 @@ int check_img_inventory(void)
 		goto out_close;
 
 	fdinfo_per_id = he->has_fdinfo_per_id ?  he->fdinfo_per_id : false;
+	ns_per_id = he->has_ns_per_id ? he->ns_per_id : false;
 
 	if (he->root_ids) {
 		root_ids = xmalloc(sizeof(*root_ids));
@@ -71,6 +73,8 @@ int write_img_inventory(void)
 	he.img_version = CRTOOLS_IMAGES_V1;
 	he.fdinfo_per_id = true;
 	he.has_fdinfo_per_id = true;
+	he.ns_per_id = true;
+	he.has_ns_per_id = true;
 
 	crt.state = TASK_ALIVE;
 	crt.pid.real = getpid();
@@ -143,7 +147,7 @@ void close_cr_fdset(struct cr_fdset **cr_fdset)
 	*cr_fdset = NULL;
 }
 
-static struct cr_fdset *cr_fdset_open(int pid, int from, int to,
+struct cr_fdset *cr_fdset_open_range(int pid, int from, int to,
 			       unsigned long flags)
 {
 	struct cr_fdset *fdset;
@@ -177,17 +181,12 @@ err:
 
 struct cr_fdset *cr_task_fdset_open(int pid, int mode)
 {
-	return cr_fdset_open(pid, _CR_FD_TASK_FROM, _CR_FD_TASK_TO, mode);
-}
-
-struct cr_fdset *cr_ns_fdset_open(int pid, int mode)
-{
-	return cr_fdset_open(pid, _CR_FD_NS_FROM, _CR_FD_NS_TO, mode);
+	return cr_fdset_open(pid, TASK, mode);
 }
 
 struct cr_fdset *cr_glob_fdset_open(int mode)
 {
-	return cr_fdset_open(-1 /* ignored */, _CR_FD_GLOB_FROM, _CR_FD_GLOB_TO, mode);
+	return cr_fdset_open(-1 /* ignored */, GLOB, mode);
 }
 
 int open_image_at(int dfd, int type, unsigned long flags, ...)

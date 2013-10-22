@@ -273,7 +273,7 @@ static int validate_mounts(struct mount_info *info)
 				continue;
 			if (mlen > tlen && m->mountpoint[tlen] != '/')
 				continue;
-			pr_err("%d:%s is overmounted", m->mnt_id, m->mountpoint);
+			pr_err("%d:%s is overmounted\n", m->mnt_id, m->mountpoint);
 			return -1;
 		}
 	}
@@ -471,7 +471,7 @@ out:
 static int tmpfs_dump(struct mount_info *pm)
 {
 	int ret = -1;
-	char tmpfs_path[PATH_MAX];
+	char tmpfs_path[PSFDS];
 	int fd, fd_img = -1;
 	DIR *fdir = NULL;
 
@@ -489,8 +489,7 @@ static int tmpfs_dump(struct mount_info *pm)
 	if (fd_img < 0)
 		goto out;
 
-	snprintf(tmpfs_path, sizeof(tmpfs_path),
-				       "/proc/self/fd/%d", fd);
+	sprintf(tmpfs_path, "/proc/self/fd/%d", fd);
 
 	ret = cr_system(-1, fd_img, -1, "tar", (char *[])
 			{ "tar", "--create",
@@ -641,37 +640,43 @@ static int dump_one_mountpoint(struct mount_info *pm, int fd)
 	return 0;
 }
 
-int dump_mnt_ns(int ns_pid, struct cr_fdset *fdset)
+int dump_mnt_ns(int ns_pid, int ns_id)
 {
 	struct mount_info *pm;
-	int img_fd;
+	int img_fd, ret = -1;
+
+	img_fd = open_image(CR_FD_MNTS, O_DUMP, ns_id);
+	if (img_fd < 0)
+		return -1;
 
 	pm = parse_mountinfo(ns_pid);
 	if (!pm) {
 		pr_err("Can't parse %d's mountinfo\n", ns_pid);
-		return -1;
+		goto err;
 	}
 
 	if (mnt_build_tree(pm) == NULL)
-		return -1;
+		goto err;
 
 	if (validate_mounts(pm))
-		return -1;
+		goto err;
 
 	pr_info("Dumping mountpoints\n");
 
-	img_fd = fdset_fd(fdset, CR_FD_MNTS);
 	do {
 		struct mount_info *n = pm->next;
 
 		if (dump_one_mountpoint(pm, img_fd))
-			return -1;
+			goto err;
 
 		xfree(pm);
 		pm = n;
 	} while (pm);
 
-	return 0;
+	ret = 0;
+err:
+	close(img_fd);
+	return ret;
 }
 
 /*
@@ -1225,6 +1230,23 @@ int mntns_collect_root(pid_t pid)
 	int ret;
 	char path[PATH_MAX + 1];
 
+	if (!(current_ns_mask & CLONE_NEWNS)) {
+		/*
+		 * If criu and tasks we dump live in the same mount
+		 * namespace, we can just open the root directory.
+		 * All paths resolution would occur relative to criu's
+		 * root. Even if it is not namespace's root, provided
+		 * file paths are resolved, we'd get consistent dump.
+		 */
+		fd = open("/", O_RDONLY | O_DIRECTORY);
+		if (fd < 0) {
+			pr_perror("Can't open root\n");
+			return -1;
+		}
+
+		goto set_root;
+	}
+
 	/*
 	 * If /proc/pid/root links on '/', it signs that a root of the task
 	 * and a root of mntns is the same.
@@ -1252,8 +1274,8 @@ int mntns_collect_root(pid_t pid)
 		return -1;
 	}
 
+set_root:
 	mntns_root = fd;
-
 	return 0;
 }
 

@@ -19,6 +19,8 @@ extern int vprint_num(char *buf, int blen, int num, char **ps);
 extern void print_on_level(unsigned int loglevel, const char *format, ...)
 	__attribute__ ((__format__ (__printf__, 2, 3)));
 
+extern int write_pidfile(char *pfname, int pid);
+
 #ifndef LOG_PREFIX
 # define LOG_PREFIX
 #endif
@@ -56,5 +58,7 @@ extern void print_on_level(unsigned int loglevel, const char *format, ...)
 
 #define pr_perror(fmt, ...)							\
 	pr_err(fmt ": %m\n", ##__VA_ARGS__)
+
+#define DEFAULT_LOG_FILENAME "criu.log"
 
 #endif /* __CR_LOG_H__ */
