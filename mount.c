@@ -12,12 +12,13 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
-#include "crtools.h"
+#include "cr_options.h"
 #include "asm/types.h"
 #include "util.h"
 #include "util-pie.h"
 #include "log.h"
 #include "mount.h"
+#include "pstree.h"
 #include "proc_parse.h"
 #include "image.h"
 #include "namespaces.h"

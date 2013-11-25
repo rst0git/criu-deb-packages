@@ -8,11 +8,12 @@
 #include <sched.h>
 #include <sys/mount.h>
 
+#include "fdset.h"
 #include "syscall-types.h"
 #include "namespaces.h"
 #include "net.h"
 #include "libnetlink.h"
-#include "crtools.h"
+#include "cr_options.h"
 #include "sk-inet.h"
 #include "tun.h"
 #include "util-pie.h"
@@ -336,10 +337,8 @@ static int restore_link(NetDeviceEntry *nde, int nlsk)
 	pr_info("Restoring link %s type %d\n", nde->name, nde->type);
 
 	switch (nde->type) {
-	case ND_TYPE__LOOPBACK:
-		return restore_one_link(nde, nlsk, NULL);
-	case ND_TYPE__EXTLINK:
-		/* see comment in protobuf/netdev.proto */
+	case ND_TYPE__LOOPBACK: /* fallthrough */
+	case ND_TYPE__EXTLINK:  /* see comment in protobuf/netdev.proto */
 		return restore_link_parms(nde, nlsk);
 	case ND_TYPE__VETH:
 		return restore_one_link(nde, nlsk, veth_link_info);
@@ -585,14 +584,11 @@ void network_unlock(void)
 {
 	pr_info("Unlock network\n");
 
-	if  (!(current_ns_mask & CLONE_NEWNET)) {
-		cpt_unlock_tcp_connections();
-		rst_unlock_tcp_connections();
+	cpt_unlock_tcp_connections();
+	rst_unlock_tcp_connections();
 
-		return;
-	}
-
-	run_scripts("network-unlock");
+	if (current_ns_mask & CLONE_NEWNET)
+		run_scripts("network-unlock");
 }
 
 struct ns_desc net_ns_desc = NS_DESC_ENTRY(CLONE_NEWNET, "net");

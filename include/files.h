@@ -3,10 +3,11 @@
 
 #include "compiler.h"
 #include "asm/types.h"
+#include "fcntl.h"
 #include "lock.h"
 #include "list.h"
 #include "image.h"
-#include "crtools.h"
+#include "pid.h"
 
 #include "protobuf/fdinfo.pb-c.h"
 #include "protobuf/fown.pb-c.h"
@@ -144,6 +145,6 @@ extern int close_old_fds(struct pstree_item *me);
 
 #define LREMAP_PARAM	"link-remap"
 
-int shared_fdt_prepare(struct pstree_item *item);
+extern int shared_fdt_prepare(struct pstree_item *item);
 
 #endif /* __CR_FILES_H__ */

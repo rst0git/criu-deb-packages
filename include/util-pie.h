@@ -4,6 +4,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#include "asm/types.h"
+
 #define UNIX_PATH_MAX (sizeof(struct sockaddr_un) - \
 			(size_t)((struct sockaddr_un *) 0)->sun_path)
 
@@ -13,7 +15,7 @@
 
 /*
  * Because of kernel doing kmalloc for user data passed
- * in SCM messages, and there is SCM_MAX_FD as a limit
+ * in SCM messages, and there is kernel's SCM_MAX_FD as a limit
  * for descriptors passed at once we're trying to reduce
  * the pressue on kernel memory manager and use predefined
  * known to work well size of the message buffer.
@@ -59,5 +61,6 @@ static inline int recv_fd(int sock)
 	return fd;
 }
 
-int open_detach_mount(char *dir);
+extern int open_detach_mount(char *dir);
+
 #endif /* __CR_UTIL_NET_H__ */

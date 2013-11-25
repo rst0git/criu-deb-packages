@@ -11,9 +11,12 @@
 #include "image.h"
 #include "lock.h"
 #include "util.h"
-#include "crtools.h"
 #include "asm/restorer.h"
+#include "rst_info.h"
 
+#include "posix-timer.h"
+#include "shmem.h"
+#include "sigframe.h"
 #include "vdso.h"
 
 #include <time.h>
@@ -39,36 +42,18 @@ typedef long (*thread_restore_fcall_t) (struct thread_restore_args *args);
  */
 #define RESTORE_ARGS_SIZE		(512)
 #define RESTORE_STACK_REDZONE		(128)
-/* sigframe should be aligned on 64 byte for x86 and 8 bytes for arm */
-#define RESTORE_STACK_SIGFRAME		ALIGN(sizeof(struct rt_sigframe) + SIGFRAME_OFFSET, 64)
 #define RESTORE_STACK_SIZE		(KILO(32))
-#define RESTORE_HEAP_SIZE		(KILO(16))
-
-#define RESTORE_ALIGN_STACK(start, size)	\
-	(ALIGN((start) + (size) - sizeof(long), sizeof(long)))
 
 struct restore_mem_zone {
 	u8				redzone[RESTORE_STACK_REDZONE];
 	u8				stack[RESTORE_STACK_SIZE];
 	u8				rt_sigframe[RESTORE_STACK_SIGFRAME];
-	u8				heap[RESTORE_HEAP_SIZE];
 } __aligned(sizeof(long));
-
-#define first_on_heap(ptr, heap)	((typeof(ptr))heap)
-#define next_on_heap(ptr, prev)		((typeof(ptr))((long)(prev) + sizeof(*(prev))))
 
 struct rst_sched_param {
 	int policy;
 	int nice;
 	int prio;
-};
-
-struct str_posix_timer {
-	long it_id;
-	int clock_id;
-	int si_signo;
-	int it_sigev_notify;
-	void * sival_ptr;
 };
 
 struct restore_posix_timer {
@@ -79,7 +64,12 @@ struct restore_posix_timer {
 
 struct task_restore_core_args;
 
-/* Make sure it's pow2 in size */
+/*
+ * We should be able to construct fpu sigframe in sigreturn_prep_fpu_frame,
+ * so the mem_zone.rt_sigframe should be 64-bytes aligned. To make things
+ * simpler, force both _args alignment be 64 bytes.
+ */
+
 struct thread_restore_args {
 	struct restore_mem_zone		mem_zone;
 
@@ -93,15 +83,15 @@ struct thread_restore_args {
 
 	struct rst_sched_param		sp;
 
-	struct task_restore_core_args	*ta;
+	struct task_restore_args	*ta;
 
 	u32				tls;
 
 	siginfo_t			*siginfo;
 	unsigned int			siginfo_nr;
-} __aligned(sizeof(long));
+} __aligned(64);
 
-struct task_restore_core_args {
+struct task_restore_args {
 	struct thread_restore_args	*t;			/* thread group leader */
 
 	int				fd_exe_link;		/* opened self->exe file */
@@ -113,7 +103,8 @@ struct task_restore_core_args {
 	int				nr_zombies;
 	thread_restore_fcall_t		clone_restore_fn;	/* helper address for clone() call */
 	struct thread_restore_args	*thread_args;		/* array of thread arguments */
-	struct shmems			*shmems;
+	struct shmem_info		*shmems;
+	unsigned int			nr_shmems;
 	struct task_entries		*task_entries;
 	void				*rst_mem;
 	unsigned long			rst_mem_size;
@@ -127,6 +118,7 @@ struct task_restore_core_args {
 
 	void				*bootstrap_start;
 	unsigned long			bootstrap_len;
+	unsigned long			vdso_rt_size;
 
 	struct itimerval		itimers[3];
 
@@ -155,31 +147,15 @@ struct task_restore_core_args {
 
 	struct vdso_symtable		vdso_sym_rt;		/* runtime vdso symbols */
 	unsigned long			vdso_rt_parked_at;	/* safe place to keep vdso */
-} __aligned(sizeof(long));
+} __aligned(64);
 
-#define SHMEMS_SIZE	4096
+#define RESTORE_ALIGN_STACK(start, size)	\
+	(ALIGN((start) + (size) - sizeof(long), sizeof(long)))
 
-/*
- * pid is a pid of a creater
- * start, end are used for open mapping
- * fd is a file discriptor, which is valid for creater,
- * it's opened in cr-restor, because pgoff may be non zero
- */
-
-struct shmem_info {
-	unsigned long	shmid;
-	unsigned long	start;
-	unsigned long	end;
-	unsigned long	size;
-	int		pid;
-	int		fd;
-	futex_t		lock;
-};
-
-struct shmems {
-	int			nr_shmems;
-	struct shmem_info	entries[0];
-};
+static inline unsigned long restorer_stack(struct thread_restore_args *a)
+{
+	return RESTORE_ALIGN_STACK((long)a->mem_zone.stack, RESTORE_STACK_SIZE);
+}
 
 #define TASK_ENTRIES_SIZE 4096
 
@@ -198,28 +174,6 @@ enum {
 	CR_STATE_RESTORE_CREDS,
 	CR_STATE_COMPLETE
 };
-
-struct task_entries {
-	int nr_threads, nr_tasks, nr_helpers;
-	futex_t nr_in_progress;
-	futex_t start;
-	mutex_t	zombie_lock;
-};
-
-static always_inline struct shmem_info *
-find_shmem(struct shmems *shmems, unsigned long shmid)
-{
-	struct shmem_info *si;
-	int i;
-
-	for (i = 0; i < shmems->nr_shmems; i++) {
-		si = &shmems->entries[i];
-		if (si->shmid == shmid)
-			return si;
-	}
-
-	return NULL;
-}
 
 #define restore_finish_stage(__stage) ({				\
 		futex_dec_and_wake(&task_entries->nr_in_progress);	\

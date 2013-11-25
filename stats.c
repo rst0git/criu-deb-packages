@@ -1,8 +1,10 @@
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/time.h>
+#include "asm/atomic.h"
 #include "protobuf.h"
 #include "stats.h"
-#include "crtools.h"
+#include "image.h"
 #include "protobuf/stats.pb-c.h"
 
 struct timing {
@@ -132,7 +134,7 @@ void write_stats(int what)
 	} else
 		return;
 
-	fd = open_image(CR_FD_STATS, O_DUMP, name);
+	fd = open_image_at(AT_FDCWD, CR_FD_STATS, O_DUMP, name);
 	if (fd >= 0) {
 		pb_write_one(fd, &stats, PB_STATS);
 		close(fd);

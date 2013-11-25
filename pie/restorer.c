@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <linux/securebits.h>
+#include <linux/capability.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -16,10 +18,12 @@
 #include "compiler.h"
 #include "asm/types.h"
 #include "syscall.h"
+#include "prctl.h"
 #include "log.h"
 #include "util.h"
 #include "image.h"
 #include "sk-inet.h"
+#include "vma.h"
 
 #include "crtools.h"
 #include "lock.h"
@@ -195,7 +199,7 @@ static void restore_sched_info(struct rst_sched_param *p)
 	sys_sched_setscheduler(0, p->policy, &parm);
 }
 
-static void restore_rlims(struct task_restore_core_args *ta)
+static void restore_rlims(struct task_restore_args *ta)
 {
 	int r;
 
@@ -312,16 +316,17 @@ core_restore_end:
 	return -1;
 }
 
-static long restore_self_exe_late(struct task_restore_core_args *args)
+static long restore_self_exe_late(struct task_restore_args *args)
 {
-	int fd = args->fd_exe_link;
+	int fd = args->fd_exe_link, ret;
 
 	pr_info("Restoring EXE link\n");
-	sys_prctl_safe(PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0);
+	ret = sys_prctl_safe(PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0);
+	if (ret)
+		pr_err("Can't restore EXE link (%d)\n", ret);
 	sys_close(fd);
 
-	/* FIXME Once kernel side stabilized -- fix error reporting */
-	return 0;
+	return ret;
 }
 
 static unsigned long restore_mapping(const VmaEntry *vma_entry)
@@ -347,7 +352,7 @@ static unsigned long restore_mapping(const VmaEntry *vma_entry)
 	if (vma_entry->fd == -1 || !(vma_entry->flags & MAP_SHARED))
 		prot |= PROT_WRITE;
 
-	pr_debug("\tmmap(%"PRIx64" -> %"PRIx64", %x %x %d\n",
+	pr_debug("\tmmap(%"PRIx64" -> %"PRIx64", %x %x %d)\n",
 			vma_entry->start, vma_entry->end,
 			prot, flags, (int)vma_entry->fd);
 	/*
@@ -380,7 +385,7 @@ static void rst_tcp_repair_off(struct rst_tcp_sock *rts)
 		pr_perror("Failed to restore of SO_REUSEADDR on socket (%d)", ret);
 }
 
-static void rst_tcp_socks_all(struct task_restore_core_args *ta)
+static void rst_tcp_socks_all(struct task_restore_args *ta)
 {
 	int i;
 
@@ -464,7 +469,7 @@ static int vma_remap(unsigned long src, unsigned long dst, unsigned long len)
 	return 0;
 }
 
-static int create_posix_timers(struct task_restore_core_args *args)
+static int create_posix_timers(struct task_restore_args *args)
 {
 	int ret, i;
 	timer_t next_id;
@@ -501,7 +506,7 @@ static int create_posix_timers(struct task_restore_core_args *args)
 	return 0;
 }
 
-static void restore_posix_timers(struct task_restore_core_args *args)
+static void restore_posix_timers(struct task_restore_args *args)
 {
 	int i;
 	struct restore_posix_timer *rt;
@@ -513,10 +518,11 @@ static void restore_posix_timers(struct task_restore_core_args *args)
 }
 static void *bootstrap_start;
 static unsigned int bootstrap_len;
+static unsigned long vdso_rt_size;
 
 void __export_unmap(void)
 {
-	sys_munmap(bootstrap_start, bootstrap_len);
+	sys_munmap(bootstrap_start, bootstrap_len - vdso_rt_size);
 	/*
 	 * sys_munmap must not return here. The controll process must
 	 * trap us on the exit from sys_munmap.
@@ -525,7 +531,19 @@ void __export_unmap(void)
 
 /*
  * This function unmaps all VMAs, which don't belong to
- * the restored process or the restorer
+ * the restored process or the restorer.
+ *
+ * The restorer memory is two regions -- area with restorer, its stack
+ * and arguments and the one with private vmas of the tasks we restore
+ * (a.k.a. premmaped area):
+ *
+ * 0                       TASK_SIZE
+ * +----+====+----+====+---+
+ *
+ * Thus to unmap old memory we have to do 3 unmaps:
+ * [ 0 -- 1st area start ]
+ * [ 1st end -- 2nd start ]
+ * [ 2nd start -- TASK_SIZE ]
  */
 static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len,
 		      void *bootstrap_start, unsigned long bootstrap_len)
@@ -575,9 +593,10 @@ static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len,
  * and jump execution to some predefined ip read from
  * core file.
  */
-long __export_restore_task(struct task_restore_core_args *args)
+long __export_restore_task(struct task_restore_args *args)
 {
 	long ret = -1;
+	int i;
 	VmaEntry *vma_entry;
 	unsigned long va;
 
@@ -589,6 +608,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 
 	bootstrap_start = args->bootstrap_start;
 	bootstrap_len	= args->bootstrap_len;
+	vdso_rt_size	= args->vdso_rt_size;
 
 	task_entries = args->task_entries;
 
@@ -615,7 +635,9 @@ long __export_restore_task(struct task_restore_core_args *args)
 		goto core_restore_end;
 
 	/* Shift private vma-s to the left */
-	for (vma_entry = args->tgt_vmas; vma_entry->start != 0; vma_entry++) {
+	for (i = 0; i < args->nr_vmas; i++) {
+		vma_entry = args->tgt_vmas + i;
+
 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
 			continue;
 
@@ -640,8 +662,9 @@ long __export_restore_task(struct task_restore_core_args *args)
 	}
 
 	/* Shift private vma-s to the right */
-	for (vma_entry = args->tgt_vmas + args->nr_vmas -1;
-				vma_entry >= args->tgt_vmas; vma_entry--) {
+	for (i = args->nr_vmas - 1; i >= 0; i--) {
+		vma_entry = args->tgt_vmas + i;
+
 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
 			continue;
 
@@ -668,7 +691,9 @@ long __export_restore_task(struct task_restore_core_args *args)
 	/*
 	 * OK, lets try to map new one.
 	 */
-	for (vma_entry = args->tgt_vmas; vma_entry->start != 0; vma_entry++) {
+	for (i = 0; i < args->nr_vmas; i++) {
+		vma_entry = args->tgt_vmas + i;
+
 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
 			continue;
 
@@ -687,14 +712,16 @@ long __export_restore_task(struct task_restore_core_args *args)
 	 * Walk though all VMAs again to drop PROT_WRITE
 	 * if it was not there.
 	 */
-	for (vma_entry = args->tgt_vmas; vma_entry->start != 0; vma_entry++) {
+	for (i = 0; i < args->nr_vmas; i++) {
+		vma_entry = args->tgt_vmas + i;
+
 		if (!(vma_entry_is(vma_entry, VMA_AREA_REGULAR)))
 			continue;
 
 		if (vma_entry_is(vma_entry, VMA_ANON_SHARED)) {
 			struct shmem_info *entry;
 
-			entry = find_shmem(args->shmems,
+			entry = find_shmem(args->shmems, args->nr_shmems,
 						  vma_entry->shmid);
 			if (entry && entry->pid == my_pid &&
 			    entry->start == vma_entry->start)
@@ -712,36 +739,31 @@ long __export_restore_task(struct task_restore_core_args *args)
 	/*
 	 * Finally restore madivse() bits
 	 */
-	for (vma_entry = args->tgt_vmas; vma_entry->start != 0; vma_entry++) {
-		unsigned long i;
+	for (i = 0; i < args->nr_vmas; i++) {
+		unsigned long m;
 
+		vma_entry = args->tgt_vmas + i;
 		if (!vma_entry->has_madv || !vma_entry->madv)
 			continue;
-		for (i = 0; i < sizeof(vma_entry->madv) * 8; i++) {
-			if (vma_entry->madv & (1ul << i)) {
+
+		for (m = 0; m < sizeof(vma_entry->madv) * 8; m++) {
+			if (vma_entry->madv & (1ul << m)) {
 				ret = sys_madvise(vma_entry->start,
 						  vma_entry_len(vma_entry),
-						  i);
+						  m);
 				if (ret) {
 					pr_err("madvise(%"PRIx64", %"PRIu64", %ld) "
 					       "failed with %ld\n",
 						vma_entry->start,
 						vma_entry_len(vma_entry),
-						i, ret);
+						m, ret);
 					goto core_restore_end;
 				}
 			}
 		}
 	}
 
-	sys_munmap(args->tgt_vmas,
-			((void *)(vma_entry + 1) - ((void *)args->tgt_vmas)));
-
-	ret = sys_munmap(args->shmems, SHMEMS_SIZE);
-	if (ret < 0) {
-		pr_err("Can't unmap shmem %ld\n", ret);
-		goto core_restore_end;
-	}
+	ret = 0;
 
 	/*
 	 * Tune up the task fields.
@@ -791,14 +813,14 @@ long __export_restore_task(struct task_restore_core_args *args)
 	 *
 	 * | <-- low addresses                                          high addresses --> |
 	 * +-------------------------------------------------------+-----------------------+
-	 * | this proc body | own stack | heap | rt_sigframe space | thread restore zone   |
+	 * | this proc body | own stack | rt_sigframe space | thread restore zone   |
 	 * +-------------------------------------------------------+-----------------------+
 	 *
 	 * where each thread restore zone is the following
 	 *
 	 * | <-- low addresses                                     high addresses --> |
 	 * +--------------------------------------------------------------------------+
-	 * | thread restore proc | thread1 stack | thread1 heap | thread1 rt_sigframe |
+	 * | thread restore proc | thread1 stack | thread1 rt_sigframe |
 	 * +--------------------------------------------------------------------------+
 	 */
 
@@ -824,10 +846,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 			if (thread_args[i].pid == args->t->pid)
 				continue;
 
-			new_sp =
-				RESTORE_ALIGN_STACK((long)thread_args[i].mem_zone.stack,
-						    sizeof(thread_args[i].mem_zone.stack));
-
+			new_sp = restorer_stack(thread_args + i);
 			last_pid_len = vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
 			ret = sys_write(fd, s, last_pid_len);
 			if (ret < 0) {

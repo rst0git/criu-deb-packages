@@ -1,3 +1,10 @@
+criu (1.0-1) experimental; urgency=low
+
+  * Updating to standards version 3.9.5.
+  * Merging upstream version 1.0.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Mon, 25 Nov 2013 20:04:24 +0100
+
 criu (0.8-1) experimental; urgency=low
 
   * Merging upstream version 0.8.

@@ -14,7 +14,8 @@
 #include <sys/stat.h>
 
 #include "crtools.h"
-#include "util-pie.h"
+#include "cr_options.h"
+#include "util.h"
 #include "log.h"
 #include "pstree.h"
 #include "cr-service.h"
@@ -120,10 +121,8 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		return -1;
 	}
 
-	if (open_image_dir() < 0)
+	if (open_image_dir(".") < 0)
 		return -1;
-
-	log_closedir();
 
 	/* initiate log file in imgs dir */
 	if (req->log_file)
@@ -218,9 +217,23 @@ exit:
 	return success ? 0 : 1;
 }
 
+static int check(int sk)
+{
+	CriuResp resp = CRIU_RESP__INIT;
+
+	resp.type = CRIU_REQ_TYPE__CHECK;
+
+	if (!cr_check())
+		resp.success = true;
+
+	return send_criu_msg(sk, &resp);
+}
+
 static int cr_service_work(int sk)
 {
 	CriuReq *msg = 0;
+
+	init_opts();
 
 	if (recv_criu_msg(sk, &msg) == -1) {
 		pr_perror("Can't recv request");
@@ -232,6 +245,8 @@ static int cr_service_work(int sk)
 		return dump_using_req(sk, msg->opts);
 	case CRIU_REQ_TYPE__RESTORE:
 		return restore_using_req(sk, msg->opts);
+	case CRIU_REQ_TYPE__CHECK:
+		return check(sk);
 
 	default: {
 		CriuResp resp = CRIU_RESP__INIT;
@@ -249,6 +264,69 @@ static int cr_service_work(int sk)
 
 err:
 	return -1;
+}
+
+static void reap_worker(int signo)
+{
+	int saved_errno;
+	int status;
+	pid_t pid;
+
+	saved_errno = errno;
+
+	/*
+	 * As we block SIGCHLD, lets wait for every child that has
+	 * already changed state.
+	 */
+	while (1) {
+		pid = waitpid(-1, &status, WNOHANG);
+
+		if (pid <= 0) {
+			errno = saved_errno;
+			return;
+		}
+
+		if (WIFEXITED(status))
+			pr_info("Worker(pid %d) exited with %d\n",
+				pid, WEXITSTATUS(status));
+		else if (WIFSIGNALED(status))
+			pr_info("Worker(pid %d) was killed by %d\n",
+				pid, WTERMSIG(status));
+	}
+}
+
+static int setup_sigchld_handler()
+{
+	struct sigaction action;
+
+	sigemptyset(&action.sa_mask);
+	sigaddset(&action.sa_mask, SIGCHLD);
+	action.sa_handler	= reap_worker;
+	action.sa_flags		= SA_RESTART;
+
+	if (sigaction(SIGCHLD, &action, NULL)) {
+		pr_perror("Can't setup SIGCHLD handler");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int restore_sigchld_handler()
+{
+	struct sigaction action;
+
+	sigemptyset(&action.sa_mask);
+	sigaddset(&action.sa_mask, SIGCHLD);
+	action.sa_handler	= SIG_DFL;
+	action.sa_flags		= SA_RESTART;
+
+	if (sigaction(SIGCHLD, &action, NULL)) {
+		pr_perror("Can't restore SIGCHLD handler");
+		return -1;
+	}
+
+	return 0;
 }
 
 int cr_service(bool daemon_mode)
@@ -303,21 +381,21 @@ int cr_service(bool daemon_mode)
 	}
 
 	if (daemon_mode) {
-		if (daemon(0, 0) == -1) {
+		if (daemon(1, 0) == -1) {
 			pr_perror("Can't run service server in the background");
 			goto err;
 		}
 	}
 
 	if (opts.pidfile) {
-		if (write_pidfile(opts.pidfile, getpid()) == -1) {
+		if (write_pidfile(getpid()) == -1) {
 			pr_perror("Can't write pidfile");
 			return -1;
 		}
 	}
 
-	/* FIXME Do not ignore children's return values */
-	signal(SIGCHLD, SIG_IGN);
+	if (setup_sigchld_handler())
+		goto err;
 
 	while (1) {
 		int sk;
@@ -334,6 +412,9 @@ int cr_service(bool daemon_mode)
 		child_pid = fork();
 		if (child_pid == 0) {
 			int ret;
+
+			if (restore_sigchld_handler())
+				exit(1);
 
 			close(server_fd);
 			ret = cr_service_work(sk);

@@ -20,6 +20,7 @@
 
 #include "compiler.h"
 #include "crtools.h"
+#include "cr_options.h"
 #include "sockets.h"
 #include "syscall.h"
 #include "files.h"
@@ -32,6 +33,16 @@
 #include "cr-service.h"
 
 struct cr_options opts;
+
+void init_opts(void)
+{
+	memset(&opts, 0, sizeof(opts));
+
+	/* Default options */
+	opts.final_state = TASK_DEAD;
+	INIT_LIST_HEAD(&opts.veth_pairs);
+	INIT_LIST_HEAD(&opts.scripts);
+}
 
 static int parse_ns_string(const char *ptr)
 {
@@ -66,8 +77,9 @@ int main(int argc, char *argv[])
 	pid_t pid = 0, tree_id = 0;
 	int ret = -1;
 	int opt, idx;
-	int log_inited = 0;
 	int log_level = 0;
+	char *imgs_dir = ".";
+	char *work_dir = NULL;
 
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 
@@ -77,16 +89,13 @@ int main(int argc, char *argv[])
 	if (argc < 2)
 		goto usage;
 
-	/* Default options */
-	opts.final_state = TASK_DEAD;
-	INIT_LIST_HEAD(&opts.veth_pairs);
-	INIT_LIST_HEAD(&opts.scripts);
+	init_opts();
 
 	if (init_service_fd())
 		return -1;
 
 	while (1) {
-		static const char short_opts[] = "dsRf:t:p:hcD:o:n:v::xVr:jl";
+		static const char short_opts[] = "dsRf:t:p:hcD:o:n:v::xVr:jlW:";
 		static struct option long_opts[] = {
 			{ "tree", required_argument, 0, 't' },
 			{ "pid", required_argument, 0, 'p' },
@@ -97,6 +106,7 @@ int main(int argc, char *argv[])
 			{ "contents", no_argument, 0, 'c' },
 			{ "file", required_argument, 0, 'f' },
 			{ "images-dir", required_argument, 0, 'D' },
+			{ "work-dir", required_argument, 0, 'W' },
 			{ "log-file", required_argument, 0, 'o' },
 			{ "namespaces", required_argument, 0, 'n' },
 			{ "root", required_argument, 0, 'r' },
@@ -155,17 +165,13 @@ int main(int argc, char *argv[])
 			opts.restore_detach = true;
 			break;
 		case 'D':
-			if (chdir(optarg)) {
-				pr_perror("Can't change directory to %s",
-						optarg);
-				return -1;
-			}
+			imgs_dir = optarg;
+			break;
+		case 'W':
+			work_dir = optarg;
 			break;
 		case 'o':
 			opts.output = optarg;
-			if (log_init(optarg))
-				return -1;
-			log_inited = 1;
 			break;
 		case 'n':
 			if (parse_ns_string(optarg))
@@ -276,25 +282,33 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	log_set_loglevel(log_level);
-
-	if (!log_inited) {
-		ret = log_init(NULL);
-		if (ret)
-			return ret;
-	}
-
-	if (opts.img_parent)
-		pr_info("Will do snapshot from %s\n", opts.img_parent);
-
-	ret = open_image_dir();
-	if (ret < 0) {
-		pr_perror("Can't open current directory");
-		return -1;
-	}
+	if (work_dir == NULL)
+		work_dir = imgs_dir;
 
 	if (optind >= argc)
 		goto usage;
+
+	/* We must not open imgs dir, if service is called */
+	if (strcmp(argv[optind], "service")) {
+		ret = open_image_dir(imgs_dir);
+		if (ret < 0) {
+			pr_perror("Can't open imgs directory");
+			return -1;
+		}
+	}
+
+	if (chdir(work_dir)) {
+		pr_perror("Can't change directory to %s", work_dir);
+		return -1;
+	}
+
+	log_set_loglevel(log_level);
+
+	if (log_init(opts.output))
+		return -1;
+
+	if (opts.img_parent)
+		pr_info("Will do snapshot from %s\n", opts.img_parent);
 
 	if (!strcmp(argv[optind], "dump")) {
 		if (!tree_id)
@@ -384,6 +398,8 @@ usage:
 "  -D|--images-dir DIR   directory for image files\n"
 "     --pidfile FILE     write a pid of a root task, service or page-server\n"
 "                        to this file\n"
+"  -W|--work-dir DIR     directory for logs/pidfiles/stats and for criu process itself\n"
+"                        if not specified, the --images-dir is used\n"
 "\n"
 "* Special resources support:\n"
 "  -x|--" USK_EXT_PARAM "      allow external unix connections\n"
@@ -398,7 +414,7 @@ usage:
 "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
 "\n"
 "* Logging:\n"
-"  -o|--log-file FILE    log file name (path is relative to --images-dir)\n"
+"  -o|--log-file FILE    log file name\n"
 "     --log-pid          enable per-process logging to separate FILE.pid files\n"
 "  -v[NUM]               set logging level:\n"
 "                          -v0        - messages regardless of log level\n"

@@ -17,6 +17,7 @@
 #include "elf.h"
 #include "parasite-syscall.h"
 #include "restorer.h"
+#include "errno.h"
 
 
 /*
@@ -62,7 +63,7 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 		unsigned long arg5,
 		unsigned long arg6)
 {
-	user_regs_struct_t regs = ctl->regs_orig;
+	user_regs_struct_t regs = ctl->orig.regs;
 	int err;
 
 	regs.ARM_r7 = (unsigned long)nr;
@@ -192,11 +193,11 @@ void arch_free_thread_info(CoreEntry *core)
 int restore_fpu(struct rt_sigframe *sigframe, CoreEntry *core)
 {
 	struct aux_sigframe *aux = (struct aux_sigframe *)&sigframe->sig.uc.uc_regspace;
-	fpu_state_t *fpu_state = &sigframe->fpu_state;
 
-	memcpy(&aux->vfp.ufp, CORE_THREAD_ARCH_INFO(core)->fpstate->vfp_regs, sizeof(aux->vfp.ufp));
-	fpu_state->ufp.fpscr = CORE_THREAD_ARCH_INFO(core)->fpstate->fpscr;
-
+	memcpy(&aux->vfp.ufp.fpregs, CORE_THREAD_ARCH_INFO(core)->fpstate->vfp_regs, sizeof(aux->vfp.ufp.fpregs));
+	aux->vfp.ufp.fpscr = CORE_THREAD_ARCH_INFO(core)->fpstate->fpscr;
+	aux->vfp.magic = VFP_MAGIC;
+	aux->vfp.size = VFP_STORAGE_SIZE;
 	return 0;
 }
 
@@ -243,16 +244,6 @@ int restore_gpregs(struct rt_sigframe *f, UserArmRegsEntry *r)
 
 #undef CPREG1
 #undef CPREG2
-
-	return 0;
-}
-
-int sigreturn_prep_fpu_frame(struct rt_sigframe *sigframe, fpu_state_t *fpu_state)
-{
-	struct aux_sigframe *aux = (struct aux_sigframe *)&sigframe->sig.uc.uc_regspace;
-
-	aux->vfp.magic = VFP_MAGIC;
-	aux->vfp.size = VFP_STORAGE_SIZE;
 
 	return 0;
 }

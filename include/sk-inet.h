@@ -24,7 +24,8 @@ struct inet_sk_desc {
 	unsigned int		dst_port;
 	unsigned int		state;
 	unsigned int		rqlen;
-	unsigned int		wqlen;
+	unsigned int		wqlen; /* sent + unsent data */
+	unsigned int		uwqlen; /* unsent data */
 	unsigned int		src_addr[4];
 	unsigned int		dst_addr[4];
 	unsigned short		shutdown;
@@ -42,8 +43,8 @@ struct inet_sk_info {
 	struct list_head rlist;
 };
 
-int inet_bind(int sk, struct inet_sk_info *);
-int inet_connect(int sk, struct inet_sk_info *);
+extern int inet_bind(int sk, struct inet_sk_info *);
+extern int inet_connect(int sk, struct inet_sk_info *);
 
 struct rst_tcp_sock {
 	int	sk;
@@ -67,16 +68,16 @@ static inline void tcp_repair_off(int fd)
 		pr_perror("Failed to turn off repair mode on socket (%d)", ret);
 }
 
-void tcp_locked_conn_add(struct inet_sk_info *);
-void rst_unlock_tcp_connections(void);
-void cpt_unlock_tcp_connections(void);
+extern void tcp_locked_conn_add(struct inet_sk_info *);
+extern void rst_unlock_tcp_connections(void);
+extern void cpt_unlock_tcp_connections(void);
 
-int dump_one_tcp(int sk, struct inet_sk_desc *sd);
-int restore_one_tcp(int sk, struct inet_sk_info *si);
+extern int dump_one_tcp(int sk, struct inet_sk_desc *sd);
+extern int restore_one_tcp(int sk, struct inet_sk_info *si);
 
 #define SK_EST_PARAM	"tcp-established"
 
-int check_tcp(void);
+extern int check_tcp(void);
 extern int rst_tcp_socks_add(int fd, bool reuseaddr);
 
 #endif /* __CR_SK_INET_H__ */

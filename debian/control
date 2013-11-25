@@ -8,7 +8,7 @@ Build-Depends:
  libprotobuf-c0-dev,
  protobuf-c-compiler,
  xmlto,
-Standards-Version: 3.9.4
+Standards-Version: 3.9.5
 Homepage: http://www.criu.org/
 Vcs-Browser: http://daniel-baumann.ch/gitweb/?p=debian/packages/criu.git
 Vcs-Git: git://daniel-baumann.ch/git/debian/packages/criu.git

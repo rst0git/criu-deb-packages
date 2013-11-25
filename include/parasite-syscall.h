@@ -1,9 +1,11 @@
 #ifndef __CR_PARASITE_SYSCALL_H__
 #define __CR_PARASITE_SYSCALL_H__
 
-#define BUILTIN_SYSCALL_SIZE	8
+#include "asm/types.h"
+#include "pid.h"
+#include "list.h"
 
-#include "pstree.h"
+#define BUILTIN_SYSCALL_SIZE	8
 
 struct parasite_dump_thread;
 struct parasite_dump_misc;
@@ -17,6 +19,11 @@ struct cr_fdset;
 struct fd_opts;
 struct pid;
 
+struct thread_ctx {
+	k_rtsigset_t		sigmask;
+	user_regs_struct_t	regs;
+};
+
 /* parasite control block */
 struct parasite_ctl {
 	struct pid		pid;
@@ -26,9 +33,8 @@ struct parasite_ctl {
 
 	/* thread leader data */
 	bool			daemonized;
-	user_regs_struct_t	regs_orig;				/* original registers */
 
-	k_rtsigset_t		sig_blocked;
+	struct thread_ctx	orig;
 
 	void			*rstack;				/* thread leader stack*/
 	struct rt_sigframe	*sigframe;
@@ -116,4 +122,5 @@ extern int parasite_fixup_vdso(struct parasite_ctl *ctl, pid_t pid,
 
 extern int parasite_stop_on_syscall(int tasks, int sys_nr);
 extern int parasite_unmap(struct parasite_ctl *ctl, unsigned long addr);
+
 #endif /* __CR_PARASITE_SYSCALL_H__ */

@@ -1,5 +1,6 @@
 #ifndef __CR_PAGE_READ_H__
 #define __CR_PAGE_READ_H__
+
 #include "protobuf/pagemap.pb-c.h"
 
 /*
@@ -65,5 +66,6 @@ struct page_read {
 	unsigned id; /* for logging */
 };
 
-int open_page_read(int pid, struct page_read *);
-#endif
+extern int open_page_read(int pid, struct page_read *);
+
+#endif /* __CR_PAGE_READ_H__ */

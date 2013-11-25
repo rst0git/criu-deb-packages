@@ -140,12 +140,12 @@ extern int reopen_fd_as_safe(char *file, int line, int new_fd, int old_fd, bool 
 #define reopen_fd_as(new_fd, old_fd)		reopen_fd_as_safe(__FILE__, __LINE__, new_fd, old_fd, false)
 #define reopen_fd_as_nocheck(new_fd, old_fd)	reopen_fd_as_safe(__FILE__, __LINE__, new_fd, old_fd, true)
 
-void close_proc(void);
-int open_pid_proc(pid_t pid);
-int close_pid_proc(void);
-int set_proc_fd(int fd);
+extern void close_proc(void);
+extern int open_pid_proc(pid_t pid);
+extern int close_pid_proc(void);
+extern int set_proc_fd(int fd);
 
-int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
+extern int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
 
 #define __open_proc(pid, flags, fmt, ...)			\
 	({							\
@@ -172,13 +172,13 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
 		int __fd = open_proc(pid, fmt, ##__VA_ARGS__);		\
 		DIR *__d = NULL;					\
 									\
-		if (__fd >= 0)						\
+		if (__fd >= 0) {					\
 			__d = fdopendir(__fd);				\
 			if (__d == NULL)				\
 				pr_perror("Can't fdopendir %d "		\
 					"(/proc/%d/" fmt ")",		\
 					__fd, pid, ##__VA_ARGS__);	\
-									\
+		}							\
 		__d;							\
 	 })
 
@@ -188,13 +188,13 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
 		int __fd = open_proc(pid,  fmt, ##__VA_ARGS__);		\
 		FILE *__f = NULL;					\
 									\
-		if (__fd >= 0)						\
+		if (__fd >= 0) {					\
 			__f = fdopen(__fd, "r");			\
 			if (__f == NULL)				\
 				pr_perror("Can't fdopen %d "		\
 					"(/proc/%d/" fmt ")",		\
 					__fd, pid, ##__VA_ARGS__);	\
-									\
+		}							\
 		__f;							\
 	 })
 
@@ -220,14 +220,22 @@ static inline u32 kdev_minor(u32 kdev)
 static inline dev_t kdev_to_odev(u32 kdev)
 {
 	/*
-	 * New kernels envcode devices in a new form
+	 * New kernels encode devices in a new form.
+	 * See kernel's fs/stat.c for details, there
+	 * choose_32_64 helpers which are the key.
 	 */
-	return (kdev_major(kdev) << 8) | kdev_minor(kdev);
+	unsigned major = kdev_major(kdev);
+	unsigned minor = kdev_minor(kdev);
+#if BITS_PER_LONG == 32
+	return (major << 8) | minor;
+#else
+	return (minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12);
+#endif
 }
 
-int copy_file(int fd_in, int fd_out, size_t bytes);
-bool is_anon_inode(struct statfs *statfs);
-int is_anon_link_type(int lfd, char *type);
+extern int copy_file(int fd_in, int fd_out, size_t bytes);
+extern bool is_anon_inode(struct statfs *statfs);
+extern int is_anon_link_type(int lfd, char *type);
 
 #define is_hex_digit(c)				\
 	(((c) >= '0' && (c) <= '9')	||	\

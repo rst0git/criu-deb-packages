@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 #include "compiler.h"
+#include "servicefd.h"
 #include "image-desc.h"
 #include "magic.h"
 
@@ -49,20 +50,31 @@
 #define VMA_AREA_SYSVIPC	(1 <<  10)
 #define VMA_AREA_SOCKET		(1 <<  11)
 
-#define vma_premmaped_start(vma) ((vma)->shmid)
-#define vma_entry_is(vma, s)	(((vma)->status & (s)) == (s))
-#define vma_entry_len(vma)	((vma)->end - (vma)->start)
-
 #define CR_CAP_SIZE	2
 
 #define TASK_COMM_LEN 16
 
 #define TASK_ALIVE		0x1
 #define TASK_DEAD		0x2
-#define TASK_STOPPED		0x3 /* FIXME - implement */
+#define TASK_STOPPED		0x3
 #define TASK_HELPER		0x4
+
+#define CR_PARENT_LINK "parent"
 
 extern bool fdinfo_per_id;
 extern bool ns_per_id;
+
+#define O_DUMP	(O_RDWR | O_CREAT | O_EXCL)
+#define O_SHOW	(O_RDONLY)
+#define O_RSTR	(O_RDONLY)
+
+extern int open_image_dir(char *dir);
+extern void close_image_dir(void);
+
+extern int open_image_at(int dfd, int type, unsigned long flags, ...);
+#define open_image(typ, flags, ...) open_image_at(get_service_fd(IMG_FD_OFF), typ, flags, ##__VA_ARGS__)
+extern int open_pages_image(unsigned long flags, int pm_fd);
+extern int open_pages_image_at(int dfd, unsigned long flags, int pm_fd);
+extern void up_page_ids_base(void);
 
 #endif /* __CR_IMAGE_H__ */

@@ -2,8 +2,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 
-#include "crtools.h"
+#include "cr_options.h"
+#include "servicefd.h"
+#include "image.h"
 #include "page-xfer.h"
 #include "page-pipe.h"
 
@@ -268,13 +271,13 @@ int cr_page_server(bool daemon_mode)
 	}
 
 	if (daemon_mode)
-		if(daemon(0, 0) == -1){
+		if (daemon(1, 0) == -1) {
 			pr_perror("Can't run in the background");
 			return -errno;
 		}
 
 	if (opts.pidfile) {
-		if (write_pidfile(opts.pidfile, getpid()) == -1) {
+		if (write_pidfile(getpid()) == -1) {
 			pr_perror("Can't write pidfile");
 			return -1;
 		}
