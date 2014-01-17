@@ -13,6 +13,7 @@ struct script {
 struct cr_options {
 	int			final_state;
 	char			*show_dump_file;
+	char			*show_fmt;
 	bool			check_ms_kernel;
 	bool			show_pages_content;
 	bool			restore_detach;
@@ -29,11 +30,13 @@ struct cr_options {
 	char			*pidfile;
 	struct list_head	veth_pairs;
 	struct list_head	scripts;
+	char			*libdir;
 	bool			use_page_server;
 	unsigned short		ps_port;
 	char			*addr;
 	bool			track_mem;
 	char			*img_parent;
+	bool			auto_dedup;
 };
 
 extern struct cr_options opts;

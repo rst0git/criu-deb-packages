@@ -9,6 +9,11 @@
 #include "protobuf.h"
 #include "protobuf/pagemap.pb-c.h"
 
+#ifndef SEEK_DATA
+#define SEEK_DATA	3
+#define SEEK_HOLE	4
+#endif
+
 static int get_page_vaddr(struct page_read *pr, struct iovec *iov)
 {
 	int ret;
@@ -37,7 +42,7 @@ static int read_page(struct page_read *pr, unsigned long vaddr, void *buf)
 	return 1;
 }
 
-static inline void pagemap2iovec(PagemapEntry *pe, struct iovec *iov)
+void pagemap2iovec(PagemapEntry *pe, struct iovec *iov)
 {
 	iov->iov_base = decode_pointer(pe->vaddr);
 	iov->iov_len = pe->nr_pages * PAGE_SIZE;
@@ -83,7 +88,7 @@ static void skip_pagemap_pages(struct page_read *pr, unsigned long len)
 	pr->cvaddr += len;
 }
 
-static int read_pagemap_page_from_parent(struct page_read *pr, unsigned long vaddr, void *buf)
+int seek_pagemap_page(struct page_read *pr, unsigned long vaddr, bool warn)
 {
 	int ret;
 	struct iovec iov;
@@ -96,7 +101,12 @@ static int read_pagemap_page_from_parent(struct page_read *pr, unsigned long vad
 	while (1) {
 		unsigned long iov_end;
 
-		BUG_ON(vaddr < pr->cvaddr);
+		if (vaddr < pr->cvaddr) {
+			if (warn)
+				pr_err("Missing %lu in parent pagemap, current iov: base=%lu,len=%zu\n",
+					vaddr, (unsigned long)iov.iov_base, iov.iov_len);
+			return -1;
+		}
 		iov_end = (unsigned long)iov.iov_base + iov.iov_len;
 
 		if (iov_end <= vaddr) {
@@ -111,7 +121,7 @@ new_pagemap:
 		}
 
 		skip_pagemap_pages(pr, vaddr - pr->cvaddr);
-		return read_pagemap_page(pr, vaddr, buf);
+		return 0;
 	}
 }
 
@@ -121,10 +131,16 @@ static int read_pagemap_page(struct page_read *pr, unsigned long vaddr, void *bu
 
 	if (pr->pe->in_parent) {
 		pr_debug("\tpr%u Read page %lx from parent\n", pr->id, vaddr);
-		ret = read_pagemap_page_from_parent(pr->parent, vaddr, buf);
+		ret = seek_pagemap_page(pr->parent, vaddr, true);
+		if (ret == -1)
+			return ret;
+		ret = read_pagemap_page(pr->parent, vaddr, buf);
+		if (ret == -1)
+			return ret;
 	} else {
+		off_t current_vaddr = lseek(pr->fd_pg, 0, SEEK_CUR);
 		pr_debug("\tpr%u Read page %lx from self %lx/%"PRIx64"\n", pr->id,
-				vaddr, pr->cvaddr, lseek(pr->fd_pg, 0, SEEK_CUR));
+				vaddr, pr->cvaddr, current_vaddr);
 		ret = read(pr->fd_pg, buf, PAGE_SIZE);
 		if (ret != PAGE_SIZE) {
 			pr_perror("Can't read mapping page %d", ret);
@@ -148,9 +164,7 @@ static void close_page_read(struct page_read *pr)
 	close(pr->fd);
 }
 
-static int open_page_read_at(int dfd, int pid, struct page_read *pr);
-
-static int try_open_parent(int dfd, int pid, struct page_read *pr)
+static int try_open_parent(int dfd, int pid, struct page_read *pr, int flags)
 {
 	int pfd;
 	struct page_read *parent = NULL;
@@ -163,7 +177,7 @@ static int try_open_parent(int dfd, int pid, struct page_read *pr)
 	if (!parent)
 		goto err_cl;
 
-	if (open_page_read_at(pfd, pid, parent)) {
+	if (open_page_read_at(pfd, pid, parent, flags)) {
 		if (errno != ENOENT)
 			goto err_free;
 		xfree(parent);
@@ -182,13 +196,13 @@ err_cl:
 	return -1;
 }
 
-static int open_page_read_at(int dfd, int pid, struct page_read *pr)
+int open_page_read_at(int dfd, int pid, struct page_read *pr, int flags)
 {
 	pr->pe = NULL;
 
 	pr->fd = open_image_at(dfd, CR_FD_PAGEMAP, O_RSTR, (long)pid);
 	if (pr->fd < 0) {
-		pr->fd_pg = open_image_at(dfd, CR_FD_PAGES_OLD, O_RSTR, pid);
+		pr->fd_pg = open_image_at(dfd, CR_FD_PAGES_OLD, flags, pid);
 		if (pr->fd_pg < 0)
 			return -1;
 
@@ -199,12 +213,12 @@ static int open_page_read_at(int dfd, int pid, struct page_read *pr)
 	} else {
 		static unsigned ids = 1;
 
-		if (try_open_parent(dfd, pid, pr)) {
+		if (try_open_parent(dfd, pid, pr, flags)) {
 			close(pr->fd);
 			return -1;
 		}
 
-		pr->fd_pg = open_pages_image_at(dfd, O_RSTR, pr->fd);
+		pr->fd_pg = open_pages_image_at(dfd, flags, pr->fd);
 		if (pr->fd_pg < 0) {
 			close_page_read(pr);
 			return -1;
@@ -226,5 +240,10 @@ static int open_page_read_at(int dfd, int pid, struct page_read *pr)
 
 int open_page_read(int pid, struct page_read *pr)
 {
-	return open_page_read_at(get_service_fd(IMG_FD_OFF), pid, pr);
+	return open_page_read_at(get_service_fd(IMG_FD_OFF), pid, pr, O_RSTR);
+}
+
+int open_page_rw(int pid, struct page_read *pr)
+{
+	return open_page_read_at(get_service_fd(IMG_FD_OFF), pid, pr, O_RDWR);
 }

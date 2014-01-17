@@ -319,6 +319,7 @@ static struct show_image_info show_infos[] = {
 	SHOW_PLAINS(FILE_LOCK),
 	SHOW_PLAIN(RLIMIT),
 	SHOW_PLAIN(TUNFILE),
+	SHOW_PLAINS(EXT_FILE),
 
 	{ TCP_STREAM_MAGIC,	PB_TCP_STREAM,		true,	show_tcp_stream, "1:%u 2:%u 3:%u 4:%u 12:%u", },
 	{ STATS_MAGIC,		PB_STATS,		true,	NULL, "1.1:%u 1.2:%u 1.3:%u 1.4:%u 1.5:%Lu 1.6:%Lu 1.7:%Lu", },
@@ -328,7 +329,7 @@ static struct show_image_info show_infos[] = {
 	{ PACKETSK_MAGIC,	PB_PACKET_SOCK,		false,	NULL, "5:%d", },
 	{ ITIMERS_MAGIC,	PB_ITIMER,		false,	NULL, "*:%Lu", },
 	{ POSIX_TIMERS_MAGIC,	PB_POSIX_TIMER,		false,	NULL, "*:%d 5:%Lu 7:%Lu 8:%lu 9:%Lu 10:%Lu", },
-	{ NETDEV_MAGIC,		PB_NETDEV, 		false,	NULL, "2:%d", },
+	{ NETDEV_MAGIC,		PB_NETDEV,		false,	NULL, "2:%d", },
 
 	{ PAGEMAP_MAGIC,	PB_PAGEMAP_HEAD,	true,	show_pagemaps,		NULL, },
 	{ PIPES_DATA_MAGIC,	PB_PIPE_DATA,		false,	pipe_data_handler,	NULL, },

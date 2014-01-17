@@ -6,14 +6,15 @@ override CPPFLAGS += -I$(LIBDIR)
 CFLAGS	= -g -O2 -Wall -Werror
 
 TST_NOFILE	=	\
-		ipc	 	\
+		ipc		\
 		ptrace		\
 		epoll		\
 		fork		\
 		fork2		\
+		thread-bomb	\
 
 TST_FILE	=	\
-		file_read 	\
+		file_read	\
 
 TST	= $(TST_NOFILE) $(TST_FILE)
 SRC	= $(TST:%=%.c)
@@ -61,6 +62,8 @@ ptrace.o:	override CFLAGS += -pthread
 ptrace:		override LDFLAGS += -pthread
 ipc:		override CFLAGS += -DNEW_IPC_NS
 fork2:		override CFLAGS += -D FORK2
+thread-bomb.o:		override CFLAGS += -pthread
+thread-bomb:		override LDFLAGS += -pthread
 
 %: %.sh
 	cp $< $@

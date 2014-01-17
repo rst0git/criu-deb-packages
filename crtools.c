@@ -16,6 +16,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <dlfcn.h>
+
 #include "asm/types.h"
 
 #include "compiler.h"
@@ -31,6 +33,7 @@
 #include "tty.h"
 #include "file-lock.h"
 #include "cr-service.h"
+#include "plugin.h"
 
 struct cr_options opts;
 
@@ -92,10 +95,10 @@ int main(int argc, char *argv[])
 	init_opts();
 
 	if (init_service_fd())
-		return -1;
+		return 1;
 
 	while (1) {
-		static const char short_opts[] = "dsRf:t:p:hcD:o:n:v::xVr:jlW:";
+		static const char short_opts[] = "dsRf:F:t:p:hcD:o:n:v::xVr:jlW:L:";
 		static struct option long_opts[] = {
 			{ "tree", required_argument, 0, 't' },
 			{ "pid", required_argument, 0, 'p' },
@@ -105,6 +108,7 @@ int main(int argc, char *argv[])
 			{ "daemon", no_argument, 0, 'd' },
 			{ "contents", no_argument, 0, 'c' },
 			{ "file", required_argument, 0, 'f' },
+			{ "fields", required_argument, 0, 'F' },
 			{ "images-dir", required_argument, 0, 'D' },
 			{ "work-dir", required_argument, 0, 'W' },
 			{ "log-file", required_argument, 0, 'o' },
@@ -129,6 +133,8 @@ int main(int argc, char *argv[])
 			{ "prev-images-dir", required_argument, 0, 53},
 			{ "ms", no_argument, 0, 54},
 			{ "track-mem", no_argument, 0, 55},
+			{ "auto-dedup", no_argument, 0, 56},
+			{ "libdir", required_argument, 0, 'L'},
 			{ },
 		};
 
@@ -158,6 +164,9 @@ int main(int argc, char *argv[])
 		case 'f':
 			opts.show_dump_file = optarg;
 			break;
+		case 'F':
+			opts.show_fmt = optarg;
+			break;
 		case 'r':
 			opts.root = optarg;
 			break;
@@ -175,7 +184,7 @@ int main(int argc, char *argv[])
 			break;
 		case 'n':
 			if (parse_ns_string(optarg))
-				return -1;
+				return 1;
 			break;
 		case 'v':
 			if (optarg) {
@@ -218,7 +227,7 @@ int main(int argc, char *argv[])
 
 				n = xmalloc(sizeof(*n));
 				if (n == NULL)
-					return -1;
+					return 1;
 				n->outside = strchr(optarg, '=');
 				if (n->outside == NULL) {
 					xfree(n);
@@ -237,7 +246,7 @@ int main(int argc, char *argv[])
 
 				script = xmalloc(sizeof(struct script));
 				if (script == NULL)
-					return -1;
+					return 1;
 
 				script->path = optarg;
 				list_add(&script->node, &opts.scripts);
@@ -253,7 +262,7 @@ int main(int argc, char *argv[])
 			opts.ps_port = htons(atoi(optarg));
 			if (!opts.ps_port) {
 				pr_err("Bad port\n");
-				return -1;
+				return 1;
 			}
 			break;
 		case 'j':
@@ -268,8 +277,14 @@ int main(int argc, char *argv[])
 		case 55:
 			opts.track_mem = true;
 			break;
+		case 56:
+			opts.auto_dedup = true;
+			break;
 		case 54:
 			opts.check_ms_kernel = true;
+			break;
+		case 'L':
+			opts.libdir = optarg;
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
@@ -293,19 +308,19 @@ int main(int argc, char *argv[])
 		ret = open_image_dir(imgs_dir);
 		if (ret < 0) {
 			pr_perror("Can't open imgs directory");
-			return -1;
+			return 1;
 		}
 	}
 
 	if (chdir(work_dir)) {
 		pr_perror("Can't change directory to %s", work_dir);
-		return -1;
+		return 1;
 	}
 
 	log_set_loglevel(log_level);
 
 	if (log_init(opts.output))
-		return -1;
+		return 1;
 
 	if (opts.img_parent)
 		pr_info("Will do snapshot from %s\n", opts.img_parent);
@@ -330,34 +345,37 @@ int main(int argc, char *argv[])
 			opts.final_state = TASK_ALIVE;
 		}
 
-		return cr_pre_dump_tasks(tree_id);
+		return cr_pre_dump_tasks(tree_id) != 0;
 	}
 
 	if (!strcmp(argv[optind], "restore")) {
 		if (tree_id)
 			pr_warn("Using -t with criu restore is obsoleted\n");
-		return cr_restore_tasks();
+		return cr_restore_tasks() != 0;
 	}
 
 	if (!strcmp(argv[optind], "show"))
-		return cr_show(pid);
+		return cr_show(pid) != 0;
 
 	if (!strcmp(argv[optind], "check"))
-		return cr_check();
+		return cr_check() != 0;
 
 	if (!strcmp(argv[optind], "exec")) {
 		if (!pid)
 			pid = tree_id; /* old usage */
 		if (!pid)
 			goto opt_pid_missing;
-		return cr_exec(pid, argv + optind + 1);
+		return cr_exec(pid, argv + optind + 1) != 0;
 	}
 
 	if (!strcmp(argv[optind], "page-server"))
-		return cr_page_server(opts.restore_detach);
+		return cr_page_server(opts.restore_detach) != 0;
 
 	if (!strcmp(argv[optind], "service"))
 		return cr_service(opts.restore_detach);
+
+	if (!strcmp(argv[optind], "dedup"))
+		return cr_dedup() != 0;
 
 	pr_msg("Unknown command \"%s\"\n", argv[optind]);
 usage:
@@ -370,6 +388,7 @@ usage:
 "  criu exec -p PID <syscall-string>\n"
 "  criu page-server\n"
 "  criu service [<options>]\n"
+"  criu dedup\n"
 "\n"
 "Commands:\n"
 "  dump           checkpoint a process/tree identified by pid\n"
@@ -380,11 +399,12 @@ usage:
 "  exec           execute a system call by other task\n"
 "  page-server    launch page server\n"
 "  service        launch service\n"
+"  dedup          remove duplicates in memory dump\n"
 	);
 
 	if (argc < 2) {
 		pr_msg("\nTry -h|--help for more info\n");
-		return -1;
+		return 1;
 	}
 
 	pr_msg("\n"
@@ -396,10 +416,9 @@ usage:
 "  -s|--leave-stopped    leave tasks in stopped state after checkpoint\n"
 "  -R|--leave-running    leave tasks in running state after checkpoint\n"
 "  -D|--images-dir DIR   directory for image files\n"
-"     --pidfile FILE     write a pid of a root task, service or page-server\n"
-"                        to this file\n"
-"  -W|--work-dir DIR     directory for logs/pidfiles/stats and for criu process itself\n"
-"                        if not specified, the --images-dir is used\n"
+"     --pidfile FILE     write root task, service or page-server pid to FILE\n"
+"  -W|--work-dir DIR     directory to cd and write logs/pidfiles/stats to\n"
+"                        (if not specified, value of --images-dir is used)\n"
 "\n"
 "* Special resources support:\n"
 "  -x|--" USK_EXT_PARAM "      allow external unix connections\n"
@@ -412,6 +431,7 @@ usage:
 "  --action-script FILE  add an external action script\n"
 "  -j|--" OPT_SHELL_JOB "        allow to dump and restore shell jobs\n"
 "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
+"  -L|--libdir           path to a plugin directory (by default " CR_PLUGIN_DEFAULT ")\n"
 "\n"
 "* Logging:\n"
 "  -o|--log-file FILE    log file name\n"
@@ -428,13 +448,14 @@ usage:
 "  --prev-images-dir DIR path to images from previous dump (relative to -D)\n"
 "  --page-server         send pages to page server (see options below as well)\n"
 "\n"
-"Page/Service server options\n"
+"Page/Service server options:\n"
 "  --address ADDR        address of server or service\n"
 "  --port PORT           port of page server\n"
 "  -d|--daemon           run in the background after creating socket\n"
 "\n"
 "Show options:\n"
 "  -f|--file FILE        show contents of a checkpoint file\n"
+"  -F|--fields FIELDS    show specified fields (comma separated)\n"
 "  -D|--images-dir DIR   directory where to get images from\n"
 "  -c|--contents         show contents of pages dumped in hexdump format\n"
 "  -p|--pid PID          show files relevant to PID (filter -D flood)\n"
@@ -445,9 +466,9 @@ usage:
 "     --ms               don't check not yet merged kernel features\n"
 	);
 
-	return -1;
+	return 1;
 
 opt_pid_missing:
 	pr_msg("No pid specified (-t option missing)\n");
-	return -1;
+	return 1;
 }

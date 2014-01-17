@@ -70,8 +70,11 @@
 #include "vdso.h"
 #include "vma.h"
 #include "cr-service.h"
+#include "plugin.h"
 
 #include "asm/dump.h"
+
+#define NR_ATTEMPTS 5
 
 static char loc_buf[PAGE_SIZE];
 
@@ -681,31 +684,6 @@ err:
 	return ret;
 }
 
-static int get_threads(struct pstree_item *item)
-{
-	return parse_threads(item->pid.real, &item->threads, &item->nr_threads);
-}
-
-static int check_threads(const struct pstree_item *item)
-{
-	struct pid *t = NULL;
-	int nr, ret;
-
-	ret = parse_threads(item->pid.real, &t, &nr);
-	if (ret)
-		return ret;
-
-	ret = ((nr == item->nr_threads) && !memcmp(t, item->threads, nr));
-	xfree(t);
-
-	if (!ret) {
-		pr_info("Threads set has changed while suspending\n");
-		return -1;
-	}
-
-	return 0;
-}
-
 static int parse_children(pid_t pid, pid_t **_c, int *_n)
 {
 	FILE *file;
@@ -756,37 +734,84 @@ err:
 	return -1;
 }
 
+static int collect_task(struct pstree_item *item);
 static int get_children(struct pstree_item *item)
 {
 	pid_t *ch;
-	int ret, i, nr_children;
+	int ret, i, nr_children, nr_inprogress;
 	struct pstree_item *c;
 
 	ret = parse_children(item->pid.real, &ch, &nr_children);
 	if (ret < 0)
 		return ret;
 
+	nr_inprogress = 0;
 	for (i = 0; i < nr_children; i++) {
+		pid_t pid = ch[i];
+
+		/* Is it already frozen? */
+		list_for_each_entry(c, &item->children, sibling)
+			if (c->pid.real == pid)
+				break;
+
+		if (&c->sibling != &item->children)
+			continue;
+
+		nr_inprogress++;
+
+		pr_info("Seized task %d, state %d\n", pid, ret);
+
 		c = alloc_pstree_item();
 		if (c == NULL) {
 			ret = -1;
 			goto free;
 		}
+
+		ret = seize_task(pid, item->pid.real, &item->pgid, &item->sid);
+		if (ret < 0) {
+			/*
+			 * Here is a race window between parse_children() and seize(),
+			 * so the task could die for these time.
+			 * Don't worry, will try again on the next attempt. The number
+			 * of attempts is restricted, so it will exit if something
+			 * really wrong.
+			 */
+			ret = 0;
+			xfree(c);
+			continue;
+		}
+
 		c->pid.real = ch[i];
 		c->parent = item;
+		c->state = ret;
 		list_add_tail(&c->sibling, &item->children);
+
+		/* Here is a recursive call (Depth-first search) */
+		ret = collect_task(c);
+		if (ret < 0)
+			goto free;
 	}
 free:
 	xfree(ch);
-	return ret;
+	return ret < 0 ? ret : nr_inprogress;
 }
 
 static void unseize_task_and_threads(const struct pstree_item *item, int st)
 {
 	int i;
 
-	for (i = 0; i < item->nr_threads; i++)
-		unseize_task(item->threads[i].real, st); /* item->pid will be here */
+	if (item->state == TASK_DEAD)
+		return;
+
+	/*
+	 * The st is the state we want to switch tasks into,
+	 * the item->state is the state task was in when we seized one.
+	 */
+
+	unseize_task(item->pid.real, item->state, st);
+
+	for (i = 1; i < item->nr_threads; i++)
+		ptrace(PTRACE_DETACH, item->threads[i].real, NULL, NULL);
 }
 
 static void pstree_switch_state(struct pstree_item *root_item, int st)
@@ -804,25 +829,58 @@ static pid_t item_ppid(const struct pstree_item *item)
 	return item ? item->pid.real : -1;
 }
 
-static int seize_threads(const struct pstree_item *item)
+static int seize_threads(struct pstree_item *item,
+				struct pid *threads, int nr_threads)
 {
-	int i = 0, ret;
+	int i = 0, ret, j, nr_inprogress;
 
-	if ((item->state == TASK_DEAD) && (item->nr_threads > 1)) {
+	if ((item->state == TASK_DEAD) && (nr_threads > 1)) {
 		pr_err("Zombies with threads are not supported\n");
 		goto err;
 	}
 
-	for (i = 0; i < item->nr_threads; i++) {
-		pid_t pid = item->threads[i].real;
+	/* The number of threads can't be less than allready frozen */
+	item->threads = xrealloc(item->threads, nr_threads * sizeof(struct pid));
+	if (item->threads == NULL)
+		return -1;
+
+	if (item->nr_threads == 0) {
+		item->threads[0].real = item->pid.real;
+		item->nr_threads = 1;
+	}
+
+	nr_inprogress = 0;
+	for (i = 0; i < nr_threads; i++) {
+		pid_t pid = threads[i].real;
 		if (item->pid.real == pid)
 			continue;
 
+		for (j = 0; j < item->nr_threads; j++)
+			if (pid == item->threads[j].real)
+				break;
+
+		if (j != item->nr_threads)
+			continue;
+		nr_inprogress++;
+
 		pr_info("\tSeizing %d's %d thread\n",
 				item->pid.real, pid);
+
 		ret = seize_task(pid, item_ppid(item), NULL, NULL);
-		if (ret < 0)
-			goto err;
+		if (ret < 0) {
+			/*
+			 * Here is a race window between parse_threads() and seize(),
+			 * so the task could die for these time.
+			 * Don't worry, will try again on the next attempt. The number
+			 * of attempts is restricted, so it will exit if something
+			 * really wrong.
+			 */
+			continue;
+		}
+
+		BUG_ON(item->nr_threads + 1 > nr_threads);
+		item->threads[item->nr_threads].real = pid;
+		item->nr_threads++;
 
 		if (ret == TASK_DEAD) {
 			pr_err("Zombie thread not supported\n");
@@ -835,50 +893,67 @@ static int seize_threads(const struct pstree_item *item)
 		}
 	}
 
-	return 0;
-
+	return nr_inprogress;
 err:
-	for (i--; i >= 0; i--) {
-		if (item->pid.real == item->threads[i].real)
-			continue;
-
-		unseize_task(item->threads[i].real, TASK_ALIVE);
-	}
-
 	return -1;
 }
 
 static int collect_threads(struct pstree_item *item)
 {
-	int ret;
+	int ret, attempts = NR_ATTEMPTS;
+	struct pid *t;
+	int nr, nr_inprogress;
 
-	ret = get_threads(item);
-	if (!ret)
-		ret = seize_threads(item);
-	if (!ret)
-		ret = check_threads(item);
+	nr_inprogress = 1;
+	while (nr_inprogress > 0 && attempts) {
+		attempts--;
 
-	return ret;
+		t = NULL;
+		nr = 0;
+
+		ret = parse_threads(item->pid.real, &t, &nr);
+		if (ret < 0)
+			break;
+
+		nr_inprogress = seize_threads(item, t, nr);
+		xfree(t);
+		if (nr_inprogress < 0)
+			break;
+
+	}
+
+	if (nr_inprogress && attempts)
+		return -1;
+
+	return 0;
 }
 
 static int collect_task(struct pstree_item *item)
 {
-	int ret;
-	pid_t pid = item->pid.real;
-
-	ret = seize_task(pid, item_ppid(item), &item->pgid, &item->sid);
-	if (ret < 0)
-		goto err;
-
-	pr_info("Seized task %d, state %d\n", pid, ret);
-	item->state = ret;
+	int ret, nr_inprogress, attempts = NR_ATTEMPTS;
 
 	ret = collect_threads(item);
 	if (ret < 0)
 		goto err_close;
 
-	ret = get_children(item);
-	if (ret < 0)
+	if (item->state == TASK_DEAD)
+		return 0;
+
+	/* Depth-first search (DFS) is used for traversing a process tree. */
+	nr_inprogress = 1;
+	while (nr_inprogress && attempts) {
+		attempts--;
+
+		/*
+		 * Freeze children and children of children, etc.
+		 * Then check again, that nobody is reparented.
+		 */
+		nr_inprogress = get_children(item);
+		if (nr_inprogress < 0)
+			goto err_close;
+	}
+
+	if (attempts == 0)
 		goto err_close;
 
 	if ((item->state == TASK_DEAD) && !list_empty(&item->children)) {
@@ -893,66 +968,7 @@ static int collect_task(struct pstree_item *item)
 
 err_close:
 	close_pid_proc();
-	unseize_task(pid, item->state);
-err:
 	return -1;
-}
-
-static int check_subtree(const struct pstree_item *item)
-{
-	pid_t *ch;
-	int nr, ret, i;
-	struct pstree_item *child;
-
-	ret = parse_children(item->pid.real, &ch, &nr);
-	if (ret < 0)
-		return ret;
-
-	i = 0;
-	list_for_each_entry(child, &item->children, sibling) {
-		if (child->pid.real != ch[i])
-			break;
-		i++;
-		if (i > nr)
-			break;
-	}
-	xfree(ch);
-
-	if (i != nr) {
-		pr_info("Children set has changed while suspending\n");
-		return -1;
-	}
-
-	return 0;
-}
-
-static int collect_subtree(struct pstree_item *item)
-{
-	struct pstree_item *child;
-	pid_t pid = item->pid.real;
-	int ret;
-
-	pr_info("Collecting tasks starting from %d\n", pid);
-	ret = collect_task(item);
-	if (ret)
-		return -1;
-
-	list_for_each_entry(child, &item->children, sibling) {
-		ret = collect_subtree(child);
-		if (ret < 0)
-			return -1;
-	}
-
-	/*
-	 * Tasks may clone() with the CLONE_PARENT flag while we collect
-	 * them, making more kids to their parent. So before proceeding
-	 * check that the parent we're working on has no more kids born.
-	 */
-
-	if (check_subtree(item))
-		return -1;
-
-	return 0;
 }
 
 static int collect_pstree_ids(void)
@@ -968,52 +984,32 @@ static int collect_pstree_ids(void)
 
 static int collect_pstree(pid_t pid)
 {
-	int ret, attempts = 5;
+	int ret;
 
 	timing_start(TIME_FREEZING);
 
-	while (1) {
-		root_item = alloc_pstree_item();
-		if (root_item == NULL)
-			return -1;
+	root_item = alloc_pstree_item();
+	if (root_item == NULL)
+		return -1;
 
-		root_item->pid.real = pid;
+	root_item->pid.real = pid;
+	ret = seize_task(pid, -1, &root_item->pgid, &root_item->sid);
+	if (ret < 0)
+		goto err;
+	pr_info("Seized task %d, state %d\n", pid, ret);
+	root_item->state = ret;
 
-		ret = collect_subtree(root_item);
-		if (ret == 0) {
-			/*
-			 * Some tasks could have been reparented to
-			 * namespaces' reaper. Check this.
-			 */
-			if (check_subtree(root_item))
-				goto try_again;
-
-			break;
-		}
-
-		/*
-		 * Old tasks can die and new ones can appear while we
-		 * try to seize the swarm. It's much simpler (and reliable)
-		 * just to restart the collection from the beginning
-		 * rather than trying to chase them.
-		 */
-try_again:
-		if (attempts == 0) {
-			pr_err("Can't freeze the tree\n");
-			return -1;
-		}
-
-		attempts--;
-		pr_info("Trying to suspend tasks again\n");
-
-		pstree_switch_state(root_item, TASK_ALIVE);
-		free_pstree(root_item);
-	}
+	ret = collect_task(root_item);
+	if (ret < 0)
+		goto err;
 
 	timing_stop(TIME_FREEZING);
 	timing_start(TIME_FROZEN);
 
 	return 0;
+err:
+	pstree_switch_state(root_item, TASK_ALIVE);
+	return -1;
 }
 
 static int collect_file_locks(void)
@@ -1670,6 +1666,9 @@ int cr_dump_tasks(pid_t pid)
 	if (init_stats(DUMP_STATS))
 		goto err;
 
+	if (cr_plugin_init())
+		goto err;
+
 	if (kerndat_init())
 		goto err;
 
@@ -1753,6 +1752,8 @@ err:
 
 	close_cr_fdset(&glob_fdset);
 
+	cr_plugin_fini();
+
 	if (!ret) {
 		/*
 		 * It might be a migration case, where we're asked
@@ -1814,5 +1815,5 @@ err:
 		pr_info("Dumping finished successfully\n");
 	}
 
-	return post_dump_ret ? : ret;
+	return post_dump_ret ? : (ret != 0);
 }

@@ -17,6 +17,7 @@
 #include "sk-inet.h"
 #include "tun.h"
 #include "util-pie.h"
+#include "plugin.h"
 
 #include "protobuf.h"
 #include "protobuf/netdev.pb-c.h"
@@ -100,15 +101,24 @@ static char *link_kind(struct ifinfomsg *ifi, struct rtattr **tb)
 	return RTA_DATA(linkinfo[IFLA_INFO_KIND]);
 }
 
-static int dump_one_ethernet(struct ifinfomsg *ifi,
+static int dump_unknown_device(struct ifinfomsg *ifi, char *kind,
 		struct rtattr **tb, struct cr_fdset *fds)
 {
-	char *kind;
+	int ret;
 
-	kind = link_kind(ifi, tb);
-	if (!kind)
-		goto unk;
+	ret = cr_plugin_dump_ext_link(ifi->ifi_index, ifi->ifi_type, kind);
+	if (ret == 0)
+		return dump_one_netdev(ND_TYPE__EXTLINK, ifi, tb, fds, NULL);
 
+	if (ret == -ENOTSUP)
+		pr_err("Unsupported link %d (type %d kind %s)\n",
+				ifi->ifi_index, ifi->ifi_type, kind);
+	return -1;
+}
+
+static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind,
+		struct rtattr **tb, struct cr_fdset *fds)
+{
 	if (!strcmp(kind, "veth"))
 		/*
 		 * This is not correct. The peer of the veth device may
@@ -121,26 +131,31 @@ static int dump_one_ethernet(struct ifinfomsg *ifi,
 		return dump_one_netdev(ND_TYPE__VETH, ifi, tb, fds, NULL);
 	if (!strcmp(kind, "tun"))
 		return dump_one_netdev(ND_TYPE__TUN, ifi, tb, fds, dump_tun_link);
-unk:
-	pr_err("Unknown eth kind %s link %d\n", kind, ifi->ifi_index);
-	return -1;
+
+	return dump_unknown_device(ifi, kind, tb, fds);
 }
 
-static int dump_one_gendev(struct ifinfomsg *ifi,
+static int dump_one_gendev(struct ifinfomsg *ifi, char *kind,
 		struct rtattr **tb, struct cr_fdset *fds)
 {
-	char *kind;
-
-	kind = link_kind(ifi, tb);
-	if (!kind)
-		goto unk;
-
 	if (!strcmp(kind, "tun"))
 		return dump_one_netdev(ND_TYPE__TUN, ifi, tb, fds, dump_tun_link);
 
-unk:
-	pr_err("Unknown ARPHRD_NONE kind %s link %d\n", kind, ifi->ifi_index);
-	return -1;
+	return dump_unknown_device(ifi, kind, tb, fds);
+}
+
+static int dump_one_voiddev(struct ifinfomsg *ifi, char *kind,
+		struct rtattr **tb, struct cr_fdset *fds)
+{
+	if (!strcmp(kind, "venet"))
+		/*
+		 * If we meet a link we know about, such as
+		 * OpenVZ's venet, save general parameters of
+		 * it as external link.
+		 */
+		return dump_one_netdev(ND_TYPE__EXTLINK, ifi, tb, fds, NULL);
+
+	return dump_unknown_device(ifi, kind, tb, fds);
 }
 
 static int dump_one_link(struct nlmsghdr *hdr, void *arg)
@@ -159,35 +174,28 @@ static int dump_one_link(struct nlmsghdr *hdr, void *arg)
 	}
 
 	parse_rtattr(tb, IFLA_MAX, IFLA_RTA(ifi), len);
-
 	pr_info("\tLD: Got link %d, type %d\n", ifi->ifi_index, ifi->ifi_type);
 
+	if (ifi->ifi_type == ARPHRD_LOOPBACK) 
+		return dump_one_netdev(ND_TYPE__LOOPBACK, ifi, tb, fds, NULL);
+
+	kind = link_kind(ifi, tb);
+	if (!kind)
+		goto unk;
+
 	switch (ifi->ifi_type) {
-	case ARPHRD_LOOPBACK:
-		ret = dump_one_netdev(ND_TYPE__LOOPBACK, ifi, tb, fds, NULL);
-		break;
 	case ARPHRD_ETHER:
-		ret = dump_one_ethernet(ifi, tb, fds);
+		ret = dump_one_ethernet(ifi, kind, tb, fds);
 		break;
 	case ARPHRD_NONE:
-		ret = dump_one_gendev(ifi, tb, fds);
+		ret = dump_one_gendev(ifi, kind, tb, fds);
 		break;
 	case ARPHRD_VOID:
-		/*
-		 * If we meet a link we know about, such as
-		 * OpenVZ's venet, save general parameters of
-		 * it as external link.
-		 */
-		kind = link_kind(ifi, tb);
-		if (kind && !strcmp(kind, "venet")) {
-			ret = dump_one_netdev(ND_TYPE__EXTLINK, ifi, tb, fds, NULL);
-			break;
-		}
-		/* Fall through otherwise! */
+		ret = dump_one_voiddev(ifi, kind, tb, fds);
+		break;
 	default:
-		pr_err("Unsupported link type %d, kind %s\n",
-				ifi->ifi_type, link_kind(ifi, tb));
-		ret = 0; /* just skip for now */
+unk:
+		ret = dump_unknown_device(ifi, kind, tb, fds);
 		break;
 	}
 
@@ -248,7 +256,13 @@ static int do_rtm_link_req(int msg_type, NetDeviceEntry *nde, int nlsk,
 	req.h.nlmsg_type = msg_type;
 	req.h.nlmsg_seq = CR_NLMSG_SEQ;
 	req.i.ifi_family = AF_PACKET;
-	req.i.ifi_index = nde->ifindex;
+	/*
+	 * SETLINK is called for external devices which may
+	 * have ifindex changed. Thus configure them by their
+	 * name only.
+	 */
+	if (msg_type == RTM_NEWLINK)
+		req.i.ifi_index = nde->ifindex;
 	req.i.ifi_flags = nde->flags;
 
 	addattr_l(&req.h, sizeof(req), IFLA_IFNAME, nde->name, strlen(nde->name));

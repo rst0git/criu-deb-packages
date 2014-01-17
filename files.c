@@ -32,12 +32,16 @@
 #include "signalfd.h"
 #include "namespaces.h"
 #include "tun.h"
+#include "fdset.h"
 
 #include "parasite.h"
 #include "parasite-syscall.h"
 
 #include "protobuf.h"
 #include "protobuf/fs.pb-c.h"
+#include "protobuf/ext-file.pb-c.h"
+
+#include "plugin.h"
 
 #define FDESC_HASH_SIZE	64
 static struct hlist_head file_desc_hash[FDESC_HASH_SIZE];
@@ -144,7 +148,7 @@ void show_saved_files(void)
 /*
  * The gen_id thing is used to optimize the comparison of shared files.
  * If two files have different gen_ids, then they are different for sure.
- * If it matches, we don't know it and have to call sys_kcmp(). 
+ * If it matches, we don't know it and have to call sys_kcmp().
  *
  * The kcmp-ids.c engine does this trick, see comments in it for more info.
  */
@@ -170,7 +174,7 @@ int do_dump_gen_file(struct fd_parms *p, int lfd,
 		ret = ops->dump(lfd, e.id, p);
 
 	if (ret < 0)
-		return -1;
+		return ret;
 
 	pr_info("fdinfo: type: 0x%2x flags: %#o/%#o pos: 0x%8"PRIx64" fd: %d\n",
 		ops->type, p->flags, (int)p->fd_flags, p->pos, p->fd);
@@ -198,12 +202,19 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 				struct fd_opts *opts, struct fd_parms *p)
 {
 	int ret;
+	struct statfs fsbuf;
 
 	if (fstat(lfd, &p->stat) < 0) {
 		pr_perror("Can't stat fd %d", lfd);
 		return -1;
 	}
 
+	if (fstatfs(lfd, &fsbuf) < 0) {
+		pr_perror("Can't statfs fd %d", lfd);
+		return -1;
+	}
+
+	p->fs_type	= fsbuf.f_type;
 	p->ctl		= ctl;
 	p->fd		= fd;
 	p->pos		= lseek(lfd, 0, SEEK_CUR);
@@ -239,13 +250,6 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 	return 0;
 }
 
-static int dump_unsupp_fd(const struct fd_parms *p, char *more, char *info)
-{
-	pr_err("Can't dump file %d of that type [%o] (%s %s)\n",
-			p->fd, p->stat.st_mode, more, info);
-	return -1;
-}
-
 static const struct fdtype_ops *get_misc_dev_ops(int minor)
 {
 	switch (minor) {
@@ -279,7 +283,7 @@ static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
 		char more[32];
 
 		sprintf(more, "%d:%d", maj, minor(p->stat.st_dev));
-		return dump_unsupp_fd(p, "chr", more);
+		return dump_unsupp_fd(p, lfd, fdinfo, "chr", more);
 	}
 	}
 
@@ -327,10 +331,10 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 		else {
 			char more[64];
 
-			if (read_fd_link(fd, more, sizeof(more)))
+			if (read_fd_link(fd, more, sizeof(more)) < 0)
 				more[0] = '\0';
 
-			return dump_unsupp_fd(&p, "anon", more);
+			return dump_unsupp_fd(&p, lfd, fdinfo, "anon", more);
 		}
 
 		return do_dump_gen_file(&p, lfd, ops, fdinfo);
@@ -349,7 +353,7 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 		if (check_ns_proc(&link))
 			return do_dump_gen_file(&p, lfd, &nsfile_dump_ops, fdinfo);
 
-		return dump_unsupp_fd(&p, "reg", link.name + 1);
+		return dump_unsupp_fd(&p, lfd, fdinfo, "reg", link.name + 1);
 	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {
@@ -361,7 +365,7 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 		return do_dump_gen_file(&p, lfd, ops, fdinfo);
 	}
 
-	return dump_unsupp_fd(&p, "unknown", NULL);
+	return dump_unsupp_fd(&p, lfd, fdinfo, "unknown", NULL);
 }
 
 int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,

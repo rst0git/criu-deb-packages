@@ -84,17 +84,19 @@ struct proc_status_creds {
 	unsigned int uids[4];
 	unsigned int gids[4];
 
-	uint32_t cap_inh[PROC_CAP_SIZE];
-	uint32_t cap_prm[PROC_CAP_SIZE];
-	uint32_t cap_eff[PROC_CAP_SIZE];
-	uint32_t cap_bnd[PROC_CAP_SIZE];
+	u32 cap_inh[PROC_CAP_SIZE];
+	u32 cap_prm[PROC_CAP_SIZE];
+	u32 cap_eff[PROC_CAP_SIZE];
+	u32 cap_bnd[PROC_CAP_SIZE];
 };
 
 struct mount_info;
 struct fstype {
 	char *name;
+	int code;
 	int (*dump)(struct mount_info *pm);
 	int (*restore)(struct mount_info *pm);
+	int (*parse)(struct mount_info *pm);
 };
 
 struct mount_info {
@@ -110,6 +112,8 @@ struct mount_info {
 	char		*source;
 	char		*options;
 	bool		mounted;
+	bool		need_plugin;
+	int		is_file;
 	struct mount_info *next;
 
 	/* tree linkage */
@@ -125,6 +129,8 @@ struct mount_info {
 	struct mount_info *mnt_master;	/* slave is on master->mnt_slave_list */
 
 	struct list_head postpone;
+
+	void		*private;	/* associated filesystem data */
 };
 
 extern struct mount_info *mnt_entry_alloc();

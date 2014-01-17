@@ -4,6 +4,16 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
+#include <ctype.h>
+
+#ifndef NFS_SUPER_MAGIC
+#define NFS_SUPER_MAGIC 0x6969
+#endif
+
+/* Stolen from kernel/fs/nfs/unlink.c */
+#define SILLYNAME_PREF ".nfs"
+#define SILLYNAME_SUFF_LEN (((unsigned)sizeof(u64) << 1) + ((unsigned)sizeof(unsigned int) << 1))
 
 #include "cr_options.h"
 #include "fdset.h"
@@ -20,6 +30,7 @@
 #include "protobuf/remap-file-path.pb-c.h"
 
 #include "files-reg.h"
+#include "plugin.h"
 
 /*
  * Ghost files are those not visible from the FS. Dumping them is
@@ -208,7 +219,7 @@ struct collect_image_info remap_cinfo = {
 	.collect = collect_one_remap,
 };
 
-static int dump_ghost_file(int _fd, u32 id, const struct stat *st)
+static int dump_ghost_file(int _fd, u32 id, const struct stat *st, dev_t phys_dev)
 {
 	int img;
 	GhostFileEntry gfe = GHOST_FILE_ENTRY__INIT;
@@ -224,7 +235,7 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st)
 	gfe.mode = st->st_mode;
 
 	gfe.has_dev = gfe.has_ino = true;
-	gfe.dev = MKKDEV(MAJOR(st->st_dev), MINOR(st->st_dev));
+	gfe.dev = phys_dev;
 	gfe.ino = st->st_ino;
 
 	if (pb_write_one(img, &gfe, PB_GHOST_FILE))
@@ -270,7 +281,7 @@ struct file_remap *lookup_ghost_remap(u32 dev, u32 ino)
 
 	mutex_lock(ghost_file_mutex);
 	list_for_each_entry(gf, &ghost_files, list) {
-		if (gf->dev == dev && gf->ino == ino) {
+		if (gf->ino == ino && (gf->dev == dev)) {
 			gf->remap.users++;
 			mutex_unlock(ghost_file_mutex);
 			return &gf->remap;
@@ -285,6 +296,7 @@ static int dump_ghost_remap(char *path, const struct stat *st, int lfd, u32 id)
 {
 	struct ghost_file *gf;
 	RemapFilePathEntry rpe = REMAP_FILE_PATH_ENTRY__INIT;
+	dev_t phys_dev;
 
 	pr_info("Dumping ghost file for fd %d id %#x\n", lfd, id);
 
@@ -294,20 +306,21 @@ static int dump_ghost_remap(char *path, const struct stat *st, int lfd, u32 id)
 		return -1;
 	}
 
+	phys_dev = phys_stat_resolve_dev(st->st_dev, path);
 	list_for_each_entry(gf, &ghost_files, list)
-		if ((gf->dev == st->st_dev) && (gf->ino == st->st_ino))
+		if ((gf->dev == phys_dev) && (gf->ino == st->st_ino))
 			goto dump_entry;
 
 	gf = xmalloc(sizeof(*gf));
 	if (gf == NULL)
 		return -1;
 
-	gf->dev = st->st_dev;
+	gf->dev = phys_dev;
 	gf->ino = st->st_ino;
 	gf->id = ghost_file_ids++;
 	list_add_tail(&gf->list, &ghost_files);
 
-	if (dump_ghost_file(lfd, gf->id, st))
+	if (dump_ghost_file(lfd, gf->id, st, phys_dev))
 		return -1;
 
 dump_entry:
@@ -369,14 +382,14 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp)
 		tmp--;
 	}
 
-	rfe.id = *idp 	= fd_id_generate_special();
+	rfe.id = *idp	= fd_id_generate_special();
 	rfe.flags	= 0;
 	rfe.pos		= 0;
 	rfe.fown	= &fwn;
 	rfe.name	= link_name + 1;
 
 	/* Any 'unique' name works here actually. Remap works by reg-file ids. */
-	sprintf(tmp + 1, "link_remap.%d", rfe.id);
+	snprintf(tmp + 1, sizeof(link_name) - (size_t)(tmp - link_name - 1), "link_remap.%d", rfe.id);
 
 	if (linkat(lfd, "", mntns_root, link_name, AT_EMPTY_PATH) < 0) {
 		pr_perror("Can't link remap to %s", path);
@@ -419,10 +432,45 @@ static int dump_linked_remap(char *path, int len, const struct stat *ost, int lf
 			&rpe, PB_REMAP_FPATH);
 }
 
-static int check_path_remap(char *rpath, int plen, const struct stat *ost, int lfd, u32 id)
+static bool is_sillyrename_name(char *name)
+{
+	int i;
+
+	name = strrchr(name, '/');
+	BUG_ON(name == NULL); /* see check in dump_one_reg_file */
+	name++;
+
+	/*
+	 * Strictly speaking this check is not bullet-proof. User
+	 * can create file with this name by hands and we have no
+	 * API to distinguish really-silly-renamed files from those
+	 * fake names :(
+	 *
+	 * But since NFS people expect .nfsXXX files to be unstable,
+	 * we treat them as such too.
+	 */
+
+	if (strncmp(name, SILLYNAME_PREF, sizeof(SILLYNAME_PREF) - 1))
+		return false;
+
+	name += sizeof(SILLYNAME_PREF) - 1;
+	for (i = 0; i < SILLYNAME_SUFF_LEN; i++)
+		if (!isxdigit(name[i]))
+			return false;
+
+	return true;
+}
+
+static inline bool nfs_silly_rename(char *rpath, const struct fd_parms *parms)
+{
+	return (parms->fs_type == NFS_SUPER_MAGIC) && is_sillyrename_name(rpath);
+}
+
+static int check_path_remap(char *rpath, int plen, const struct fd_parms *parms, int lfd, u32 id)
 {
 	int ret;
 	struct stat pst;
+	const struct stat *ost = &parms->stat;
 
 	if (ost->st_nlink == 0)
 		/*
@@ -432,6 +480,18 @@ static int check_path_remap(char *rpath, int plen, const struct stat *ost, int l
 		 * also open.
 		 */
 		return dump_ghost_remap(rpath + 1, ost, lfd, id);
+
+	if (nfs_silly_rename(rpath, parms)) {
+		/*
+		 * If this is NFS silly-rename file the path we have at hands
+		 * will be accessible by fstat(), but once we kill the dumping
+		 * tasks it will disappear. So we just go ahead an dump it as
+		 * linked-remap file (NFS will allow us to create more hard
+		 * links on it) to have some persistent name at hands.
+		 */
+		pr_debug("Dump silly-rename linked remap for %x\n", id);
+		return dump_linked_remap(rpath + 1, plen - 1, ost, lfd, id);
+	}
 
 	ret = fstatat(mntns_root, rpath, &pst, 0);
 	if (ret < 0) {
@@ -502,7 +562,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 		return -1;
 	}
 
-	if (check_path_remap(link->name, link->len, &p->stat, lfd, id))
+	if (check_path_remap(link->name, link->len, p, lfd, id))
 		return -1;
 
 	rfe.id		= id;

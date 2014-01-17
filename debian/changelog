@@ -1,3 +1,10 @@
+criu (1.1~rc1-1) experimental; urgency=low
+
+  * Merging upstream version 1.1~rc1.
+  * Updating year in copyright file for 2014.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Fri, 17 Jan 2014 06:15:52 +0100
+
 criu (1.0-1) experimental; urgency=low
 
   * Updating to standards version 3.9.5.

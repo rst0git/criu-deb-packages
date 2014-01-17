@@ -11,9 +11,9 @@
 static unsigned int cr_uid, cr_gid;
 
 /*
- * Setup what user is requesting for dump (via rpc or using 
- * suid bit on crtools). Later we would deny to dump/restore 
- * a task, to which the original user doesn't have the direct 
+ * Setup what user is requesting for dump (via rpc or using
+ * suid bit on crtools). Later we would deny to dump/restore
+ * a task, to which the original user doesn't have the direct
  * access to. (Or implement some trickier security policy).
  */
 
@@ -35,7 +35,7 @@ static bool check_ids(unsigned int crid, unsigned int rid, unsigned int eid, uns
 	return false;
 }
 
-static bool check_caps(uint32_t *inh, uint32_t *eff, uint32_t *prm)
+static bool check_caps(u32 *inh, u32 *eff, u32 *prm)
 {
 	int i;
 

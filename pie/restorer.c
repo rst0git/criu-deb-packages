@@ -36,7 +36,7 @@
 #define sys_prctl_safe(opcode, val1, val2, val3)			\
 	({								\
 		long __ret = sys_prctl(opcode, val1, val2, val3, 0);	\
-		if (__ret) 						\
+		if (__ret)						\
 			 pr_err("prctl failed @%d with %ld\n", __LINE__, __ret);\
 		__ret;							\
 	})
@@ -911,7 +911,7 @@ long __export_restore_task(struct task_restore_args *args)
 
 	rst_tcp_socks_all(args);
 
-	/* 
+	/*
 	 * Writing to last-pid is CAP_SYS_ADMIN protected,
 	 * turning off TCP repair is CAP_SYS_NED_ADMIN protected,
 	 * thus restore* creds _after_ all of the above.
