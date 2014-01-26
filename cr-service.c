@@ -35,6 +35,12 @@ static int recv_criu_msg(int socket_fd, CriuReq **msg)
 		return -1;
 	}
 
+	if (len == 0) {
+		pr_info("Client exited unexpectedly\n");
+		errno = ECONNRESET;
+		return -1;
+	}
+
 	*msg = criu_req__unpack(NULL, len, buf);
 	if (!*msg) {
 		pr_perror("Failed unpacking request");
@@ -186,7 +192,7 @@ static int dump_using_req(int sk, CriuOpts *req)
 
 	success = true;
 exit:
-	if (req->leave_running  || !self_dump) {
+	if (req->leave_running  || !self_dump || !success) {
 		if (send_criu_dump_resp(sk, success, false) == -1) {
 			pr_perror("Can't send response");
 			success = false;
@@ -232,6 +238,9 @@ static int check(int sk)
 	CriuResp resp = CRIU_RESP__INIT;
 
 	resp.type = CRIU_REQ_TYPE__CHECK;
+
+	/* Check only minimal kernel support */
+	opts.check_ms_kernel = true;
 
 	if (!cr_check())
 		resp.success = true;

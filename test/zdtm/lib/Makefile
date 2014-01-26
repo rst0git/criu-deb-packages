@@ -14,10 +14,12 @@ DEPEND.c = $(COMPILE.c) -MM -MP
 	$(DEPEND.c) $(OUTPUT_OPTION) $<
 
 all:	$(LIB)
-	@echo > /dev/null
+	@true
 install: all
+.PHONY: all install
 
-$(LIB):	$(LIB)(${LIBOBJ})
+$(LIB):	$(LIBOBJ)
+	$(Q) ar rv $@ $^
 
 clean:
 	$(RM) -f $(LIBOBJ) $(LIB) *~
@@ -25,9 +27,12 @@ clean:
 cleandep:
 	$(RM) -f $(LIBDEP)
 
+cleanout:
+	@true
+
 realclean:	clean cleandep
 
-.PHONY:	force clean cleandep cleanout realclean start check_start stop wait_stop
+.PHONY:	clean cleandep cleanout realclean
 
 ifeq ($(filter-out no-deps-targets, $(MAKECMDGOALS)),)
 -include $(LIBDEP)

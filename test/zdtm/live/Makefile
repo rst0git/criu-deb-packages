@@ -1,8 +1,7 @@
 SUBDIRS	=	streaming transition static
 
 default:	all
-
-.PHONY:	default
+.PHONY: default
 
 %:
 	set -e; for d in $(SUBDIRS); do $(MAKE) -C $$d $@; done

@@ -1334,6 +1334,12 @@ static int pre_dump_one_task(struct pstree_item *item, struct list_head *ctls)
 		goto err_free;
 	}
 
+	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
+	if (ret) {
+		pr_err("Can't fixup vdso VMAs (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
 	ret = parasite_dump_misc_seized(parasite_ctl, &misc);
 	if (ret) {
 		pr_err("Can't dump misc (pid: %d)\n", pid);
@@ -1417,7 +1423,7 @@ static int dump_one_task(struct pstree_item *item)
 	}
 
 	ret = parse_posix_timers(pid, &proc_args);
-	if (ret < 0){
+	if (ret < 0) {
 		pr_err("Can't read posix timers file (pid: %d)\n", pid);
 		goto err;
 	}
@@ -1600,6 +1606,12 @@ int cr_pre_dump_tasks(pid_t pid)
 		goto err;
 
 	if (kerndat_init())
+		goto err;
+
+	if (cpu_init())
+		goto err;
+
+	if (vdso_init())
 		goto err;
 
 	if (connect_to_page_server())

@@ -13,15 +13,15 @@
 
 struct cr_plugin_entry {
 	union {
-		cr_plugin_fini_t *cr_fini;
+		cr_plugin_fini_t		*cr_fini;
 
-		cr_plugin_dump_unix_sk_t *cr_plugin_dump_unix_sk;
-		cr_plugin_restore_unix_sk_t *cr_plugin_restore_unix_sk;
-		cr_plugin_dump_file_t *cr_plugin_dump_file;
-		cr_plugin_restore_file_t *cr_plugin_restore_file;
-		cr_plugin_dump_ext_mount_t *cr_plugin_dump_ext_mount;
-		cr_plugin_restore_ext_mount_t *cr_plugin_restore_ext_mount;
-		cr_plugin_dump_ext_link_t *cr_plugin_dump_ext_link;
+		cr_plugin_dump_unix_sk_t	*cr_plugin_dump_unix_sk;
+		cr_plugin_restore_unix_sk_t	*cr_plugin_restore_unix_sk;
+		cr_plugin_dump_file_t		*cr_plugin_dump_file;
+		cr_plugin_restore_file_t	*cr_plugin_restore_file;
+		cr_plugin_dump_ext_mount_t	*cr_plugin_dump_ext_mount;
+		cr_plugin_restore_ext_mount_t	*cr_plugin_restore_ext_mount;
+		cr_plugin_dump_ext_link_t	*cr_plugin_dump_ext_link;
 	};
 
 	struct cr_plugin_entry *next;
@@ -47,15 +47,14 @@ struct cr_plugins cr_plugins;
 		name = dlsym(h, #name);					\
 		if (name) {						\
 			struct cr_plugin_entry *__ce;			\
-			__ce = xmalloc(sizeof(struct cr_plugin_entry));	\
+			__ce = xmalloc(sizeof(*__ce));			\
 			if (__ce == NULL)				\
 				goto nomem;				\
 			__ce->name = name;				\
 			__ce->next = cr_plugins.name;			\
 			cr_plugins.name = __ce;				\
 		}							\
-	} while (0);							\
-
+	} while (0)
 
 #define run_plugin_funcs(name, ...) ({					\
 		struct cr_plugin_entry *__ce = cr_plugins.name;		\
@@ -135,7 +134,7 @@ static int cr_lib_load(char *path)
 	ce = NULL;
 	f_fini = dlsym(h, "cr_plugin_fini");
 	if (f_fini) {
-		ce = xmalloc(sizeof(struct cr_plugin_entry));
+		ce = xmalloc(sizeof(*ce));
 		if (ce == NULL)
 			goto nomem;
 		ce->cr_fini = f_fini;

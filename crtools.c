@@ -71,7 +71,7 @@ static int parse_ns_string(const char *ptr)
 	return 0;
 
 bad_ns:
-	pr_err("Unknown namespace '%s'\n", ptr);
+	pr_msg("Error: unknown namespace: %s\n", ptr);
 	return -1;
 }
 
@@ -79,10 +79,50 @@ int main(int argc, char *argv[])
 {
 	pid_t pid = 0, tree_id = 0;
 	int ret = -1;
+	bool usage_error = true;
 	int opt, idx;
 	int log_level = 0;
 	char *imgs_dir = ".";
 	char *work_dir = NULL;
+	static const char short_opts[] = "dsRf:F:t:p:hcD:o:n:v::xVr:jlW:L:";
+	static struct option long_opts[] = {
+		{ "tree", required_argument, 0, 't' },
+		{ "pid", required_argument, 0, 'p' },
+		{ "leave-stopped", no_argument, 0, 's' },
+		{ "leave-running", no_argument, 0, 'R' },
+		{ "restore-detached", no_argument, 0, 'd' },
+		{ "daemon", no_argument, 0, 'd' },
+		{ "contents", no_argument, 0, 'c' },
+		{ "file", required_argument, 0, 'f' },
+		{ "fields", required_argument, 0, 'F' },
+		{ "images-dir", required_argument, 0, 'D' },
+		{ "work-dir", required_argument, 0, 'W' },
+		{ "log-file", required_argument, 0, 'o' },
+		{ "namespaces", required_argument, 0, 'n' },
+		{ "root", required_argument, 0, 'r' },
+		{ USK_EXT_PARAM, no_argument, 0, 'x' },
+		{ "help", no_argument, 0, 'h' },
+		{ SK_EST_PARAM, no_argument, 0, 42 },
+		{ "close", required_argument, 0, 43 },
+		{ "log-pid", no_argument, 0, 44},
+		{ "version", no_argument, 0, 'V'},
+		{ "evasive-devices", no_argument, 0, 45},
+		{ "pidfile", required_argument, 0, 46},
+		{ "veth-pair", required_argument, 0, 47},
+		{ "action-script", required_argument, 0, 49},
+		{ LREMAP_PARAM, no_argument, 0, 41},
+		{ OPT_SHELL_JOB, no_argument, 0, 'j'},
+		{ OPT_FILE_LOCKS, no_argument, 0, 'l'},
+		{ "page-server", no_argument, 0, 50},
+		{ "address", required_argument, 0, 51},
+		{ "port", required_argument, 0, 52},
+		{ "prev-images-dir", required_argument, 0, 53},
+		{ "ms", no_argument, 0, 54},
+		{ "track-mem", no_argument, 0, 55},
+		{ "auto-dedup", no_argument, 0, 56},
+		{ "libdir", required_argument, 0, 'L'},
+		{ },
+	};
 
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 
@@ -98,46 +138,7 @@ int main(int argc, char *argv[])
 		return 1;
 
 	while (1) {
-		static const char short_opts[] = "dsRf:F:t:p:hcD:o:n:v::xVr:jlW:L:";
-		static struct option long_opts[] = {
-			{ "tree", required_argument, 0, 't' },
-			{ "pid", required_argument, 0, 'p' },
-			{ "leave-stopped", no_argument, 0, 's' },
-			{ "leave-running", no_argument, 0, 'R' },
-			{ "restore-detached", no_argument, 0, 'd' },
-			{ "daemon", no_argument, 0, 'd' },
-			{ "contents", no_argument, 0, 'c' },
-			{ "file", required_argument, 0, 'f' },
-			{ "fields", required_argument, 0, 'F' },
-			{ "images-dir", required_argument, 0, 'D' },
-			{ "work-dir", required_argument, 0, 'W' },
-			{ "log-file", required_argument, 0, 'o' },
-			{ "namespaces", required_argument, 0, 'n' },
-			{ "root", required_argument, 0, 'r' },
-			{ USK_EXT_PARAM, no_argument, 0, 'x' },
-			{ "help", no_argument, 0, 'h' },
-			{ SK_EST_PARAM, no_argument, 0, 42 },
-			{ "close", required_argument, 0, 43 },
-			{ "log-pid", no_argument, 0, 44},
-			{ "version", no_argument, 0, 'V'},
-			{ "evasive-devices", no_argument, 0, 45},
-			{ "pidfile", required_argument, 0, 46},
-			{ "veth-pair", required_argument, 0, 47},
-			{ "action-script", required_argument, 0, 49},
-			{ LREMAP_PARAM, no_argument, 0, 41},
-			{ OPT_SHELL_JOB, no_argument, 0, 'j'},
-			{ OPT_FILE_LOCKS, no_argument, 0, 'l'},
-			{ "page-server", no_argument, 0, 50},
-			{ "address", required_argument, 0, 51},
-			{ "port", required_argument, 0, 52},
-			{ "prev-images-dir", required_argument, 0, 53},
-			{ "ms", no_argument, 0, 54},
-			{ "track-mem", no_argument, 0, 55},
-			{ "auto-dedup", no_argument, 0, 56},
-			{ "libdir", required_argument, 0, 'L'},
-			{ },
-		};
-
+		idx = -1;
 		opt = getopt_long(argc, argv, short_opts, long_opts, &idx);
 		if (opt == -1)
 			break;
@@ -154,9 +155,13 @@ int main(int argc, char *argv[])
 			break;
 		case 'p':
 			pid = atoi(optarg);
+			if (pid <= 0)
+				goto bad_arg;
 			break;
 		case 't':
 			tree_id = atoi(optarg);
+			if (tree_id <= 0)
+				goto bad_arg;
 			break;
 		case 'c':
 			opts.show_pages_content	= true;
@@ -184,7 +189,7 @@ int main(int argc, char *argv[])
 			break;
 		case 'n':
 			if (parse_ns_string(optarg))
-				return 1;
+				goto bad_arg;
 			break;
 		case 'v':
 			if (optarg) {
@@ -231,8 +236,7 @@ int main(int argc, char *argv[])
 				n->outside = strchr(optarg, '=');
 				if (n->outside == NULL) {
 					xfree(n);
-					pr_err("Invalid argument for --veth-pair\n");
-					goto usage;
+					goto bad_arg;
 				}
 
 				*n->outside++ = '\0';
@@ -260,10 +264,8 @@ int main(int argc, char *argv[])
 			break;
 		case 52:
 			opts.ps_port = htons(atoi(optarg));
-			if (!opts.ps_port) {
-				pr_err("Bad port\n");
-				return 1;
-			}
+			if (!opts.ps_port)
+				goto bad_arg;
 			break;
 		case 'j':
 			opts.shell_job = true;
@@ -292,6 +294,8 @@ int main(int argc, char *argv[])
 				pr_msg("GitID: %s\n", CRIU_GITID);
 			return 0;
 		case 'h':
+			usage_error = false;
+			goto usage;
 		default:
 			goto usage;
 		}
@@ -300,16 +304,16 @@ int main(int argc, char *argv[])
 	if (work_dir == NULL)
 		work_dir = imgs_dir;
 
-	if (optind >= argc)
+	if (optind >= argc) {
+		pr_msg("Error: command is required\n");
 		goto usage;
+	}
 
 	/* We must not open imgs dir, if service is called */
 	if (strcmp(argv[optind], "service")) {
 		ret = open_image_dir(imgs_dir);
-		if (ret < 0) {
-			pr_perror("Can't open imgs directory");
+		if (ret < 0)
 			return 1;
-		}
 	}
 
 	if (chdir(work_dir)) {
@@ -377,7 +381,7 @@ int main(int argc, char *argv[])
 	if (!strcmp(argv[optind], "dedup"))
 		return cr_dedup() != 0;
 
-	pr_msg("Unknown command \"%s\"\n", argv[optind]);
+	pr_msg("Error: unknown command: %s\n", argv[optind]);
 usage:
 	pr_msg("\n"
 "Usage:\n"
@@ -402,7 +406,7 @@ usage:
 "  dedup          remove duplicates in memory dump\n"
 	);
 
-	if (argc < 2) {
+	if (usage_error) {
 		pr_msg("\nTry -h|--help for more info\n");
 		return 1;
 	}
@@ -436,12 +440,11 @@ usage:
 "* Logging:\n"
 "  -o|--log-file FILE    log file name\n"
 "     --log-pid          enable per-process logging to separate FILE.pid files\n"
-"  -v[NUM]               set logging level:\n"
-"                          -v0        - messages regardless of log level\n"
-"                          -v1, -v    - errors, when we are in trouble\n"
-"                          -v2, -vv   - warnings (default)\n"
-"                          -v3, -vvv  - informative, everything is fine\n"
-"                          -v4, -vvvv - debug only\n"
+"  -v[NUM]               set logging level (higher level means more output):\n"
+"                          -v1|-v    - only errors and messages\n"
+"                          -v2|-vv   - also warnings (default level)\n"
+"                          -v3|-vvv  - also information messages and timestamps\n"
+"                          -v4|-vvvv - lots of debug\n"
 "\n"
 "* Memory dumping options:\n"
 "  --track-mem           turn on memory changes tracker in kernel\n"
@@ -466,9 +469,18 @@ usage:
 "     --ms               don't check not yet merged kernel features\n"
 	);
 
-	return 1;
+	return 0;
 
 opt_pid_missing:
-	pr_msg("No pid specified (-t option missing)\n");
+	pr_msg("Error: pid not specified\n");
+	return 1;
+
+bad_arg:
+	if (idx < 0) /* short option */
+		pr_msg("Error: invalid argument for -%c: %s\n",
+				opt, optarg);
+	else /* long option */
+		pr_msg("Error: invalid argument for --%s: %s\n",
+				long_opts[idx].name, optarg);
 	return 1;
 }

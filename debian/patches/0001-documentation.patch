@@ -4,18 +4,25 @@ Description: Remove non-working echo entries from documentation makefile.
 diff -Naurp criu.orig/Documentation/Makefile criu/Documentation/Makefile
 --- criu.orig/Documentation/Makefile
 +++ criu/Documentation/Makefile
-@@ -11,17 +11,14 @@ MAN8DIR		:= $(MANDIR)/man8
- all: $(MANS)
+@@ -27,24 +27,19 @@ check:
+ 	done
  
  %.8: %.txt
 -	$(E) "  GEN     " $@
  	$(Q) $(ASCIIDOC) -b docbook -d manpage -o $(patsubst %.8,%.xml,$@) $<
  	$(Q) $(XMLTO) man --skip-validation $(patsubst %.8,%.xml,$@) 2>/dev/null
  
+ %.ps: %.8
+-	$(E) "  GEN     " $@
+ 	$(Q) $(GROFF) $(GROFF_OPTS) $^ > $@
+ 
+ %.pdf: %.ps
+-	$(E) "  GEN     " $@
+ 	$(Q) ps2pdf $< $@
+ 
  clean:
 -	$(E) "  CLEAN   "
- 	$(Q) rm -f ./*.xml
- 	$(Q) rm -f ./*.8
+ 	$(Q) rm -f $(XMLS) $(MANS) $(PSS) $(PDFS)
  
  install: $(MANS)
 -	$(E) "  INSTALL " $(MANS)
