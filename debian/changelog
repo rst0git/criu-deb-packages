@@ -1,3 +1,9 @@
+criu (1.1-1) experimental; urgency=low
+
+  * Merging upstream version 1.1.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Sat, 01 Feb 2014 06:39:06 +0100
+
 criu (1.1~rc2-1) experimental; urgency=low
 
   * Merging upstream version 1.1~rc2.
