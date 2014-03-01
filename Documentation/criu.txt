@@ -19,6 +19,11 @@ DESCRIPTION
 
 The 'command' can be one of the following:
 
+*pre-dump*::
+Launch that named pre-dump procedure, where *criu* does snapshot of
+memory changes since previous pre-dump. Also *criu* forms fsnotify
+cache which speedup *restore* procedure.
+
 *dump*::
 Initiate checkpoint procedure.
 
@@ -40,6 +45,11 @@ Execute a system call from other task\'s context.
 *service*::
 Start RPC service.
 
+*dedup*::
+Starts pagemap data deduplication procedure, where *criu* scans over all
+pagemap files and tries to minimalize the number of pagemap entries by
+obtaining the references from a parent pagemap image.
+
 OPTIONS
 -------
 *-c*::
@@ -48,6 +58,10 @@ OPTIONS
 *-D*, *--images-dir* 'path'::
     Use path 'path' as a base directory where to look for dump files set. This
     commands applies to any 'command'.
+
+*-W*, *--work-dir* 'dir'::
+    Use directory 'dir' for putting logs, pidfiles and statistics. If not
+    specified, 'path' from *-D* option is taken.
 
 *-s*, *--leave-stopped*::
     Leave tasks in stopped state after checkpoint instead of killing them.

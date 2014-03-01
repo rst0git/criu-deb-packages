@@ -71,6 +71,7 @@
 #include "vma.h"
 #include "cr-service.h"
 #include "plugin.h"
+#include "irmap.h"
 
 #include "asm/dump.h"
 
@@ -83,15 +84,15 @@ bool privately_dump_vma(struct vma_area *vma)
 	/*
 	 * The special areas are not dumped.
 	 */
-	if (!(vma->vma.status & VMA_AREA_REGULAR))
+	if (!(vma->e->status & VMA_AREA_REGULAR))
 		return false;
 
 	/* No dumps for file-shared mappings */
-	if (vma->vma.status & VMA_FILE_SHARED)
+	if (vma->e->status & VMA_FILE_SHARED)
 		return false;
 
 	/* No dumps for SYSV IPC mappings */
-	if (vma->vma.status & VMA_AREA_SYSVIPC)
+	if (vma->e->status & VMA_AREA_SYSVIPC)
 		return false;
 
 	if (vma_area_is(vma, VMA_ANON_SHARED))
@@ -103,10 +104,22 @@ bool privately_dump_vma(struct vma_area *vma)
 		return false;
 	}
 
-	if (vma->vma.end > TASK_SIZE)
+	if (vma->e->end > TASK_SIZE)
 		return false;
 
 	return true;
+}
+
+static void close_vma_file(struct vma_area *vma)
+{
+	if (vma->vm_file_fd < 0)
+		return;
+	if (vma->e->status & VMA_AREA_SOCKET)
+		return;
+	if (vma->file_borrowed)
+		return;
+
+	close(vma->vm_file_fd);
 }
 
 void free_mappings(struct vm_area_list *vma_area_list)
@@ -114,8 +127,9 @@ void free_mappings(struct vm_area_list *vma_area_list)
 	struct vma_area *vma_area, *p;
 
 	list_for_each_entry_safe(vma_area, p, &vma_area_list->h, list) {
-		if (vma_area->vm_file_fd > 0)
-			close(vma_area->vm_file_fd);
+		close_vma_file(vma_area);
+		if (!vma_area->file_borrowed)
+			free(vma_area->st);
 		free(vma_area);
 	}
 
@@ -135,7 +149,7 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list)
 	if (ret < 0)
 		goto err;
 
-	pr_info("Collected, longest ares %lu bytes\n", vma_area_list->longest);
+	pr_info("Collected, longest area occupies %lu pages\n", vma_area_list->longest);
 	pr_info_vma_list(&vma_area_list->h);
 
 	pr_info("----------------------------------------\n");
@@ -230,7 +244,7 @@ static int collect_fds(pid_t pid, struct parasite_drain_fd *dfds)
 static int dump_task_exe_link(pid_t pid, MmEntry *mm)
 {
 	struct fd_parms params = FD_PARMS_INIT;
-	int fd, ret;
+	int fd, ret = 0;
 
 	fd = open_proc(pid, "exe");
 	if (fd < 0)
@@ -241,11 +255,10 @@ static int dump_task_exe_link(pid_t pid, MmEntry *mm)
 		return -1;
 	}
 
-	mm->exe_file_id = fd_id_generate_special();
+	if (fd_id_generate_special(&params.stat, &mm->exe_file_id))
+		ret = dump_one_reg_file(fd, mm->exe_file_id, &params);
 
-	ret = dump_one_reg_file(fd, mm->exe_file_id, &params);
 	close(fd);
-
 	return ret;
 }
 
@@ -267,11 +280,11 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_fd
 		return -1;
 	}
 
-	fe.cwd_id = fd_id_generate_special();
-
-	ret = dump_one_reg_file(fd, fe.cwd_id, &p);
-	if (ret < 0)
-		return ret;
+	if (fd_id_generate_special(&p.stat, &fe.cwd_id)) {
+		ret = dump_one_reg_file(fd, fe.cwd_id, &p);
+		if (ret < 0)
+			return ret;
+	}
 
 	close(fd);
 
@@ -285,11 +298,11 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_fd
 		return -1;
 	}
 
-	fe.root_id = fd_id_generate_special();
-
-	ret = dump_one_reg_file(fd, fe.root_id, &p);
-	if (ret < 0)
-		return ret;
+	if (fd_id_generate_special(&p.stat, &fe.root_id)) {
+		ret = dump_one_reg_file(fd, fe.root_id, &p);
+		if (ret < 0)
+			return ret;
+	}
 
 	close(fd);
 
@@ -329,23 +342,27 @@ static int dump_task_rlims(int pid, struct cr_fdset *fds)
 	return 0;
 }
 
-static int dump_filemap(pid_t pid, VmaEntry *vma, int file_fd,
+static int dump_filemap(pid_t pid, struct vma_area *vma_area,
 		const struct cr_fdset *fdset)
 {
 	struct fd_parms p = FD_PARMS_INIT;
+	VmaEntry *vma = vma_area->e;
+	int ret = 0;
+	u32 id;
 
-	if (fstat(file_fd, &p.stat) < 0) {
-		pr_perror("Can't stat file for vma");
-		return -1;
-	}
+	BUG_ON(!vma_area->st);
+	p.stat = *vma_area->st;
 
 	if ((vma->prot & PROT_WRITE) && vma_entry_is(vma, VMA_FILE_SHARED))
 		p.flags = O_RDWR;
 	else
 		p.flags = O_RDONLY;
-	vma->shmid = fd_id_generate_special();
 
-	return dump_one_reg_file(file_fd, vma->shmid, &p);
+	if (fd_id_generate_special(&p.stat, &id))
+		ret = dump_one_reg_file(vma_area->vm_file_fd, id, &p);
+
+	vma->shmid = id;
+	return ret;
 }
 
 static int check_sysvipc_map_dump(pid_t pid, VmaEntry *vma)
@@ -358,20 +375,54 @@ static int check_sysvipc_map_dump(pid_t pid, VmaEntry *vma)
 	return -1;
 }
 
-static int dump_task_mappings(pid_t pid, const struct vm_area_list *vma_area_list,
-			      const struct cr_fdset *cr_fdset)
+static int get_task_auxv(pid_t pid, MmEntry *mm)
 {
+	auxv_t mm_saved_auxv[AT_VECTOR_SIZE];
+	int fd, i, ret;
+
+	pr_info("Obtaining task auvx ...\n");
+
+	fd = open_proc(pid, "auxv");
+	if (fd < 0)
+		return -1;
+
+	ret = read(fd, mm_saved_auxv, sizeof(mm_saved_auxv));
+	if (ret < 0) {
+		ret = -1;
+		pr_perror("Error reading %d's auxv", pid);
+		goto err;
+	} else {
+		mm->n_mm_saved_auxv = ret / sizeof(auxv_t);
+		for (i = 0; i < mm->n_mm_saved_auxv; i++)
+			mm->mm_saved_auxv[i] = (u64)mm_saved_auxv[i];
+	}
+
+	ret = 0;
+err:
+	close_safe(&fd);
+	return ret;
+}
+
+static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
+		const struct parasite_dump_misc *misc,
+		const struct vm_area_list *vma_area_list,
+		const struct cr_fdset *fdset)
+{
+	MmEntry mme = MM_ENTRY__INIT;
 	struct vma_area *vma_area;
-	int ret = -1, fd;
+	int ret = -1, i = 0;
 
 	pr_info("\n");
-	pr_info("Dumping mappings (pid: %d)\n", pid);
+	pr_info("Dumping mm (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
 
-	fd = fdset_fd(cr_fdset, CR_FD_VMAS);
+	mme.n_vmas = vma_area_list->nr;
+	mme.vmas = xmalloc(mme.n_vmas * sizeof(VmaEntry *));
+	if (!mme.vmas)
+		goto err;
 
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
-		VmaEntry *vma = &vma_area->vma;
+		VmaEntry *vma = vma_area->e;
 
 		pr_info_vma(vma_area);
 
@@ -383,20 +434,44 @@ static int dump_task_mappings(pid_t pid, const struct vm_area_list *vma_area_lis
 			ret = add_shmem_area(pid, vma);
 		else if (vma_entry_is(vma, VMA_FILE_PRIVATE) ||
 				vma_entry_is(vma, VMA_FILE_SHARED))
-			ret = dump_filemap(pid, vma, vma_area->vm_file_fd, cr_fdset);
+			ret = dump_filemap(pid, vma_area, fdset);
 		else if (vma_entry_is(vma, VMA_AREA_SOCKET))
 			ret = dump_socket_map(vma_area);
 		else
 			ret = 0;
-
-		if (!ret)
-			ret = pb_write_one(fd, vma, PB_VMA);
 		if (ret)
 			goto err;
+
+		mme.vmas[i++] = vma;
 	}
 
-	ret = 0;
-	pr_info("----------------------------------------\n");
+	mme.mm_start_code = stat->start_code;
+	mme.mm_end_code = stat->end_code;
+	mme.mm_start_data = stat->start_data;
+	mme.mm_end_data = stat->end_data;
+	mme.mm_start_stack = stat->start_stack;
+	mme.mm_start_brk = stat->start_brk;
+
+	mme.mm_arg_start = stat->arg_start;
+	mme.mm_arg_end = stat->arg_end;
+	mme.mm_env_start = stat->env_start;
+	mme.mm_env_end = stat->env_end;
+
+	mme.mm_brk = misc->brk;
+
+	mme.n_mm_saved_auxv = AT_VECTOR_SIZE;
+	mme.mm_saved_auxv = xmalloc(pb_repeated_size(&mme, mm_saved_auxv));
+	if (!mme.mm_saved_auxv)
+		goto err;
+
+	if (get_task_auxv(pid, &mme))
+		goto err;
+
+	if (dump_task_exe_link(pid, &mme))
+		goto err;
+
+	ret = pb_write_one(fdset_fd(fdset, CR_FD_MM), &mme, PB_MM);
+	xfree(mme.mm_saved_auxv);
 err:
 	return ret;
 }
@@ -435,74 +510,6 @@ static int dump_task_creds(struct parasite_ctl *ctl,
 		return -1;
 
 	return pb_write_one(fdset_fd(fds, CR_FD_CREDS), &ce, PB_CREDS);
-}
-
-static int get_task_auxv(pid_t pid, MmEntry *mm, size_t *size)
-{
-	int fd, ret, i;
-
-	pr_info("Obtaining task auvx ... ");
-
-	fd = open_proc(pid, "auxv");
-	if (fd < 0)
-		return -1;
-
-	for (i = 0; i < AT_VECTOR_SIZE; i++) {
-		ret = read(fd, &mm->mm_saved_auxv[i],
-			   sizeof(auxv_t));
-		if (ret == 0)
-			break;
-		else if (ret != sizeof(auxv_t)) {
-			ret = -1;
-			pr_perror("Error reading %d's auxv[%d]",
-				  pid, i);
-			goto err;
-		}
-	}
-
-	*size = i;
-	ret = 0;
-err:
-	close_safe(&fd);
-	return ret;
-}
-
-static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
-		const struct parasite_dump_misc *misc, const struct cr_fdset *fdset)
-{
-	MmEntry mme = MM_ENTRY__INIT;
-	int ret = -1;
-
-	mme.mm_start_code = stat->start_code;
-	mme.mm_end_code = stat->end_code;
-	mme.mm_start_data = stat->start_data;
-	mme.mm_end_data = stat->end_data;
-	mme.mm_start_stack = stat->start_stack;
-	mme.mm_start_brk = stat->start_brk;
-
-	mme.mm_arg_start = stat->arg_start;
-	mme.mm_arg_end = stat->arg_end;
-	mme.mm_env_start = stat->env_start;
-	mme.mm_env_end = stat->env_end;
-
-	mme.mm_brk = misc->brk;
-
-	mme.n_mm_saved_auxv = AT_VECTOR_SIZE;
-	mme.mm_saved_auxv = xmalloc(pb_repeated_size(&mme, mm_saved_auxv));
-	if (!mme.mm_saved_auxv)
-		goto out;
-
-	if (get_task_auxv(pid, &mme, &mme.n_mm_saved_auxv))
-		goto out;
-	pr_info("OK\n");
-
-	if (dump_task_exe_link(pid, &mme))
-		goto out;
-
-	ret = pb_write_one(fdset_fd(fdset, CR_FD_MM), &mme, PB_MM);
-	xfree(mme.mm_saved_auxv);
-out:
-	return ret;
 }
 
 static int get_task_futex_robust_list(pid_t pid, ThreadCoreEntry *info)
@@ -1346,6 +1353,12 @@ static int pre_dump_one_task(struct pstree_item *item, struct list_head *ctls)
 		goto err_cure;
 	}
 
+	ret = predump_task_files(pid);
+	if (ret) {
+		pr_err("Pre-dumping files failed (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
 	parasite_ctl->pid.virt = item->pid.virt = misc.pid;
 
 	ret = parasite_dump_pages_seized(parasite_ctl, &vmas, &parasite_ctl->mem_pp);
@@ -1526,12 +1539,6 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure;
 	}
 
-	ret = dump_task_mm(pid, &pps_buf, &misc, cr_fdset);
-	if (ret) {
-		pr_err("Dump mm (pid: %d) failed with %d\n", pid, ret);
-		goto err_cure;
-	}
-
 	ret = dump_task_core_all(item, &pps_buf, &misc, cr_fdset);
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
@@ -1556,7 +1563,7 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
-	ret = dump_task_mappings(pid, &vmas, cr_fdset);
+	ret = dump_task_mm(pid, &pps_buf, &misc, &vmas, cr_fdset);
 	if (ret) {
 		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1602,10 +1609,23 @@ int cr_pre_dump_tasks(pid_t pid)
 	LIST_HEAD(ctls);
 	struct parasite_ctl *ctl, *n;
 
+	if (!opts.track_mem) {
+		pr_info("Enforcing memory tracking for pre-dump.\n");
+		opts.track_mem = true;
+	}
+
+	if (opts.final_state == TASK_DEAD) {
+		pr_info("Enforcing tasks run after pre-dump.\n");
+		opts.final_state = TASK_ALIVE;
+	}
+
 	if (init_stats(DUMP_STATS))
 		goto err;
 
 	if (kerndat_init())
+		goto err;
+
+	if (irmap_load_cache())
 		goto err;
 
 	if (cpu_init())
@@ -1618,6 +1638,15 @@ int cr_pre_dump_tasks(pid_t pid)
 		goto err;
 
 	if (collect_pstree(pid))
+		goto err;
+
+	if (gen_predump_ns_mask())
+		goto err;
+
+	if (collect_mount_info(pid))
+		goto err;
+
+	if (mntns_collect_root(root_item->pid.real))
 		goto err;
 
 	for_each_pstree_item(item)
@@ -1656,6 +1685,9 @@ err:
 		parasite_cure_local(ctl);
 	}
 
+	if (irmap_predump_run())
+		ret = -1;
+
 	if (disconnect_from_page_server())
 		ret = -1;
 
@@ -1686,6 +1718,9 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	if (kerndat_init())
+		goto err;
+
+	if (irmap_load_cache())
 		goto err;
 
 	if (cpu_init())

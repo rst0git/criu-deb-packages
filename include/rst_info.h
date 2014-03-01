@@ -3,6 +3,7 @@
 
 #include "lock.h"
 #include "list.h"
+#include "vma.h"
 
 struct task_entries {
 	int nr_threads, nr_tasks, nr_helpers;
@@ -21,6 +22,8 @@ struct fdt {
 	futex_t			fdt_lock;
 };
 
+struct _MmEntry;
+
 struct rst_info {
 	struct list_head	fds;
 	struct list_head	eventpoll;
@@ -36,6 +39,9 @@ struct rst_info {
 
 	int service_fd_id;
 	struct fdt		*fdt;
+
+	struct vm_area_list	vmas;
+	struct _MmEntry		*mm;
 
 	union {
 		struct pstree_item	*pgrp_leader;

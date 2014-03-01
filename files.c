@@ -169,7 +169,7 @@ int do_dump_gen_file(struct fd_parms *p, int lfd,
 	e.fd	= p->fd;
 	e.flags = p->fd_flags;
 
-	ret = fd_id_generate(p->pid, &e);
+	ret = fd_id_generate(p->pid, &e, &p->stat);
 	if (ret == 1) /* new ID generated */
 		ret = ops->dump(lfd, e.id, p);
 
@@ -294,11 +294,14 @@ static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
 #define PIPEFS_MAGIC	0x50495045
 #endif
 
+#ifndef ANON_INODE_FS_MAGIC
+# define ANON_INODE_FS_MAGIC 0x09041934
+#endif
+
 static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_opts *opts,
 		       const int fdinfo)
 {
 	struct fd_parms p = FD_PARMS_INIT;
-	struct statfs statfs;
 	const struct fdtype_ops *ops;
 
 	if (fill_fd_params(ctl, fd, lfd, opts, &p) < 0) {
@@ -312,30 +315,24 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 	if (S_ISCHR(p.stat.st_mode))
 		return dump_chrdev(&p, lfd, fdinfo);
 
-	if (fstatfs(lfd, &statfs)) {
-		pr_perror("Can't obtain statfs on fd %d", fd);
-		return -1;
-	}
+	if (p.fs_type == ANON_INODE_FS_MAGIC) {
+		char link[32];
 
-	if (is_anon_inode(&statfs)) {
-		if (is_eventfd_link(lfd))
+		if (read_fd_link(lfd, link, sizeof(link)) < 0)
+			return -1;
+
+		if (is_eventfd_link(link))
 			ops = &eventfd_dump_ops;
-		else if (is_eventpoll_link(lfd))
+		else if (is_eventpoll_link(link))
 			ops = &eventpoll_dump_ops;
-		else if (is_inotify_link(lfd))
+		else if (is_inotify_link(link))
 			ops = &inotify_dump_ops;
-		else if (is_fanotify_link(lfd))
+		else if (is_fanotify_link(link))
 			ops = &fanotify_dump_ops;
-		else if (is_signalfd_link(lfd))
+		else if (is_signalfd_link(link))
 			ops = &signalfd_dump_ops;
-		else {
-			char more[64];
-
-			if (read_fd_link(fd, more, sizeof(more)) < 0)
-				more[0] = '\0';
-
-			return dump_unsupp_fd(&p, lfd, fdinfo, "anon", more);
-		}
+		else
+			return dump_unsupp_fd(&p, lfd, fdinfo, "anon", link);
 
 		return do_dump_gen_file(&p, lfd, ops, fdinfo);
 	}
@@ -357,7 +354,7 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {
-		if (statfs.f_type == PIPEFS_MAGIC)
+		if (p.fs_type == PIPEFS_MAGIC)
 			ops = &pipe_dump_ops;
 		else
 			ops = &fifo_dump_ops;
@@ -410,6 +407,76 @@ err2:
 err1:
 	xfree(lfds);
 err:
+	return ret;
+}
+
+static int predump_one_fd(int pid, int fd)
+{
+	int lfd, ret = 0;
+	struct statfs buf;
+	const struct fdtype_ops *ops;
+	char link[32];
+
+	/*
+	 * This should look like the dump_task_files_seized,
+	 * but since we pre-dump only *notify-s, we use the
+	 * enightened version without fds draining.
+	 */
+
+	lfd = open_proc(pid, "fd/%d", fd);
+	if (lfd < 0)
+		return 0; /* That's OK, it can be a socket */
+
+	if (fstatfs(lfd, &buf)) {
+		pr_perror("Can't fstatfs file");
+		return -1;
+	}
+
+	if (buf.f_type != ANON_INODE_FS_MAGIC)
+		goto out;
+
+	if (read_fd_link(lfd, link, sizeof(link)) < 0) {
+		ret = -1;
+		goto out;
+	}
+
+	if (is_inotify_link(link))
+		ops = &inotify_dump_ops;
+	else if (is_fanotify_link(link))
+		ops = &fanotify_dump_ops;
+	else
+		goto out;
+
+	pr_debug("Pre-dumping %d's %d fd\n", pid, fd);
+	ret = ops->pre_dump(pid, fd);
+out:
+	close(lfd);
+	return ret;
+}
+
+int predump_task_files(int pid)
+{
+	struct dirent *de;
+	DIR *fd_dir;
+	int ret = -1;
+
+	pr_info("Pre-dump fds for %d)\n", pid);
+
+	fd_dir = opendir_proc(pid, "fd");
+	if (!fd_dir)
+		return -1;
+
+	while ((de = readdir(fd_dir))) {
+		if (dir_dots(de))
+			continue;
+
+		if (predump_one_fd(pid, atoi(de->d_name)))
+			goto out;
+	}
+
+	ret = 0;
+out:
+	closedir(fd_dir);
 	return ret;
 }
 
@@ -466,14 +533,6 @@ int rst_file_params(int fd, FownEntry *fown, int flags)
 	return 0;
 }
 
-static struct list_head *select_ps_list(struct file_desc *desc, struct rst_info *ri)
-{
-	if (desc->ops->select_ps_list)
-		return desc->ops->select_ps_list(desc, ri);
-	else
-		return &ri->fds;
-}
-
 static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 {
 	struct fdinfo_list_entry *le, *new_le;
@@ -500,9 +559,13 @@ static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 		if (pid_rst_prio(new_le->pid, le->pid))
 			break;
 
+	if (fdesc->ops->collect_fd)
+		fdesc->ops->collect_fd(fdesc, new_le, rst_info);
+	else
+		collect_gen_fd(new_le, rst_info);
+
 	list_add_tail(&new_le->desc_list, &le->desc_list);
 	new_le->desc = fdesc;
-	list_add_tail(&new_le->ps_list, select_ps_list(fdesc, rst_info));
 
 	return 0;
 }
@@ -1022,11 +1085,6 @@ out_i:
 	close_safe(&ifd);
 out:
 	return ret;
-}
-
-int get_filemap_fd(int pid, VmaEntry *vma_entry)
-{
-	return open_reg_by_id(vma_entry->shmid);
 }
 
 int shared_fdt_prepare(struct pstree_item *item)

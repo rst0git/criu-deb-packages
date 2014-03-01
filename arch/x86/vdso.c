@@ -70,33 +70,10 @@ static int vdso_fill_self_symtable(struct vdso_symtable *s)
 
 int vdso_init(void)
 {
-	int ret = -1, fd;
-	off_t off;
-
 	if (vdso_fill_self_symtable(&vdso_sym_rt))
 		return -1;
 
-	fd = open_proc(getpid(), "pagemap");
-	if (fd < 0)
-		return -1;
-
-	off = (vdso_sym_rt.vma_start / PAGE_SIZE) * sizeof(u64);
-	if (lseek(fd, off, SEEK_SET) != off) {
-		pr_perror("Failed to seek address %lx\n", vdso_sym_rt.vma_start);
-		goto out;
-	}
-
-	ret = read(fd, &vdso_pfn, sizeof(vdso_pfn));
-	if (ret < 0 || ret != sizeof(vdso_pfn)) {
-		pr_perror("Can't read pme for pid %d", getpid());
-		ret = -1;
-	} else {
-		vdso_pfn = PME_PFRAME(vdso_pfn);
-		ret = 0;
-	}
-out:
-	close(fd);
-	return ret;
+	return vaddr_to_pfn(vdso_sym_rt.vma_start, &vdso_pfn);
 }
 
 /*
@@ -123,10 +100,14 @@ int parasite_fixup_vdso(struct parasite_ctl *ctl, pid_t pid,
 		if (!vma_area_is(vma, VMA_AREA_REGULAR))
 			continue;
 
-		if ((vma->vma.prot & VDSO_PROT) != VDSO_PROT)
+		if (vma_area_is(vma, VMA_FILE_SHARED) ||
+				vma_area_is(vma, VMA_FILE_PRIVATE))
 			continue;
 
-		if (vma->vma.start > TASK_SIZE)
+		if ((vma->e->prot & VDSO_PROT) != VDSO_PROT)
+			continue;
+
+		if (vma->e->start > TASK_SIZE)
 			continue;
 
 		/*
@@ -134,7 +115,7 @@ int parasite_fixup_vdso(struct parasite_ctl *ctl, pid_t pid,
 		 * otherwise if task never called for vdso functions
 		 * page frame number won't be reported.
 		 */
-		args->start = vma->vma.start;
+		args->start = vma->e->start;
 		args->len = vma_area_len(vma);
 
 		if (parasite_execute_daemon(PARASITE_CMD_CHECK_VDSO_MARK, ctl)) {
@@ -154,15 +135,8 @@ int parasite_fixup_vdso(struct parasite_ctl *ctl, pid_t pid,
 			continue;
 		}
 
-		off = (vma->vma.start / PAGE_SIZE) * sizeof(u64);
-		if (lseek(fd, off, SEEK_SET) != off) {
-			pr_perror("Failed to seek address %lx\n",
-				  (long unsigned int)vma->vma.start);
-			ret = -1;
-			goto err;
-		}
-
-		ret = read(fd, &pfn, sizeof(pfn));
+		off = (vma->e->start / PAGE_SIZE) * sizeof(u64);
+		ret = pread(fd, &pfn, sizeof(pfn), off);
 		if (ret < 0 || ret != sizeof(pfn)) {
 			pr_perror("Can't read pme for pid %d", pid);
 			ret = -1;
@@ -178,14 +152,14 @@ int parasite_fixup_vdso(struct parasite_ctl *ctl, pid_t pid,
 		if (pfn == vdso_pfn) {
 			if (!vma_area_is(vma, VMA_AREA_VDSO)) {
 				pr_debug("vdso: Restore status by pfn at %lx\n",
-					 (long)vma->vma.start);
-				vma->vma.status |= VMA_AREA_VDSO;
+					 (long)vma->e->start);
+				vma->e->status |= VMA_AREA_VDSO;
 			}
 		} else {
 			if (vma_area_is(vma, VMA_AREA_VDSO)) {
 				pr_debug("vdso: Drop mishinted status at %lx\n",
-					 (long)vma->vma.start);
-				vma->vma.status &= ~VMA_AREA_VDSO;
+					 (long)vma->e->start);
+				vma->e->status &= ~VMA_AREA_VDSO;
 			}
 		}
 	}
@@ -196,23 +170,23 @@ int parasite_fixup_vdso(struct parasite_ctl *ctl, pid_t pid,
 	 */
 	if (marked) {
 		pr_debug("vdso: Found marked at %lx (proxy at %lx)\n",
-			 (long)marked->vma.start, (long)proxy_addr);
+			 (long)marked->e->start, (long)proxy_addr);
 
 		/*
 		 * Don't forget to restore the proxy vdso status, since
 		 * it's being not recognized by the kernel as vdso.
 		 */
 		list_for_each_entry(vma, &vma_area_list->h, list) {
-			if (vma->vma.start == proxy_addr) {
-				vma->vma.status |= VMA_AREA_REGULAR | VMA_AREA_VDSO;
+			if (vma->e->start == proxy_addr) {
+				vma->e->status |= VMA_AREA_REGULAR | VMA_AREA_VDSO;
 				pr_debug("vdso: Restore proxy status at %lx\n",
-					 (long)vma->vma.start);
+					 (long)vma->e->start);
 				break;
 			}
 		}
 
 		pr_debug("vdso: Droppping marked vdso at %lx\n",
-			 (long)vma->vma.start);
+			 (long)vma->e->start);
 		list_del(&marked->list);
 		xfree(marked);
 	}

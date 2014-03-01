@@ -4,7 +4,7 @@ Upstream-Contact: CriuML <criu@openvz.org>
 Source: http://git.criu.org/?p=crtools.git
 
 Files: *
-Copyright: 2011-2013, Parallels Inc.
+Copyright: 2011-2014, Parallels Inc.
 License: GPL-2
 
 Files: debian/*

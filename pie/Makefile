@@ -14,8 +14,16 @@ restorer-obj-e		+= $(ARCH_DIR)/restorer.o
 restorer-obj-e		+= $(ARCH_DIR)/vdso-pie.o
 restorer-libs-e		+= $(SYSCALL-LIB)
 
+#
+# We can't provide proper mount implementation
+# in parasite code -- it requires run-time rellocation
+# applications, which is not the target of the
+# project.
+#
+CFLAGS			:= $(filter-out -pg,$(CFLAGS))
+
 cflags-y		+= -DCR_NOGLIBC -fpie  -Wa,--noexecstack -fno-stack-protector
-ifeq ($(ARCH), arm)
+ifeq ($(SRCARCH), arm)
 	cflags-y	+= -marm
 endif
 ASMFLAGS		+= -D__ASSEMBLY__

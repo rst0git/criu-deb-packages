@@ -7,12 +7,14 @@
 #include <errno.h>
 
 #include "log.h"
+#include "bug.h"
 #include "kerndat.h"
 #include "mem.h"
 #include "compiler.h"
 #include "sysctl.h"
 #include "asm/types.h"
 #include "cr_options.h"
+#include "util.h"
 
 dev_t kerndat_shmem_dev;
 
@@ -151,6 +153,34 @@ out:
 	return 0;
 }
 
+/* The page frame number (PFN) is constant for the zero page */
+u64 zero_page_pfn;
+
+static int init_zero_page_pfn()
+{
+	void *addr;
+	int ret;
+
+	addr = mmap(NULL, PAGE_SIZE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (addr == MAP_FAILED) {
+		pr_perror("Unable to map zero page");
+		return 0;
+	}
+
+	if (*((int *) addr) != 0) {
+		BUG();
+		return -1;
+	}
+
+	ret = vaddr_to_pfn((unsigned long)addr, &zero_page_pfn);
+	munmap(addr, PAGE_SIZE);
+
+	if (zero_page_pfn == 0)
+		ret = -1;
+
+	return ret;
+}
+
 int kerndat_init(void)
 {
 	int ret;
@@ -158,6 +188,8 @@ int kerndat_init(void)
 	ret = kerndat_get_shmemdev();
 	if (!ret)
 		ret = kerndat_get_dirty_track();
+	if (!ret)
+		ret = init_zero_page_pfn();
 
 	return ret;
 }

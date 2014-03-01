@@ -81,7 +81,7 @@ int main(int argc, char *argv[])
 	int ret = -1;
 	bool usage_error = true;
 	int opt, idx;
-	int log_level = 0;
+	int log_level = LOG_UNSET;
 	char *imgs_dir = ".";
 	char *work_dir = NULL;
 	static const char short_opts[] = "dsRf:F:t:p:hcD:o:n:v::xVr:jlW:L:";
@@ -192,6 +192,8 @@ int main(int argc, char *argv[])
 				goto bad_arg;
 			break;
 		case 'v':
+			if (log_level == LOG_UNSET)
+				log_level = 0;
 			if (optarg) {
 				if (optarg[0] == 'v')
 					/* handle -vvvvv */
@@ -228,20 +230,15 @@ int main(int argc, char *argv[])
 			break;
 		case 47:
 			{
-				struct veth_pair *n;
+				char *aux;
 
-				n = xmalloc(sizeof(*n));
-				if (n == NULL)
-					return 1;
-				n->outside = strchr(optarg, '=');
-				if (n->outside == NULL) {
-					xfree(n);
+				aux = strchr(optarg, '=');
+				if (aux == NULL)
 					goto bad_arg;
-				}
 
-				*n->outside++ = '\0';
-				n->inside = optarg;
-				list_add(&n->node, &opts.veth_pairs);
+				*aux = '\0';
+				if (veth_pair_add(optarg, aux + 1))
+					return 1;
 			}
 			break;
 		case 49:
@@ -339,16 +336,6 @@ int main(int argc, char *argv[])
 		if (!tree_id)
 			goto opt_pid_missing;
 
-		if (!opts.track_mem) {
-			pr_info("Enforcing memory tracking for pre-dump.\n");
-			opts.track_mem = true;
-		}
-
-		if (opts.final_state == TASK_DEAD) {
-			pr_info("Enforcing tasks run after pre-dump.\n");
-			opts.final_state = TASK_ALIVE;
-		}
-
 		return cr_pre_dump_tasks(tree_id) != 0;
 	}
 
@@ -373,7 +360,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (!strcmp(argv[optind], "page-server"))
-		return cr_page_server(opts.restore_detach) != 0;
+		return cr_page_server(opts.restore_detach) > 0 ? 0 : 1;
 
 	if (!strcmp(argv[optind], "service"))
 		return cr_service(opts.restore_detach);
@@ -450,6 +437,8 @@ usage:
 "  --track-mem           turn on memory changes tracker in kernel\n"
 "  --prev-images-dir DIR path to images from previous dump (relative to -D)\n"
 "  --page-server         send pages to page server (see options below as well)\n"
+"  --auto-dedup          when used on dump it will deduplicate \"old\" data in\n"
+"                        pages images of previous dump\n"
 "\n"
 "Page/Service server options:\n"
 "  --address ADDR        address of server or service\n"

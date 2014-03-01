@@ -41,9 +41,9 @@ struct eventpoll_tfd_file_info {
 static LIST_HEAD(eventpoll_tfds);
 
 /* Checks if file descriptor @lfd is eventfd */
-int is_eventpoll_link(int lfd)
+int is_eventpoll_link(char *link)
 {
-	return is_anon_link_type(lfd, "[eventpoll]");
+	return is_anon_link_type(link, "[eventpoll]");
 }
 
 static void pr_info_eventpoll_tfd(char *action, EventpollTfdEntry *e)
@@ -144,16 +144,17 @@ static int eventpoll_post_open(struct file_desc *d, int fd)
 	return 0;
 }
 
-static struct list_head *eventpoll_select_list(struct file_desc *d, struct rst_info *ri)
+static void eventpoll_collect_fd(struct file_desc *d,
+		struct fdinfo_list_entry *fle, struct rst_info *ri)
 {
-	return &ri->eventpoll;
+	list_add_tail(&fle->ps_list, &ri->eventpoll);
 }
 
 static struct file_desc_ops desc_ops = {
 	.type = FD_TYPES__EVENTPOLL,
 	.open = eventpoll_open,
 	.post_open = eventpoll_post_open,
-	.select_ps_list = eventpoll_select_list,
+	.collect_fd = eventpoll_collect_fd,
 };
 
 static int collect_one_epoll_tfd(void *o, ProtobufCMessage *msg)

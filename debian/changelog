@@ -1,3 +1,12 @@
+criu (1.2-1) experimental; urgency=low
+
+  * Merging upstream version 1.2.
+  * Updating year in copyright for 2014.
+  * Refreshing documentation.patch.
+  * Updating rules for logrotate files installation.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Sat, 01 Mar 2014 13:38:13 +0100
+
 criu (1.1-1) experimental; urgency=low
 
   * Merging upstream version 1.1.

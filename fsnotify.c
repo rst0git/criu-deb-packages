@@ -36,6 +36,7 @@
 #include "log.h"
 #include "list.h"
 #include "lock.h"
+#include "irmap.h"
 
 #include "protobuf.h"
 #include "protobuf/fsnotify.pb-c.h"
@@ -73,15 +74,81 @@ static LIST_HEAD(inotify_info_head);
 static LIST_HEAD(fanotify_info_head);
 
 /* Checks if file descriptor @lfd is inotify */
-int is_inotify_link(int lfd)
+int is_inotify_link(char *link)
 {
-	return is_anon_link_type(lfd, "inotify");
+	return is_anon_link_type(link, "inotify");
 }
 
 /* Checks if file descriptor @lfd is fanotify */
-int is_fanotify_link(int lfd)
+int is_fanotify_link(char *link)
 {
-	return is_anon_link_type(lfd, "[fanotify]");
+	return is_anon_link_type(link, "[fanotify]");
+}
+
+static void decode_handle(fh_t *handle, FhEntry *img)
+{
+	memzero(handle, sizeof(*handle));
+
+	handle->type	= img->type;
+	handle->bytes	= img->bytes;
+
+	memcpy(handle->__handle, img->handle,
+			min(pb_repeated_size(img, handle),
+				sizeof(handle->__handle)));
+}
+
+static int open_handle(unsigned int s_dev, unsigned long i_ino,
+		FhEntry *f_handle)
+{
+	int mntfd, fd = -1;
+	fh_t handle;
+
+	decode_handle(&handle, f_handle);
+
+	pr_debug("Opening fhandle %x:%Lx...\n",
+			s_dev, (unsigned long long)handle.__handle[0]);
+
+	mntfd = open_mount(s_dev);
+	if (mntfd < 0) {
+		pr_perror("Mount root for 0x%08x not found\n", s_dev);
+		goto out;
+	}
+
+	fd = sys_open_by_handle_at(mntfd, (void *)&handle, O_PATH);
+	if (fd < 0) {
+		errno = -fd;
+		pr_perror("Can't open file handle for 0x%08x:0x%016lx",
+				s_dev, i_ino);
+	}
+
+	close(mntfd);
+out:
+	return fd;
+}
+
+int check_open_handle(unsigned int s_dev, unsigned long i_ino,
+		FhEntry *f_handle)
+{
+	int fd;
+	char *path;
+
+	fd = open_handle(s_dev, i_ino, f_handle);
+	if (fd >= 0) {
+		close(fd);
+		pr_debug("\tHandle %x:%lx is openable\n", s_dev, i_ino);
+		return 0;
+	}
+
+	pr_warn("\tHandle %x:%lx cannot be opened\n", s_dev, i_ino);
+	path = irmap_lookup(s_dev, i_ino);
+	if (!path) {
+		pr_err("\tCan't dump that handle\n");
+		return -1;
+	}
+
+	pr_debug("\tDumping %s as path for handle\n", path);
+	f_handle->path = path;
+	return 0;
 }
 
 static int dump_inotify_entry(union fdinfo_entries *e, void *arg)
@@ -94,6 +161,10 @@ static int dump_inotify_entry(union fdinfo_entries *e, void *arg)
 	pr_info("\t[fhandle] bytes 0x%08x type 0x%08x __handle 0x%016"PRIx64":0x%016"PRIx64"\n",
 			we->f_handle->bytes, we->f_handle->type,
 			we->f_handle->handle[0], we->f_handle->handle[1]);
+
+	if (check_open_handle(we->s_dev, we->i_ino, we->f_handle))
+		return -1;
+
 	return pb_write_one(fdset_fd(glob_fdset, CR_FD_INOTIFY_WD), we, PB_INOTIFY_WD);
 }
 
@@ -112,9 +183,21 @@ static int dump_one_inotify(int lfd, u32 id, const struct fd_parms *p)
 	return parse_fdinfo(lfd, FD_TYPES__INOTIFY, dump_inotify_entry, &id);
 }
 
+static int pre_dump_inotify_entry(union fdinfo_entries *e, void *arg)
+{
+	InotifyWdEntry *we = &e->ify;
+	return irmap_queue_cache(we->s_dev, we->i_ino, we->f_handle);
+}
+
+static int pre_dump_one_inotify(int pid, int lfd)
+{
+	return parse_fdinfo_pid(pid, lfd, FD_TYPES__INOTIFY, pre_dump_inotify_entry, NULL);
+}
+
 const struct fdtype_ops inotify_dump_ops = {
 	.type		= FD_TYPES__INOTIFY,
 	.dump		= dump_one_inotify,
+	.pre_dump	= pre_dump_one_inotify,
 };
 
 static int dump_fanotify_entry(union fdinfo_entries *e, void *arg)
@@ -134,6 +217,9 @@ static int dump_fanotify_entry(union fdinfo_entries *e, void *arg)
 		pr_info("\t[fhandle] bytes 0x%08x type 0x%08x __handle 0x%016"PRIx64":0x%016"PRIx64"\n",
 			fme->ie->f_handle->bytes, fme->ie->f_handle->type,
 			fme->ie->f_handle->handle[0], fme->ie->f_handle->handle[1]);
+
+		if (check_open_handle(fme->s_dev, fme->ie->i_ino, fme->ie->f_handle))
+			return -1;
 	}
 
 	if (fme->type == MARK_TYPE__MOUNT) {
@@ -177,30 +263,33 @@ static int dump_one_fanotify(int lfd, u32 id, const struct fd_parms *p)
 	return pb_write_one(fdset_fd(glob_fdset, CR_FD_FANOTIFY_FILE), &fe, PB_FANOTIFY_FILE);
 }
 
+static int pre_dump_fanotify_entry(union fdinfo_entries *e, void *arg)
+{
+	FanotifyMarkEntry *fme = &e->ffy;
+
+	if (fme->type == MARK_TYPE__INODE)
+		return irmap_queue_cache(fme->s_dev, fme->ie->i_ino,
+				fme->ie->f_handle);
+	else
+		return 0;
+}
+
+static int pre_dump_one_fanotify(int pid, int lfd)
+{
+	return parse_fdinfo_pid(pid, lfd, FD_TYPES__FANOTIFY, pre_dump_fanotify_entry, NULL);
+}
+
 const struct fdtype_ops fanotify_dump_ops = {
 	.type		= FD_TYPES__FANOTIFY,
 	.dump		= dump_one_fanotify,
+	.pre_dump	= pre_dump_one_fanotify,
 };
-
-static void decode_handle(fh_t *handle, FhEntry *img)
-{
-	memzero(handle, sizeof(*handle));
-
-	handle->type	= img->type;
-	handle->bytes	= img->bytes;
-
-	memcpy(handle->__handle, img->handle,
-			min(pb_repeated_size(img, handle),
-				sizeof(handle->__handle)));
-}
 
 static char *get_mark_path(const char *who, struct file_remap *remap,
 			   FhEntry *f_handle, unsigned long i_ino,
 			   unsigned int s_dev, char *buf, int *target)
 {
 	char *path = NULL;
-	int mntfd = -1;
-	fh_t handle;
 
 	if (remap) {
 		pr_debug("\t\tRestore %s watch for 0x%08x:0x%016lx (via %s)\n",
@@ -208,20 +297,14 @@ static char *get_mark_path(const char *who, struct file_remap *remap,
 		return remap->path;
 	}
 
-	decode_handle(&handle, f_handle);
-
-	mntfd = open_mount(s_dev);
-	if (mntfd < 0) {
-		pr_err("Mount root for 0x%08x not found\n", s_dev);
-		goto err;
+	if (f_handle->path) {
+		pr_debug("\t\tRestore with path hint %s\n", f_handle->path);
+		return f_handle->path;
 	}
 
-	*target = sys_open_by_handle_at(mntfd, (void *)&handle, 0);
-	if (*target < 0) {
-		pr_perror("Can't open file handle for 0x%08x:0x%016lx",
-				s_dev, i_ino);
+	*target = open_handle(s_dev, i_ino, f_handle);
+	if (*target < 0)
 		goto err;
-	}
 
 	/*
 	 * fanotify/inotify open syscalls want path to attach
@@ -244,7 +327,6 @@ static char *get_mark_path(const char *who, struct file_remap *remap,
 				who, s_dev, i_ino, path, link);
 	}
 err:
-	close_safe(&mntfd);
 	return path;
 }
 

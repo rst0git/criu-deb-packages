@@ -118,21 +118,6 @@ extern void pr_vma(unsigned int loglevel, const struct vma_area *vma_area);
 	} while (0)
 #define pr_info_vma_list(head)	pr_vma_list(LOG_INFO, head)
 
-/*
- * Note since VMA_AREA_NONE = 0 we can skip assignment
- * here and simply rely on xzalloc
- */
-#define alloc_vma_area()					\
-	({							\
-		struct vma_area *p__ = xzalloc(sizeof(*p__));	\
-		if (p__) {					\
-			vma_entry__init(&p__->vma);		\
-			p__->vm_file_fd = -1;			\
-			p__->vma.fd	= -1;			\
-		}						\
-		p__;						\
-	})
-
 extern int move_img_fd(int *img_fd, int want_fd);
 extern int close_safe(int *fd);
 
@@ -234,8 +219,7 @@ static inline dev_t kdev_to_odev(u32 kdev)
 }
 
 extern int copy_file(int fd_in, int fd_out, size_t bytes);
-extern bool is_anon_inode(struct statfs *statfs);
-extern int is_anon_link_type(int lfd, char *type);
+extern int is_anon_link_type(char *link, char *type);
 
 #define is_hex_digit(c)				\
 	(((c) >= '0' && (c) <= '9')	||	\
@@ -272,6 +256,7 @@ extern void shfree_last(void *ptr);
 extern int run_scripts(char *action);
 
 extern int cr_system(int in, int out, int err, char *cmd, char *const argv[]);
+extern int cr_daemon(int nochdir, int noclose);
 extern int is_root_user(void);
 
 static inline bool dir_dots(struct dirent *de)
@@ -289,5 +274,7 @@ extern int read_fd_link(int lfd, char *buf, size_t size);
 
 #define USEC_PER_SEC	1000000L
 #define NSEC_PER_SEC    1000000000L
+
+int vaddr_to_pfn(unsigned long vaddr, u64 *pfn);
 
 #endif /* __CR_UTIL_H__ */
