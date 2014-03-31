@@ -1,3 +1,9 @@
+criu (1.2-2) unstable; urgency=low
+
+  * Building with dh --parallel.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Mon, 31 Mar 2014 19:45:46 +0200
+
 criu (1.2-1) experimental; urgency=low
 
   * Merging upstream version 1.2.
