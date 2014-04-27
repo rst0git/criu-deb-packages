@@ -12,6 +12,7 @@ static/maps00
 static/maps01
 static/maps02
 static/maps04
+static/maps_file_prot
 static/mprotect00
 static/mtime_mmap
 static/sleeping00
@@ -67,6 +68,7 @@ static/unlink_mmap02
 static/eventfs00
 static/signalfd00
 static/inotify00
+static/inotify_irmap
 static/fanotify00
 static/unbound_sock
 static/fifo-rowo-pair
@@ -122,6 +124,8 @@ static/pty03
 static/mountpoints
 ns/static/session00
 ns/static/session01
+ns/static/tempfs
+ns/static/bind-mount
 static/utsname
 static/ipc_namespace
 static/shm
@@ -156,6 +160,10 @@ chroot-file
 rtc
 tempfs
 maps007
+tempfs
+bind-mount
+mountpoints
+inotify_irmap
 "
 
 source $(readlink -f `dirname $0`/env.sh) || exit 1
@@ -179,6 +187,8 @@ PS_PORT=12345
 COMPILE_ONLY=0
 BATCH_TEST=0
 SPECIFIED_NAME_USED=0
+
+cat /proc/self/fdinfo/1 | grep -q mnt_id || export ZDTM_NOSUBNS=1
 
 zdtm_sep()
 { (
@@ -458,6 +468,15 @@ EOF
 		args="$args -L `pwd`/$tdir/lib"
 	fi
 
+	if [ -n "$AUTO_DEDUP" ]; then
+		args="$args --auto-dedup"
+		ps_args="--auto-dedup"
+	fi
+
+	if echo $tname | fgrep -q 'irmap'; then
+		args="$args --force-irmap"
+	fi
+
 	for i in `seq $ITERATIONS`; do
 		local dump_only=
 		local postdump=
@@ -470,7 +489,7 @@ EOF
 		[ -n "$DUMP_ONLY" ] && dump_only=1
 
 		if [ $PAGE_SERVER -eq 1 ]; then
-			$CRIU page-server -D $ddump -o page_server.log -v4 --port $PS_PORT --daemon || return 1
+			$CRIU page-server -D $ddump -o page_server.log -v4 --port $PS_PORT $ps_args --daemon || return 1
 			ps_pid=`lsof -s TCP:LISTEN -i :$PS_PORT -t`
 			ps -p "$ps_pid" -o cmd h | grep -q page-server || {
 				echo "Unable to determing PID of page-server"
@@ -480,9 +499,9 @@ EOF
 		fi
 
 		if [ -n "$SNAPSHOT" ]; then
-			snapopt=""
+			snapopt="--track-mem"
 			if [ "$i" -ne "$ITERATIONS" ]; then
-				snapopt="$snapopt -R --track-mem"
+				snapopt="$snapopt -R"
 				dump_only=1
 				[ -n "$PRE_DUMP" ] && dump_cmd="pre-dump"
 			fi
@@ -584,6 +603,18 @@ EOF
 		[ $sltime -lt 9 ] && sltime=$((sltime+1))
 	done
 
+	if [ -n "$AUTO_DEDUP" ]; then
+		for img in $ddump/pages-*.img; do
+			img_name="${img##*/}"
+			size=$(du -sh -BK "$img" | grep -Eo '[0-9]+' | head -1)
+			echo "Size of $img_name is $size"
+			if [ "$size" -ne 0 ]; then
+				echo "Check: $test, Auto-dedup: image size is more than 0"
+				return 2
+			fi
+		done
+	fi
+
 	cat $test.out
 	cat $test.out | grep -q PASS || return 2
 	[ "$CLEANUP" -ne 0 ] && rm -rf `dirname $ddump`
@@ -679,6 +710,7 @@ Options:
 	-v : Verbose mode
 	-P : Make pre-dump instead of dump on all iterations except the last one
 	-s : Make iterative snapshots. Only the last one will be checked.
+	--auto-dedup : Make auto-dedup on restore. Check sizes of pages imges, it must be zero.
 EOF
 }
 
@@ -751,6 +783,10 @@ while :; do
 		fi
 		PRE_DUMP=1
 		SNAPSHOT=1
+		shift
+		;;
+	  --auto-dedup)
+		AUTO_DEDUP=1
 		shift
 		;;
 	  -g)

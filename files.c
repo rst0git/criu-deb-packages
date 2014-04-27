@@ -33,6 +33,8 @@
 #include "namespaces.h"
 #include "tun.h"
 #include "fdset.h"
+#include "fs-magic.h"
+#include "proc_parse.h"
 
 #include "parasite.h"
 #include "parasite-syscall.h"
@@ -169,7 +171,7 @@ int do_dump_gen_file(struct fd_parms *p, int lfd,
 	e.fd	= p->fd;
 	e.flags = p->fd_flags;
 
-	ret = fd_id_generate(p->pid, &e, &p->stat);
+	ret = fd_id_generate(p->pid, &e, p);
 	if (ret == 1) /* new ID generated */
 		ret = ops->dump(lfd, e.id, p);
 
@@ -203,6 +205,7 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 {
 	int ret;
 	struct statfs fsbuf;
+	struct fdinfo_common fdinfo = { .mnt_id = -1 };
 
 	if (fstat(lfd, &p->stat) < 0) {
 		pr_perror("Can't stat fd %d", lfd);
@@ -214,16 +217,15 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 		return -1;
 	}
 
+	if (parse_fdinfo(lfd, FD_TYPES__UND, NULL, &fdinfo))
+		return -1;
+
 	p->fs_type	= fsbuf.f_type;
 	p->ctl		= ctl;
 	p->fd		= fd;
-	p->pos		= lseek(lfd, 0, SEEK_CUR);
-	ret = fcntl(lfd, F_GETFL);
-	if (ret == -1) {
-		pr_perror("Unable to get fd %d flags", lfd);
-		return -1;
-	}
-	p->flags	= ret;
+	p->pos		= fdinfo.pos;
+	p->flags	= fdinfo.flags;
+	p->mnt_id	= fdinfo.mnt_id;
 	p->pid		= ctl->pid.real;
 	p->fd_flags	= opts->flags;
 
@@ -282,21 +284,13 @@ static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
 	default: {
 		char more[32];
 
-		sprintf(more, "%d:%d", maj, minor(p->stat.st_dev));
+		sprintf(more, "%d:%d", maj, minor(p->stat.st_rdev));
 		return dump_unsupp_fd(p, lfd, fdinfo, "chr", more);
 	}
 	}
 
 	return do_dump_gen_file(p, lfd, ops, fdinfo);
 }
-
-#ifndef PIPEFS_MAGIC
-#define PIPEFS_MAGIC	0x50495045
-#endif
-
-#ifndef ANON_INODE_FS_MAGIC
-# define ANON_INODE_FS_MAGIC 0x09041934
-#endif
 
 static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_opts *opts,
 		       const int fdinfo)
@@ -412,34 +406,22 @@ err:
 
 static int predump_one_fd(int pid, int fd)
 {
-	int lfd, ret = 0;
-	struct statfs buf;
 	const struct fdtype_ops *ops;
-	char link[32];
+	char link[PATH_MAX], t[32];
+	int ret = 0;
 
-	/*
-	 * This should look like the dump_task_files_seized,
-	 * but since we pre-dump only *notify-s, we use the
-	 * enightened version without fds draining.
-	 */
-
-	lfd = open_proc(pid, "fd/%d", fd);
-	if (lfd < 0)
-		return 0; /* That's OK, it can be a socket */
-
-	if (fstatfs(lfd, &buf)) {
-		pr_perror("Can't fstatfs file");
+	snprintf(t, sizeof(t), "/proc/%d/fd/%d", pid, fd);
+	ret = readlink(t, link, sizeof(link));
+	if (ret < 0) {
+		pr_perror("Can't read link of fd %d", fd);
+		return -1;
+	} else if ((size_t)ret == sizeof(link)) {
+		pr_err("Buffer for read link of fd %d is too small\n", fd);
 		return -1;
 	}
+	link[ret] = 0;
 
-	if (buf.f_type != ANON_INODE_FS_MAGIC)
-		goto out;
-
-	if (read_fd_link(lfd, link, sizeof(link)) < 0) {
-		ret = -1;
-		goto out;
-	}
-
+	ret = 0;
 	if (is_inotify_link(link))
 		ops = &inotify_dump_ops;
 	else if (is_fanotify_link(link))
@@ -450,7 +432,6 @@ static int predump_one_fd(int pid, int fd)
 	pr_debug("Pre-dumping %d's %d fd\n", pid, fd);
 	ret = ops->pre_dump(pid, fd);
 out:
-	close(lfd);
 	return ret;
 }
 
@@ -608,9 +589,9 @@ int prepare_fd_pid(struct pstree_item *item)
 	INIT_LIST_HEAD(&rst_info->tty_slaves);
 
 	if (!fdinfo_per_id) {
-		fdinfo_fd = open_image(CR_FD_FDINFO, O_RSTR, pid);
+		fdinfo_fd = open_image(CR_FD_FDINFO, O_RSTR | O_OPT, pid);
 		if (fdinfo_fd < 0) {
-			if (errno == ENOENT)
+			if (fdinfo_fd == -ENOENT)
 				return 0;
 			return -1;
 		}

@@ -15,7 +15,6 @@
 #include <sys/vfs.h>
 
 #include <sys/sendfile.h>
-#include <sys/mman.h>
 
 #include <sched.h>
 #include <sys/resource.h>
@@ -241,21 +240,45 @@ static int collect_fds(pid_t pid, struct parasite_drain_fd *dfds)
 	return 0;
 }
 
+static int get_fd_mntid(int fd, int *mnt_id)
+{
+	struct fdinfo_common fdinfo = { .mnt_id = -1};
+
+	if (parse_fdinfo(fd, FD_TYPES__UND, NULL, &fdinfo))
+		return -1;
+
+	*mnt_id = fdinfo.mnt_id;
+	return 0;
+}
+
+static int fill_fd_params_special(int fd, struct fd_parms *p)
+{
+	*p = FD_PARMS_INIT;
+
+	if (fstat(fd, &p->stat) < 0) {
+		pr_perror("Can't fstat exe link");
+		return -1;
+	}
+
+	if (get_fd_mntid(fd, &p->mnt_id))
+		return -1;
+
+	return 0;
+}
+
 static int dump_task_exe_link(pid_t pid, MmEntry *mm)
 {
-	struct fd_parms params = FD_PARMS_INIT;
+	struct fd_parms params;
 	int fd, ret = 0;
 
 	fd = open_proc(pid, "exe");
 	if (fd < 0)
 		return -1;
 
-	if (fstat(fd, &params.stat) < 0) {
-		pr_perror("Can't fstat exe link");
+	if (fill_fd_params_special(fd, &params))
 		return -1;
-	}
 
-	if (fd_id_generate_special(&params.stat, &mm->exe_file_id))
+	if (fd_id_generate_special(&params, &mm->exe_file_id))
 		ret = dump_one_reg_file(fd, mm->exe_file_id, &params);
 
 	close(fd);
@@ -264,7 +287,7 @@ static int dump_task_exe_link(pid_t pid, MmEntry *mm)
 
 static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_fdset *fdset)
 {
-	struct fd_parms p = FD_PARMS_INIT;
+	struct fd_parms p;
 	FsEntry fe = FS_ENTRY__INIT;
 	int fd, ret;
 
@@ -275,12 +298,10 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_fd
 	if (fd < 0)
 		return -1;
 
-	if (fstat(fd, &p.stat) < 0) {
-		pr_perror("Can't stat cwd");
+	if (fill_fd_params_special(fd, &p))
 		return -1;
-	}
 
-	if (fd_id_generate_special(&p.stat, &fe.cwd_id)) {
+	if (fd_id_generate_special(&p, &fe.cwd_id)) {
 		ret = dump_one_reg_file(fd, fe.cwd_id, &p);
 		if (ret < 0)
 			return ret;
@@ -292,13 +313,10 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_fd
 	if (fd < 0)
 		return -1;
 
-	p = FD_PARMS_INIT;
-	if (fstat(fd, &p.stat) < 0) {
-		pr_perror("Can't stat root");
+	if (fill_fd_params_special(fd, &p))
 		return -1;
-	}
 
-	if (fd_id_generate_special(&p.stat, &fe.root_id)) {
+	if (fd_id_generate_special(&p, &fe.root_id)) {
 		ret = dump_one_reg_file(fd, fe.root_id, &p);
 		if (ret < 0)
 			return ret;
@@ -317,26 +335,20 @@ static inline u_int64_t encode_rlim(unsigned long val)
 	return val == RLIM_INFINITY ? -1 : val;
 }
 
-static int dump_task_rlims(int pid, struct cr_fdset *fds)
+static int dump_task_rlimits(int pid, TaskRlimitsEntry *rls)
 {
-	int res, fd;
+	int res;
 
-	fd = fdset_fd(fds, CR_FD_RLIMIT);
-
-	for (res = 0; res < RLIM_NLIMITS; res++) {
+	for (res = 0; res <rls->n_rlimits ; res++) {
 		struct rlimit lim;
-		RlimitEntry re = RLIMIT_ENTRY__INIT;
 
 		if (prlimit(pid, res, NULL, &lim)) {
 			pr_perror("Can't get rlimit %d", res);
 			return -1;
 		}
 
-		re.cur = encode_rlim(lim.rlim_cur);
-		re.max = encode_rlim(lim.rlim_max);
-
-		if (pb_write_one(fd, &re, PB_RLIMIT))
-			return -1;
+		rls->rlimits[res]->cur = encode_rlim(lim.rlim_cur);
+		rls->rlimits[res]->max = encode_rlim(lim.rlim_max);
 	}
 
 	return 0;
@@ -353,12 +365,12 @@ static int dump_filemap(pid_t pid, struct vma_area *vma_area,
 	BUG_ON(!vma_area->st);
 	p.stat = *vma_area->st;
 
-	if ((vma->prot & PROT_WRITE) && vma_entry_is(vma, VMA_FILE_SHARED))
-		p.flags = O_RDWR;
-	else
-		p.flags = O_RDONLY;
+	if (get_fd_mntid(vma_area->vm_file_fd, &p.mnt_id))
+		return -1;
 
-	if (fd_id_generate_special(&p.stat, &id))
+	/* Flags will be set during restore in get_filemap_fd() */
+
+	if (fd_id_generate_special(&p, &id))
 		ret = dump_one_reg_file(vma_area->vm_file_fd, id, &p);
 
 	vma->shmid = id;
@@ -367,7 +379,7 @@ static int dump_filemap(pid_t pid, struct vma_area *vma_area,
 
 static int check_sysvipc_map_dump(pid_t pid, VmaEntry *vma)
 {
-	if (current_ns_mask & CLONE_NEWIPC)
+	if (root_ns_mask & CLONE_NEWIPC)
 		return 0;
 
 	pr_err("Task %d with SysVIPC shmem map @%"PRIx64" doesn't live in IPC ns\n",
@@ -681,6 +693,10 @@ static int dump_task_core_all(struct pstree_item *item,
 	if (ret)
 		goto err;
 
+	ret = dump_task_rlimits(pid, core->tc->rlimits);
+	if (ret)
+		goto err;
+
 	ret = pb_write_one(fd_core, core, PB_CORE);
 	if (ret < 0)
 		goto err;
@@ -839,7 +855,7 @@ static pid_t item_ppid(const struct pstree_item *item)
 static int seize_threads(struct pstree_item *item,
 				struct pid *threads, int nr_threads)
 {
-	int i = 0, ret, j, nr_inprogress;
+	int i = 0, ret, j, nr_inprogress, nr_stopped = 0;
 
 	if ((item->state == TASK_DEAD) && (nr_threads > 1)) {
 		pr_err("Zombies with threads are not supported\n");
@@ -895,9 +911,13 @@ static int seize_threads(struct pstree_item *item,
 		}
 
 		if (ret == TASK_STOPPED) {
-			pr_err("Stopped threads not supported\n");
-			goto err;
+			nr_stopped++;
 		}
+	}
+
+	if (nr_stopped && nr_stopped != nr_inprogress) {
+		pr_err("Individually stopped threads not supported\n");
+		goto err;
 	}
 
 	return nr_inprogress;
@@ -978,7 +998,7 @@ err_close:
 	return -1;
 }
 
-static int collect_pstree_ids(void)
+int collect_pstree_ids(void)
 {
 	struct pstree_item *item;
 
@@ -1260,7 +1280,7 @@ static int dump_zombies(void)
 {
 	struct pstree_item *item;
 	int ret = -1;
-	int pidns = current_ns_mask & CLONE_NEWPID;
+	int pidns = root_ns_mask & CLONE_NEWPID;
 
 	if (pidns && set_proc_fd(get_service_fd(CR_PROC_FD_OFF)))
 		return -1;
@@ -1387,7 +1407,7 @@ static int dump_one_task(struct pstree_item *item)
 	int ret = -1;
 	struct parasite_dump_misc misc;
 	struct cr_fdset *cr_fdset = NULL;
-	struct parasite_drain_fd *dfds;
+	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
 	struct proc_status_creds cr;
 
@@ -1403,10 +1423,6 @@ static int dump_one_task(struct pstree_item *item)
 		 * zombies are dumped separately in dump_zombies()
 		 */
 		return 0;
-
-	dfds = xmalloc(sizeof(*dfds));
-	if (!dfds)
-		goto err_free;
 
 	pr_info("Obtaining task stat ... ");
 	ret = parse_pid_stat(pid, &pps_buf);
@@ -1429,6 +1445,10 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
+	dfds = xmalloc(sizeof(*dfds));
+	if (!dfds)
+		goto err;
+
 	ret = collect_fds(pid, dfds);
 	if (ret) {
 		pr_err("Collect fds (pid: %d) failed with %d\n", pid, ret);
@@ -1448,7 +1468,7 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
-	if (current_ns_mask & CLONE_NEWPID && root_item == item) {
+	if (root_ns_mask & CLONE_NEWPID && root_item == item) {
 		int pfd;
 
 		pfd = parasite_get_proc_fd_seized(parasite_ctl);
@@ -1527,13 +1547,13 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure;
 	}
 
-	ret = parasite_dump_itimers_seized(parasite_ctl, cr_fdset);
+	ret = parasite_dump_itimers_seized(parasite_ctl, item);
 	if (ret) {
 		pr_err("Can't dump itimers (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
-	ret = parasite_dump_posix_timers_seized(&proc_args, parasite_ctl, cr_fdset);
+	ret = parasite_dump_posix_timers_seized(&proc_args, parasite_ctl, item);
 	if (ret) {
 		pr_err("Can't dump posix timers (pid: %d)\n", pid);
 		goto err_cure;
@@ -1575,12 +1595,6 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
-	ret = dump_task_rlims(pid, cr_fdset);
-	if (ret) {
-		pr_err("Dump %d rlimits failed %d\n", pid, ret);
-		goto err;
-	}
-
 	ret = dump_task_signals(pid, item, cr_fdset);
 	if (ret) {
 		pr_err("Dump %d signals failed %d\n", pid, ret);
@@ -1590,7 +1604,6 @@ static int dump_one_task(struct pstree_item *item)
 	close_cr_fdset(&cr_fdset);
 err:
 	close_pid_proc();
-err_free:
 	free_mappings(&vmas);
 	xfree(dfds);
 	return ret;
@@ -1643,10 +1656,7 @@ int cr_pre_dump_tasks(pid_t pid)
 	if (gen_predump_ns_mask())
 		goto err;
 
-	if (collect_mount_info(pid))
-		goto err;
-
-	if (mntns_collect_root(root_item->pid.real))
+	if (collect_mnt_namespaces() < 0)
 		goto err;
 
 	for_each_pstree_item(item)
@@ -1753,10 +1763,7 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_file_locks())
 		goto err;
 
-	if (collect_mount_info(pid))
-		goto err;
-
-	if (mntns_collect_root(root_item->pid.real))
+	if (dump_mnt_namespaces() < 0)
 		goto err;
 
 	if (collect_sockets(pid))
@@ -1780,8 +1787,8 @@ int cr_dump_tasks(pid_t pid)
 	if (dump_pstree(root_item))
 		goto err;
 
-	if (current_ns_mask)
-		if (dump_namespaces(root_item, current_ns_mask) < 0)
+	if (root_ns_mask)
+		if (dump_namespaces(root_item, root_ns_mask) < 0)
 			goto err;
 
 	ret = cr_dump_shmem();

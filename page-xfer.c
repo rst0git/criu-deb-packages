@@ -167,7 +167,7 @@ static int page_server_serve(int sk)
 	while (1) {
 		struct page_server_iov pi;
 
-		ret = read(sk, &pi, sizeof(pi));
+		ret = recv(sk, &pi, sizeof(pi), MSG_WAITALL);
 		if (!ret)
 			break;
 
@@ -216,7 +216,7 @@ static int page_server_serve(int sk)
 			break;
 	}
 
-	if (!flushed) {
+	if (!ret && !flushed) {
 		pr_err("The data were not flushed\n");
 		ret = -1;
 	}
@@ -460,7 +460,7 @@ static int write_pagemap_loc(struct page_xfer *xfer,
 	pe.vaddr = encode_pointer(iov->iov_base);
 	pe.nr_pages = iov->iov_len / PAGE_SIZE;
 
-	if (opts.auto_dedup && !opts.use_page_server && xfer->parent != NULL) {
+	if (opts.auto_dedup && xfer->parent != NULL) {
 		ret = dedup_one_iovec(xfer->parent, iov);
 		if (ret == -1) {
 			pr_perror("Auto-deduplication failed");
@@ -656,9 +656,9 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, long id)
 			return -1;
 		}
 
-		ret = open_page_read_at(pfd, id, xfer->parent, O_RDWR);
+		ret = open_page_read_at(pfd, id, xfer->parent, O_RDWR, false);
 		if (ret) {
-			pr_perror("Can't dedup old image format");
+			pr_perror("No parent image found, though parent directory is set");
 			xfree(xfer->parent);
 			xfer->parent = NULL;
 			close(pfd);

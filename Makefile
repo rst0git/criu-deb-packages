@@ -1,5 +1,5 @@
 VERSION_MAJOR		:= 1
-VERSION_MINOR		:= 2
+VERSION_MINOR		:= 3-rc1
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -35,6 +35,8 @@ OBJCOPY		:= $(CROSS_COMPILE)objcopy
 
 CFLAGS		+= $(USERCFLAGS)
 
+VDSO_O		:= vdso.o
+
 #
 # Fetch ARCH from the uname if not yet set
 #
@@ -69,6 +71,8 @@ ifeq ($(shell echo $(ARCH) | sed -e 's/arm.*/arm/'),arm)
 	ifeq ($(ARMV),7)
 		USERCFLAGS += -march=armv7-a
 	endif
+
+	VDSO_O       := vdso-stub.o
 endif
 
 SRCARCH		?= $(ARCH)
@@ -117,6 +121,7 @@ CRIU-INC	:= lib/criu.h include/criu-plugin.h include/criu-log.h protobuf/rpc.pro
 export CC MAKE CFLAGS LIBS SRCARCH DEFINES MAKEFLAGS CRIU-SO
 export SRC_DIR SYSCALL-LIB SH RM ARCH_DIR OBJCOPY LDARCH LD
 export cflags-y
+export VDSO_O
 
 include Makefile.inc
 include Makefile.config
@@ -175,6 +180,10 @@ PROGRAM-BUILTINS	+= built-in.o
 $(ARCH_DIR)/vdso-pie.o: pie
 	$(Q) $(MAKE) $(build)=pie $(ARCH_DIR)/vdso-pie.o
 PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-pie.o
+pie/$(VDSO_O): pie
+	$(Q) $(MAKE) $(build)=pie pie/$(VDSO_O)
+PROGRAM-BUILTINS	+= pie/$(VDSO_O)
+
 
 $(PROGRAM): $(SYSCALL-LIB) $(ARCH-LIB) $(PROGRAM-BUILTINS)
 	$(E) "  LINK    " $@
@@ -256,6 +265,7 @@ install: $(PROGRAM) install-man
 	$(Q) mkdir -p $(DESTDIR)$(SYSTEMDUNITDIR)
 	$(Q) install -m 644 scripts/sd/criu.socket $(DESTDIR)$(SYSTEMDUNITDIR)
 	$(Q) install -m 644 scripts/sd/criu.service $(DESTDIR)$(SYSTEMDUNITDIR)
+	$(Q) mkdir -p $(DESTDIR)$(LOGROTATEDIR)
 	$(Q) install -m 644 scripts/logrotate.d/criu-service $(DESTDIR)$(LOGROTATEDIR)
 
 install-man:

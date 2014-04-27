@@ -23,6 +23,7 @@
 #include "util.h"
 #include "image.h"
 #include "stats.h"
+#include "pstree.h"
 
 #include "protobuf.h"
 #include "protobuf/fsnotify.pb-c.h"
@@ -55,6 +56,8 @@ static struct irmap *cache[IRMAP_CACHE_SIZE];
 static struct irmap hints[] = {
 	{ .path = "/etc", .nr_kids = -1, },
 	{ .path = "/var/spool", .nr_kids = -1, },
+	{ .path = "/lib/udev", .nr_kids = -1, },
+	{ .path = "/no-such-path", .nr_kids = -1, },
 	{ },
 };
 
@@ -64,10 +67,13 @@ static struct irmap hints[] = {
 static int irmap_update_stat(struct irmap *i)
 {
 	struct stat st;
+	int mntns_root;
 	unsigned hv;
 
 	if (i->ino)
 		return 0;
+
+	mntns_root = get_service_fd(ROOT_FD_OFF);
 
 	pr_debug("Refresh stat for %s\n", i->path);
 	if (fstatat(mntns_root, i->path + 1, &st, AT_SYMLINK_NOFOLLOW)) {
@@ -94,12 +100,14 @@ static int irmap_update_stat(struct irmap *i)
  */
 static int irmap_update_dir(struct irmap *t)
 {
-	int fd, nr = 0, dlen;
+	int fd, nr = 0, dlen, mntns_root;
 	DIR *dfd;
 	struct dirent *de;
 
 	if (t->nr_kids >= 0)
 		return 0;
+
+	mntns_root = get_service_fd(ROOT_FD_OFF);
 
 	pr_debug("Refilling %s dir\n", t->path);
 	fd = openat(mntns_root, t->path + 1, O_RDONLY);
@@ -182,6 +190,9 @@ static struct irmap *irmap_scan(struct irmap *t, unsigned int dev, unsigned long
 static int irmap_revalidate(struct irmap *c, struct irmap **p)
 {
 	struct stat st;
+	int mntns_root;
+
+	mntns_root = get_service_fd(ROOT_FD_OFF);
 
 	pr_debug("Revalidate stat for %s\n", c->path);
 	if (fstatat(mntns_root, c->path + 1, &st, AT_SYMLINK_NOFOLLOW)) {
@@ -212,7 +223,12 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 	char *path = NULL;
 	int hv;
 
+	s_dev = kdev_to_odev(s_dev);
+
 	pr_debug("Resolving %x:%lx path\n", s_dev, i_ino);
+
+	if (__mntns_get_root_fd(root_item->pid.real) < 0)
+		goto out;
 
 	timing_start(TIME_IRMAP_RESOLVE);
 
@@ -294,8 +310,10 @@ int irmap_predump_run(void)
 	for (ip = predump_queue; ip; ip = ip->next) {
 		pr_debug("\tchecking %x:%lx\n", ip->dev, ip->ino);
 		ret = check_open_handle(ip->dev, ip->ino, &ip->fh);
-		if (ret)
+		if (ret) {
+			pr_err("Failed to resolve %x:%lx\n", ip->dev, ip->ino);
 			break;
+		}
 
 		if (ip->fh.path) {
 			IrmapCacheEntry ic = IRMAP_CACHE_ENTRY__INIT;
@@ -354,7 +372,7 @@ static int open_irmap_cache(int *fd)
 
 	pr_info("Searching irmap cache in work dir\n");
 in:
-	*fd = open_image_at(dir, CR_FD_IRMAP_CACHE, O_RSTR);
+	*fd = open_image_at(dir, CR_FD_IRMAP_CACHE, O_RSTR | O_OPT);
 	if (dir != AT_FDCWD)
 		close(dir);
 
@@ -363,14 +381,14 @@ in:
 		return 1;
 	}
 
-	if (errno == ENOENT && dir == AT_FDCWD) {
+	if (*fd == -ENOENT && dir == AT_FDCWD) {
 		pr_info("Searching irmap cache in parent\n");
 		dir = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
 		if (dir >= 0)
 			goto in;
 	}
 
-	if (errno != ENOENT)
+	if (*fd != -ENOENT)
 		return -1;
 
 	pr_info("No irmap cache\n");

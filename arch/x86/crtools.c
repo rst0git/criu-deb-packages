@@ -7,6 +7,7 @@
 #include "asm/types.h"
 #include "asm/fpu.h"
 
+#include "cr_options.h"
 #include "compiler.h"
 #include "ptrace.h"
 #include "parasite-syscall.h"
@@ -226,28 +227,37 @@ err:
 
 int arch_alloc_thread_info(CoreEntry *core)
 {
-	ThreadInfoX86 *thread_info;
-	UserX86RegsEntry *gpregs;
-	UserX86FpregsEntry *fpregs;
+	size_t sz;
+	bool with_fpu, with_xsave = false;
+	void *m;
+	ThreadInfoX86 *ti = NULL;
 
-	thread_info = xmalloc(sizeof(*thread_info));
-	if (!thread_info)
-		goto err;
-	thread_info_x86__init(thread_info);
-	core->thread_info = thread_info;
 
-	gpregs = xmalloc(sizeof(*gpregs));
-	if (!gpregs)
-		goto err;
-	user_x86_regs_entry__init(gpregs);
-	thread_info->gpregs = gpregs;
+	with_fpu = cpu_has_feature(X86_FEATURE_FPU);
 
-	if (cpu_has_feature(X86_FEATURE_FPU)) {
-		fpregs = xmalloc(sizeof(*fpregs));
-		if (!fpregs)
-			goto err;
+	sz = sizeof(ThreadInfoX86) + sizeof(UserX86RegsEntry);
+	if (with_fpu) {
+		sz += sizeof(UserX86FpregsEntry);
+		with_xsave = cpu_has_feature(X86_FEATURE_XSAVE);
+		if (with_xsave)
+			sz += sizeof(UserX86XsaveEntry);
+	}
+
+	m = xmalloc(sz);
+	if (!m)
+		return -1;
+
+	ti = core->thread_info = xptr_pull(&m, ThreadInfoX86);
+	thread_info_x86__init(ti);
+	ti->gpregs = xptr_pull(&m, UserX86RegsEntry);
+	user_x86_regs_entry__init(ti->gpregs);
+
+	if (with_fpu) {
+		UserX86FpregsEntry *fpregs;
+
+		fpregs = ti->fpregs = xptr_pull(&m, UserX86FpregsEntry);
 		user_x86_fpregs_entry__init(fpregs);
-		thread_info->fpregs = fpregs;
+
 		/* These are numbers from kernel */
 		fpregs->n_st_space	= 32;
 		fpregs->n_xmm_space	= 64;
@@ -258,13 +268,11 @@ int arch_alloc_thread_info(CoreEntry *core)
 		if (!fpregs->st_space || !fpregs->xmm_space)
 			goto err;
 
-		if (cpu_has_feature(X86_FEATURE_XSAVE)) {
+		if (with_xsave) {
 			UserX86XsaveEntry *xsave;
-			xsave = xmalloc(sizeof(*xsave));
-			if (!xsave)
-				goto err;
+
+			xsave = fpregs->xsave = xptr_pull(&m, UserX86XsaveEntry);
 			user_x86_xsave_entry__init(xsave);
-			thread_info->fpregs->xsave = xsave;
 
 			xsave->n_ymmh_space = 64;
 			xsave->ymmh_space = xzalloc(pb_repeated_size(xsave, ymmh_space));
@@ -280,20 +288,14 @@ err:
 
 void arch_free_thread_info(CoreEntry *core)
 {
-	if (core->thread_info) {
-		if (core->thread_info->fpregs) {
-			if (core->thread_info->fpregs->xsave)
-				xfree(core->thread_info->fpregs->xsave->ymmh_space);
-			xfree(core->thread_info->fpregs->xsave);
-			xfree(core->thread_info->fpregs->st_space);
-			xfree(core->thread_info->fpregs->xmm_space);
-			xfree(core->thread_info->fpregs->padding);
-		}
-		xfree(core->thread_info->gpregs);
-		xfree(core->thread_info->fpregs);
-		xfree(core->thread_info);
-		core->thread_info = NULL;
-	}
+	if (!core->thread_info)
+		return;
+
+	if (core->thread_info->fpregs->xsave)
+		xfree(core->thread_info->fpregs->xsave->ymmh_space);
+	xfree(core->thread_info->fpregs->st_space);
+	xfree(core->thread_info->fpregs->xmm_space);
+	xfree(core->thread_info);
 }
 
 static bool valid_xsave_frame(CoreEntry *core)
@@ -317,12 +319,8 @@ static bool valid_xsave_frame(CoreEntry *core)
 	}
 
 	if (cpu_has_feature(X86_FEATURE_XSAVE)) {
-		if (!core->thread_info->fpregs->xsave) {
-			pr_err("FPU xsave area is missing, "
-			       "but host cpu requires it\n");
-			return false;
-		}
-		if (core->thread_info->fpregs->xsave->n_ymmh_space < ARRAY_SIZE(x->ymmh.ymmh_space)) {
+		if (core->thread_info->fpregs->xsave &&
+		    core->thread_info->fpregs->xsave->n_ymmh_space < ARRAY_SIZE(x->ymmh.ymmh_space)) {
 			pr_err("Corruption in FPU ymmh_space area "
 			       "(got %li but %li expected)\n",
 			       (long)core->thread_info->fpregs->xsave->n_ymmh_space,
@@ -330,12 +328,19 @@ static bool valid_xsave_frame(CoreEntry *core)
 			return false;
 		}
 	} else {
+		/*
+		 * If the image has xsave area present then CPU we're restoring
+		 * on must have X86_FEATURE_XSAVE feature until explicitly
+		 * stated in options.
+		 */
 		if (core->thread_info->fpregs->xsave) {
-			pr_err("FPU xsave area present, "
-			       "but host cpu doesn't support it\n");
-			return false;
+			if (opts.cpu_cap & CPU_CAP_FPU) {
+				pr_err("FPU xsave area present, "
+				       "but host cpu doesn't support it\n");
+				return false;
+			} else
+				pr_warn_once("FPU is about to restore ignoring ymm state!\n");
 		}
-		return true;
 	}
 
 	return true;
@@ -402,7 +407,13 @@ int restore_fpu(struct rt_sigframe *sigframe, CoreEntry *core)
 		void *magic2;
 
 		x->xsave_hdr.xstate_bv	= XSTATE_FP | XSTATE_SSE | XSTATE_YMM;
-		assign_array(x->ymmh, core->thread_info->fpregs->xsave, ymmh_space);
+
+		/*
+		 * fpregs->xsave pointer might not present on image so we
+		 * simply clear out all ymm registers.
+		 */
+		if (core->thread_info->fpregs->xsave)
+			assign_array(x->ymmh, core->thread_info->fpregs->xsave, ymmh_space);
 
 		fpx_sw->magic1		= FP_XSTATE_MAGIC1;
 		fpx_sw->xstate_bv	= XSTATE_FP | XSTATE_SSE | XSTATE_YMM;

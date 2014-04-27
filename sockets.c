@@ -19,6 +19,7 @@
 #include "sk-packet.h"
 #include "namespaces.h"
 #include "net.h"
+#include "fs-magic.h"
 
 #ifndef NETLINK_SOCK_DIAG
 #define NETLINK_SOCK_DIAG NETLINK_INET_DIAG
@@ -26,10 +27,6 @@
 
 #ifndef SOCK_DIAG_BY_FAMILY
 #define SOCK_DIAG_BY_FAMILY 20
-#endif
-
-#ifndef SOCKFS_MAGIC
-#define SOCKFS_MAGIC	0x534F434B
 #endif
 
 #define SK_HASH_SIZE		32
@@ -525,7 +522,7 @@ int collect_sockets(int pid)
 	int nl;
 	struct sock_diag_req req;
 
-	if (current_ns_mask & CLONE_NEWNET) {
+	if (root_ns_mask & CLONE_NEWNET) {
 		pr_info("Switching to %d's net for collecting sockets\n", pid);
 
 		if (switch_ns(pid, &net_ns_desc, &rst))

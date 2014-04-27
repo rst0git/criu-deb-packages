@@ -45,6 +45,8 @@ void init_opts(void)
 	opts.final_state = TASK_DEAD;
 	INIT_LIST_HEAD(&opts.veth_pairs);
 	INIT_LIST_HEAD(&opts.scripts);
+
+	opts.cpu_cap = CPU_CAP_ALL;
 }
 
 static int parse_ns_string(const char *ptr)
@@ -75,11 +77,49 @@ bad_ns:
 	return -1;
 }
 
+static int parse_cpu_cap(struct cr_options *opts, const char *optarg)
+{
+	bool inverse = false;
+
+#define ____cpu_set_cap(__opts, __cap, __inverse)	\
+	do {						\
+		if ((__inverse))			\
+			(__opts)->cpu_cap &= ~(__cap);	\
+		else					\
+			(__opts)->cpu_cap |=  (__cap);	\
+	} while (0)
+
+	for (; *optarg; optarg++) {
+		if (optarg[0] == '^') {
+			inverse = !inverse;
+			continue;
+		} else if (optarg[0] == ',') {
+			inverse = false;
+			continue;
+		}
+
+		if (!strncmp(optarg, "fpu", 3))
+			____cpu_set_cap(opts, CPU_CAP_FPU, inverse);
+		if (!strncmp(optarg, "all", 3))
+			____cpu_set_cap(opts, CPU_CAP_ALL, inverse);
+		else
+			goto Esyntax;
+	}
+#undef ____cpu_set_cap
+
+	return 0;
+
+Esyntax:
+	pr_err("Unknown FPU mode `%s' selected\n", optarg);
+	return -1;
+}
+
 int main(int argc, char *argv[])
 {
 	pid_t pid = 0, tree_id = 0;
 	int ret = -1;
 	bool usage_error = true;
+	bool has_exec_cmd = false;
 	int opt, idx;
 	int log_level = LOG_UNSET;
 	char *imgs_dir = ".";
@@ -121,6 +161,9 @@ int main(int argc, char *argv[])
 		{ "track-mem", no_argument, 0, 55},
 		{ "auto-dedup", no_argument, 0, 56},
 		{ "libdir", required_argument, 0, 'L'},
+		{ "cpu-cap", required_argument, 0, 57},
+		{ "force-irmap", no_argument, 0, 58},
+		{ "exec-cmd", no_argument, 0, 59},
 		{ },
 	};
 
@@ -279,11 +322,21 @@ int main(int argc, char *argv[])
 		case 56:
 			opts.auto_dedup = true;
 			break;
+		case 57:
+			if (parse_cpu_cap(&opts, optarg))
+				goto usage;
+			break;
+		case 58:
+			opts.force_irmap = true;
+			break;
 		case 54:
 			opts.check_ms_kernel = true;
 			break;
 		case 'L':
 			opts.libdir = optarg;
+			break;
+		case 59:
+			has_exec_cmd = true;
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
@@ -304,6 +357,27 @@ int main(int argc, char *argv[])
 	if (optind >= argc) {
 		pr_msg("Error: command is required\n");
 		goto usage;
+	}
+
+	if (has_exec_cmd) {
+		if (argc - optind <= 1) {
+			pr_msg("Error: --exec-cmd requires a command\n");
+			goto usage;
+		}
+
+		if (strcmp(argv[optind], "restore")) {
+			pr_msg("Error: --exec-cmd is available for the restore command only\n");
+			goto usage;
+		}
+
+		if (opts.restore_detach) {
+			pr_msg("Error: --restore-detached and --exec-cmd cannot be used together\n");
+			goto usage;
+		}
+
+		opts.exec_cmd = xmalloc((argc - optind) * sizeof(char *));
+		memcpy(opts.exec_cmd, &argv[optind + 1], (argc - optind - 1) * sizeof(char *));
+		opts.exec_cmd[argc - optind - 1] = NULL;
 	}
 
 	/* We must not open imgs dir, if service is called */
@@ -342,7 +416,16 @@ int main(int argc, char *argv[])
 	if (!strcmp(argv[optind], "restore")) {
 		if (tree_id)
 			pr_warn("Using -t with criu restore is obsoleted\n");
-		return cr_restore_tasks() != 0;
+
+		ret = cr_restore_tasks();
+		if (ret == 0 && opts.exec_cmd) {
+			close_pid_proc();
+			execvp(opts.exec_cmd[0], opts.exec_cmd);
+			pr_perror("Failed to exec command %s", opts.exec_cmd[0]);
+			ret = 1;
+		}
+
+		return ret != 0;
 	}
 
 	if (!strcmp(argv[optind], "show"))
@@ -410,6 +493,10 @@ usage:
 "     --pidfile FILE     write root task, service or page-server pid to FILE\n"
 "  -W|--work-dir DIR     directory to cd and write logs/pidfiles/stats to\n"
 "                        (if not specified, value of --images-dir is used)\n"
+"     --cpu-cap CAP      require certain cpu capability. CAP: may be one of:\n"
+"                        'fpu','all'. To disable capability, prefix it with '^'.\n"
+"     --exec-cmd         execute the command specified after '--' on successful\n"
+"                        restore making it the parent of the restored process\n"
 "\n"
 "* Special resources support:\n"
 "  -x|--" USK_EXT_PARAM "      allow external unix connections\n"
@@ -423,6 +510,7 @@ usage:
 "  -j|--" OPT_SHELL_JOB "        allow to dump and restore shell jobs\n"
 "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
 "  -L|--libdir           path to a plugin directory (by default " CR_PLUGIN_DEFAULT ")\n"
+"  --force-irmap         force resolving names for inotify/fsnotify watches\n"
 "\n"
 "* Logging:\n"
 "  -o|--log-file FILE    log file name\n"
@@ -439,6 +527,8 @@ usage:
 "  --page-server         send pages to page server (see options below as well)\n"
 "  --auto-dedup          when used on dump it will deduplicate \"old\" data in\n"
 "                        pages images of previous dump\n"
+"                        when used on restore, as soon as page is restored, it\n"
+"                        will be punched from the image.\n"
 "\n"
 "Page/Service server options:\n"
 "  --address ADDR        address of server or service\n"

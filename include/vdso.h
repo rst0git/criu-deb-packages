@@ -9,23 +9,6 @@
 
 #define VDSO_PROT		(PROT_READ | PROT_EXEC)
 
-/*
- * This is a minimal amount of symbols
- * we should support at the moment.
- */
-enum {
-	VDSO_SYMBOL_GETTIMEOFDAY,
-	VDSO_SYMBOL_GETCPU,
-	VDSO_SYMBOL_CLOCK_GETTIME,
-	VDSO_SYMBOL_TIME,
-
-	VDSO_SYMBOL_MAX
-};
-
-#define VDSO_SYMBOL_GETTIMEOFDAY_NAME	"__vdso_gettimeofday"
-#define VDSO_SYMBOL_GETCPU_NAME		"__vdso_getcpu"
-#define VDSO_SYMBOL_CLOCK_GETTIME_NAME	"__vdso_clock_gettime"
-#define VDSO_SYMBOL_TIME_NAME		"__vdso_time"
 
 #define VDSO_BAD_ADDR		(-1ul)
 #define VDSO_BAD_PFN		(-1ull)
@@ -110,5 +93,8 @@ static inline void vdso_put_mark(void *where, unsigned long proxy_addr)
 extern struct vdso_symtable vdso_sym_rt;
 extern u64 vdso_pfn;
 extern int vdso_init(void);
+extern int vdso_remap(char *who, unsigned long from, unsigned long to, size_t size);
+extern int vdso_fill_symtable(char *mem, size_t size, struct vdso_symtable *t);
+extern int vdso_proxify(char *who, struct vdso_symtable *sym_rt, VmaEntry *vma_entry, unsigned long vdso_rt_parked_at);
 
 #endif /* __CR_VDSO_H__ */

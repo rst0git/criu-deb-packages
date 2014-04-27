@@ -86,8 +86,8 @@ static struct pstree_item *current;
 static int restore_task_with_children(void *);
 static int sigreturn_restore(pid_t pid, CoreEntry *core);
 static int prepare_restorer_blob(void);
-static int prepare_rlimits(int pid);
-static int prepare_posix_timers(int pid);
+static int prepare_rlimits(int pid, CoreEntry *core);
+static int prepare_posix_timers(int pid, CoreEntry *core);
 static int prepare_signals(int pid);
 
 static int shmem_remap(void *old_addr, void *new_addr, unsigned long size)
@@ -217,7 +217,7 @@ err:
 }
 
 /* Map a private vma, if it is not mapped by a parent yet */
-static int map_private_vma(pid_t pid, struct vma_area *vma, void *tgt_addr,
+static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
 			struct vma_area **pvma, struct list_head *pvma_list)
 {
 	int ret;
@@ -284,7 +284,7 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void *tgt_addr,
 		pr_info("Map 0x%016"PRIx64"-0x%016"PRIx64" 0x%016"PRIx64" vma\n",
 			vma->e->start, vma->e->end, vma->e->pgoff);
 
-		addr = mmap(tgt_addr, size,
+		addr = mmap(*tgt_addr, size,
 				vma->e->prot | PROT_WRITE,
 				vma->e->flags | MAP_FIXED,
 				vma->e->fd, vma->e->pgoff);
@@ -301,8 +301,8 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void *tgt_addr,
 		vma->ppage_bitmap = p->page_bitmap;
 
 		addr = mremap(paddr, size, size,
-				MREMAP_FIXED | MREMAP_MAYMOVE, tgt_addr);
-		if (addr != tgt_addr) {
+				MREMAP_FIXED | MREMAP_MAYMOVE, *tgt_addr);
+		if (addr != *tgt_addr) {
 			pr_perror("Unable to remap a private vma");
 			return -1;
 		}
@@ -321,7 +321,8 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void *tgt_addr,
 	if (vma_area_is(vma, VMA_FILE_PRIVATE))
 		close(vma->e->fd);
 
-	return size;
+	*tgt_addr += size;
+	return 0;
 }
 
 static int restore_priv_vma_content(pid_t pid)
@@ -338,7 +339,9 @@ static int restore_priv_vma_content(pid_t pid)
 	struct page_read pr;
 
 	vma = list_first_entry(vmas, struct vma_area, list);
-	ret = open_page_read(pid, &pr);
+
+	ret = open_page_read(pid, &pr,
+			opts.auto_dedup ? O_RDWR : O_RSTR, false);
 	if (ret)
 		return -1;
 
@@ -516,11 +519,9 @@ static int prepare_mappings(int pid)
 		if (!vma_priv(vma->e))
 			continue;
 
-		ret = map_private_vma(pid, vma, addr, &pvma, parent_vmas);
+		ret = map_private_vma(pid, vma, &addr, &pvma, parent_vmas);
 		if (ret < 0)
 			break;
-
-		addr += ret;
 	}
 
 	if (ret >= 0)
@@ -712,10 +713,10 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (prepare_signals(pid))
 		return -1;
 
-	if (prepare_posix_timers(pid))
+	if (prepare_posix_timers(pid, core))
 		return -1;
 
-	if (prepare_rlimits(pid) < 0)
+	if (prepare_rlimits(pid, core) < 0)
 		return -1;
 
 	return sigreturn_restore(pid, core);
@@ -1236,9 +1237,6 @@ static int restore_task_with_children(void *_arg)
 		if (restore_finish_stage(CR_STATE_RESTORE_NS) < 0)
 			exit(1);
 
-		if (collect_mount_info(getpid()))
-			exit(1);
-
 		if (prepare_namespace(current, ca->clone_flags))
 			exit(1);
 
@@ -1248,10 +1246,13 @@ static int restore_task_with_children(void *_arg)
 		 * Thus -- mount proc at custom location for any new namespace
 		 */
 		if (mount_proc())
+			goto err;
+
+		if (close_old_fds(current))
 			exit(1);
 
 		if (root_prepare_shared())
-			exit(1);
+			goto err;
 	}
 
 	/*
@@ -1264,11 +1265,11 @@ static int restore_task_with_children(void *_arg)
 	ret = sigprocmask(SIG_BLOCK, &blockmask, NULL);
 	if (ret) {
 		pr_perror("%d: Can't block signals", current->pid.virt);
-		exit(1);
+		goto err;
 	}
 
 	if (prepare_mappings(pid))
-		exit(1);
+		goto err;
 
 	if (!(ca->clone_flags & CLONE_FILES)) {
 		ret = close_old_fds(current);
@@ -1277,20 +1278,31 @@ static int restore_task_with_children(void *_arg)
 	}
 
 	if (create_children_and_session())
-		exit(1);
+		goto err;
+
+	if (restore_task_mnt_ns(current))
+		goto err;
 
 	if (unmap_guard_pages())
-		exit(1);
+		goto err;
 
 	restore_pgid();
 
 	if (restore_finish_stage(CR_STATE_FORKING) < 0)
-		exit(1);
+		goto err;
+
+	if (current->parent == NULL && fini_mnt_ns())
+		exit (1);
 
 	if (current->state == TASK_HELPER)
 		return 0;
 
 	return restore_one_task(current->pid.virt, ca->core);
+err:
+	if (current->parent == NULL)
+		fini_mnt_ns();
+
+	exit(1);
 }
 
 static inline int stage_participants(int next_stage)
@@ -1463,14 +1475,14 @@ static int restore_root_task(struct pstree_item *init)
 	 */
 
 	if (init->pid.virt == INIT_PID) {
-		if (!(current_ns_mask & CLONE_NEWPID)) {
+		if (!(root_ns_mask & CLONE_NEWPID)) {
 			pr_err("This process tree can only be restored "
 				"in a new pid namespace.\n"
 				"criu should be re-executed with the "
 				"\"--namespace pid\" option.\n");
 			return -1;
 		}
-	} else	if (current_ns_mask & CLONE_NEWPID) {
+	} else	if (root_ns_mask & CLONE_NEWPID) {
 		pr_err("Can't restore pid namespace without the process init\n");
 		return -1;
 	}
@@ -1514,6 +1526,14 @@ static int restore_root_task(struct pstree_item *init)
 		goto out_kill;
 	}
 
+	ret = run_scripts("post-restore");
+	if (ret != 0) {
+		pr_err("Aborting restore due to script ret code %d\n", ret);
+		timing_stop(TIME_RESTORE);
+		write_stats(RESTORE_STATS);
+		goto out_kill;
+	}
+
 	/* Unlock network before disabling repair mode on sockets */
 	network_unlock();
 
@@ -1526,13 +1546,6 @@ static int restore_root_task(struct pstree_item *init)
 	BUG_ON(ret);
 
 	timing_stop(TIME_RESTORE);
-
-	ret = run_scripts("post-restore");
-	if (ret != 0) {
-		pr_warn("Aborting restore due to script ret code %d\n", ret);
-		write_stats(RESTORE_STATS);
-		goto out_kill;
-	}
 
 	ret = attach_to_tasks();
 
@@ -1550,7 +1563,7 @@ static int restore_root_task(struct pstree_item *init)
 
 	write_stats(RESTORE_STATS);
 
-	if (!opts.restore_detach)
+	if (!opts.restore_detach && !opts.exec_cmd)
 		wait(NULL);
 
 	return 0;
@@ -1560,7 +1573,7 @@ out_kill:
 	 * The processes can be killed only when all of them have been created,
 	 * otherwise an external proccesses can be killed.
 	 */
-	if (current_ns_mask & CLONE_NEWPID) {
+	if (root_ns_mask & CLONE_NEWPID) {
 		/* Kill init */
 		if (root_item->pid.real > 0)
 			kill(root_item->pid.real, SIGKILL);
@@ -1686,8 +1699,7 @@ static inline int timeval_valid(struct timeval *tv)
 	return (tv->tv_sec >= 0) && ((unsigned long)tv->tv_usec < USEC_PER_SEC);
 }
 
-static inline int itimer_restore_and_fix(char *n, ItimerEntry *ie,
-		struct itimerval *val)
+static inline int decode_itimer(char *n, ItimerEntry *ie, struct itimerval *val)
 {
 	if (ie->isec == 0 && ie->iusec == 0) {
 		memzero_p(val);
@@ -1726,7 +1738,11 @@ static inline int itimer_restore_and_fix(char *n, ItimerEntry *ie,
 	return 0;
 }
 
-static int prepare_itimers(int pid, struct task_restore_args *args)
+/*
+ * Legacy itimers restore from CR_FD_ITIMERS
+ */
+
+static int prepare_itimers_from_fd(int pid, struct task_restore_args *args)
 {
 	int fd, ret = -1;
 	ItimerEntry *ie;
@@ -1738,7 +1754,7 @@ static int prepare_itimers(int pid, struct task_restore_args *args)
 	ret = pb_read_one(fd, &ie, PB_ITIMER);
 	if (ret < 0)
 		goto out;
-	ret = itimer_restore_and_fix("real", ie, &args->itimers[0]);
+	ret = decode_itimer("real", ie, &args->itimers[0]);
 	itimer_entry__free_unpacked(ie, NULL);
 	if (ret < 0)
 		goto out;
@@ -1746,7 +1762,7 @@ static int prepare_itimers(int pid, struct task_restore_args *args)
 	ret = pb_read_one(fd, &ie, PB_ITIMER);
 	if (ret < 0)
 		goto out;
-	ret = itimer_restore_and_fix("virt", ie, &args->itimers[1]);
+	ret = decode_itimer("virt", ie, &args->itimers[1]);
 	itimer_entry__free_unpacked(ie, NULL);
 	if (ret < 0)
 		goto out;
@@ -1754,7 +1770,7 @@ static int prepare_itimers(int pid, struct task_restore_args *args)
 	ret = pb_read_one(fd, &ie, PB_ITIMER);
 	if (ret < 0)
 		goto out;
-	ret = itimer_restore_and_fix("prof", ie, &args->itimers[2]);
+	ret = decode_itimer("prof", ie, &args->itimers[2]);
 	itimer_entry__free_unpacked(ie, NULL);
 	if (ret < 0)
 		goto out;
@@ -1763,12 +1779,27 @@ out:
 	return ret;
 }
 
+static int prepare_itimers(int pid, CoreEntry *core, struct task_restore_args *args)
+{
+	int ret = 0;
+	TaskTimersEntry *tte = core->tc->timers;
+
+	if (!tte)
+		return prepare_itimers_from_fd(pid, args);
+
+	ret |= decode_itimer("real", tte->real, &args->itimers[0]);
+	ret |= decode_itimer("virt", tte->virt, &args->itimers[1]);
+	ret |= decode_itimer("prof", tte->prof, &args->itimers[2]);
+
+	return ret;
+}
+
 static inline int timespec_valid(struct timespec *ts)
 {
 	return (ts->tv_sec >= 0) && ((unsigned long)ts->tv_nsec < NSEC_PER_SEC);
 }
 
-static inline int posix_timer_restore_and_fix(PosixTimerEntry *pte,
+static inline int decode_posix_timer(PosixTimerEntry *pte,
 		struct restore_posix_timer *pt)
 {
 	pt->val.it_interval.tv_sec = pte->isec;
@@ -1812,13 +1843,32 @@ static int cmp_posix_timer_proc_id(const void *p1, const void *p2)
 static unsigned long posix_timers_cpos;
 static unsigned int posix_timers_nr;
 
-static int prepare_posix_timers(int pid)
+static void sort_posix_timers(void)
 {
-	int fd;
+	/*
+	 * This is required for restorer's create_posix_timers(),
+	 * it will probe them one-by-one for the desired ID, since
+	 * kernel doesn't provide another API for timer creation
+	 * with given ID.
+	 */
+
+	if (posix_timers_nr > 0)
+		qsort(rst_mem_remap_ptr(posix_timers_cpos, RM_PRIVATE),
+				posix_timers_nr,
+				sizeof(struct restore_posix_timer),
+				cmp_posix_timer_proc_id);
+}
+
+/*
+ * Legacy posix timers restoration from CR_FD_POSIX_TIMERS
+ */
+
+static int prepare_posix_timers_from_fd(int pid)
+{
+	int fd = -1;
 	int ret = -1;
 	struct restore_posix_timer *t;
 
-	posix_timers_cpos = rst_mem_cpos(RM_PRIVATE);
 	fd = open_image(CR_FD_POSIX_TIMERS, O_RSTR, pid);
 	if (fd < 0) {
 		if (errno == ENOENT) /* backward compatibility */
@@ -1831,29 +1881,52 @@ static int prepare_posix_timers(int pid)
 		PosixTimerEntry *pte;
 
 		ret = pb_read_one_eof(fd, &pte, PB_POSIX_TIMER);
-		if (ret <= 0) {
-			goto out;
-		}
+		if (ret <= 0)
+			break;
 
 		t = rst_mem_alloc(sizeof(struct restore_posix_timer), RM_PRIVATE);
 		if (!t)
-			goto out;
+			break;
 
-		ret = posix_timer_restore_and_fix(pte, t);
+		ret = decode_posix_timer(pte, t);
 		if (ret < 0)
-			goto out;
+			break;
 
 		posix_timer_entry__free_unpacked(pte, NULL);
 		posix_timers_nr++;
 	}
-out:
-	if (posix_timers_nr > 0)
-		qsort(rst_mem_remap_ptr(posix_timers_cpos, RM_PRIVATE),
-				posix_timers_nr,
-				sizeof(struct restore_posix_timer),
-				cmp_posix_timer_proc_id);
 
 	close_safe(&fd);
+	if (!ret)
+		sort_posix_timers();
+
+	return ret;
+}
+
+static int prepare_posix_timers(int pid, CoreEntry *core)
+{
+	int i, ret = -1;
+	TaskTimersEntry *tte = core->tc->timers;
+	struct restore_posix_timer *t;
+
+	posix_timers_cpos = rst_mem_cpos(RM_PRIVATE);
+
+	if (!tte)
+		return prepare_posix_timers_from_fd(pid);
+
+	posix_timers_nr = tte->n_posix;
+	for (i = 0; i < posix_timers_nr; i++) {
+		t = rst_mem_alloc(sizeof(struct restore_posix_timer), RM_PRIVATE);
+		if (!t)
+			goto out;
+
+		if (decode_posix_timer(tte->posix[i], t))
+			goto out;
+	}
+
+	ret = 0;
+	sort_posix_timers();
+out:
 	return ret;
 }
 
@@ -2032,16 +2105,21 @@ static unsigned long decode_rlim(u_int64_t ival)
 static unsigned long rlims_cpos;
 static unsigned int rlims_nr;
 
-static int prepare_rlimits(int pid)
+/*
+ * Legacy rlimits restore from CR_FD_RLIMIT
+ */
+
+static int prepare_rlimits_from_fd(int pid)
 {
 	struct rlimit *r;
 	int fd, ret;
 
-	rlims_cpos = rst_mem_cpos(RM_PRIVATE);
-
-	fd = open_image(CR_FD_RLIMIT, O_RSTR, pid);
+	/*
+	 * Old image -- read from the file.
+	 */
+	fd = open_image(CR_FD_RLIMIT, O_RSTR | O_OPT, pid);
 	if (fd < 0) {
-		if (errno == ENOENT) {
+		if (fd == -ENOENT) {
 			pr_info("Skip rlimits for %d\n", pid);
 			return 0;
 		}
@@ -2081,13 +2159,44 @@ static int prepare_rlimits(int pid)
 	return 0;
 }
 
+static int prepare_rlimits(int pid, CoreEntry *core)
+{
+	int i;
+	TaskRlimitsEntry *rls = core->tc->rlimits;
+	struct rlimit *r;
+
+	rlims_cpos = rst_mem_cpos(RM_PRIVATE);
+
+	if (!rls)
+		return prepare_rlimits_from_fd(pid);
+
+	for (i = 0; i < rls->n_rlimits; i++) {
+		r = rst_mem_alloc(sizeof(*r), RM_PRIVATE);
+		if (!r) {
+			pr_err("Can't allocate memory for resource %d\n", i);
+			return -1;
+		}
+
+		r->rlim_cur = decode_rlim(rls->rlimits[i]->cur);
+		r->rlim_max = decode_rlim(rls->rlimits[i]->max);
+
+		if (r->rlim_cur > r->rlim_max) {
+			pr_warn("Can't restore cur > max for %d.%d\n", pid, i);
+			r->rlim_cur = r->rlim_max;
+		}
+	}
+
+	rlims_nr = rls->n_rlimits;
+	return 0;
+}
+
 static int open_signal_image(int type, pid_t pid, unsigned int *nr)
 {
 	int fd, ret;
 
-	fd = open_image(type, O_RSTR, pid);
+	fd = open_image(type, O_RSTR | O_OPT, pid);
 	if (fd < 0) {
-		if (errno == ENOENT) /* backward compatibility */
+		if (fd == -ENOENT) /* backward compatibility */
 			return 0;
 		else
 			return -1;
@@ -2232,7 +2341,6 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	 */
 
 	ret = parse_self_maps_lite(&self_vmas);
-	close_proc();
 	if (ret < 0)
 		goto err;
 
@@ -2451,7 +2559,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	/* No longer need it */
 	core_entry__free_unpacked(core, NULL);
 
-	ret = prepare_itimers(pid, task_args);
+	ret = prepare_itimers(pid, core, task_args);
 	if (ret < 0)
 		goto err;
 
@@ -2490,6 +2598,8 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 		goto err;
 
 	close_image_dir();
+	close_proc();
+	close_service_fd(ROOT_FD_OFF);
 
 	__gcov_flush();
 

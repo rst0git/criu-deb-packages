@@ -27,7 +27,7 @@ static struct ns_desc *ns_desc_array[] = {
 
 static unsigned int parse_ns_link(char *link, size_t len, struct ns_desc *d)
 {
-	unsigned int kid = 0;
+	unsigned long kid = 0;
 	char *end;
 
 	if (len >= d->len + 2) {
@@ -40,7 +40,7 @@ static unsigned int parse_ns_link(char *link, size_t len, struct ns_desc *d)
 		}
 	}
 
-	return kid;
+	return (unsigned int)kid;
 }
 
 bool check_ns_proc(struct fd_link *link)
@@ -113,17 +113,47 @@ int restore_ns(int rst, struct ns_desc *nd)
 	return ret;
 }
 
-struct ns_id {
-	unsigned int kid;
-	unsigned int id;
-	pid_t pid;
-	struct ns_desc *nd;
-	struct ns_id *next;
-};
-
-static struct ns_id *ns_ids;
+struct ns_id *ns_ids = NULL;
 static unsigned int ns_next_id = 1;
-unsigned long current_ns_mask = 0;
+unsigned long root_ns_mask = 0;
+
+struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd)
+{
+	struct ns_id *nsid;
+
+	nsid = shmalloc(sizeof(*nsid));
+	if (nsid) {
+		nsid->nd = nd;
+		nsid->id = id;
+		nsid->pid = pid;
+		futex_set(&nsid->created, 0);
+
+		nsid->next = ns_ids;
+		ns_ids = nsid;
+	}
+
+	return nsid;
+}
+
+int rst_add_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd)
+{
+	struct ns_id *nsid;
+
+	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
+		if (nsid->id == id) {
+			if (pid_rst_prio(pid, nsid->pid))
+				nsid->pid = pid;
+			return 0;
+		}
+	}
+
+	nsid = rst_new_ns_id(id, pid, nd);
+	if (nsid == NULL)
+		return -1;
+
+	pr_info("Add namespace %d pid %d\n", nsid->id, nsid->pid);
+	return 0;
+}
 
 static unsigned int lookup_ns_id(unsigned int kid, struct ns_desc *nd)
 {
@@ -134,6 +164,17 @@ static unsigned int lookup_ns_id(unsigned int kid, struct ns_desc *nd)
 			return nsid->id;
 
 	return 0;
+}
+
+struct ns_id *lookup_ns_by_id(unsigned int id, struct ns_desc *nd)
+{
+	struct ns_id *nsid;
+
+	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next)
+		if (nsid->id == id && nsid->nd == nd)
+			return nsid;
+
+	return NULL;
 }
 
 static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd)
@@ -147,10 +188,10 @@ static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd
 
 	if (pid != getpid()) {
 		if (pid == root_item->pid.real) {
-			BUG_ON(current_ns_mask & nd->cflag);
+			BUG_ON(root_ns_mask & nd->cflag);
 			pr_info("Will take %s namespace in the image\n", nd->str);
-			current_ns_mask |= nd->cflag;
-		} else {
+			root_ns_mask |= nd->cflag;
+		} else if (nd->cflag & ~CLONE_SUBNS) {
 			pr_err("Can't dump nested %s namespace for %d\n",
 					nd->str, pid);
 			return 0;
@@ -355,7 +396,7 @@ int dump_task_ns_ids(struct pstree_item *item)
 
 static int gen_ns_ids(int pid)
 {
-	/* needed for mntns_collect_root */
+	/* needed for mntns_get_root_fd */
 	if (!get_ns_id(pid, &mnt_ns_desc))
 		return -1;
 	return 0;
@@ -370,14 +411,14 @@ static int gen_ns_ids(int pid)
  */
 int gen_predump_ns_mask(void)
 {
-	BUG_ON(current_ns_mask);
+	BUG_ON(root_ns_mask);
 
 	if (gen_ns_ids(getpid()))
 		return -1;
 	if (gen_ns_ids(root_item->pid.real))
 		return -1;
 
-	pr_info("NS mask generated: %lx\n", current_ns_mask);
+	pr_info("NS mask generated: %lx\n", root_ns_mask);
 	return 0;
 }
 
@@ -387,6 +428,7 @@ static int do_dump_namespaces(struct ns_id *ns)
 
 	switch (ns->nd->cflag) {
 	case CLONE_NEWPID:
+	case CLONE_NEWNS:
 		ret = 0;
 		break;
 	case CLONE_NEWUTS:
@@ -398,11 +440,6 @@ static int do_dump_namespaces(struct ns_id *ns)
 		pr_info("Dump IPC namespace %d via %d\n",
 				ns->id, ns->pid);
 		ret = dump_ipc_ns(ns->pid, ns->id);
-		break;
-	case CLONE_NEWNS:
-		pr_info("Dump MNT namespace (mountpoints) %d via %d\n",
-				ns->id, ns->pid);
-		ret = dump_mnt_ns(ns->pid, ns->id);
 		break;
 	case CLONE_NEWNET:
 		pr_info("Dump NET namespace info %d via %d\n",
@@ -443,14 +480,10 @@ int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 		return -1;
 	}
 
-	ns = ns_ids;
-
-	while (ns) {
+	for (ns = ns_ids; ns; ns = ns->next) {
 		/* Skip current namespaces, which are in the list too  */
-		if (ns->pid == getpid()) {
-			ns = ns->next;
+		if (ns->pid == getpid())
 			continue;
-		}
 
 		pid = fork();
 		if (pid < 0) {
@@ -473,7 +506,6 @@ int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 			pr_err("Namespaces dumping finished with error %d\n", status);
 			return -1;
 		}
-		ns = ns->next;
 	}
 
 	pr_info("Namespaces dump complete\n");
@@ -503,8 +535,12 @@ int prepare_namespace(struct pstree_item *item, unsigned long clone_flags)
 	id = ns_per_id ? item->ids->ipc_ns_id : pid;
 	if ((clone_flags & CLONE_NEWIPC) && prepare_ipc_ns(id))
 		return -1;
-	id = ns_per_id ? item->ids->mnt_ns_id : pid;
-	if ((clone_flags & CLONE_NEWNS)  && prepare_mnt_ns(id))
+
+	/*
+	 * This one is special -- there can be several mount
+	 * namespaces and prepare_mnt_ns handles them itself.
+	 */
+	if (prepare_mnt_ns())
 		return -1;
 
 	return 0;

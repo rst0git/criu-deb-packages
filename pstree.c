@@ -9,6 +9,7 @@
 #include "namespaces.h"
 #include "files.h"
 #include "tty.h"
+#include "mount.h"
 #include "asm/dump.h"
 
 #include "protobuf.h"
@@ -18,61 +19,89 @@ struct pstree_item *root_item;
 
 void core_entry_free(CoreEntry *core)
 {
-	if (core) {
-		arch_free_thread_info(core);
-		if (core->thread_core)
-			xfree(core->thread_core->sas);
-		xfree(core->thread_core);
-		xfree(core->tc);
-		xfree(core->ids);
-	}
+	if (core->tc && core->tc->timers)
+		xfree(core->tc->timers->posix);
+	arch_free_thread_info(core);
+	xfree(core);
 }
 
-CoreEntry *core_entry_alloc(int alloc_thread_info, int alloc_tc)
+#ifndef RLIM_NLIMITS
+# define RLIM_NLIMITS 16
+#endif
+
+CoreEntry *core_entry_alloc(int th, int tsk)
 {
-	CoreEntry *core;
-	TaskCoreEntry *tc;
+	size_t sz;
+	CoreEntry *core = NULL;
+	void *m;
 
-	core = xmalloc(sizeof(*core));
-	if (!core)
-		return NULL;
-	core_entry__init(core);
-
-	core->mtype = CORE_ENTRY__MARCH;
-
-	if (alloc_thread_info) {
-		ThreadCoreEntry *thread_core;
-		ThreadSasEntry *sas;
-
-		if (arch_alloc_thread_info(core))
-			goto err;
-
-		thread_core = xmalloc(sizeof(*thread_core));
-		if (!thread_core)
-			goto err;
-		thread_core_entry__init(thread_core);
-		core->thread_core = thread_core;
-
-		sas = xmalloc(sizeof(*sas));
-		if (!sas)
-			goto err;
-		thread_sas_entry__init(sas);
-		core->thread_core->sas = sas;
+	sz = sizeof(CoreEntry);
+	if (tsk) {
+		sz += sizeof(TaskCoreEntry) + TASK_COMM_LEN;
+		if (th) {
+			sz += sizeof(TaskRlimitsEntry);
+			sz += RLIM_NLIMITS * sizeof(RlimitEntry *);
+			sz += RLIM_NLIMITS * sizeof(RlimitEntry);
+			sz += sizeof(TaskTimersEntry);
+			sz += 3 * sizeof(ItimerEntry); /* 3 for real, virt and prof */
+		}
 	}
+	if (th)
+		sz += sizeof(ThreadCoreEntry) + sizeof(ThreadSasEntry);
 
-	if (alloc_tc) {
-		tc = xzalloc(sizeof(*tc) + TASK_COMM_LEN);
-		if (!tc)
-			goto err;
-		task_core_entry__init(tc);
-		tc->comm = (void *)tc + sizeof(*tc);
-		core->tc = tc;
+	m = xmalloc(sz);
+	if (m) {
+		core = xptr_pull(&m, CoreEntry);
+		core_entry__init(core);
+		core->mtype = CORE_ENTRY__MARCH;
+
+		if (tsk) {
+			core->tc = xptr_pull(&m, TaskCoreEntry);
+			task_core_entry__init(core->tc);
+			core->tc->comm = xptr_pull_s(&m, TASK_COMM_LEN);
+			memzero(core->tc->comm, TASK_COMM_LEN);
+
+			if (th) {
+				TaskRlimitsEntry *rls;
+				TaskTimersEntry *tte;
+				int i;
+
+				rls = core->tc->rlimits = xptr_pull(&m, TaskRlimitsEntry);
+				task_rlimits_entry__init(rls);
+
+				rls->n_rlimits = RLIM_NLIMITS;
+				rls->rlimits = xptr_pull_s(&m, sizeof(RlimitEntry *) * RLIM_NLIMITS);
+
+				for (i = 0; i < RLIM_NLIMITS; i++) {
+					rls->rlimits[i] = xptr_pull(&m, RlimitEntry);
+					rlimit_entry__init(rls->rlimits[i]);
+				}
+
+				tte = core->tc->timers = xptr_pull(&m, TaskTimersEntry);
+				task_timers_entry__init(tte);
+				tte->real = xptr_pull(&m, ItimerEntry);
+				itimer_entry__init(tte->real);
+				tte->virt = xptr_pull(&m, ItimerEntry);
+				itimer_entry__init(tte->virt);
+				tte->prof = xptr_pull(&m, ItimerEntry);
+				itimer_entry__init(tte->prof);
+			}
+		}
+
+		if (th) {
+			core->thread_core = xptr_pull(&m, ThreadCoreEntry);
+			thread_core_entry__init(core->thread_core);
+			core->thread_core->sas = xptr_pull(&m, ThreadSasEntry);
+			thread_sas_entry__init(core->thread_core->sas);
+
+			if (arch_alloc_thread_info(core)) {
+				xfree(core);
+				core = NULL;
+			}
+		}
 	}
 
 	return core;
-err:
-	core_entry_free(core);
-	return NULL;
 }
 
 int pstree_alloc_cores(struct pstree_item *item)
@@ -385,6 +414,10 @@ static int read_pstree_image(void)
 		if (ret != 1)
 			goto err;
 
+		if (pi->ids->has_mnt_ns_id) {
+			if (rst_add_ns_id(pi->ids->mnt_ns_id, pi->pid.virt, &mnt_ns_desc))
+				goto err;
+		}
 	}
 err:
 	close(ps_fd);
@@ -630,22 +663,28 @@ static int prepare_pstree_kobj_ids(void)
 set_mask:
 		item->rst->clone_flags = cflags;
 
-		/*
-		 * Workaround for current namespaces model --
-		 * all tasks should be in one namespace. And
-		 * this namespace is either inherited from the
-		 * criu or is created for the init task (only)
-		 */
+		cflags &= CLONE_ALLNS;
+
 		if (item == root_item) {
 			pr_info("Will restore in %lx namespaces\n", cflags);
-			current_ns_mask = cflags & CLONE_ALLNS;
-		} else if (cflags & CLONE_ALLNS) {
+			root_ns_mask = cflags;
+		} else if (cflags & ~(root_ns_mask & CLONE_SUBNS)) {
+			/*
+			 * Namespaces from CLONE_SUBNS can be nested, but in
+			 * this case nobody can't share external namespaces of
+			 * these types.
+			 *
+			 * Workaround for all other namespaces --
+			 * all tasks should be in one namespace. And
+			 * this namespace is either inherited from the
+			 * criu or is created for the init task (only)
+			 */
 			pr_err("Can't restore sub-task in NS\n");
 			return -1;
 		}
 	}
 
-	pr_debug("NS mask to use %lx\n", current_ns_mask);
+	pr_debug("NS mask to use %lx\n", root_ns_mask);
 	return 0;
 }
 

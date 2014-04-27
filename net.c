@@ -573,7 +573,7 @@ int prepare_net_ns(int pid)
 
 int netns_pre_create(void)
 {
-	ns_fd = open("/proc/self/ns/net", O_RDONLY);
+	ns_fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
 	if (ns_fd < 0) {
 		pr_perror("Can't cache net fd");
 		return -1;
@@ -588,7 +588,7 @@ int network_lock(void)
 	pr_info("Lock network\n");
 
 	/* Each connection will be locked on dump */
-	if  (!(current_ns_mask & CLONE_NEWNET))
+	if  (!(root_ns_mask & CLONE_NEWNET))
 		return 0;
 
 	return run_scripts("network-lock");
@@ -601,7 +601,7 @@ void network_unlock(void)
 	cpt_unlock_tcp_connections();
 	rst_unlock_tcp_connections();
 
-	if (current_ns_mask & CLONE_NEWNET)
+	if (root_ns_mask & CLONE_NEWNET)
 		run_scripts("network-unlock");
 }
 

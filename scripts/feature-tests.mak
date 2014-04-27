@@ -30,16 +30,26 @@ int main(void)
 }
 endef
 
+define LIBBSD_DEV_TEST
+#include <bsd/string.h>
+
+int main(void)
+{
+	return 0;
+}
+endef
+
 define STRLCPY_TEST
 
 #include <string.h>
 
+#ifdef CONFIG_HAS_LIBBSD
+# include <bsd/string.h>
+#endif
+
 int main(void)
 {
-	char src[32] = "strlcpy";
-	char dst[32];
-
-	return strlcpy(dst, src, sizeof(dst));
+	return strlcpy(NULL, NULL, 0);
 }
 endef
 
@@ -47,12 +57,13 @@ define STRLCAT_TEST
 
 #include <string.h>
 
+#ifdef CONFIG_HAS_LIBBSD
+# include <bsd/string.h>
+#endif
+
 int main(void)
 {
-	char src[32] = "strlcat";
-	char dst[32];
-
-	return strlcat(dst, src, sizeof(dst));
+	return strlcat(NULL, NULL, 0);
 }
 endef
 

@@ -99,9 +99,46 @@ void criu_set_log_level(int log_level)
 	opts->log_level		= log_level;
 }
 
+void criu_set_root(char *root)
+{
+	opts->root = strdup(root);
+}
+
 void criu_set_log_file(char *log_file)
 {
 	opts->log_file = strdup(log_file);
+}
+
+void criu_set_cpu_cap(unsigned int cap)
+{
+	opts->has_cpu_cap	= true;
+	opts->cpu_cap		= cap;
+}
+
+int criu_set_exec_cmd(int argc, char *argv[])
+{
+	int i;
+
+	opts->n_exec_cmd = argc;
+	opts->exec_cmd = malloc((argc) * sizeof(char *));
+
+	if (opts->exec_cmd) {
+		for (i = 0; i < argc; i++) {
+			opts->exec_cmd[i] = strdup(argv[i]);
+			if (!opts->exec_cmd[i]) {
+				while (i > 0)
+					free(opts->exec_cmd[i--]);
+				free(opts->exec_cmd);
+				opts->n_exec_cmd = 0;
+				opts->exec_cmd = NULL;
+				goto out;
+			}
+		}
+		return 0;
+	}
+
+out:
+	return -ENOMEM;
 }
 
 static CriuResp *recv_resp(int socket_fd)
