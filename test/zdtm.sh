@@ -12,6 +12,7 @@ static/maps00
 static/maps01
 static/maps02
 static/maps04
+static/maps05
 static/maps_file_prot
 static/mprotect00
 static/mtime_mmap
@@ -100,6 +101,7 @@ static/sk-netlink
 static/proc-self
 static/grow_map
 static/grow_map02
+static/grow_map03
 static/stopped
 static/chroot
 static/chroot-file
@@ -135,6 +137,8 @@ transition/ipc
 ns/static/tun
 static/netns-nf
 static/netns
+static/cgroup00
+ns/static/clean_mntns
 "
 
 TEST_CR_KERNEL="
@@ -164,6 +168,8 @@ tempfs
 bind-mount
 mountpoints
 inotify_irmap
+cgroup00
+clean_mntns
 "
 
 source $(readlink -f `dirname $0`/env.sh) || exit 1
@@ -185,6 +191,7 @@ CLEANUP=0
 PAGE_SERVER=0
 PS_PORT=12345
 COMPILE_ONLY=0
+START_ONLY=0
 BATCH_TEST=0
 SPECIFIED_NAME_USED=0
 
@@ -444,6 +451,11 @@ run_test()
 	echo "Execute $test"
 
 	start_test $tdir $tname || return 1
+
+	if [ $START_ONLY -eq 1 ]; then
+		echo "Test is started"
+		return 0
+	fi
 
 	local ddump
 	if ! kill -s 0 "$PID"; then
@@ -705,6 +717,7 @@ Options:
 	-t : mount tmpfs for dump files
 	-a <FILE>.tar.gz : save archive with dump files and logs
 	-g : Generate executables only
+	-S : Only start the test
 	-n : Batch test
 	-r : Run test with specified name directly without match or check
 	-v : Verbose mode
@@ -791,6 +804,10 @@ while :; do
 		;;
 	  -g)
 		COMPILE_ONLY=1
+		shift
+		;;
+	  -S)
+	  	START_ONLY=1
 		shift
 		;;
 	  -n)

@@ -58,12 +58,12 @@
 #include "sk-packet.h"
 #include "cpu.h"
 #include "elf.h"
+#include "cgroup.h"
 #include "file-lock.h"
 #include "page-xfer.h"
 #include "kerndat.h"
 #include "stats.h"
 #include "mem.h"
-#include "vdso.h"
 #include "page-pipe.h"
 #include "posix-timer.h"
 #include "vdso.h"
@@ -471,6 +471,9 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
 
 	mme.mm_brk = misc->brk;
 
+	mme.dumpable = misc->dumpable;
+	mme.has_dumpable = true;
+
 	mme.n_mm_saved_auxv = AT_VECTOR_SIZE;
 	mme.mm_saved_auxv = xmalloc(pb_repeated_size(&mme, mm_saved_auxv));
 	if (!mme.mm_saved_auxv)
@@ -694,6 +697,11 @@ static int dump_task_core_all(struct pstree_item *item,
 		goto err;
 
 	ret = dump_task_rlimits(pid, core->tc->rlimits);
+	if (ret)
+		goto err;
+
+	core->tc->has_cg_set = true;
+	ret = dump_task_cgroup(item, &core->tc->cg_set);
 	if (ret)
 		goto err;
 
@@ -1790,6 +1798,10 @@ int cr_dump_tasks(pid_t pid)
 	if (root_ns_mask)
 		if (dump_namespaces(root_item, root_ns_mask) < 0)
 			goto err;
+
+	ret = dump_cgroups();
+	if (ret)
+		goto err;
 
 	ret = cr_dump_shmem();
 	if (ret)

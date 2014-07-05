@@ -18,7 +18,7 @@ Architecture: armhf amd64
 Depends:
  ${misc:Depends},
  ${shlibs:Depends},
-Recommends: iproute
+Recommends: iproute2 | iproute
 Description: checkpoint and restore in userspace
  criu contains the utilities to checkpoint and restore processes in
  userspace.

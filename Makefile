@@ -1,5 +1,5 @@
 VERSION_MAJOR		:= 1
-VERSION_MINOR		:= 3-rc1
+VERSION_MINOR		:= 3-rc2
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -35,8 +35,6 @@ OBJCOPY		:= $(CROSS_COMPILE)objcopy
 
 CFLAGS		+= $(USERCFLAGS)
 
-VDSO_O		:= vdso.o
-
 #
 # Fetch ARCH from the uname if not yet set
 #
@@ -52,11 +50,13 @@ ARCH ?= $(shell uname -m | sed		\
 ifeq ($(ARCH),i386)
 	SRCARCH      := x86-32
 	DEFINES      := -DCONFIG_X86_32
+	VDSO         := y
 endif
 ifeq ($(ARCH),x86_64)
 	SRCARCH      := x86
 	DEFINES      := -DCONFIG_X86_64
 	LDARCH       := i386:x86-64
+	VDSO         := y
 endif
 
 ifeq ($(shell echo $(ARCH) | sed -e 's/arm.*/arm/'),arm)
@@ -71,8 +71,6 @@ ifeq ($(shell echo $(ARCH) | sed -e 's/arm.*/arm/'),arm)
 	ifeq ($(ARMV),7)
 		USERCFLAGS += -march=armv7-a
 	endif
-
-	VDSO_O       := vdso-stub.o
 endif
 
 SRCARCH		?= $(ARCH)
@@ -120,8 +118,9 @@ CRIU-INC	:= lib/criu.h include/criu-plugin.h include/criu-log.h protobuf/rpc.pro
 
 export CC MAKE CFLAGS LIBS SRCARCH DEFINES MAKEFLAGS CRIU-SO
 export SRC_DIR SYSCALL-LIB SH RM ARCH_DIR OBJCOPY LDARCH LD
+export USERCFLAGS
 export cflags-y
-export VDSO_O
+export VDSO
 
 include Makefile.inc
 include Makefile.config
@@ -152,9 +151,9 @@ protobuf/%::
 protobuf:
 	$(Q) $(MAKE) $(build)=protobuf all
 
-$(ARCH_DIR)/%:: protobuf
+$(ARCH_DIR)/%:: protobuf config
 	$(Q) $(MAKE) $(build)=$(ARCH_DIR) $@
-$(ARCH_DIR): protobuf
+$(ARCH_DIR): protobuf config
 	$(Q) $(MAKE) $(build)=$(ARCH_DIR) all
 
 pie/%:: $(ARCH_DIR)
@@ -172,18 +171,15 @@ lib/%:: $(VERSION_HEADER) config built-in.o
 lib: $(VERSION_HEADER) config built-in.o
 	$(Q) $(MAKE) $(build)=lib all
 
+ifeq ($(VDSO),y)
+PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-pie.o
+endif
 PROGRAM-BUILTINS	+= pie/util-fd.o
 PROGRAM-BUILTINS	+= pie/util.o
 PROGRAM-BUILTINS	+= protobuf/built-in.o
 PROGRAM-BUILTINS	+= built-in.o
 
-$(ARCH_DIR)/vdso-pie.o: pie
-	$(Q) $(MAKE) $(build)=pie $(ARCH_DIR)/vdso-pie.o
-PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-pie.o
-pie/$(VDSO_O): pie
-	$(Q) $(MAKE) $(build)=pie pie/$(VDSO_O)
-PROGRAM-BUILTINS	+= pie/$(VDSO_O)
-
+$(SYSCALL-LIB) $(ARCH-LIB) $(PROGRAM-BUILTINS): config
 
 $(PROGRAM): $(SYSCALL-LIB) $(ARCH-LIB) $(PROGRAM-BUILTINS)
 	$(E) "  LINK    " $@
@@ -193,7 +189,7 @@ zdtm: all
 	$(Q) $(MAKE) -C test/zdtm all
 
 test: zdtm
-	$(Q) $(SH) test/zdtm.sh -C
+	$(Q) $(MAKE) -C test
 
 clean-built:
 	$(Q) $(RM) $(VERSION_HEADER)

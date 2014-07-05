@@ -68,6 +68,7 @@
 #include "kerndat.h"
 #include "rst-malloc.h"
 #include "plugin.h"
+#include "cgroup.h"
 
 #include "parasite-syscall.h"
 
@@ -114,6 +115,9 @@ static int crtools_prepare_shared(void)
 		return -1;
 
 	if (tty_prep_fds())
+		return -1;
+
+	if (prepare_cgroup())
 		return -1;
 
 	return 0;
@@ -239,7 +243,7 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
 	if (vma->page_bitmap == NULL)
 		return -1;
 
-	list_for_each_entry_continue(p, pvma_list, list) {
+	list_for_each_entry_from(p, pvma_list, list) {
 		if (p->e->start > vma->e->start)
 			 break;
 
@@ -260,10 +264,10 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
 
 		pr_info("COW 0x%016"PRIx64"-0x%016"PRIx64" 0x%016"PRIx64" vma\n",
 			vma->e->start, vma->e->end, vma->e->pgoff);
-		paddr = decode_pointer(vma->premmaped_addr);
-	}
+		paddr = decode_pointer(p->premmaped_addr);
 
-	*pvma = p;
+		break;
+	}
 
 	/*
 	 * A grow-down VMA has a guard page, which protect a VMA below it.
@@ -293,6 +297,8 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
 			pr_perror("Unable to map ANON_VMA");
 			return -1;
 		}
+
+		*pvma = p;
 	} else {
 		/*
 		 * This region was found in parent -- remap it to inherit physical
@@ -307,6 +313,7 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
 			return -1;
 		}
 
+		*pvma = list_entry(p->list.next, struct vma_area, list);
 	}
 
 	vma->premmaped_addr = (unsigned long) addr;
@@ -506,7 +513,7 @@ static int prepare_mappings(int pid)
 	current->rst->premmapped_addr = addr;
 	current->rst->premmapped_len = vmas->priv_size;
 
-	pvma = list_entry(parent_vmas, struct vma_area, list);
+	pvma = list_first_entry(parent_vmas, struct vma_area, list);
 
 	list_for_each_entry(vma, &vmas->h, list) {
 		if (pstart > vma->e->start) {
@@ -901,6 +908,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 			return -1;
 
 		item->state = ca.core->tc->task_state;
+		item->rst->cg_set = ca.core->tc->cg_set;
 
 		switch (item->state) {
 		case TASK_ALIVE:
@@ -913,8 +921,14 @@ static inline int fork_with_pid(struct pstree_item *item)
 			pr_err("Unknown task state %d\n", item->state);
 			return -1;
 		}
-	} else
+	} else {
+		/*
+		 * Helper entry will not get moved around and thus
+		 * will live in the parent's cgset.
+		 */
+		item->rst->cg_set = item->parent->rst->cg_set;
 		ca.core = NULL;
+	}
 
 	ret = -1;
 
@@ -926,7 +940,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 	if (!(ca.clone_flags & CLONE_NEWPID)) {
 		char buf[32];
 
-		ca.fd = open(LAST_PID_PATH, O_RDWR);
+		ca.fd = open_proc_rw(PROC_GEN, LAST_PID_PATH);
 		if (ca.fd < 0) {
 			pr_perror("%d: Can't open %s", pid, LAST_PID_PATH);
 			goto err;
@@ -1276,6 +1290,15 @@ static int restore_task_with_children(void *_arg)
 		if (ret)
 			exit(1);
 	}
+
+	/*
+	 * Call this _before_ forking to optimize cgroups
+	 * restore -- if all tasks live in one set of cgroups
+	 * we will only move the root one there, others will
+	 * just have it inherited.
+	 */
+	if (prepare_task_cgroup(current) < 0)
+		return -1;
 
 	if (create_children_and_session())
 		goto err;
@@ -1641,6 +1664,8 @@ int cr_restore_tasks(void)
 		goto err;
 
 	ret = restore_root_task(root_item);
+
+	fini_cgroup();
 err:
 	cr_plugin_fini();
 	return ret;
@@ -2283,9 +2308,11 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	void *tcp_socks_mem;
 	unsigned long tcp_socks;
 
+#ifdef CONFIG_VDSO
 	unsigned long vdso_rt_vma_size = 0;
 	unsigned long vdso_rt_size = 0;
 	unsigned long vdso_rt_delta = 0;
+#endif
 
 	struct vm_area_list self_vmas;
 	struct vm_area_list *vmas = &current->rst->vmas;
@@ -2348,6 +2375,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 				TASK_ENTRIES_SIZE +
 				rst_mem_remap_size();
 
+#ifdef CONFIG_VDSO
 	/*
 	 * Figure out how much memory runtime vdso will need.
 	 */
@@ -2358,6 +2386,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	}
 
 	restore_bootstrap_len += vdso_rt_size;
+#endif
 
 	/*
 	 * Restorer is a blob (code + args) that will get mapped in some
@@ -2437,7 +2466,9 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 	task_args->bootstrap_start = (void *)exec_mem_hint;
 	task_args->bootstrap_len = restore_bootstrap_len;
+#ifdef CONFIG_VDSO
 	task_args->vdso_rt_size = vdso_rt_size;
+#endif
 
 	task_args->premmapped_addr = (unsigned long) current->rst->premmapped_addr;
 	task_args->premmapped_len = current->rst->premmapped_len;
@@ -2544,6 +2575,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 	}
 
+#ifdef CONFIG_VDSO
 	/*
 	 * Restorer needs own copy of vdso parameters. Runtime
 	 * vdso must be kept non intersecting with anything else,
@@ -2553,6 +2585,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	mem += rst_mem_remap_size();
 	task_args->vdso_rt_parked_at = (unsigned long)mem + vdso_rt_delta;
 	task_args->vdso_sym_rt = vdso_sym_rt;
+#endif
 
 	new_sp = restorer_stack(task_args->t);
 
@@ -2575,7 +2608,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	 * Open the last_pid syscl early, since restorer (maybe) lives
 	 * in chroot and has no access to "/proc/..." paths.
 	 */
-	task_args->fd_last_pid = open(LAST_PID_PATH, O_RDWR);
+	task_args->fd_last_pid = open_proc_rw(PROC_GEN, LAST_PID_PATH);
 	if (task_args->fd_last_pid < 0) {
 		pr_perror("Can't open sys.ns_last_pid");
 		goto err;

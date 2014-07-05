@@ -7,6 +7,10 @@ enum fstype {
 	TMPFS			= 5;
 	DEVPTS			= 6;
 	SIMFS			= 7;
+	PSTORE			= 8;
+	SECURITYFS		= 9;
+	FUSECTL			= 10;
+	DEBUGFS			= 11;
 };
 
 message mnt_entry {
@@ -25,4 +29,5 @@ message mnt_entry {
 	optional uint32		master_id		= 11;
 
 	optional bool		with_plugin		= 12;
+	optional bool		ext_mount		= 13;
 }
