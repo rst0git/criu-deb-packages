@@ -1,3 +1,9 @@
+criu (1.3~rc2-3) unstable; urgency=low
+
+  * I don't care anymore, not worth it.. orphaning.
+
+ -- Daniel Baumann <mail@daniel-baumann.ch>  Fri, 25 Jul 2014 20:54:56 +0200
+
 criu (1.3~rc2-2) unstable; urgency=low
 
   * Adding patch from Arthur Marble <arthur@info9.net> to fix FTBFS with
