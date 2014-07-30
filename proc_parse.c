@@ -92,6 +92,8 @@ static bool is_vma_range_fmt(char *line)
 static int parse_vmflags(char *buf, struct vma_area *vma_area)
 {
 	char *tok;
+	bool shared = false;
+	bool maywrite = false;
 
 	if (!buf[0])
 		return 0;
@@ -103,6 +105,12 @@ static int parse_vmflags(char *buf, struct vma_area *vma_area)
 #define _vmflag_match(_t, _s) (_t[0] == _s[0] && _t[1] == _s[1])
 
 	do {
+		/* open() block */
+		if (_vmflag_match(tok, "sh"))
+			shared = true;
+		else if (_vmflag_match(tok, "mw"))
+			maywrite = true;
+
 		/* mmap() block */
 		if (_vmflag_match(tok, "gd"))
 			vma_area->e->flags |= MAP_GROWSDOWN;
@@ -135,6 +143,12 @@ static int parse_vmflags(char *buf, struct vma_area *vma_area)
 	} while ((tok = strtok(NULL, " \n")));
 
 #undef _vmflag_match
+
+	if (shared && maywrite)
+		vma_area->e->fdflags = O_RDWR;
+	else
+		vma_area->e->fdflags = O_RDONLY;
+	vma_area->e->has_fdflags = true;
 
 	if (vma_area->e->madv)
 		vma_area->e->has_madv = true;
@@ -171,6 +185,13 @@ static int vma_get_mapfile(struct vma_area *vma, DIR *mfd,
 
 	if (prev_vfi->vma && vfi_equal(vfi, prev_vfi)) {
 		struct vma_area *prev = prev_vfi->vma;
+
+		/*
+		 * If vfi is equal (!) and negative @vm_file_fd --
+		 * we have nothing to borrow for sure.
+		 */
+		if (prev->vm_file_fd < 0)
+			return 0;
 
 		pr_debug("vma %"PRIx64" borrows vfi from previous %"PRIx64"\n",
 				vma->e->start, prev->e->start);
@@ -836,12 +857,21 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new)
 	char *opt;
 	char *fstype;
 
-	ret = sscanf(str, "%i %i %u:%u %ms %ms %ms %n",
-			&new->mnt_id, &new->parent_mnt_id,
-			&kmaj, &kmin, &new->root, &new->mountpoint,
-			&opt, &n);
-	if (ret != 7)
+	new->mountpoint = xmalloc(PATH_MAX);
+	if (new->mountpoint == NULL)
 		return -1;
+
+	new->mountpoint[0] = '.';
+	ret = sscanf(str, "%i %i %u:%u %ms %s %ms %n",
+			&new->mnt_id, &new->parent_mnt_id,
+			&kmaj, &kmin, &new->root, new->mountpoint + 1,
+			&opt, &n);
+	if (ret != 7) {
+		xfree(new->mountpoint);
+		return -1;
+	}
+
+	new->mountpoint = xrealloc(new->mountpoint, strlen(new->mountpoint) + 1);
 
 	new->s_dev = MKKDEV(kmaj, kmin);
 	new->flags = 0;
@@ -876,7 +906,7 @@ err:
 	return ret;
 }
 
-struct mount_info *parse_mountinfo(pid_t pid)
+struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid)
 {
 	struct mount_info *list = NULL;
 	FILE *f;
@@ -896,6 +926,8 @@ struct mount_info *parse_mountinfo(pid_t pid)
 		new = mnt_entry_alloc();
 		if (!new)
 			goto err;
+
+		new->nsid = nsid;
 
 		new->next = list;
 		list = new;
@@ -999,7 +1031,30 @@ static int parse_fdinfo_pid_s(char *pid, int fd, int type,
 	while (fgets(str, sizeof(str), f)) {
 		union fdinfo_entries entry;
 
-		if (fdinfo_field(str, "pos") || fdinfo_field(str, "counter"))
+		if (fdinfo_field(str, "pos") ||
+		    fdinfo_field(str, "flags") ||
+		    fdinfo_field(str, "mnt_id")) {
+			unsigned long long val;
+			struct fdinfo_common *fdinfo = arg;
+
+			if (type != FD_TYPES__UND)
+				continue;
+			ret = sscanf(str, "%*s %lli", &val);
+			if (ret != 1)
+				goto parse_err;
+
+			if (fdinfo_field(str, "pos"))
+				fdinfo->pos = val;
+			else if (fdinfo_field(str, "flags"))
+				fdinfo->flags = val;
+			else if (fdinfo_field(str, "mnt_id"))
+				fdinfo->mnt_id = val;
+
+			entry_met = true;
+			continue;
+		}
+
+		if (type == FD_TYPES__UND)
 			continue;
 
 		if (fdinfo_field(str, "eventfd-count")) {
@@ -1293,6 +1348,16 @@ err:
 	return ret;
 }
 
+void free_posix_timers(struct proc_posix_timers_stat *st)
+{
+	while (!list_empty(&st->timers)) {
+		struct proc_posix_timer *timer;
+		timer = list_first_entry(&st->timers, struct proc_posix_timer, list);
+		list_del(&timer->list);
+		xfree(timer);
+	}
+}
+
 int parse_posix_timers(pid_t pid, struct proc_posix_timers_stat *args)
 {
 	int ret = 0;
@@ -1365,11 +1430,7 @@ int parse_posix_timers(pid_t pid, struct proc_posix_timers_stat *args)
 		args->timer_n++;
 	}
 err:
-	while (!list_empty(&args->timers)) {
-		timer = list_first_entry(&args->timers, struct proc_posix_timer, list);
-		list_del(&timer->list);
-		xfree(timer);
-	}
+	free_posix_timers(args);
 	pr_perror("Parse error in posix timers proc file!");
 	ret = -1;
 out:

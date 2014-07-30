@@ -18,3 +18,10 @@ message posix_timer_entry {
 	required uint64		vsec		= 9;
 	required uint64		vnsec		= 10;
 }
+
+message task_timers_entry {
+	required itimer_entry		real	= 1;
+	required itimer_entry		virt	= 2;
+	required itimer_entry		prof	= 3;
+	repeated posix_timer_entry	posix	= 4;
+}

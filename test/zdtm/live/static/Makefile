@@ -73,6 +73,7 @@ TST_NOFILE	=				\
 		eventfs00			\
 		signalfd00			\
 		inotify00			\
+		inotify_irmap			\
 		fanotify00			\
 		uptime_grow			\
 		session00			\
@@ -140,6 +141,7 @@ TST_FILE	=				\
 		file_locks00			\
 		file_locks01			\
 		netns-nf			\
+		maps_file_prot			\
 
 TST_DIR		=				\
 		cwd00				\
@@ -148,6 +150,7 @@ TST_DIR		=				\
 		overmount_fifo			\
 		overmount_sock			\
 		tempfs				\
+		bind-mount			\
 
 TST_DIR_FILE	=				\
 		chroot				\

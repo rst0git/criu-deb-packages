@@ -28,6 +28,9 @@
 #include "ptrace.h"
 #include "kerndat.h"
 #include "tun.h"
+#include "namespaces.h"
+#include "pstree.h"
+#include "cr_options.h"
 
 static int check_tty(void)
 {
@@ -244,6 +247,28 @@ static int check_fdinfo_eventfd(void)
 
 static int check_one_sfd(union fdinfo_entries *e, void *arg)
 {
+	return 0;
+}
+
+int check_mnt_id(void)
+{
+	struct fdinfo_common fdinfo = { .mnt_id = -1 };
+	int ret;
+
+	if (opts.check_ms_kernel) {
+		pr_warn("Skipping mnt_id support check\n");
+		return 0;
+	}
+
+	ret = parse_fdinfo(get_service_fd(LOG_FD_OFF), FD_TYPES__UND, NULL, &fdinfo);
+	if (ret < 0)
+		return -1;
+
+	if (fdinfo.mnt_id == -1) {
+		pr_err("fdinfo doesn't contain the mnt_id field\n");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -529,6 +554,7 @@ static int check_posix_timers(void)
 
 int cr_check(void)
 {
+	struct ns_id ns = { .pid = getpid(), .nd = &mnt_ns_desc };
 	int ret = 0;
 
 	log_set_loglevel(LOG_WARN);
@@ -536,15 +562,20 @@ int cr_check(void)
 	if (!is_root_user())
 		return -1;
 
-	if (mntns_collect_root(getpid())) {
-		pr_err("Can't collect root mount point\n");
+	root_item = alloc_pstree_item();
+	if (root_item == NULL)
 		return -1;
-	}
 
-	if (collect_mount_info(getpid())) {
-		pr_err("Can't collect mount infos\n");
+	root_item->pid.real = getpid();
+
+	if (collect_pstree_ids())
 		return -1;
-	}
+
+	ns.id = root_item->ids->mnt_ns_id;
+
+	mntinfo = collect_mntinfo(&ns);
+	if (mntinfo == NULL)
+		return -1;
 
 	ret |= check_map_files();
 	ret |= check_sock_diag();
@@ -565,6 +596,7 @@ int cr_check(void)
 	ret |= check_mem_dirty_track();
 	ret |= check_posix_timers();
 	ret |= check_tun();
+	ret |= check_mnt_id();
 
 	if (!ret)
 		pr_msg("Looks good.\n");

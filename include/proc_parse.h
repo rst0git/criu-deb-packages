@@ -104,6 +104,11 @@ struct mount_info {
 	int		parent_mnt_id;
 	unsigned int	s_dev;
 	char		*root;
+	/*
+	 * mountpoint contains path with dot at the beginning.
+	 * It allows to use openat, statat, etc without creating
+	 * a temporary copy.
+	 */
 	char		*mountpoint;
 	unsigned	flags;
 	int		master_id;
@@ -114,7 +119,9 @@ struct mount_info {
 	bool		mounted;
 	bool		need_plugin;
 	int		is_file;
+	bool		is_ns_root;
 	struct mount_info *next;
+	struct ns_id	*nsid;
 
 	/* tree linkage */
 	struct mount_info *parent;
@@ -138,7 +145,7 @@ extern void mnt_entry_free(struct mount_info *mi);
 
 struct vm_area_list;
 
-extern struct mount_info *parse_mountinfo(pid_t pid);
+extern struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid);
 extern int parse_pid_stat(pid_t pid, struct proc_pid_stat *s);
 extern int parse_pid_stat_small(pid_t pid, struct proc_pid_stat_small *s);
 extern int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_files);
@@ -153,6 +160,12 @@ union fdinfo_entries {
 	FanotifyMarkEntry ffy;
 };
 
+struct fdinfo_common {
+	off64_t pos;
+	int flags;
+	int mnt_id;
+};
+
 extern int parse_fdinfo(int fd, int type,
 		int (*cb)(union fdinfo_entries *e, void *arg), void *arg);
 extern int parse_fdinfo_pid(int pid, int fd, int type,
@@ -162,5 +175,7 @@ extern int parse_file_locks(void);
 
 struct pid;
 extern int parse_threads(int pid, struct pid **_t, int *_n);
+
+extern int check_mnt_id(void);
 
 #endif /* __CR_PROC_PARSE_H__ */

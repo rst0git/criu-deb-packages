@@ -2,14 +2,11 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <ctype.h>
-
-#ifndef NFS_SUPER_MAGIC
-#define NFS_SUPER_MAGIC 0x6969
-#endif
 
 /* Stolen from kernel/fs/nfs/unlink.c */
 #define SILLYNAME_PREF ".nfs"
@@ -23,7 +20,10 @@
 #include "image.h"
 #include "list.h"
 #include "util.h"
+#include "fs-magic.h"
 #include "asm/atomic.h"
+#include "namespaces.h"
+#include "proc_parse.h"
 
 #include "protobuf.h"
 #include "protobuf/regfile.pb-c.h"
@@ -57,6 +57,7 @@ static mutex_t *ghost_file_mutex;
  */
 struct link_remap_rlb {
 	struct list_head	list;
+	struct ns_id		*mnt_ns;
 	char			*path;
 };
 static LIST_HEAD(link_remaps);
@@ -73,6 +74,7 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	struct ghost_file *gf;
 	GhostFileEntry *gfe = NULL;
 	int gfd, ifd, ghost_flags;
+	char *root, path[PATH_MAX];
 
 	rfe->remap_id &= ~REMAP_GHOST;
 	list_for_each_entry(gf, &ghost_files, list)
@@ -86,6 +88,12 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	 */
 
 	pr_info("Opening ghost file %#x for %s\n", rfe->remap_id, rfi->path);
+
+	root = rst_get_mnt_root(rfi->rfe->mnt_id);
+	if (root == NULL) {
+		pr_err("The %d mount is not found\n", rfi->rfe->mnt_id);
+		return -1;
+	}
 
 	gf = shmalloc(sizeof(*gf));
 	if (!gf)
@@ -120,9 +128,10 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	} else
 		ghost_flags = O_WRONLY | O_CREAT | O_EXCL;
 
-	gfd = open(gf->remap.path, ghost_flags, gfe->mode);
+	snprintf(path, sizeof(path), "%s/%s", root, gf->remap.path);
+	gfd = open(path, ghost_flags, gfe->mode);
 	if (gfd < 0) {
-		pr_perror("Can't open ghost file %s", gf->remap.path);
+		pr_perror("Can't open ghost file %s", path);
 		goto close_ifd;
 	}
 
@@ -291,7 +300,8 @@ struct file_remap *lookup_ghost_remap(u32 dev, u32 ino)
 	return NULL;
 }
 
-static int dump_ghost_remap(char *path, const struct stat *st, int lfd, u32 id)
+static int dump_ghost_remap(char *path, const struct stat *st,
+				int lfd, u32 id, struct ns_id *nsid)
 {
 	struct ghost_file *gf;
 	RemapFilePathEntry rpe = REMAP_FILE_PATH_ENTRY__INIT;
@@ -305,7 +315,7 @@ static int dump_ghost_remap(char *path, const struct stat *st, int lfd, u32 id)
 		return -1;
 	}
 
-	phys_dev = phys_stat_resolve_dev(st->st_dev, path);
+	phys_dev = phys_stat_resolve_dev(nsid->mnt.mntinfo_tree, st->st_dev, path);
 	list_for_each_entry(gf, &ghost_files, list)
 		if ((gf->dev == phys_dev) && (gf->ino == st->st_ino))
 			goto dump_entry;
@@ -335,11 +345,15 @@ dump_entry:
 static void __rollback_link_remaps(bool do_unlink)
 {
 	struct link_remap_rlb *rlb, *tmp;
+	int mntns_root;
 
 	if (!opts.link_remap_ok)
 		return;
 
 	list_for_each_entry_safe(rlb, tmp, &link_remaps, list) {
+		mntns_root = mntns_get_root_fd(rlb->mnt_ns);
+		if (mntns_root < 0)
+			return;
 		list_del(&rlb->list);
 		if (do_unlink)
 			unlinkat(mntns_root, rlb->path, 0);
@@ -351,12 +365,14 @@ static void __rollback_link_remaps(bool do_unlink)
 void delete_link_remaps(void) { __rollback_link_remaps(true); }
 void free_link_remaps(void) { __rollback_link_remaps(false); }
 
-static int create_link_remap(char *path, int len, int lfd, u32 *idp)
+static int create_link_remap(char *path, int len, int lfd,
+				u32 *idp, struct ns_id *nsid)
 {
 	char link_name[PATH_MAX], *tmp;
 	RegFileEntry rfe = REG_FILE_ENTRY__INIT;
 	FownEntry fwn = FOWN_ENTRY__INIT;
 	struct link_remap_rlb *rlb;
+	int mntns_root;
 
 	if (!opts.link_remap_ok) {
 		pr_err("Can't create link remap for %s. "
@@ -391,6 +407,8 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp)
 	/* Any 'unique' name works here actually. Remap works by reg-file ids. */
 	snprintf(tmp + 1, sizeof(link_name) - (size_t)(tmp - link_name - 1), "link_remap.%d", rfe.id);
 
+	mntns_root = mntns_get_root_fd(nsid);
+
 	if (linkat(lfd, "", mntns_root, link_name, AT_EMPTY_PATH) < 0) {
 		pr_perror("Can't link remap to %s", path);
 		return -1;
@@ -406,6 +424,8 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp)
 	if (rlb)
 		rlb->path = strdup(link_name);
 
+	rlb->mnt_ns = nsid;
+
 	if (!rlb || !rlb->path) {
 		pr_perror("Can't register rollback for %s", path);
 		xfree(rlb ? rlb->path : NULL);
@@ -417,12 +437,13 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp)
 	return pb_write_one(fdset_fd(glob_fdset, CR_FD_REG_FILES), &rfe, PB_REG_FILE);
 }
 
-static int dump_linked_remap(char *path, int len, const struct stat *ost, int lfd, u32 id)
+static int dump_linked_remap(char *path, int len, const struct stat *ost,
+				int lfd, u32 id, struct ns_id *nsid)
 {
 	u32 lid;
 	RemapFilePathEntry rpe = REMAP_FILE_PATH_ENTRY__INIT;
 
-	if (create_link_remap(path, len, lfd, &lid))
+	if (create_link_remap(path, len, lfd, &lid, nsid))
 		return -1;
 
 	rpe.orig_id = id;
@@ -466,9 +487,10 @@ static inline bool nfs_silly_rename(char *rpath, const struct fd_parms *parms)
 	return (parms->fs_type == NFS_SUPER_MAGIC) && is_sillyrename_name(rpath);
 }
 
-static int check_path_remap(char *rpath, int plen, const struct fd_parms *parms, int lfd, u32 id)
+static int check_path_remap(char *rpath, int plen, const struct fd_parms *parms,
+				int lfd, u32 id, struct ns_id *nsid)
 {
-	int ret;
+	int ret, mntns_root;
 	struct stat pst;
 	const struct stat *ost = &parms->stat;
 
@@ -479,7 +501,7 @@ static int check_path_remap(char *rpath, int plen, const struct fd_parms *parms,
 		 * be careful whether anybody still has any of its hardlinks
 		 * also open.
 		 */
-		return dump_ghost_remap(rpath + 1, ost, lfd, id);
+		return dump_ghost_remap(rpath + 1, ost, lfd, id, nsid);
 
 	if (nfs_silly_rename(rpath, parms)) {
 		/*
@@ -490,8 +512,12 @@ static int check_path_remap(char *rpath, int plen, const struct fd_parms *parms,
 		 * links on it) to have some persistent name at hands.
 		 */
 		pr_debug("Dump silly-rename linked remap for %x\n", id);
-		return dump_linked_remap(rpath + 1, plen - 1, ost, lfd, id);
+		return dump_linked_remap(rpath + 1, plen - 1, ost, lfd, id, nsid);
 	}
+
+	mntns_root = mntns_get_root_fd(nsid);
+	if (mntns_root < 0)
+		return -1;
 
 	ret = fstatat(mntns_root, rpath, &pst, 0);
 	if (ret < 0) {
@@ -503,7 +529,8 @@ static int check_path_remap(char *rpath, int plen, const struct fd_parms *parms,
 		 */
 
 		if (errno == ENOENT)
-			return dump_linked_remap(rpath + 1, plen - 1, ost, lfd, id);
+			return dump_linked_remap(rpath + 1, plen - 1,
+							ost, lfd, id, nsid);
 
 		pr_perror("Can't stat path");
 		return -1;
@@ -540,6 +567,7 @@ static int check_path_remap(char *rpath, int plen, const struct fd_parms *parms,
 int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 {
 	struct fd_link _link, *link;
+	struct ns_id *nsid;
 	int rfd;
 
 	RegFileEntry rfe = REG_FILE_ENTRY__INIT;
@@ -550,6 +578,17 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 		link = &_link;
 	} else
 		link = p->link;
+
+	nsid = lookup_nsid_by_mnt_id(p->mnt_id);
+	if (nsid == NULL) {
+		pr_err("Unable to look up the %d mount\n", p->mnt_id);
+		return -1;
+	}
+
+	if (p->mnt_id >= 0 && (root_ns_mask & CLONE_NEWNS)) {
+		rfe.mnt_id = p->mnt_id;
+		rfe.has_mnt_id = true;
+	}
 
 	pr_info("Dumping path for %d fd via self %d [%s]\n",
 			p->fd, lfd, &link->name[1]);
@@ -562,7 +601,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 		return -1;
 	}
 
-	if (check_path_remap(link->name, link->len, p, lfd, id))
+	if (check_path_remap(link->name, link->len, p, lfd, id, nsid))
 		return -1;
 
 	rfe.id		= id;
@@ -659,17 +698,30 @@ int open_path(struct file_desc *d,
 	return tmp;
 }
 
-static int do_open_reg_noseek(struct reg_file_info *rfi, void *arg)
+static int do_open_reg_noseek_flags(struct reg_file_info *rfi, void *arg)
 {
-	int fd;
+	u32 flags = *(u32 *)arg;
+	int fd, mntns_root;
+	struct ns_id *nsid;
 
-	fd = open(rfi->path, rfi->rfe->flags);
+	nsid = lookup_nsid_by_mnt_id(rfi->rfe->mnt_id);
+	if (nsid == NULL)
+		return -1;
+
+	mntns_root = mntns_get_root_fd(nsid);
+
+	fd = openat(mntns_root, rfi->path, flags);
 	if (fd < 0) {
 		pr_perror("Can't open file %s on restore", rfi->path);
 		return fd;
 	}
 
 	return fd;
+}
+
+static int do_open_reg_noseek(struct reg_file_info *rfi, void *arg)
+{
+	return do_open_reg_noseek_flags(rfi, &rfi->rfe->flags);
 }
 
 static int do_open_reg(struct reg_file_info *rfi, void *arg)
@@ -711,6 +763,8 @@ int open_reg_by_id(u32 id)
 
 int get_filemap_fd(struct vma_area *vma)
 {
+	u32 flags;
+
 	/*
 	 * Thevma->fd should have been assigned in collect_filemap
 	 *
@@ -718,7 +772,15 @@ int get_filemap_fd(struct vma_area *vma)
 	 */
 
 	BUG_ON(vma->fd == NULL);
-	return open_path(vma->fd, do_open_reg_noseek, NULL);
+	if (vma->e->has_fdflags)
+		flags = vma->e->fdflags;
+	else if ((vma->e->prot & PROT_WRITE) &&
+			vma_area_is(vma, VMA_FILE_SHARED))
+		flags = O_RDWR;
+	else
+		flags = O_RDONLY;
+
+	return open_path(vma->fd, do_open_reg_noseek_flags, &flags);
 }
 
 static void remap_get(struct file_desc *fdesc, char typ)

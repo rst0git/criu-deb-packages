@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <sys/inotify.h>
 #include <sys/vfs.h>
+#include <linux/magic.h>
 #include <sys/wait.h>
 #include <sys/poll.h>
 #include <sys/mman.h>
@@ -37,9 +38,11 @@
 #include "list.h"
 #include "lock.h"
 #include "irmap.h"
+#include "cr_options.h"
 
 #include "protobuf.h"
 #include "protobuf/fsnotify.pb-c.h"
+#include "protobuf/mnt.pb-c.h"
 
 #undef	LOG_PREFIX
 #define LOG_PREFIX "fsnotify: "
@@ -129,14 +132,50 @@ out:
 int check_open_handle(unsigned int s_dev, unsigned long i_ino,
 		FhEntry *f_handle)
 {
-	int fd;
+	int fd = -1;
 	char *path;
 
 	fd = open_handle(s_dev, i_ino, f_handle);
 	if (fd >= 0) {
-		close(fd);
+		struct mount_info *mi;
+
 		pr_debug("\tHandle %x:%lx is openable\n", s_dev, i_ino);
-		return 0;
+
+		mi = lookup_mnt_sdev(s_dev);
+		if (mi == NULL) {
+			pr_err("Unable to lookup a mount by dev %x\n", s_dev);
+			goto err;
+		}
+
+		/*
+		 * Inode numbers are not restored for tmpfs content, but we can
+		 * get file names, becasue tmpfs cache is not pruned.
+		 */
+		if ((mi->fstype->code == FSTYPE__TMPFS) ||
+				(mi->fstype->code == FSTYPE__DEVTMPFS)) {
+			char p[PATH_MAX];
+
+			if (read_fd_link(fd, p, sizeof(p)) < 0)
+				goto err;
+
+			path = xstrdup(p);
+			if (path == NULL)
+				goto err;
+
+			goto out;
+		}
+
+		if (!opts.force_irmap)
+			/*
+			 * If we're not forced to do irmap, then
+			 * say we have no path for watch. Otherwise
+			 * do irmap scan even if the handle is
+			 * working.
+			 *
+			 * FIXME -- no need to open-by-handle if
+			 * we are in force-irmap and not on tempfs
+			 */
+			goto out_nopath;
 	}
 
 	pr_warn("\tHandle %x:%lx cannot be opened\n", s_dev, i_ino);
@@ -145,10 +184,15 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino,
 		pr_err("\tCan't dump that handle\n");
 		return -1;
 	}
-
+out:
 	pr_debug("\tDumping %s as path for handle\n", path);
 	f_handle->path = path;
+out_nopath:
+	close_safe(&fd);
 	return 0;
+err:
+	close_safe(&fd);
+	return -1;
 }
 
 static int dump_inotify_entry(union fdinfo_entries *e, void *arg)
@@ -276,7 +320,8 @@ static int pre_dump_fanotify_entry(union fdinfo_entries *e, void *arg)
 
 static int pre_dump_one_fanotify(int pid, int lfd)
 {
-	return parse_fdinfo_pid(pid, lfd, FD_TYPES__FANOTIFY, pre_dump_fanotify_entry, NULL);
+	struct fsnotify_params fsn_params = { };
+	return parse_fdinfo_pid(pid, lfd, FD_TYPES__FANOTIFY, pre_dump_fanotify_entry, &fsn_params);
 }
 
 const struct fdtype_ops fanotify_dump_ops = {

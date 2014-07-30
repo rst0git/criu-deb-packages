@@ -1,7 +1,6 @@
 #ifndef __CR_ASM_TYPES_H__
 #define __CR_ASM_TYPES_H__
 
-#include <stdint.h>
 #include <stdbool.h>
 #include <signal.h>
 #include "protobuf/core.pb-c.h"
@@ -110,6 +109,7 @@ typedef UserArmRegsEntry UserRegsEntry;
 #define TI_SP(core) ((core)->ti_arm->gpregs->sp)
 
 typedef u32 auxv_t;
+typedef u32 tls_t;
 
 static inline void *decode_pointer(u64 v) { return (void*)(u32)v; }
 static inline u64 encode_pointer(void *p) { return (u32)p; }
