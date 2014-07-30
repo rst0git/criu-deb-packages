@@ -3,21 +3,19 @@ Section: admin
 Priority: optional
 Maintainer: Salvatore Bonaccorso <carnil@debian.org>
 Build-Depends:
- debhelper (>= 9),
  asciidoc,
+ debhelper (>= 9),
  libprotobuf-c0-dev,
  protobuf-c-compiler,
- xmlto,
+ xmlto
 Standards-Version: 3.9.5
 Homepage: http://www.criu.org/
 Vcs-Browser: http://daniel-baumann.ch/gitweb/?p=debian/packages/criu.git
 Vcs-Git: git://daniel-baumann.ch/git/debian/packages/criu.git
 
 Package: criu
-Architecture: armhf amd64
-Depends:
- ${misc:Depends},
- ${shlibs:Depends},
+Architecture: amd64 armhf
+Depends: ${misc:Depends}, ${shlibs:Depends}
 Recommends: iproute2 | iproute
 Description: checkpoint and restore in userspace
  criu contains the utilities to checkpoint and restore processes in
@@ -26,10 +24,8 @@ Description: checkpoint and restore in userspace
 Package: criu-dbg
 Section: debug
 Priority: extra
-Architecture: armhf amd64
-Depends:
- ${misc:Depends},
- criu (= ${binary:Version}),
+Architecture: amd64 armhf
+Depends: criu (= ${binary:Version}), ${misc:Depends}
 Description: checkpoint and restore in userspace (debug)
  criu contains the utilities to checkpoint and restore processes in
  userspace.
