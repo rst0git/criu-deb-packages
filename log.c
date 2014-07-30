@@ -15,7 +15,8 @@
 #include "compiler.h"
 #include "asm/types.h"
 #include "util.h"
-#include "crtools.h"
+#include "cr_options.h"
+#include "servicefd.h"
 
 #define DEFAULT_LOGFD		STDERR_FILENO
 
@@ -62,29 +63,13 @@ int log_get_fd(void)
 
 int log_init(const char *output)
 {
-	int new_logfd, dfd, fd;
+	int new_logfd, fd;
 
 	gettimeofday(&start, NULL);
 	buf_off = TS_BUF_OFF;
 
-	dfd = get_service_fd(LOG_DIR_FD_OFF);
-	if (dfd < 0) {
-		int tmp;
-		tmp = open(".", O_RDONLY);
-		if (tmp == -1) {
-			pr_perror("Can't open a current directory");
-			return -1;
-		}
-
-		dfd = install_service_fd(LOG_DIR_FD_OFF, tmp);
-		close(tmp);
-		if (dfd < 0)
-			return -1;
-	}
-
 	if (output) {
-		new_logfd = openat(dfd, output,
-					O_CREAT | O_TRUNC | O_WRONLY | O_APPEND, 0600);
+		new_logfd = open(output, O_CREAT|O_TRUNC|O_WRONLY|O_APPEND, 0600);
 		if (new_logfd < 0) {
 			pr_perror("Can't create log file %s", output);
 			return -1;
@@ -136,12 +121,6 @@ int log_init_by_pid(void)
 void log_fini(void)
 {
 	close_service_fd(LOG_FD_OFF);
-	log_closedir();
-}
-
-void log_closedir(void)
-{
-	close_service_fd(LOG_DIR_FD_OFF);
 }
 
 void log_set_loglevel(unsigned int level)
@@ -192,14 +171,13 @@ void print_on_level(unsigned int loglevel, const char *format, ...)
 	va_end(params);
 }
 
-int write_pidfile(char *pfname, int pid)
+int write_pidfile(int pid)
 {
 	int fd;
 
-	fd = open(pfname, O_WRONLY | O_TRUNC | O_CREAT, 0600);
+	fd = open(opts.pidfile, O_WRONLY | O_TRUNC | O_CREAT, 0600);
 	if (fd == -1) {
-		pr_perror("Can't open %s", pfname);
-		kill(pid, SIGKILL);
+		pr_perror("Can't open %s", opts.pidfile);
 		return -1;
 	}
 

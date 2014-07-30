@@ -2,8 +2,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+#include "cr_options.h"
 #include "pstree.h"
-#include "restorer.h"
 #include "util.h"
 #include "lock.h"
 #include "namespaces.h"

@@ -1,5 +1,5 @@
-VERSION_MAJOR		:= 0
-VERSION_MINOR		:= 8
+VERSION_MAJOR		:= 1
+VERSION_MINOR		:= 0
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -69,6 +69,8 @@ ifeq ($(shell echo $(ARCH) | sed -e 's/arm.*/arm/'),arm)
 		CFLAGS += -march=armv7-a
 	endif
 endif
+
+LDARCH		?= $(ARCH)
 
 SRC_DIR		?= $(CURDIR)
 ARCH_DIR	:= arch/$(ARCH)

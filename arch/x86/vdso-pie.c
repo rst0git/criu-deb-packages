@@ -13,8 +13,10 @@
 #include "asm/types.h"
 
 #include "compiler.h"
+#include "syscall.h"
 #include "crtools.h"
 #include "vdso.h"
+#include "vma.h"
 #include "log.h"
 
 #ifdef LOG_PREFIX

@@ -6,14 +6,13 @@
 #include <sys/mman.h>
 #include <string.h>
 
-#include "crtools.h"
+#include "cr_options.h"
 #include "util.h"
 #include "list.h"
 #include "log.h"
 #include "asm/types.h"
 #include "files.h"
 #include "sockets.h"
-#include "files.h"
 #include "sk-inet.h"
 #include "netfilter.h"
 #include "image.h"
@@ -95,6 +94,13 @@ static int refresh_inet_sk(struct inet_sk_desc *sk)
 
 	sk->wqlen = size;
 
+	if (ioctl(sk->rfd, SIOCOUTQNSD, &size) == -1) {
+		pr_perror("Unable to get size of unsent data");
+		return -1;
+	}
+
+	sk->uwqlen = size;
+
 	if (ioctl(sk->rfd, SIOCINQ, &size) == -1) {
 		pr_perror("Unable to get size of recv queue");
 		return -1;
@@ -154,9 +160,11 @@ static void tcp_unlock_one(struct inet_sk_desc *sk)
 
 	list_del(&sk->rlist);
 
-	ret = nf_unlock_connection(sk);
-	if (ret < 0)
-		pr_perror("Failed to unlock TCP connection");
+	if (!(current_ns_mask & CLONE_NEWNET)) {
+		ret = nf_unlock_connection(sk);
+		if (ret < 0)
+			pr_perror("Failed to unlock TCP connection");
+	}
 
 	tcp_repair_off(sk->rfd);
 
@@ -323,6 +331,8 @@ static int dump_tcp_conn_state(struct inet_sk_desc *sk)
 
 	pr_info("Reading outq for socket\n");
 	tse.outq_len = sk->wqlen;
+	tse.unsq_len = sk->uwqlen;
+	tse.has_unsq_len = true;
 	ret = tcp_stream_get_queue(sk->rfd, TCP_SEND_QUEUE,
 			&tse.outq_seq, tse.outq_len, &out_buf);
 	if (ret < 0)
@@ -442,18 +452,11 @@ static int restore_tcp_seqs(int sk, TcpStreamEntry *tse)
 	return 0;
 }
 
-static int send_tcp_queue(int sk, int queue, u32 len, int imgfd)
+static int __send_tcp_queue(int sk, int queue, u32 len, int imgfd)
 {
 	int ret, err = -1;
 	int off, max;
 	char *buf;
-
-	pr_debug("\tRestoring TCP %d queue data %u bytes\n", queue, len);
-
-	if (setsockopt(sk, SOL_TCP, TCP_REPAIR_QUEUE, &queue, sizeof(queue)) < 0) {
-		pr_perror("Can't set repair queue");
-		return -1;
-	}
 
 	buf = xmalloc(len);
 	if (!buf)
@@ -484,16 +487,49 @@ err:
 	return err;
 }
 
+static int send_tcp_queue(int sk, int queue, u32 len, int imgfd)
+{
+	pr_debug("\tRestoring TCP %d queue data %u bytes\n", queue, len);
+
+	if (setsockopt(sk, SOL_TCP, TCP_REPAIR_QUEUE, &queue, sizeof(queue)) < 0) {
+		pr_perror("Can't set repair queue");
+		return -1;
+	}
+
+	return __send_tcp_queue(sk, queue, len, imgfd);
+}
+
 static int restore_tcp_queues(int sk, TcpStreamEntry *tse, int fd)
 {
+	u32 len;
+
 	if (restore_prepare_socket(sk))
 		return -1;
 
-	if (tse->inq_len &&
-			send_tcp_queue(sk, TCP_RECV_QUEUE, tse->inq_len, fd))
+	len = tse->inq_len;
+	if (len && send_tcp_queue(sk, TCP_RECV_QUEUE, len, fd))
 		return -1;
-	if (tse->outq_len &&
-			send_tcp_queue(sk, TCP_SEND_QUEUE, tse->outq_len, fd))
+
+	/*
+	 * All data in a write buffer can be divided on two parts sent
+	 * but not yet acknowledged data and unsent data.
+	 * The TCP stack must know which data have been sent, because
+	 * acknowledgment can be received for them. These data must be
+	 * restored in repair mode.
+	 */
+	len = tse->outq_len - tse->unsq_len;
+	if (len && send_tcp_queue(sk, TCP_SEND_QUEUE, len, fd))
+		return -1;
+
+	/*
+	 * The second part of data have never been sent to outside, so
+	 * they can be restored without any tricks.
+	 */
+	len = tse->unsq_len;
+	tcp_repair_off(sk);
+	if (len && __send_tcp_queue(sk, TCP_SEND_QUEUE, len, fd))
+		return -1;
+	if (tcp_repair_on(sk))
 		return -1;
 
 	return 0;
@@ -647,6 +683,10 @@ void tcp_locked_conn_add(struct inet_sk_info *ii)
 void rst_unlock_tcp_connections(void)
 {
 	struct inet_sk_info *ii;
+
+	/* Network will be unlocked by network-unlock scripts */
+	if (current_ns_mask & CLONE_NEWNET)
+		return;
 
 	list_for_each_entry(ii, &rst_tcp_repair_sockets, rlist)
 		nf_unlock_connection_info(ii);

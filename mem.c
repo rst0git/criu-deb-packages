@@ -2,8 +2,10 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <fcntl.h>
 
-#include "crtools.h"
+#include "cr_options.h"
+#include "servicefd.h"
 #include "mem.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
@@ -12,6 +14,7 @@
 #include "log.h"
 #include "kerndat.h"
 #include "stats.h"
+#include "vma.h"
 
 #include "protobuf.h"
 #include "protobuf/pagemap.pb-c.h"

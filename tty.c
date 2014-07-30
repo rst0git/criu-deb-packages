@@ -17,7 +17,9 @@
 
 #include "syscall.h"
 #include "files.h"
-#include "crtools.h"
+#include "cr_options.h"
+#include "fdset.h"
+#include "servicefd.h"
 #include "image.h"
 #include "util.h"
 #include "log.h"
@@ -28,7 +30,6 @@
 
 #include "protobuf.h"
 #include "protobuf/tty.pb-c.h"
-#include "protobuf/creds.pb-c.h"
 
 #include "parasite-syscall.h"
 #include "parasite.h"

@@ -2,7 +2,9 @@
 #define __CR_PSTREE_H__
 
 #include "list.h"
-#include "crtools.h"
+#include "pid.h"
+#include "image.h"
+#include "rst_info.h"
 #include "protobuf/core.pb-c.h"
 
 /*
@@ -10,23 +12,6 @@
  * all orphaned children in the system.
  */
 #define INIT_PID	(1)
-
-struct pid {
-	/*
-	 * The @real pid is used to fetch tasks during dumping stage,
-	 * This is a global pid seen from the context where the dumping
-	 * is running.
-	 */
-	pid_t real;
-
-	/*
-	 * The @virt pid is one which used in the image itself and keeps
-	 * the pid value to be restored. This pid fetched from the
-	 * dumpee context, because the dumpee might have own pid namespace.
-	 */
-	pid_t virt;
-};
-
 struct pstree_item {
 	struct pstree_item	*parent;
 	struct list_head	children;	/* list of my children */
@@ -74,7 +59,7 @@ extern bool pid_in_pstree(pid_t pid);
 struct task_entries;
 extern struct task_entries *task_entries;
 
-int get_task_ids(struct pstree_item *);
+extern int get_task_ids(struct pstree_item *);
 extern struct _TaskKobjIdsEntry *root_ids;
 
 extern void core_entry_free(CoreEntry *core);

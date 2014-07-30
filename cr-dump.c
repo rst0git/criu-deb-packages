@@ -32,10 +32,13 @@
 
 #include "asm/types.h"
 #include "list.h"
+#include "fdset.h"
 #include "file-ids.h"
 #include "kcmp-ids.h"
 #include "compiler.h"
 #include "crtools.h"
+#include "cr_options.h"
+#include "servicefd.h"
 #include "syscall.h"
 #include "ptrace.h"
 #include "util.h"
@@ -63,7 +66,9 @@
 #include "mem.h"
 #include "vdso.h"
 #include "page-pipe.h"
+#include "posix-timer.h"
 #include "vdso.h"
+#include "vma.h"
 #include "cr-service.h"
 
 #include "asm/dump.h"
@@ -1767,18 +1772,37 @@ err:
 	}
 
 	/*
-	 * If we've failed to do anything -- unlock all TCP sockets
-	 * so that the connections can go on. But if we succeeded --
-	 * don't, just close them silently.
+	 * Dump is complete at this stage. To choose what
+	 * to do next we need to consider the following
+	 * scenarios
+	 *
+	 *  - error happened during checkpoint: just clean up
+	 *    everything and continue execution of the dumpee;
+	 *
+	 *  - dump successed but post-dump script returned
+	 *    some ret code: same as in previous scenario --
+	 *    just clean up everything and continue execution,
+	 *    we will return script ret code back to criu caller
+	 *    and it's up to a caller what to do with running instance
+	 *    of the dumpee -- either kill it, or continue running;
+	 *
+	 *  - dump successed but -R option passed, pointing that
+	 *    we're asked to continue execution of the dumpee. It's
+	 *    assumed that a user will use post-dump script to keep
+	 *    consistency of the FS and other resources, we simply
+	 *    start rollback procedure and cleanup everyhting.
 	 */
-	if (ret || post_dump_ret)
+	if (ret || post_dump_ret || opts.final_state == TASK_ALIVE) {
 		network_unlock();
+		delete_link_remaps();
+	}
 	pstree_switch_state(root_item,
 			    (ret || post_dump_ret) ?
 			    TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
 	free_pstree(root_item);
 	free_file_locks();
+	free_link_remaps();
 
 	close_service_fd(CR_PROC_FD_OFF);
 

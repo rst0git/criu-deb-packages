@@ -1,5 +1,5 @@
-#ifndef __CR_SEIZE_H__
-#define __CR_SEIZE_H__
+#ifndef __CR_PTRACE_H__
+#define __CR_PTRACE_H__
 
 #include <linux/types.h>
 #include <sys/ptrace.h>
@@ -25,6 +25,11 @@ struct ptrace_peeksiginfo_args {
 
 /* Read signals from a shared (process wide) queue */
 #define PTRACE_PEEKSIGINFO_SHARED       (1 << 0)
+#endif
+
+#ifndef PTRACE_GETREGSET
+# define PTRACE_GETREGSET	0x4204
+# define PTRACE_SETREGSET	0x4205
 #endif
 
 #define PTRACE_GETSIGMASK	0x420a
@@ -56,4 +61,4 @@ extern int ptrace_peek_area(pid_t pid, void *dst, void *addr, long bytes);
 extern int ptrace_poke_area(pid_t pid, void *src, void *addr, long bytes);
 extern int ptrace_swap_area(pid_t pid, void *dst, void *src, long bytes);
 
-#endif /* __CR_SEIZE_H__ */
+#endif /* __CR_PTRACE_H__ */

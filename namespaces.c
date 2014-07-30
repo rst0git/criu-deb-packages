@@ -2,11 +2,14 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <stdlib.h>
+#include "cr-show.h"
 #include "util.h"
+#include "fdset.h"
 #include "syscall.h"
 #include "uts_ns.h"
 #include "ipc_ns.h"
 #include "mount.h"
+#include "pstree.h"
 #include "namespaces.h"
 #include "net.h"
 

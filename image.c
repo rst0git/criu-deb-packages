@@ -1,17 +1,10 @@
 #include <unistd.h>
 #include <stdarg.h>
+#include <fcntl.h>
 #include "crtools.h"
+#include "cr_options.h"
+#include "fdset.h"
 #include "image.h"
-#include "eventpoll.h"
-#include "signalfd.h"
-#include "fsnotify.h"
-#include "sockets.h"
-#include "uts_ns.h"
-#include "ipc_ns.h"
-#include "sk-inet.h"
-#include "sk-packet.h"
-#include "mount.h"
-#include "net.h"
 #include "pstree.h"
 #include "stats.h"
 #include "protobuf.h"
@@ -236,37 +229,39 @@ err:
 	return -1;
 }
 
-int open_image_dir(void)
+int open_image_dir(char *dir)
 {
 	int fd, ret;
 
-	fd = open(".", O_RDONLY);
+	fd = open(dir, O_RDONLY);
 	if (fd < 0) {
-		pr_perror("Can't open cwd");
+		pr_perror("Can't open dir %s", dir);
 		return -1;
 	}
 
 	ret = install_service_fd(IMG_FD_OFF, fd);
 
-	close(fd);
-
 	if (opts.img_parent) {
-		ret = symlink(opts.img_parent, CR_PARENT_LINK);
+		int pfd;
+
+		ret = symlinkat(opts.img_parent, fd, CR_PARENT_LINK);
 		if (ret < 0) {
 			pr_perror("Can't link parent snapshot.");
 			goto err;
 		}
 
-		fd = open(CR_PARENT_LINK, O_RDONLY);
-		if (fd < 0) {
+		pfd = openat(fd, CR_PARENT_LINK, O_RDONLY);
+		if (pfd < 0) {
 			pr_perror("Can't open parent snapshot.");
 			goto err;
 		}
 
-		ret = install_service_fd(PARENT_FD_OFF, fd);
+		ret = install_service_fd(PARENT_FD_OFF, pfd);
 
-		close(fd);
+		close(pfd);
 	}
+
+	close(fd);
 
 	return ret;
 
