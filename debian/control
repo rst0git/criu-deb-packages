@@ -5,7 +5,7 @@ Maintainer: Salvatore Bonaccorso <carnil@debian.org>
 Build-Depends:
  asciidoc,
  debhelper (>= 9),
- libprotobuf-c0-dev,
+ libprotobuf-c-dev,
  protobuf-c-compiler,
  xmlto
 Standards-Version: 3.9.5
