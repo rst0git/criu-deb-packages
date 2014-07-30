@@ -44,6 +44,7 @@ struct fd_parms {
 	pid_t		pid;
 	FownEntry	fown;
 	struct fd_link	*link;
+	long		fs_type;
 
 	struct parasite_ctl *ctl;
 };
@@ -146,5 +147,9 @@ extern int close_old_fds(struct pstree_item *me);
 #define LREMAP_PARAM	"link-remap"
 
 extern int shared_fdt_prepare(struct pstree_item *item);
+
+extern struct collect_image_info ext_file_cinfo;
+extern int dump_unsupp_fd(struct fd_parms *p, int lfd,
+			  const int fdinfo, char *more, char *info);
 
 #endif /* __CR_FILES_H__ */

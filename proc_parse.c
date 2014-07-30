@@ -759,19 +759,21 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new)
 	if (ret != 3)
 		return -1;
 
+	ret = -1;
 	new->fstype = find_fstype_by_name(fstype);
-	free(fstype);
 
 	new->options = xmalloc(strlen(opt) + 1);
 	if (!new->options)
-		return -1;
+		goto err;
 
 	if (parse_sb_opt(opt, &new->flags, new->options))
-		return -1;
+		goto err;
 
+	ret = 0;
+err:
 	free(opt);
-
-	return 0;
+	free(fstype);
+	return ret;
 }
 
 struct mount_info *parse_mountinfo(pid_t pid)
@@ -808,6 +810,15 @@ struct mount_info *parse_mountinfo(pid_t pid)
 				new->fstype->name, new->source,
 				new->s_dev, new->root, new->mountpoint,
 				new->flags, new->options);
+
+		if (new->fstype->parse) {
+			ret = new->fstype->parse(new);
+			if (ret) {
+				pr_err("Failed to parse FS specific data on %s\n",
+						new->mountpoint);
+				goto err;
+			}
+		}
 	}
 out:
 	fclose(f);

@@ -73,6 +73,7 @@ static/fifo_wronly
 static/zombie00
 static/rlimits00
 transition/fork
+transition/thread-bomb
 static/pty00
 static/pty01
 static/pty04
@@ -97,6 +98,7 @@ static/grow_map02
 static/stopped
 static/chroot
 static/chroot-file
+static/rtc
 "
 # Duplicate list with ns/ prefix
 TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#ns/#')
@@ -147,6 +149,7 @@ sk-netlink
 tun
 chroot
 chroot-file
+rtc
 "
 
 source $(readlink -f `dirname $0`/env.sh) || exit 1
@@ -354,7 +357,7 @@ stop_test()
 save_fds()
 {
 	test -n "$PIDNS" && return 0
-	ls -l /proc/$1/fd | sed 's/\(-> \(pipe\|socket\)\):.*/\1/' | awk '{ print $9,$10,$11; }' > $2
+	ls -l /proc/$1/fd | sed 's/\(-> \(pipe\|socket\)\):.*/\1/' | sed -e 's/\/.nfs[0-9a-zA-Z]*/.nfs-silly-rename/' | awk '{ print $9,$10,$11; }' > $2
 }
 
 save_maps()
@@ -398,6 +401,9 @@ run_test()
 	if [[ $1 =~ "unlink_" ]]; then
 		linkremap="--link-remap"
 	fi
+	if [[ $1 =~ "write_read10" ]]; then
+		linkremap="--link-remap"
+	fi
 
 	if [ -n "$MAINSTREAM_KERNEL" ] && [ $COMPILE_ONLY -eq 0 ] && echo $TEST_CR_KERNEL | grep -q ${test#ns/}; then
 		echo "Skip $test"
@@ -439,6 +445,10 @@ EOF
 			exit 1
 		fi
 		args="--root $ZDTM_ROOT --pidfile $TPID $args"
+	fi
+
+	if [ $tname = "rtc" ]; then
+		args="$args -L `pwd`/$tdir/lib"
 	fi
 
 	for i in `seq $ITERATIONS`; do
@@ -509,7 +519,9 @@ EOF
 			diff_fds $ddump/dump.fd $ddump/dump.fd.after || return 1
 
 			save_maps $PID  $ddump/dump.maps.after
-			diff_maps $ddump/dump.maps $ddump/dump.maps.after || return 1
+			expr $tname : "static" > /dev/null && {
+				diff_maps $ddump/dump.maps $ddump/dump.maps.after || return 1
+			}
 
 			if [[ $linkremap ]]; then
 				echo "remove ./$tdir/link_remap.*"
@@ -542,7 +554,9 @@ EOF
 			[ $i -eq 5 ] && return 2
 
 			save_maps $PID $ddump/restore.maps
-			diff_maps $ddump/dump.maps $ddump/restore.maps || return 2
+			expr $tname : "static" > /dev/null && {
+				diff_maps $ddump/dump.maps $ddump/restore.maps || return 2
+			}
 		fi
 
 	done
@@ -653,7 +667,7 @@ Options:
 	-g : Generate executables only
 	-n : Batch test
 	-r : Run test with specified name directly without match or check
-	-v : Verbose mode 
+	-v : Verbose mode
 EOF
 }
 
@@ -693,7 +707,11 @@ while :; do
 		;;
 	  -x)
 		shift
-		EXCLUDE_PATTERN=$1
+		if [ -z "$EXCLUDE_PATTERN" ]; then
+			EXCLUDE_PATTERN=$1
+		else
+			EXCLUDE_PATTERN="${EXCLUDE_PATTERN}\|$1"
+		fi
 		shift
 		;;
 	  -t)

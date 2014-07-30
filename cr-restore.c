@@ -67,6 +67,7 @@
 #include "vma.h"
 #include "kerndat.h"
 #include "rst-malloc.h"
+#include "plugin.h"
 
 #include "parasite-syscall.h"
 
@@ -140,6 +141,7 @@ static struct collect_image_info *cinfos[] = {
 	&tty_info_cinfo,
 	&tty_cinfo,
 	&tunfile_cinfo,
+	&ext_file_cinfo,
 };
 
 static int root_prepare_shared(void)
@@ -382,7 +384,7 @@ static int restore_priv_vma_content(pid_t pid)
 
 				ret = pr.read_page(&pr, va, buf);
 				if (ret < 0)
-					break;
+					goto err_read;
 				va += PAGE_SIZE;
 
 				if (memcmp(p, buf, PAGE_SIZE) == 0) {
@@ -394,7 +396,7 @@ static int restore_priv_vma_content(pid_t pid)
 			} else {
 				ret = pr.read_page(&pr, va, p);
 				if (ret < 0)
-					break;
+					goto err_read;
 				va += PAGE_SIZE;
 			}
 
@@ -405,6 +407,7 @@ static int restore_priv_vma_content(pid_t pid)
 			pr.put_pagemap(&pr);
 	}
 
+err_read:
 	pr.close(&pr);
 	if (ret < 0)
 		return ret;
@@ -1260,6 +1263,9 @@ static int restore_task_with_children(void *_arg)
 
 	/* Restore root task */
 	if (current->parent == NULL) {
+		if (restore_finish_stage(CR_STATE_RESTORE_NS) < 0)
+			exit(1);
+
 		if (collect_mount_info(getpid()))
 			exit(1);
 
@@ -1272,9 +1278,6 @@ static int restore_task_with_children(void *_arg)
 		 * Thus -- mount proc at custom location for any new namespace
 		 */
 		if (mount_proc())
-			exit(1);
-
-		if (restore_finish_stage(CR_STATE_RESTORE_NS) < 0)
 			exit(1);
 
 		if (root_prepare_shared())
@@ -1616,33 +1619,41 @@ static int prepare_task_entries()
 
 int cr_restore_tasks(void)
 {
-	if (check_img_inventory() < 0)
+	int ret = -1;
+
+	if (cr_plugin_init())
 		return -1;
+
+	if (check_img_inventory() < 0)
+		goto err;
 
 	if (init_stats(RESTORE_STATS))
-		return -1;
+		goto err;
 
 	if (kerndat_init_rst())
-		return -1;
+		goto err;
 
 	timing_start(TIME_RESTORE);
 
 	if (cpu_init() < 0)
-		return -1;
+		goto err;
 
 	if (vdso_init())
-		return -1;
+		goto err;
 
 	if (prepare_task_entries() < 0)
-		return -1;
+		goto err;
 
 	if (prepare_pstree() < 0)
-		return -1;
+		goto err;
 
 	if (crtools_prepare_shared() < 0)
-		return -1;
+		goto err;
 
-	return restore_root_task(root_item);
+	ret = restore_root_task(root_item);
+err:
+	cr_plugin_fini();
+	return ret;
 }
 
 static long restorer_get_vma_hint(pid_t pid, struct list_head *tgt_vma_list,

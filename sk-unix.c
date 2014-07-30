@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sys/un.h>
 #include <stdlib.h>
+#include <dlfcn.h>
 
 #include "asm/types.h"
 #include "libnetlink.h"
@@ -23,6 +24,7 @@
 #include "sk-queue.h"
 #include "mount.h"
 #include "cr-service.h"
+#include "plugin.h"
 
 #include "protobuf.h"
 #include "protobuf/sk-unix.pb-c.h"
@@ -45,6 +47,12 @@ struct unix_sk_desc {
 	gid_t			gid;
 
 	struct list_head	list;
+
+	int			fd;
+	struct list_head	peer_list;
+	struct list_head	peer_node;
+
+	UnixSkEntry		*ue;
 };
 
 static LIST_HEAD(unix_sockets);
@@ -119,12 +127,46 @@ static int can_dump_unix_sk(const struct unix_sk_desc *sk)
 	return 1;
 }
 
+static int write_unix_entry(struct unix_sk_desc *sk)
+{
+	int ret;
+
+	ret = pb_write_one(fdset_fd(glob_fdset, CR_FD_UNIXSK), sk->ue, PB_UNIX_SK);
+
+	show_one_unix_img("Dumped", sk->ue);
+
+	release_skopts(sk->ue->opts);
+	xfree(sk->ue);
+
+	sk->ue = NULL;
+
+	return ret;
+}
+
 static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 {
-	struct unix_sk_desc *sk;
-	UnixSkEntry ue = UNIX_SK_ENTRY__INIT;
-	SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
-	FilePermsEntry perms = FILE_PERMS_ENTRY__INIT;
+	struct unix_sk_desc *sk, *peer;
+	UnixSkEntry *ue;
+	SkOptsEntry *skopts;
+	FilePermsEntry *perms;
+	FownEntry *fown;
+
+	ue = xmalloc(sizeof(UnixSkEntry) +
+			sizeof(SkOptsEntry) +
+			sizeof(FilePermsEntry) +
+			sizeof(FownEntry));
+	if (ue == NULL)
+		return -1;
+
+	skopts = (void *) ue + sizeof(UnixSkEntry);
+	perms = (void *) skopts + sizeof(SkOptsEntry);
+	fown = (void *) perms + sizeof(FilePermsEntry);
+
+	unix_sk_entry__init(ue);
+	sk_opts_entry__init(skopts);
+	file_perms_entry__init(perms);
+
+	*fown = p->fown;
 
 	sk = (struct unix_sk_desc *)lookup_socket(p->stat.st_ino, PF_UNIX, 0);
 	if (IS_ERR_OR_NULL(sk)) {
@@ -137,47 +179,45 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 
 	BUG_ON(sk->sd.already_dumped);
 
-	ue.name.len	= (size_t)sk->namelen;
-	ue.name.data	= (void *)sk->name;
+	ue->name.len	= (size_t)sk->namelen;
+	ue->name.data	= (void *)sk->name;
 
-	ue.id		= id;
-	ue.ino		= sk->sd.ino;
-	ue.type		= sk->type;
-	ue.state	= sk->state;
-	ue.flags	= p->flags;
-	ue.backlog	= sk->wqlen;
-	ue.peer		= sk->peer_ino;
-	ue.fown		= (FownEntry *)&p->fown;
-	ue.opts		= &skopts;
-	ue.uflags	= 0;
+	ue->id		= id;
+	ue->ino		= sk->sd.ino;
+	ue->type	= sk->type;
+	ue->state	= sk->state;
+	ue->flags	= p->flags;
+	ue->backlog	= sk->wqlen;
+	ue->peer	= sk->peer_ino;
+	ue->fown	= fown;
+	ue->opts	= skopts;
+	ue->uflags	= 0;
 
 	/*
 	 * Check if this socket is connected to criu service.
 	 * Dump it like closed one and mark it for restore.
 	 */
-	if (unlikely(ue.peer == service_sk_ino)) {
-		ue.state = TCP_CLOSE;
-		ue.peer = 0;
-		ue.uflags |= USK_SERVICE;
+	if (unlikely(ue->peer == service_sk_ino)) {
+		ue->state = TCP_CLOSE;
+		ue->peer = 0;
+		ue->uflags |= USK_SERVICE;
 	}
 
 	if (sk->namelen && *sk->name) {
-		ue.file_perms = &perms;
+		ue->file_perms = perms;
 
-		perms.mode	= sk->mode;
-		perms.uid	= sk->uid;
-		perms.gid	= sk->gid;
+		perms->mode	= sk->mode;
+		perms->uid	= sk->uid;
+		perms->gid	= sk->gid;
 	}
 
-	sk_encode_shutdown(&ue, sk->shutdown);
+	sk_encode_shutdown(ue, sk->shutdown);
 
-	if (ue.peer) {
-		struct unix_sk_desc *peer;
-
-		peer = (struct unix_sk_desc *)lookup_socket(ue.peer, PF_UNIX, 0);
+	if (ue->peer) {
+		peer = (struct unix_sk_desc *)lookup_socket(ue->peer, PF_UNIX, 0);
 		if (IS_ERR_OR_NULL(peer)) {
 			pr_err("Unix socket %#x without peer %#x\n",
-					ue.ino, ue.peer);
+					ue->ino, ue->peer);
 			goto err;
 		}
 
@@ -185,10 +225,10 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 		 * Peer should have us as peer or have a name by which
 		 * we can access one.
 		 */
-		if (peer->peer_ino != ue.ino) {
+		if (peer->peer_ino != ue->ino) {
 			if (!peer->name) {
 				pr_err("Unix socket %#x with unreachable peer %#x (%#x/%s)\n",
-				       ue.ino, ue.peer, peer->peer_ino, peer->name);
+				       ue->ino, ue->peer, peer->peer_ino, peer->name);
 				goto err;
 			}
 		}
@@ -197,30 +237,39 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 		 * It can be external socket, so we defer dumping
 		 * until all sockets the program owns are processed.
 		 */
-		if (!peer->sd.already_dumped && list_empty(&peer->list)) {
-			show_one_unix("Add a peer", peer);
-			list_add_tail(&peer->list, &unix_sockets);
+		if (!peer->sd.already_dumped) {
+			if (list_empty(&peer->list)) {
+				show_one_unix("Add a peer", peer);
+				list_add_tail(&peer->list, &unix_sockets);
+			}
+
+			list_add(&sk->peer_node, &peer->peer_list);
+			sk->fd = dup(lfd);
+			if (sk->fd < 0) {
+				pr_perror("Unable to dup(%d)", lfd);
+				goto err;
+			}
 		}
 
-		if ((ue.type != SOCK_DGRAM) && (
-				((ue.shutdown == SK_SHUTDOWN__READ)  &&
+		if ((ue->type != SOCK_DGRAM) && (
+				((ue->shutdown == SK_SHUTDOWN__READ)  &&
 				 (peer->shutdown != SK_SHUTDOWN__WRITE)) ||
-				((ue.shutdown == SK_SHUTDOWN__WRITE) &&
+				((ue->shutdown == SK_SHUTDOWN__WRITE) &&
 				 (peer->shutdown != SK_SHUTDOWN__READ))  ||
-				((ue.shutdown == SK_SHUTDOWN__BOTH)  &&
+				((ue->shutdown == SK_SHUTDOWN__BOTH)  &&
 				 (peer->shutdown != SK_SHUTDOWN__BOTH)) )) {
 			/*
 			 * On restore we assume, that stream pairs must
 			 * be shut down from one end only
 			 */
 			pr_err("Shutdown mismatch %u:%d -> %u:%d\n",
-					ue.ino, ue.shutdown, peer->sd.ino, peer->shutdown);
+					ue->ino, ue->shutdown, peer->sd.ino, peer->shutdown);
 			goto err;
 		}
-	} else if (ue.state == TCP_ESTABLISHED) {
+	} else if (ue->state == TCP_ESTABLISHED) {
 		const struct unix_sk_listen_icon *e;
 
-		e = lookup_unix_listen_icons(ue.ino);
+		e = lookup_unix_listen_icons(ue->ino);
 		if (!e) {
 			/*
 			 * ESTABLISHED socket without peer and without
@@ -228,12 +277,12 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 			 * connection.
 			 */
 
-			if (ue.shutdown == SK_SHUTDOWN__BOTH) {
+			if (ue->shutdown == SK_SHUTDOWN__BOTH) {
 				pr_info("Dumping semi-closed connection\n");
 				goto dump;
 			}
 
-			pr_err("Dangling connection %#x\n", ue.ino);
+			pr_err("Dangling connection %#x\n", ue->ino);
 			goto err;
 		}
 
@@ -249,20 +298,17 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 		/* e->sk_desc is _never_ NULL */
 		if (e->sk_desc->state != TCP_LISTEN) {
 			pr_err("In-flight connection on "
-				"non-listening socket %d\n", ue.ino);
+				"non-listening socket %d\n", ue->ino);
 			goto err;
 		}
 
-		ue.peer = e->sk_desc->sd.ino;
+		ue->peer = e->sk_desc->sd.ino;
 
 		pr_debug("\t\tFixed inflight socket %#x peer %#x)\n",
-				ue.ino, ue.peer);
+				ue->ino, ue->peer);
 	}
 dump:
-	if (dump_socket_opts(lfd, &skopts))
-		goto err;
-
-	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_UNIXSK), &ue, PB_UNIX_SK))
+	if (dump_socket_opts(lfd, skopts))
 		goto err;
 
 	/*
@@ -273,21 +319,40 @@ dump:
 	 */
 	if (sk->rqlen != 0 && !(sk->type == SOCK_STREAM &&
 				sk->state == TCP_LISTEN))
-		if (dump_sk_queue(lfd, ue.id))
+		if (dump_sk_queue(lfd, id))
 			goto err;
 
 	pr_info("Dumping unix socket at %d\n", p->fd);
 	show_one_unix("Dumping", sk);
-	show_one_unix_img("Dumped", &ue);
-	release_skopts(&skopts);
+
+	sk->ue = ue;
+	/*
+	 *  Postpone writing the entry if a peer isn't found yet.
+	 *  It's required, because we may need to modify the entry.
+	 *  For example, if a socket is external and is dumped by
+	 *  a callback, the USK_CALLBACK flag must be set.
+	 */
+	if (list_empty(&sk->peer_node) && write_unix_entry(sk))
+		return -1;
 
 	list_del_init(&sk->list);
 	sk->sd.already_dumped = 1;
 
+	while (!list_empty(&sk->peer_list)) {
+		struct unix_sk_desc *psk;
+		psk = list_first_entry(&sk->peer_list, struct unix_sk_desc, peer_node);
+		close_safe(&psk->fd);
+		list_del_init(&psk->peer_node);
+
+		if (write_unix_entry(psk))
+			return -1;
+	}
+
 	return 0;
 
 err:
-	release_skopts(&skopts);
+	release_skopts(skopts);
+	xfree(ue);
 	return -1;
 }
 
@@ -310,6 +375,10 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 	d->type	 = m->udiag_type;
 	d->state = m->udiag_state;
 	INIT_LIST_HEAD(&d->list);
+
+	INIT_LIST_HEAD(&d->peer_list);
+	INIT_LIST_HEAD(&d->peer_node);
+	d->fd = -1;
 
 	if (tb[UNIX_DIAG_SHUTDOWN])
 		d->shutdown = *(u8 *)RTA_DATA(tb[UNIX_DIAG_SHUTDOWN]);
@@ -349,16 +418,17 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 			uv = RTA_DATA(tb[UNIX_DIAG_VFS]);
 			snprintf(rpath, sizeof(rpath), ".%s", name);
 			if (fstatat(mntns_root, rpath, &st, 0)) {
-				pr_perror("Can't stat socket %#x(%s)",
-						m->udiag_ino, rpath);
+				pr_warn("Can't stat socket %#x(%s), skipping: %m (err %d)\n",
+					m->udiag_ino, rpath, errno);
 				goto skip;
 			}
 
 			if ((st.st_ino != uv->udiag_vfs_ino) ||
-			    (st.st_dev != kdev_to_odev(uv->udiag_vfs_dev))) {
-				pr_info("unix: Dropping path for "
+			    !phys_stat_dev_match(st.st_dev, uv->udiag_vfs_dev, name)) {
+				pr_info("unix: Dropping path %s for "
 						"unlinked bound "
 						"sk %#x.%#x real %#x.%#x\n",
+						name,
 						(int)st.st_dev,
 						(int)st.st_ino,
 						(int)uv->udiag_vfs_dev,
@@ -451,6 +521,42 @@ int unix_receive_one(struct nlmsghdr *h, void *arg)
 	return unix_collect_one(m, tb);
 }
 
+static int dump_external_sockets(struct unix_sk_desc *peer)
+{
+	struct unix_sk_desc *sk;
+	int ret;
+
+	while (!list_empty(&peer->peer_list)) {
+		sk = list_first_entry(&peer->peer_list, struct unix_sk_desc, peer_node);
+
+		ret = cr_plugin_dump_unix_sk(sk->fd, sk->sd.ino);
+		if (ret == -ENOTSUP) {
+			if (!opts.ext_unix_sk) {
+				show_one_unix("Runaway socket", peer);
+				pr_err("External socket is used. "
+						"Consider using --" USK_EXT_PARAM " option.\n");
+				return -1;
+			}
+
+			if (peer->type != SOCK_DGRAM) {
+				show_one_unix("Ext stream not supported", peer);
+				pr_err("Can't dump half of stream unix connection.\n");
+				return -1;
+			}
+		} else if (ret < 0)
+			return -1;
+		else
+			sk->ue->uflags |= USK_CALLBACK;
+
+		if (write_unix_entry(sk))
+			return -1;
+		close_safe(&sk->fd);
+		list_del_init(&sk->peer_node);
+	}
+
+	return 0;
+}
+
 int fix_external_unix_sockets(void)
 {
 	struct unix_sk_desc *sk;
@@ -465,19 +571,6 @@ int fix_external_unix_sockets(void)
 		show_one_unix("Dumping extern", sk);
 
 		BUG_ON(sk->sd.already_dumped);
-
-		if (!opts.ext_unix_sk) {
-			show_one_unix("Runaway socket", sk);
-			pr_err("External socket is used. "
-					"Consider using --" USK_EXT_PARAM " option.\n");
-			goto err;
-		}
-
-		if (sk->type != SOCK_DGRAM) {
-			show_one_unix("Ext stream not supported", sk);
-			pr_err("Can't dump half of stream unix connection.\n");
-			goto err;
-		}
 
 		e.id		= fd_id_generate_special();
 		e.ino		= sk->sd.ino;
@@ -494,6 +587,9 @@ int fix_external_unix_sockets(void)
 			goto err;
 
 		show_one_unix_img("Dumped extern", &e);
+
+		if (dump_external_sockets(sk))
+			goto err;
 	}
 
 	return 0;
@@ -557,6 +653,9 @@ static int post_open_unix_sk(struct file_desc *d, int fd)
 	peer = ui->peer;
 
 	if (peer == NULL)
+		return 0;
+
+	if (ui->ue->uflags & USK_CALLBACK)
 		return 0;
 
 	pr_info("\tConnect %#x to %#x\n", ui->ue->ino, peer->ue->ino);
@@ -796,6 +895,25 @@ static int open_unixsk_standalone(struct unix_sk_info *ui)
 		close(sks[1]);
 		sk = sks[0];
 	} else {
+		if (ui->ue->uflags & USK_CALLBACK) {
+			sk = cr_plugin_restore_unix_sk(ui->ue->ino);
+			if (sk >= 0)
+				goto out;
+		}
+
+		/*
+		 * Connect to external sockets requires
+		 * special option to be passed.
+		 */
+		if (ui->peer && (ui->peer->ue->uflags & USK_EXTERN) &&
+				!(opts.ext_unix_sk)) {
+			pr_err("External socket found in image. "
+					"Consider using the --" USK_EXT_PARAM
+					"option to allow restoring it.\n");
+			return -1;
+		}
+
+
 		sk = socket(PF_UNIX, ui->ue->type, 0);
 		if (sk < 0) {
 			pr_perror("Can't make unix socket");
@@ -813,7 +931,7 @@ static int open_unixsk_standalone(struct unix_sk_info *ui)
 			return -1;
 		}
 	}
-
+out:
 	if (rst_file_params(sk, ui->ue->fown, ui->ue->flags))
 		return -1;
 
@@ -906,18 +1024,6 @@ int resolve_unix_peers(void)
 		if (!peer) {
 			pr_err("FATAL: Peer %#x unresolved for %#x\n",
 					ui->ue->peer, ui->ue->ino);
-			return -1;
-		}
-
-		/*
-		 * Connect to external sockets requires
-		 * special option to be passed.
-		 */
-		if ((peer->ue->uflags & USK_EXTERN) &&
-				!(opts.ext_unix_sk)) {
-			pr_err("External socket found in image. "
-					"Consider using the --" USK_EXT_PARAM " option "
-					"to allow restoring it.\n");
 			return -1;
 		}
 

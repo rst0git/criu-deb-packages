@@ -240,19 +240,21 @@ int open_image_dir(char *dir)
 	}
 
 	ret = install_service_fd(IMG_FD_OFF, fd);
+	close(fd);
+	fd = ret;
 
 	if (opts.img_parent) {
 		int pfd;
 
 		ret = symlinkat(opts.img_parent, fd, CR_PARENT_LINK);
 		if (ret < 0) {
-			pr_perror("Can't link parent snapshot.");
+			pr_perror("Can't link parent snapshot");
 			goto err;
 		}
 
 		pfd = openat(fd, CR_PARENT_LINK, O_RDONLY);
 		if (pfd < 0) {
-			pr_perror("Can't open parent snapshot.");
+			pr_perror("Can't open parent snapshot");
 			goto err;
 		}
 
@@ -260,8 +262,6 @@ int open_image_dir(char *dir)
 
 		close(pfd);
 	}
-
-	close(fd);
 
 	return ret;
 
@@ -295,7 +295,7 @@ int open_pages_image_at(int dfd, unsigned long flags, int pm_fd)
 {
 	unsigned id;
 
-	if (flags == O_RDONLY) {
+	if (flags == O_RDONLY || flags == O_RDWR) {
 		PagemapHead *h;
 		if (pb_read_one(pm_fd, &h, PB_PAGEMAP_HEAD) < 0)
 			return -1;

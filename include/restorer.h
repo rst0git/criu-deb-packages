@@ -74,7 +74,7 @@ struct thread_restore_args {
 	struct restore_mem_zone		mem_zone;
 
 	int				pid;
-	UserRegsEntry		        gpregs;
+	UserRegsEntry			gpregs;
 	u64				clear_tid_addr;
 
 	bool				has_futex;
@@ -122,15 +122,15 @@ struct task_restore_args {
 
 	struct itimerval		itimers[3];
 
-	int 				timer_n;
-	struct restore_posix_timer 	*posix_timers;
+	int				timer_n;
+	struct restore_posix_timer	*posix_timers;
 
 	CredsEntry			creds;
-	uint32_t			cap_inh[CR_CAP_SIZE];
-	uint32_t			cap_prm[CR_CAP_SIZE];
-	uint32_t			cap_eff[CR_CAP_SIZE];
-	uint32_t			cap_bnd[CR_CAP_SIZE];
-	uint32_t			cap_last_cap;
+	u32				cap_inh[CR_CAP_SIZE];
+	u32				cap_prm[CR_CAP_SIZE];
+	u32				cap_eff[CR_CAP_SIZE];
+	u32				cap_bnd[CR_CAP_SIZE];
+	u32				cap_last_cap;
 
 	MmEntry				mm;
 	auxv_t				mm_saved_auxv[AT_VECTOR_SIZE];

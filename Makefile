@@ -1,5 +1,5 @@
 VERSION_MAJOR		:= 1
-VERSION_MINOR		:= 0
+VERSION_MINOR		:= 1-rc1
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -82,7 +82,7 @@ cflags-y		+= -iquote $(ARCH_DIR) -iquote $(ARCH_DIR)/include
 cflags-y		+= -fno-strict-aliasing
 export cflags-y
 
-LIBS		:= -lrt -lpthread -lprotobuf-c
+LIBS		:= -lrt -lpthread -lprotobuf-c -ldl
 
 DEFINES		+= -D_FILE_OFFSET_BITS=64
 DEFINES		+= -D_GNU_SOURCE
@@ -167,7 +167,7 @@ PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-pie.o
 
 $(PROGRAM): $(SYSCALL-LIB) $(ARCH-LIB) $(PROGRAM-BUILTINS)
 	$(E) "  LINK    " $@
-	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(LDFLAGS) -o $@
+	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(LDFLAGS) -rdynamic -o $@
 
 zdtm: all
 	$(Q) $(MAKE) -C test/zdtm all
@@ -202,6 +202,7 @@ clean: clean-built
 	$(Q) $(RM) -r ./test/lib64/
 	$(Q) $(RM) protobuf-desc-gen.h
 	$(Q) $(MAKE) -C test/zdtm cleandep clean cleanout
+	$(Q) $(MAKE) -C test/libcriu clean
 
 distclean: clean
 	$(E) "  DISTCLEAN"
@@ -232,6 +233,9 @@ install: $(PROGRAM) install-man
 	$(E) "  INSTALL " $(PROGRAM)
 	$(Q) mkdir -p $(DESTDIR)$(SBINDIR)
 	$(Q) install -m 755 $(PROGRAM) $(DESTDIR)$(SBINDIR)
+	$(Q) mkdir -p $(DESTDIR)$(SYSTEMDUNITDIR)
+	$(Q) install -m 644 scripts/sd/criu.socket $(DESTDIR)$(SYSTEMDUNITDIR)
+	$(Q) install -m 644 scripts/sd/criu.service $(DESTDIR)$(SYSTEMDUNITDIR)
 
 install-man:
 	$(Q) $(MAKE) -C Documentation install

@@ -319,6 +319,11 @@ int get_service_fd(enum sfd_type type)
 	return __get_service_fd(type, service_fd_id);
 }
 
+int criu_get_image_dir(void)
+{
+	return get_service_fd(IMG_FD_OFF);
+}
+
 int close_service_fd(enum sfd_type type)
 {
 	int fd;
@@ -454,13 +459,17 @@ int run_scripts(char *action)
 	struct script *script;
 	int ret = 0;
 
+	pr_debug("Running %s scripts\n", action);
+
 	if (setenv("CRTOOLS_SCRIPT_ACTION", action, 1)) {
 		pr_perror("Can't set CRTOOLS_SCRIPT_ACTION=%s", action);
 		return -1;
 	}
 
-	list_for_each_entry(script, &opts.scripts, node)
+	list_for_each_entry(script, &opts.scripts, node) {
+		pr_debug("\t[%s]\n", script->path);
 		ret |= system(script->path);
+	}
 
 	unsetenv("CRTOOLS_SCRIPT_ACTION");
 	return ret;
@@ -570,4 +579,14 @@ out:
 	}
 
 	return ret;
+}
+
+int is_root_user()
+{
+	if (geteuid() != 0) {
+		pr_err("You need to be root to run this command\n");
+		return 0;
+	}
+
+	return 1;
 }
