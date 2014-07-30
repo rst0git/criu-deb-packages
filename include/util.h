@@ -130,6 +130,17 @@ extern int open_pid_proc(pid_t pid);
 extern int close_pid_proc(void);
 extern int set_proc_fd(int fd);
 
+/*
+ * Values for pid argument of the proc opening routines below.
+ * SELF would open file under /proc/self
+ * GEN would open a file under /proc itself
+ * NONE is internal, don't use it ;)
+ */
+
+#define PROC_SELF	0
+#define PROC_GEN	-1
+#define PROC_NONE	-2
+
 extern int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
 
 #define __open_proc(pid, flags, fmt, ...)				\
@@ -211,11 +222,8 @@ static inline dev_t kdev_to_odev(u32 kdev)
 	 */
 	unsigned major = kdev_major(kdev);
 	unsigned minor = kdev_minor(kdev);
-#if BITS_PER_LONG == 32
-	return (major << 8) | minor;
-#else
-	return (minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12);
-#endif
+
+	return makedev(major, minor);
 }
 
 extern int copy_file(int fd_in, int fd_out, size_t bytes);
@@ -276,5 +284,23 @@ extern int read_fd_link(int lfd, char *buf, size_t size);
 #define NSEC_PER_SEC    1000000000L
 
 int vaddr_to_pfn(unsigned long vaddr, u64 *pfn);
+
+/*
+ * Check whether @str starts with @sub
+ */
+static inline bool strstartswith(char *str, char *sub)
+{
+	while (1) {
+		if (*sub == '\0') /* end of sub -- match */
+			return true;
+		if (*str == '\0') /* end of str, sub is NOT ended -- miss */
+			return false;
+		if (*str != *sub)
+			return false;
+
+		str++;
+		sub++;
+	}
+}
 
 #endif /* __CR_UTIL_H__ */

@@ -18,6 +18,7 @@
 #include "compiler.h"
 #include "asm/types.h"
 #include "syscall.h"
+#include "config.h"
 #include "prctl.h"
 #include "log.h"
 #include "util.h"
@@ -30,6 +31,7 @@
 #include "restorer.h"
 
 #include "protobuf/creds.pb-c.h"
+#include "protobuf/mm.pb-c.h"
 
 #include "asm/restorer.h"
 
@@ -187,6 +189,25 @@ static int restore_creds(CredsEntry *ce)
 	return 0;
 }
 
+static int restore_dumpable_flag(MmEntry *mme)
+{
+	int ret;
+
+	if (mme->has_dumpable) {
+               /*
+                * Allowed values for PR_SET_DUMPABLE are only
+                * SUID_DUMP_DISABLE (0) and SUID_DUMP_USER (1).
+                */
+               ret = sys_prctl(PR_SET_DUMPABLE, mme->dumpable == 1 ? 1 : 0, 0, 0, 0);
+		if (ret) {
+			pr_err("Unable to set PR_SET_DUMPABLE: %d\n", ret);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
 static void restore_sched_info(struct rst_sched_param *p)
 {
 	struct sched_param parm;
@@ -292,6 +313,10 @@ long __export_restore_thread(struct thread_restore_args *args)
 		goto core_restore_end;
 
 	ret = restore_creds(&args->ta->creds);
+	if (ret)
+		goto core_restore_end;
+
+	ret = restore_dumpable_flag(&args->ta->mm);
 	if (ret)
 		goto core_restore_end;
 
@@ -518,16 +543,23 @@ static void restore_posix_timers(struct task_restore_args *args)
 }
 static void *bootstrap_start;
 static unsigned int bootstrap_len;
-static unsigned long vdso_rt_size;
 
+/*
+ * sys_munmap must not return here. The controll process must
+ * trap us on the exit from sys_munmap.
+ */
+#ifdef CONFIG_VDSO
+static unsigned long vdso_rt_size;
 void __export_unmap(void)
 {
 	sys_munmap(bootstrap_start, bootstrap_len - vdso_rt_size);
-	/*
-	 * sys_munmap must not return here. The controll process must
-	 * trap us on the exit from sys_munmap.
-	 */
 }
+#else
+void __export_unmap(void)
+{
+	sys_munmap(bootstrap_start, bootstrap_len);
+}
+#endif
 
 /*
  * This function unmaps all VMAs, which don't belong to
@@ -608,7 +640,10 @@ long __export_restore_task(struct task_restore_args *args)
 
 	bootstrap_start = args->bootstrap_start;
 	bootstrap_len	= args->bootstrap_len;
+
+#ifdef CONFIG_VDSO
 	vdso_rt_size	= args->vdso_rt_size;
+#endif
 
 	task_entries = args->task_entries;
 
@@ -625,10 +660,12 @@ long __export_restore_task(struct task_restore_args *args)
 
 	pr_info("Switched to the restorer %d\n", my_pid);
 
+#ifdef CONFIG_VDSO
 	if (vdso_remap("rt-vdso", args->vdso_sym_rt.vma_start,
 		       args->vdso_rt_parked_at,
 		       vdso_vma_size(&args->vdso_sym_rt)))
 		goto core_restore_end;
+#endif
 
 	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len,
 				bootstrap_start, bootstrap_len))
@@ -653,12 +690,13 @@ long __export_restore_task(struct task_restore_args *args)
 		if (vma_remap(vma_premmaped_start(vma_entry),
 				vma_entry->start, vma_entry_len(vma_entry)))
 			goto core_restore_end;
-
+#ifdef CONFIG_VDSO
 		if (vma_entry_is(vma_entry, VMA_AREA_VDSO)) {
 			if (vdso_proxify("left dumpee", &args->vdso_sym_rt,
 					 vma_entry, args->vdso_rt_parked_at))
 				goto core_restore_end;
 		}
+#endif
 	}
 
 	/* Shift private vma-s to the right */
@@ -680,12 +718,13 @@ long __export_restore_task(struct task_restore_args *args)
 		if (vma_remap(vma_premmaped_start(vma_entry),
 				vma_entry->start, vma_entry_len(vma_entry)))
 			goto core_restore_end;
-
+#ifdef CONFIG_VDSO
 		if (vma_entry_is(vma_entry, VMA_AREA_VDSO)) {
 			if (vdso_proxify("right dumpee", &args->vdso_sym_rt,
 					 vma_entry, args->vdso_rt_parked_at))
 				goto core_restore_end;
 		}
+#endif
 	}
 
 	/*
@@ -918,6 +957,7 @@ long __export_restore_task(struct task_restore_args *args)
 	 */
 
 	ret = restore_creds(&args->creds);
+	ret = ret || restore_dumpable_flag(&args->mm);
 
 	futex_set_and_wake(&thread_inprogress, args->nr_threads);
 

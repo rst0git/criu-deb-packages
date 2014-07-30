@@ -4,6 +4,7 @@ LIBDIR	= ../../lib
 LIB	= $(LIBDIR)/libzdtmtst.a
 override CPPFLAGS += -I$(LIBDIR)
 CFLAGS	= -g -O2 -Wall -Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+CFLAGS	+= $(USERCFLAGS)
 
 TST_NOFILE	=				\
 		busyloop00			\
@@ -66,6 +67,7 @@ TST_NOFILE	=				\
 		maps02				\
 		maps03				\
 		maps04				\
+		maps05				\
 		xids00				\
 		groups				\
 		file_fown			\
@@ -102,9 +104,11 @@ TST_NOFILE	=				\
 		mem-touch			\
 		grow_map			\
 		grow_map02			\
+		grow_map03			\
 		tun				\
 		stopped				\
 		rtc				\
+		clean_mntns			\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -151,6 +155,7 @@ TST_DIR		=				\
 		overmount_sock			\
 		tempfs				\
 		bind-mount			\
+		cgroup00			\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -258,7 +263,7 @@ sigaltstack:		override LDLIBS += -pthread
 shm:			override CFLAGS += -DNEW_IPC_NS
 msgque:			override CFLAGS += -DNEW_IPC_NS
 sem:			override CFLAGS += -DNEW_IPC_NS
-posix_timers:		override LDLIBS += -lrt
+posix_timers:		override LDLIBS += -lrt -pthread
 socket-tcp6: override CFLAGS += -D ZDTM_IPV6
 socket-tcpbuf6: override CFLAGS += -D ZDTM_IPV6
 socket-tcpbuf-local: override CFLAGS += -D ZDTM_TCP_LOCAL
@@ -288,7 +293,7 @@ criu-rtc.pb-c.c: criu-rtc.proto
 	protoc-c --proto_path=. --c_out=. criu-rtc.proto
 
 criu-rtc.so: criu-rtc.c criu-rtc.pb-c.c
-	gcc -g -Wall -shared -nostartfiles criu-rtc.c criu-rtc.pb-c.c -o criu-rtc.so -iquote ../../../../include -fPIC
+	gcc -g -Wall -shared -nostartfiles criu-rtc.c criu-rtc.pb-c.c -o criu-rtc.so -iquote ../../../../include -fPIC $(USERCFLAGS)
 
 .PHONY:	force clean cleandep cleanout realclean start check_start stop wait_stop
 

@@ -30,6 +30,52 @@
 #include "protobuf/mnt.pb-c.h"
 
 /*
+ * Structure to keep external mount points resolving info.
+ *
+ * On dump the key is the mountpoint as seen from the mount
+ * namespace, the val is some name that will be put into image
+ * instead of the mount point's root path.
+ *
+ * On restore the key is the name from the image (the one 
+ * mentioned above) and the val is the path in criu's mount 
+ * namespace that will become the mount point's root, i.e. -- 
+ * be bind mounted to the respective mountpoint.
+ */
+
+struct ext_mount {
+	char *key;
+	char *val;
+	struct list_head l;
+};
+
+int ext_mount_add(char *key, char *val)
+{
+	struct ext_mount *em;
+
+	em = xmalloc(sizeof(*em));
+	if (!em)
+		return -1;
+
+	em->key = key;
+	em->val = val;
+	list_add_tail(&em->l, &opts.ext_mounts);
+	pr_info("Added %s:%s ext mount mapping\n", key, val);
+	return 0;
+}
+
+/* Lookup ext_mount by key field */
+static struct ext_mount *ext_mount_lookup(char *key)
+{
+	struct ext_mount *em;
+
+	list_for_each_entry(em, &opts.ext_mounts, l)
+		if (!strcmp(em->key, key))
+			return em;
+
+	return NULL;
+}
+
+/*
  * Single linked list of mount points get from proc/images
  */
 struct mount_info *mntinfo;
@@ -51,7 +97,7 @@ static void mntinfo_add_list(struct mount_info *new)
 static int open_mountpoint(struct mount_info *pm);
 
 static struct mount_info *mnt_build_tree(struct mount_info *list);
-static int validate_mounts(struct mount_info *info, bool call_plugins);
+static int validate_mounts(struct mount_info *info, bool for_dump);
 
 /* Asolute paths are used on dump and relative paths are used on restore */
 static inline int is_root(char *p)
@@ -158,7 +204,7 @@ dev_t phys_stat_resolve_dev(struct mount_info *tree,
 	 * obtained from mountinfo (ie subvolume0).
 	 */
 	return strcmp(m->fstype->name, "btrfs") ?
-		MKKDEV(MAJOR(st_dev), MINOR(st_dev)) : m->s_dev;
+		MKKDEV(major(st_dev), minor(st_dev)) : m->s_dev;
 }
 
 bool phys_stat_dev_match(struct mount_info *tree, dev_t st_dev,
@@ -308,12 +354,30 @@ static void mnt_tree_show(struct mount_info *tree, int off)
 	pr_info("%*s<--\n", off, "");
 }
 
-static int validate_mounts(struct mount_info *info, bool call_plugins)
+static int try_resolve_ext_mount(struct mount_info *info)
+{
+	struct ext_mount *em;
+
+	em = ext_mount_lookup(info->mountpoint + 1 /* trim the . */);
+	if (em == NULL)
+		return -ENOTSUP;
+
+	pr_info("Found %s mapping for %s mountpoint\n",
+			em->val, info->mountpoint);
+	info->external = em;
+	return 0;
+}
+
+static int validate_mounts(struct mount_info *info, bool for_dump)
 {
 	struct mount_info *m, *t;
 
 	for (m = info; m; m = m->next) {
-		if (m->parent && m->parent->shared_id) {
+		if (m->parent == NULL || m->is_ns_root)
+			/* root mount can be any */
+			continue;
+
+		if (m->parent->shared_id) {
 			struct mount_info *ct;
 			if (list_empty(&m->parent->mnt_share))
 				continue;
@@ -333,23 +397,52 @@ static int validate_mounts(struct mount_info *info, bool call_plugins)
 			}
 		}
 
-		if (m->parent && !fsroot_mounted(m)) {
+		/*
+		 * Mountpoint can point to / of an FS. In that case this FS
+		 * should be of some known type so that we can just mount one.
+		 *
+		 * Otherwise it's a bindmount mountpoint and we try to find
+		 * what fsroot mountpoint it's bound to. If this point is the
+		 * root mount, the path to bindmount root should be accessible
+		 * form the rootmount path (the strstartswith check in the
+		 * else branch below).
+		 */
+
+		if (fsroot_mounted(m)) {
+			if (m->fstype->code == FSTYPE__UNSUPPORTED) {
+				pr_err("FS mnt %s dev %#x root %s unsupported id %x\n",
+						m->mountpoint, m->s_dev, m->root, m->mnt_id);
+				return -1;
+			}
+		} else {
 			list_for_each_entry(t, &m->mnt_bind, mnt_bind) {
-				if (fsroot_mounted(t) || t->parent == NULL)
+				if (fsroot_mounted(t) ||
+						(t->parent == NULL &&
+						 strstartswith(m->root, t->root)))
 					break;
 			}
+
 			if (&t->mnt_bind == &m->mnt_bind) {
 				int ret;
 
-				if (call_plugins) {
+				if (for_dump) {
 					ret = cr_plugin_dump_ext_mount(m->mountpoint + 1, m->mnt_id);
 					if (ret == 0)
 						m->need_plugin = true;
-				} else if (m->need_plugin)
-					/* plugin should take care of this one */
-					ret = 0;
-				else
-					ret = -ENOTSUP;
+					else if (ret == -ENOTSUP)
+						ret = try_resolve_ext_mount(m);
+				} else {
+					if (m->need_plugin || m->external)
+						/*
+						 * plugin should take care of this one
+						 * in restore_ext_mount, or do_bind_mount
+						 * will mount it as external
+						 */
+						ret = 0;
+					else
+						ret = -ENOTSUP;
+				}
+
 				if (ret < 0) {
 					if (ret == -ENOTSUP)
 						pr_err("%d:%s doesn't have a proper root mount\n",
@@ -358,9 +451,6 @@ static int validate_mounts(struct mount_info *info, bool call_plugins)
 				}
 			}
 		}
-
-		if (m->parent == NULL)
-			continue;
 
 		list_for_each_entry(t, &m->parent->children, siblings) {
 			int tlen, mlen;
@@ -559,15 +649,34 @@ out:
 	return -1;
 }
 
+static int attach_option(struct mount_info *pm, char *opt)
+{
+	char *buf;
+	int len, olen;
+
+	len = strlen(pm->options);
+	olen = strlen(opt);
+	buf = xrealloc(pm->options, len + olen + 2);
+	if (buf == NULL)
+		return -1;
+
+	if (len && buf[len - 1] != ',') {
+		buf[len] = ',';
+		len++;
+	}
+
+	memcpy(buf + len, opt, olen + 1);
+	pm->options = buf;
+
+	return 0;
+}
+
 /* Is it mounted w or w/o the newinstance option */
 static int devpts_dump(struct mount_info *pm)
 {
-	static const char newinstance[] = ",newinstance";
 	struct stat *host_st;
 	struct stat st;
 	int fdir;
-	char *buf;
-	int len;
 
 	host_st = kerndat_get_devpts_stat();
 	if (host_st == NULL)
@@ -588,15 +697,7 @@ static int devpts_dump(struct mount_info *pm)
 	if (host_st->st_dev == st.st_dev)
 		return 0;
 
-	len = strlen(pm->options);
-	buf = xrealloc(pm->options, len + sizeof(newinstance));
-	if (buf == NULL)
-		return -1;
-	memcpy(buf, newinstance, sizeof(newinstance));
-
-	pm->options = buf;
-
-	return 0;
+	return attach_option(pm, "newinstance");
 }
 
 static int tmpfs_dump(struct mount_info *pm)
@@ -614,7 +715,7 @@ static int tmpfs_dump(struct mount_info *pm)
 		goto out;
 	}
 
-	fd_img = open_image(CR_FD_TMPFS_IMG, O_DUMP, pm->mnt_id);
+	fd_img = open_image(CR_FD_TMPFS_DEV, O_DUMP, pm->s_dev);
 	if (fd_img < 0)
 		goto out;
 
@@ -644,7 +745,9 @@ static int tmpfs_restore(struct mount_info *pm)
 	int ret;
 	int fd_img;
 
-	fd_img = open_image(CR_FD_TMPFS_IMG, O_RSTR, pm->mnt_id);
+	fd_img = open_image(CR_FD_TMPFS_DEV, O_RSTR, pm->s_dev);
+	if (fd_img < 0 && errno == ENOENT)
+		fd_img = open_image(CR_FD_TMPFS_IMG, O_RSTR, pm->mnt_id);
 	if (fd_img < 0)
 		return -1;
 
@@ -695,6 +798,37 @@ out:
 	return ret;
 }
 
+
+static int dump_empty_fs(struct mount_info *pm)
+{
+	int fd, ret = -1;
+	struct dirent *de;
+	DIR *fdir = NULL;
+	fd = open_mountpoint(pm);
+
+	if (fd < 0)
+		return -1;
+
+	fdir = fdopendir(fd);
+	if (fdir == NULL) {
+		close(fd);
+		return -1;
+	}
+
+	while ((de = readdir(fdir))) {
+		if (dir_dots(de))
+			continue;
+
+		pr_err("%s isn't empty: %s\n", pm->fstype->name, de->d_name);
+		goto out;
+	}
+
+	ret = 0;
+out:
+	closedir(fdir);
+	return ret;
+}
+
 static struct fstype fstypes[] = {
 	{
 		.name = "unsupported",
@@ -727,6 +861,20 @@ static struct fstype fstypes[] = {
 	}, {
 		.name = "btrfs",
 		.code = FSTYPE__UNSUPPORTED,
+	}, {
+		.name = "pstore",
+		.dump = dump_empty_fs,
+		.code = FSTYPE__PSTORE,
+	}, {
+		.name = "securityfs",
+		.code = FSTYPE__SECURITYFS,
+	}, {
+		.name = "fusectl",
+		.dump = dump_empty_fs,
+		.code = FSTYPE__FUSECTL,
+	}, {
+		.name = "debugfs",
+		.code = FSTYPE__DEBUGFS,
 	}
 };
 
@@ -763,6 +911,19 @@ uns:
 	return &fstypes[0];
 }
 
+static char *strip(char *opt)
+{
+	int len;
+
+	len = strlen(opt);
+	if (len > 1 && opt[len - 1] == ',')
+		opt[len - 1] = '\0';
+	if (opt[0] == ',')
+		opt++;
+
+	return opt;
+}
+
 static int dump_one_mountpoint(struct mount_info *pm, int fd)
 {
 	MntEntry me = MNT_ENTRY__INIT;
@@ -771,33 +932,25 @@ static int dump_one_mountpoint(struct mount_info *pm, int fd)
 			pm->root, pm->mountpoint);
 
 	me.fstype		= pm->fstype->code;
-	if ((me.fstype == FSTYPE__UNSUPPORTED) && !is_root_mount(pm)) {
+
+	if (pm->parent && !pm->dumped && !pm->need_plugin &&
+	    pm->fstype->dump && fsroot_mounted(pm)) {
 		struct mount_info *t;
 
-		/* Is it a bind-mount of the root mount */
-		list_for_each_entry(t, &pm->mnt_bind, mnt_bind)
-			if (t->parent == NULL)
-				break;
-
-		if (&t->mnt_bind == &pm->mnt_bind ||
-		    strlen(t->source) > strlen(pm->source)) {
-			pr_err("FS mnt %s dev %#x root %s unsupported\n",
-					pm->mountpoint, pm->s_dev, pm->root);
+		if (pm->fstype->dump(pm))
 			return -1;
-		}
-	}
 
-	if (!pm->need_plugin && pm->fstype->dump && pm->fstype->dump(pm))
-		return -1;
+		list_for_each_entry(t, &pm->mnt_bind, mnt_bind)
+			t->dumped = true;
+	}
 
 	me.mnt_id		= pm->mnt_id;
 	me.root_dev		= pm->s_dev;
 	me.parent_mnt_id	= pm->parent_mnt_id;
 	me.flags		= pm->flags;
-	me.root			= pm->root;
 	me.mountpoint		= pm->mountpoint + 1;
 	me.source		= pm->source;
-	me.options		= pm->options;
+	me.options		= strip(pm->options);
 	me.shared_id		= pm->shared_id;
 	me.has_shared_id	= true;
 	me.master_id		= pm->master_id;
@@ -806,6 +959,18 @@ static int dump_one_mountpoint(struct mount_info *pm, int fd)
 		me.has_with_plugin = true;
 		me.with_plugin = true;
 	}
+
+	if (pm->external) {
+		/*
+		 * For external mount points dump the mapping's
+		 * value instead of root. See collect_mnt_from_image
+		 * for reverse mapping details.
+		 */
+		me.root	= pm->external->val;
+		me.has_ext_mount = true;
+		me.ext_mount = true;
+	} else
+		me.root = pm->root;
 
 	if (pb_write_one(fd, &me, PB_MNT))
 		return -1;
@@ -1159,8 +1324,19 @@ static int do_bind_mount(struct mount_info *mi)
 	bool shared = mi->shared_id && mi->shared_id == mi->bind->shared_id;
 
 	if (!mi->need_plugin) {
-		char rpath[PATH_MAX];
+		char *root, rpath[PATH_MAX];
 		int tok = 0;
+
+		if (mi->external) {
+			/*
+			 * We have / pointing to criu's ns root still,
+			 * so just use the mapping's path. The mountpoint
+			 * is tuned in collect_mnt_from_image to refer
+			 * to proper location in the namespace we restore.
+			 */
+			root = mi->root;
+			goto do_bind;
+		}
 
 		/*
 		 * Cut common part of root.
@@ -1176,9 +1352,10 @@ static int do_bind_mount(struct mount_info *mi)
 
 		snprintf(rpath, sizeof(rpath), "%s/%s",
 				mi->bind->mountpoint, mi->root + tok);
-		pr_info("\tBind %s to %s\n", rpath, mi->mountpoint);
-
-		if (mount(rpath, mi->mountpoint, NULL,
+		root = rpath;
+do_bind:
+		pr_info("\tBind %s to %s\n", root, mi->mountpoint);
+		if (mount(root, mi->mountpoint, NULL,
 					MS_BIND, NULL) < 0) {
 			pr_perror("Can't mount at %s", mi->mountpoint);
 			return -1;
@@ -1478,10 +1655,31 @@ static int collect_mnt_from_image(struct mount_info **pms, struct ns_id *nsid)
 		/* FIXME: abort unsupported early */
 		pm->fstype		= decode_fstype(me->fstype);
 
-		pr_debug("\t\tGetting root for %d\n", pm->mnt_id);
-		pm->root = xstrdup(me->root);
-		if (!pm->root)
-			goto err;
+		if (me->ext_mount) {
+			struct ext_mount *em;
+
+			/*
+			 * External mount point -- get the reverse mapping
+			 * from the command line and put into root's place
+			 */
+
+			em = ext_mount_lookup(me->root);
+			if (!em) {
+				pr_err("No mapping for %s mountpoint\n", me->mountpoint);
+				goto err;
+			}
+
+			pm->external = em;
+			pm->root = em->val;
+			pr_debug("Mountpoint %s will have root from %s\n",
+					me->mountpoint, pm->root);
+
+		} else {
+			pr_debug("\t\tGetting root for %d\n", pm->mnt_id);
+			pm->root = xstrdup(me->root);
+			if (!pm->root)
+				goto err;
+		}
 
 		len  = strlen(me->mountpoint) + root_len + 1;
 		pm->mountpoint = xmalloc(len);

@@ -137,6 +137,10 @@ static int parse_vmflags(char *buf, struct vma_area *vma_area)
 		else if (_vmflag_match(tok, "nh"))
 			vma_area->e->madv |= (1ul << MADV_NOHUGEPAGE);
 
+		/* vmsplice doesn't work for VM_IO and VM_PFNMAP mappings. */
+		if (_vmflag_match(tok, "io") || _vmflag_match(tok, "pf"))
+			vma_area->e->status |= VMA_UNSUPP;
+
 		/*
 		 * Anything else is just ignored.
 		 */
@@ -239,7 +243,7 @@ int parse_self_maps_lite(struct vm_area_list *vms)
 
 	vm_area_list_init(vms);
 
-	maps = fopen("/proc/self/maps", "r");
+	maps = fopen_proc(PROC_SELF, "maps");
 	if (maps == NULL) {
 		pr_perror("Can't open self maps");
 		return -1;
@@ -272,8 +276,7 @@ static char smaps_buf[PAGE_SIZE];
 int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_files)
 {
 	struct vma_area *vma_area = NULL;
-	unsigned long start, end, pgoff;
-	bool prev_growsdown = false;
+	unsigned long start, end, pgoff, prev_end = 0;
 	char r, w, x, s;
 	int ret = -1;
 	struct vma_file_info vfi;
@@ -327,10 +330,17 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 		}
 
 		if (vma_area) {
-			/* If we've split the stack vma, only the lowest one has the guard page. */
-			if ((vma_area->e->flags & MAP_GROWSDOWN) && !prev_growsdown)
+			if (vma_area->e->status & VMA_UNSUPP) {
+				pr_err("Unsupported mapping found %016"PRIx64"-%016"PRIx64"\n",
+							vma_area->e->start, vma_area->e->end);
+				goto err;
+			}
+
+			/* Add a guard page only if here is enough space for it */
+			if ((vma_area->e->flags & MAP_GROWSDOWN) &&
+			    prev_end < vma_area->e->start)
 				vma_area->e->start -= PAGE_SIZE; /* Guard page */
-			prev_growsdown = (bool)(vma_area->e->flags & MAP_GROWSDOWN);
+			prev_end = vma_area->e->end;
 
 			list_add_tail(&vma_area->list, &vma_area_list->h);
 			vma_area_list->nr++;
@@ -391,9 +401,14 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 		} else if (strstr(buf, "[vsyscall]") || strstr(buf, "[vectors]")) {
 			vma_area->e->status |= VMA_AREA_VSYSCALL;
 		} else if (strstr(buf, "[vdso]")) {
+#ifdef CONFIG_VDSO
 			vma_area->e->status |= VMA_AREA_REGULAR;
 			if ((vma_area->e->prot & VDSO_PROT) == VDSO_PROT)
 				vma_area->e->status |= VMA_AREA_VDSO;
+#else
+			pr_warn_once("Found vDSO area without support\n");
+			goto err;
+#endif
 		} else if (strstr(buf, "[heap]")) {
 			vma_area->e->status |= VMA_AREA_REGULAR | VMA_AREA_HEAP;
 		} else {
@@ -1481,4 +1496,63 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 		BUG_ON(nr - 1 != *_n);
 
 	return 0;
+}
+
+int parse_task_cgroup(int pid, struct list_head *retl, unsigned int *n)
+{
+	int ret = 0;
+	FILE *f;
+
+	f = fopen_proc(pid, "cgroup");
+	while (fgets(buf, BUF_SIZE, f)) {
+		struct cg_ctl *ncc, *cc;
+		char *name, *path, *e;
+
+		ret = -1;
+		ncc = xmalloc(sizeof(*cc));
+		if (!ncc)
+			goto err;
+
+		name = strchr(buf, ':') + 1;
+		path = strchr(name, ':');
+		e = strchr(name, '\n');
+		*path++ = '\0';
+		if (e)
+			*e = '\0';
+
+		ncc->name = xstrdup(name);
+		ncc->path = xstrdup(path);
+		if (!ncc->name || !ncc->name) {
+			xfree(ncc->name);
+			xfree(ncc->path);
+			xfree(ncc);
+			goto err;
+		}
+
+		list_for_each_entry(cc, retl, l)
+			if (strcmp(cc->name, name) >= 0)
+				break;
+
+		list_add_tail(&ncc->l, &cc->l);
+		(*n)++;
+	}
+
+	fclose(f);
+	return 0;
+
+err:
+	put_ctls(retl);
+	fclose(f);
+	return ret;
+}
+
+void put_ctls(struct list_head *l)
+{
+	struct cg_ctl *c, *n;
+
+	list_for_each_entry_safe(c, n, l, l) {
+		xfree(c->name);
+		xfree(c->path);
+		xfree(c);
+	}
 }

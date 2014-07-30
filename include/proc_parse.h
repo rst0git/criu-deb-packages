@@ -99,6 +99,7 @@ struct fstype {
 	int (*parse)(struct mount_info *pm);
 };
 
+struct ext_mount;
 struct mount_info {
 	int		mnt_id;
 	int		parent_mnt_id;
@@ -116,12 +117,17 @@ struct mount_info {
 	struct fstype	*fstype;
 	char		*source;
 	char		*options;
-	bool		mounted;
+	union {
+		bool		mounted;
+		bool		dumped;
+	};
 	bool		need_plugin;
 	int		is_file;
 	bool		is_ns_root;
 	struct mount_info *next;
 	struct ns_id	*nsid;
+
+	struct ext_mount *external;
 
 	/* tree linkage */
 	struct mount_info *parent;
@@ -177,5 +183,24 @@ struct pid;
 extern int parse_threads(int pid, struct pid **_t, int *_n);
 
 extern int check_mnt_id(void);
+
+/*
+ * This struct describes a group controlled by one controller.
+ * The @name is the controller name or 'name=...' for named cgroups.
+ * The @path is the path from the hierarchy root.
+ */
+
+struct cg_ctl {
+	struct list_head l;
+	char *name;
+	char *path;
+};
+
+/*
+ * Returns the list of cg_ctl-s sorted by name
+ */
+
+extern int parse_task_cgroup(int pid, struct list_head *l, unsigned int *n);
+extern void put_ctls(struct list_head *);
 
 #endif /* __CR_PROC_PARSE_H__ */
