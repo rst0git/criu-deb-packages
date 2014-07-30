@@ -4,6 +4,8 @@
 #include <linux/types.h>
 #include <sys/ptrace.h>
 
+#include "config.h"
+
 /* some constants for ptrace */
 #ifndef PTRACE_SEIZE
 # define PTRACE_SEIZE		0x4206
@@ -19,14 +21,17 @@
 
 #ifndef PTRACE_PEEKSIGINFO
 #define PTRACE_PEEKSIGINFO      0x4209
+
+/* Read signals from a shared (process wide) queue */
+#define PTRACE_PEEKSIGINFO_SHARED       (1 << 0)
+#endif
+
+#ifndef CONFIG_HAS_PEEKSIGINFO_ARGS
 struct ptrace_peeksiginfo_args {
         __u64 off;	/* from which siginfo to start */
         __u32 flags;
         __u32 nr;	/* how may siginfos to take */
 };
-
-/* Read signals from a shared (process wide) queue */
-#define PTRACE_PEEKSIGINFO_SHARED       (1 << 0)
 #endif
 
 #ifndef PTRACE_GETREGSET

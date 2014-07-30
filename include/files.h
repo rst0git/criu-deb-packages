@@ -8,6 +8,7 @@
 #include "list.h"
 #include "image.h"
 #include "pid.h"
+#include "rst_info.h"
 
 #include "protobuf/fdinfo.pb-c.h"
 #include "protobuf/fown.pb-c.h"
@@ -96,11 +97,18 @@ struct file_desc_ops {
 	 */
 	int			(*want_transport)(FdinfoEntry *fe, struct file_desc *d);
 	/*
-	 * Helps determining sequence of different file types restore.
-	 * See the prepare_fds for details.
+	 * Called to collect a new fd before adding it on desc. Clients
+	 * may chose to collect it to some specific rst_info list. See
+	 * prepare_fds() for details.
 	 */
-	struct list_head *	(*select_ps_list)(struct file_desc *, struct rst_info *);
+	void			(*collect_fd)(struct file_desc *, struct fdinfo_list_entry *,
+						struct rst_info *);
 };
+
+static inline void collect_gen_fd(struct fdinfo_list_entry *fle, struct rst_info *ri)
+{
+	list_add_tail(&fle->ps_list, &ri->fds);
+}
 
 struct file_desc {
 	u32			id;		/* File id, unique */
@@ -112,6 +120,7 @@ struct file_desc {
 struct fdtype_ops {
 	unsigned int		type;
 	int			(*dump)(int lfd, u32 id, const struct fd_parms *p);
+	int			(*pre_dump)(int pid, int lfd);
 };
 
 extern int do_dump_gen_file(struct fd_parms *p, int lfd,
@@ -120,6 +129,7 @@ extern int do_dump_gen_file(struct fd_parms *p, int lfd,
 struct parasite_drain_fd;
 int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 		struct parasite_drain_fd *dfds);
+int predump_task_files(int pid);
 
 extern int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops);
 extern struct fdinfo_list_entry *file_master(struct file_desc *d);
@@ -135,7 +145,7 @@ extern int prepare_fds(struct pstree_item *me);
 extern int prepare_fd_pid(struct pstree_item *me);
 extern int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id);
 extern int prepare_shared_fdinfo(void);
-extern int get_filemap_fd(int pid, VmaEntry *vma_entry);
+extern int get_filemap_fd(struct vma_area *);
 extern int prepare_fs(int pid);
 extern int set_fd_flags(int fd, int flags);
 

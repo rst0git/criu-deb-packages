@@ -61,6 +61,9 @@ static/selfexe00
 static/unlink_fstat00
 static/unlink_fstat02
 static/unlink_fstat03
+static/unlink_mmap00
+static/unlink_mmap01
+static/unlink_mmap02
 static/eventfs00
 static/signalfd00
 static/inotify00
@@ -99,6 +102,7 @@ static/stopped
 static/chroot
 static/chroot-file
 static/rtc
+transition/maps007
 "
 # Duplicate list with ns/ prefix
 TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#ns/#')
@@ -150,6 +154,8 @@ tun
 chroot
 chroot-file
 rtc
+tempfs
+maps007
 "
 
 source $(readlink -f `dirname $0`/env.sh) || exit 1

@@ -142,6 +142,7 @@ extern struct mount_info *parse_mountinfo(pid_t pid);
 extern int parse_pid_stat(pid_t pid, struct proc_pid_stat *s);
 extern int parse_pid_stat_small(pid_t pid, struct proc_pid_stat_small *s);
 extern int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_files);
+extern int parse_self_maps_lite(struct vm_area_list *vms);
 extern int parse_pid_status(pid_t pid, struct proc_status_creds *);
 
 union fdinfo_entries {
@@ -153,6 +154,8 @@ union fdinfo_entries {
 };
 
 extern int parse_fdinfo(int fd, int type,
+		int (*cb)(union fdinfo_entries *e, void *arg), void *arg);
+extern int parse_fdinfo_pid(int pid, int fd, int type,
 		int (*cb)(union fdinfo_entries *e, void *arg), void *arg);
 extern int parse_cpuinfo_features(int (*handler)(char *tok));
 extern int parse_file_locks(void);

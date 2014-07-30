@@ -402,6 +402,7 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 			struct unix_diag_vfs *uv;
 			struct stat st;
 			char rpath[PATH_MAX];
+			bool drop_path = false;
 
 			if (name[0] != '/') {
 				pr_warn("Relative bind path '%s' "
@@ -418,12 +419,16 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 			uv = RTA_DATA(tb[UNIX_DIAG_VFS]);
 			snprintf(rpath, sizeof(rpath), ".%s", name);
 			if (fstatat(mntns_root, rpath, &st, 0)) {
-				pr_warn("Can't stat socket %#x(%s), skipping: %m (err %d)\n",
-					m->udiag_ino, rpath, errno);
-				goto skip;
-			}
+				if (errno != ENOENT) {
+					pr_warn("Can't stat socket %#x(%s), skipping: %m (err %d)\n",
+							m->udiag_ino, rpath, errno);
+					goto skip;
+				}
 
-			if ((st.st_ino != uv->udiag_vfs_ino) ||
+				pr_info("unix: Dropping path %s for unlinked sk %#x\n",
+						name, m->udiag_ino);
+				drop_path = true;
+			} else if ((st.st_ino != uv->udiag_vfs_ino) ||
 			    !phys_stat_dev_match(st.st_dev, uv->udiag_vfs_dev, name)) {
 				pr_info("unix: Dropping path %s for "
 						"unlinked bound "
@@ -433,6 +438,10 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 						(int)st.st_ino,
 						(int)uv->udiag_vfs_dev,
 						(int)uv->udiag_vfs_ino);
+				drop_path = true;
+			}
+
+			if (drop_path) {
 				/*
 				 * When a socket is bound to unlinked file, we
 				 * just drop his name, since no one will access
@@ -572,7 +581,7 @@ int fix_external_unix_sockets(void)
 
 		BUG_ON(sk->sd.already_dumped);
 
-		e.id		= fd_id_generate_special();
+		fd_id_generate_special(NULL, &e.id);
 		e.ino		= sk->sd.ino;
 		e.type		= SOCK_DGRAM;
 		e.state		= TCP_LISTEN;

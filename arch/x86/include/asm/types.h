@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <signal.h>
 
+#include "asm-generic/page.h"
 #include "asm/bitops.h"
 #include "asm/int.h"
 #include "asm/prlimit.h"
@@ -108,14 +109,6 @@ typedef struct {
 #define ASSIGN_TYPED(a, b) do { a = (typeof(a))b; } while (0)
 #define ASSIGN_MEMBER(a,b,m) do { ASSIGN_TYPED((a)->m, (b)->m); } while (0)
 
-#ifndef PAGE_SIZE
-# define PAGE_SIZE	4096
-#endif
-
-#ifndef PAGE_MASK
-# define PAGE_MASK	(~(PAGE_SIZE - 1))
-#endif
-
 #define TASK_SIZE ((1UL << 47) - PAGE_SIZE)
 
 typedef u64 auxv_t;
@@ -126,11 +119,7 @@ typedef u64 auxv_t;
 
 #define CORE_ENTRY__MARCH CORE_ENTRY__MARCH__X86_64
 
-#if defined(CONFIG_X86_64)
-# define AT_VECTOR_SIZE 44
-#elif defined(CONFIG_ARM)
-# define AT_VECTOR_SIZE 22             /* Not needed at moment */
-#endif
+#define AT_VECTOR_SIZE 44
 
 #define CORE_THREAD_ARCH_INFO(core) core->thread_info
 

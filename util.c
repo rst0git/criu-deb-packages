@@ -38,9 +38,11 @@
 #include "rst-malloc.h"
 #include "image.h"
 #include "vma.h"
+#include "mem.h"
 
 #include "cr_options.h"
 #include "servicefd.h"
+#include "cr-service.h"
 
 #define VMA_OPT_LEN	128
 
@@ -49,7 +51,7 @@ static void vma_opt_str(const struct vma_area *v, char *opt)
 	int p = 0;
 
 #define opt2s(_o, _s)	do {				\
-		if (v->vma.status & _o)			\
+		if (v->e->status & _o)			\
 			p += sprintf(opt + p, _s " ");	\
 	} while (0)
 
@@ -81,12 +83,12 @@ void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
 	vma_opt_str(vma_area, opt);
 	print_on_level(loglevel, "%#"PRIx64"-%#"PRIx64" (%"PRIi64"K) prot %#x flags %#x off %#"PRIx64" "
 			"%s shmid: %#"PRIx64"\n",
-			vma_area->vma.start, vma_area->vma.end,
+			vma_area->e->start, vma_area->e->end,
 			KBYTES(vma_area_len(vma_area)),
-			vma_area->vma.prot,
-			vma_area->vma.flags,
-			vma_area->vma.pgoff,
-			opt, vma_area->vma.shmid);
+			vma_area->e->prot,
+			vma_area->e->flags,
+			vma_area->e->pgoff,
+			opt, vma_area->e->shmid);
 }
 
 int close_safe(int *fd)
@@ -404,15 +406,6 @@ int copy_file(int fd_in, int fd_out, size_t bytes)
 	return 0;
 }
 
-#ifndef ANON_INODE_FS_MAGIC
-# define ANON_INODE_FS_MAGIC 0x09041934
-#endif
-
-bool is_anon_inode(struct statfs *statfs)
-{
-	return statfs->f_type == ANON_INODE_FS_MAGIC;
-}
-
 int read_fd_link(int lfd, char *buf, size_t size)
 {
 	char t[32];
@@ -432,12 +425,9 @@ int read_fd_link(int lfd, char *buf, size_t size)
 	return ret;
 }
 
-int is_anon_link_type(int lfd, char *type)
+int is_anon_link_type(char *link, char *type)
 {
-	char link[32], aux[32];
-
-	if (read_fd_link(lfd, link, sizeof(link)) < 0)
-		return -1;
+	char aux[32];
 
 	snprintf(aux, sizeof(aux), "anon_inode:%s", type);
 	return !strcmp(link, aux);
@@ -467,8 +457,13 @@ int run_scripts(char *action)
 	}
 
 	list_for_each_entry(script, &opts.scripts, node) {
-		pr_debug("\t[%s]\n", script->path);
-		ret |= system(script->path);
+		if (script->path == SCRIPT_RPC_NOTIFY) {
+			pr_debug("\tRPC\n");
+			ret |= send_criu_rpc_script(action, script->arg);
+		} else {
+			pr_debug("\t[%s]\n", script->path);
+			ret |= system(script->path);
+		}
 	}
 
 	unsetenv("CRTOOLS_SCRIPT_ACTION");
@@ -485,6 +480,47 @@ int run_scripts(char *action)
 		}						\
 		ret__;						\
 	})
+
+static int fixup_env(void)
+{
+	char *ep, *nep;
+	int len;
+
+	/*
+	 * FIXME
+	 *
+	 * We sometimes call other tools inside namespace
+	 * we restore. Host system may not have PATH properly
+	 * reflecting where the tools are in other namespaces.
+	 *
+	 * E.g. when restoring Centos6 container from FC20
+	 * host we fail to find /bin/tar, as in FC20 /bin is
+	 * not in PATH.
+	 *
+	 * It's not cool at all, things we think we call might
+	 * not coincide with what is really called. Proper fix
+	 * will come a bit later.
+	 */
+
+	ep = getenv("PATH");
+	if (!ep)
+		return 0;
+
+	len = strlen(ep);
+	nep = xmalloc(len + sizeof("/bin:"));
+	if (!nep)
+		return -1;
+
+	sprintf(nep, "/bin:%s", ep);
+	if (setenv("PATH", nep, 1)) {
+		pr_perror("Failed to override PATH");
+		xfree(nep);
+		return -1;
+	}
+
+	xfree(nep);
+	return 0;
+}
 
 /*
  * If "in" is negative, stdin will be closed.
@@ -508,6 +544,9 @@ int cr_system(int in, int out, int err, char *cmd, char *const argv[])
 		pr_perror("fork() failed");
 		goto out;
 	} else if (pid == 0) {
+		if (fixup_env())
+			goto out_chld;
+
 		if (out < 0)
 			out = log_get_fd();
 		if (err < 0)
@@ -581,6 +620,36 @@ out:
 	return ret;
 }
 
+int cr_daemon(int nochdir, int noclose)
+{
+	int pid;
+
+	pid = fork();
+	if (pid < 0) {
+		pr_perror("Can't fork");
+		return -1;
+	}
+
+	if (pid > 0)
+		return pid;
+
+	setsid();
+	if (!nochdir)
+		if (chdir("/") == -1)
+			pr_perror("Can't change directory");
+	if (!noclose) {
+		int fd;
+
+		fd = open("/dev/null", O_RDWR);
+		dup2(fd, 0);
+		dup2(fd, 1);
+		dup2(fd, 2);
+		close(fd);
+	}
+
+	return 0;
+}
+
 int is_root_user()
 {
 	if (geteuid() != 0) {
@@ -589,4 +658,51 @@ int is_root_user()
 	}
 
 	return 1;
+}
+
+int vaddr_to_pfn(unsigned long vaddr, u64 *pfn)
+{
+	int fd, ret = -1;
+	off_t off;
+
+	fd = open_proc(getpid(), "pagemap");
+	if (fd < 0)
+		return -1;
+
+	off = (vaddr / PAGE_SIZE) * sizeof(u64);
+	if (lseek(fd, off, SEEK_SET) != off) {
+		pr_perror("Failed to seek address %lx\n", vaddr);
+		goto out;
+	}
+
+	ret = read(fd, pfn, sizeof(*pfn));
+	if (ret != sizeof(*pfn)) {
+		pr_perror("Can't read pme for pid %d", getpid());
+		ret = -1;
+	} else {
+		*pfn &= PME_PFRAME_MASK;
+		ret = 0;
+	}
+out:
+	close(fd);
+	return ret;
+}
+
+/*
+ * Note since VMA_AREA_NONE = 0 we can skip assignment
+ * here and simply rely on xzalloc
+ */
+struct vma_area *alloc_vma_area(void)
+{
+	struct vma_area *p;
+
+	p = xzalloc(sizeof(*p) + sizeof(VmaEntry));
+	if (p) {
+		p->e = (VmaEntry *)(p + 1);
+		vma_entry__init(p->e);
+		p->vm_file_fd = -1;
+		p->e->fd = -1;
+	}
+
+	return p;
 }

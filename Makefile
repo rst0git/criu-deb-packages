@@ -1,10 +1,13 @@
 VERSION_MAJOR		:= 1
-VERSION_MINOR		:= 1
+VERSION_MINOR		:= 2
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
+VERSION_SO_MAJOR	:= 1
+VERSION_SO_MINOR	:= 0
 
 export VERSION_MAJOR VERSION_MINOR VERSION_SUBLEVEL VERSION_EXTRA VERSION_NAME
+export VERSION_SO_MAJOR VERSION_SO_MINOR
 
 #
 # FIXME zdtm building procedure requires implicit rules
@@ -15,9 +18,6 @@ export VERSION_MAJOR VERSION_MINOR VERSION_SUBLEVEL VERSION_EXTRA VERSION_NAME
 # may be uncommented.
 #
 #MAKEFLAGS := -r -R
-
-include Makefile.inc
-include Makefile.config
 
 #
 # Common definitions
@@ -33,6 +33,8 @@ SH		:= bash
 MAKE		:= make
 OBJCOPY		:= $(CROSS_COMPILE)objcopy
 
+CFLAGS		+= $(USERCFLAGS)
+
 #
 # Fetch ARCH from the uname if not yet set
 #
@@ -46,34 +48,34 @@ ARCH ?= $(shell uname -m | sed		\
 		-e s/sh[234].*/sh/)
 
 ifeq ($(ARCH),i386)
-	ARCH         := x86-32
+	SRCARCH      := x86-32
 	DEFINES      := -DCONFIG_X86_32
 endif
 ifeq ($(ARCH),x86_64)
-	ARCH         := x86
+	SRCARCH      := x86
 	DEFINES      := -DCONFIG_X86_64
 	LDARCH       := i386:x86-64
 endif
 
 ifeq ($(shell echo $(ARCH) | sed -e 's/arm.*/arm/'),arm)
-	ARMV         := $(shell echo $(ARCH) | sed -r -e 's/armv([[:digit:]]).*/\1/')
-	ARCH         := arm
-	DEFINES      := -DCONFIG_ARM -DCONFIG_ARMV$(ARMV)
-	LDARCH       := arm
+	ARMV         := $(shell echo $(ARCH) | sed -nr 's/armv([[:digit:]]).*/\1/p; t; i7')
+	SRCARCH      := arm
+	DEFINES      := -DCONFIG_ARMV$(ARMV)
 
 	ifeq ($(ARMV),6)
-		CFLAGS += -march=armv6
+		USERCFLAGS += -march=armv6
 	endif
 
 	ifeq ($(ARMV),7)
-		CFLAGS += -march=armv7-a
+		USERCFLAGS += -march=armv7-a
 	endif
 endif
 
-LDARCH		?= $(ARCH)
+SRCARCH		?= $(ARCH)
+LDARCH		?= $(SRCARCH)
 
 SRC_DIR		?= $(CURDIR)
-ARCH_DIR	:= arch/$(ARCH)
+ARCH_DIR	:= arch/$(SRCARCH)
 
 $(if $(wildcard $(ARCH_DIR)),,$(error "The architecture $(ARCH) isn't supported"))
 
@@ -100,15 +102,24 @@ else
 	CFLAGS	+= -O2
 endif
 
-CFLAGS		+= $(WARNINGS) $(DEFINES)
-SYSCALL-LIB	:= arch/$(ARCH)/syscalls.built-in.o
-ARCH-LIB	:= arch/$(ARCH)/crtools.built-in.o
-CRIU-LIB	:= lib/libcriu.so
+ifeq ($(GMON),1)
+	CFLAGS	+= -pg
+	GMONLDOPT = -pg
+endif
 
-export CC MAKE CFLAGS LIBS ARCH DEFINES MAKEFLAGS
+CFLAGS		+= $(WARNINGS) $(DEFINES)
+SYSCALL-LIB	:= $(ARCH_DIR)/syscalls.built-in.o
+ARCH-LIB	:= $(ARCH_DIR)/crtools.built-in.o
+CRIU-SO		:= libcriu
+CRIU-LIB	:= lib/$(CRIU-SO).so
+CRIU-INC	:= lib/criu.h include/criu-plugin.h include/criu-log.h protobuf/rpc.proto
+
+export CC MAKE CFLAGS LIBS SRCARCH DEFINES MAKEFLAGS CRIU-SO
 export SRC_DIR SYSCALL-LIB SH RM ARCH_DIR OBJCOPY LDARCH LD
 export cflags-y
 
+include Makefile.inc
+include Makefile.config
 include scripts/Makefile.version
 include scripts/Makefile.rules
 
@@ -122,7 +133,7 @@ build-crtools := -r -R -f scripts/Makefile.build makefile=Makefile.crtools obj
 PROGRAM		:= criu
 
 .PHONY: all zdtm test rebuild clean distclean tags cscope	\
-	docs help pie protobuf arch/$(ARCH) clean-built lib
+	docs help pie protobuf $(ARCH_DIR) clean-built lib
 
 ifeq ($(GCOV),1)
 %.o $(PROGRAM): override CFLAGS += --coverage
@@ -136,14 +147,14 @@ protobuf/%::
 protobuf:
 	$(Q) $(MAKE) $(build)=protobuf all
 
-arch/$(ARCH)/%:: protobuf
-	$(Q) $(MAKE) $(build)=arch/$(ARCH) $@
-arch/$(ARCH): protobuf
-	$(Q) $(MAKE) $(build)=arch/$(ARCH) all
+$(ARCH_DIR)/%:: protobuf
+	$(Q) $(MAKE) $(build)=$(ARCH_DIR) $@
+$(ARCH_DIR): protobuf
+	$(Q) $(MAKE) $(build)=$(ARCH_DIR) all
 
-pie/%:: arch/$(ARCH)
+pie/%:: $(ARCH_DIR)
 	$(Q) $(MAKE) $(build)=pie $@
-pie: arch/$(ARCH)
+pie: $(ARCH_DIR)
 	$(Q) $(MAKE) $(build)=pie all
 
 %.o %.i %.s %.d: $(VERSION_HEADER) pie
@@ -167,7 +178,7 @@ PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-pie.o
 
 $(PROGRAM): $(SYSCALL-LIB) $(ARCH-LIB) $(PROGRAM-BUILTINS)
 	$(E) "  LINK    " $@
-	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(LDFLAGS) -rdynamic -o $@
+	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@
 
 zdtm: all
 	$(Q) $(MAKE) -C test/zdtm all
@@ -177,7 +188,7 @@ test: zdtm
 
 clean-built:
 	$(Q) $(RM) $(VERSION_HEADER)
-	$(Q) $(MAKE) $(build)=arch/$(ARCH) clean
+	$(Q) $(MAKE) $(build)=$(ARCH_DIR) clean
 	$(Q) $(MAKE) $(build)=protobuf clean
 	$(Q) $(MAKE) $(build)=pie clean
 	$(Q) $(MAKE) $(build)=lib clean
@@ -233,9 +244,19 @@ install: $(PROGRAM) install-man
 	$(E) "  INSTALL " $(PROGRAM)
 	$(Q) mkdir -p $(DESTDIR)$(SBINDIR)
 	$(Q) install -m 755 $(PROGRAM) $(DESTDIR)$(SBINDIR)
+	$(Q) mkdir -p $(DESTDIR)$(LIBDIR)
+	$(Q) install -m 755 $(CRIU-LIB) \
+		$(DESTDIR)$(LIBDIR)/$(CRIU-SO).so.$(VERSION_SO_MAJOR).$(VERSION_SO_MINOR)
+	$(Q) ln -fns $(CRIU-SO).so.$(VERSION_SO_MAJOR).$(VERSION_SO_MINOR) \
+		$(DESTDIR)$(LIBDIR)/$(CRIU-SO).so.$(VERSION_SO_MAJOR)
+	$(Q) ln -fns $(CRIU-SO).so.$(VERSION_SO_MAJOR).$(VERSION_SO_MINOR) \
+		$(DESTDIR)$(LIBDIR)/$(CRIU-SO).so
+	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)
+	$(Q) install -m 644 $(CRIU-INC) $(DESTDIR)$(INCLUDEDIR)
 	$(Q) mkdir -p $(DESTDIR)$(SYSTEMDUNITDIR)
 	$(Q) install -m 644 scripts/sd/criu.socket $(DESTDIR)$(SYSTEMDUNITDIR)
 	$(Q) install -m 644 scripts/sd/criu.service $(DESTDIR)$(SYSTEMDUNITDIR)
+	$(Q) install -m 644 scripts/logrotate.d/criu-service $(DESTDIR)$(LOGROTATEDIR)
 
 install-man:
 	$(Q) $(MAKE) -C Documentation install

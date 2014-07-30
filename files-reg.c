@@ -144,7 +144,6 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	gf->remap.users = 0;
 	list_add_tail(&gf->list, &ghost_files);
 gf_found:
-	gf->remap.users++;
 	rfi->remap = &gf->remap;
 	return 0;
 
@@ -181,7 +180,7 @@ static int open_remap_linked(struct reg_file_info *rfi,
 	pr_info("Remapped %s -> %s\n", rfi->path, rrfi->path);
 
 	rm->path = rrfi->path;
-	rm->users = 1;
+	rm->users = 0;
 	rfi->remap = rm;
 	return 0;
 }
@@ -382,7 +381,8 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp)
 		tmp--;
 	}
 
-	rfe.id = *idp	= fd_id_generate_special();
+	fd_id_generate_special(NULL, idp);
+	rfe.id		= *idp;
 	rfe.flags	= 0;
 	rfe.pos		= 0;
 	rfe.fown	= &fwn;
@@ -581,20 +581,56 @@ const struct fdtype_ops regfile_dump_ops = {
 	.dump		= dump_one_reg_file,
 };
 
-static int open_path(struct file_desc *d,
+/*
+ * This routine properly resolves d's path handling ghost/link-remaps.
+ * The open_cb is a routine that does actual open, it differs for
+ * files, directories, fifos, etc.
+ */
+
+static inline int rfi_remap(struct reg_file_info *rfi)
+{
+	return link(rfi->remap->path, rfi->path);
+}
+
+int open_path(struct file_desc *d,
 		int(*open_cb)(struct reg_file_info *, void *), void *arg)
 {
 	struct reg_file_info *rfi;
 	int tmp;
+	char *orig_path = NULL;
 
 	rfi = container_of(d, struct reg_file_info, d);
 
 	if (rfi->remap) {
 		mutex_lock(ghost_file_mutex);
-		if (link(rfi->remap->path, rfi->path) < 0) {
-			pr_perror("Can't link %s -> %s",
-					rfi->remap->path, rfi->path);
-			return -1;
+		if (rfi_remap(rfi) < 0) {
+			static char tmp_path[PATH_MAX];
+
+			if (errno != EEXIST) {
+				pr_perror("Can't link %s -> %s", rfi->path,
+						rfi->remap->path);
+				return -1;
+			}
+
+			/*
+			 * The file whose name we're trying to create
+			 * exists. Need to pick some other one, we're
+			 * going to remove it anyway.
+			 *
+			 * Strictly speaking, this is cheating, file
+			 * name shouldn't change. But since NFS with
+			 * its silly-rename doesn't care, why should we?
+			 */
+
+			orig_path = rfi->path;
+			rfi->path = tmp_path;
+			snprintf(tmp_path, sizeof(tmp_path), "%s.cr_link", orig_path);
+			pr_debug("Fake %s -> %s link\n", rfi->path, rfi->remap->path);
+
+			if (rfi_remap(rfi) < 0) {
+				pr_perror("Can't create even fake link!");
+				return -1;
+			}
 		}
 	}
 
@@ -611,6 +647,9 @@ static int open_path(struct file_desc *d,
 			pr_info("Unlink the ghost %s\n", rfi->remap->path);
 			unlink(rfi->remap->path);
 		}
+
+		if (orig_path)
+			rfi->path = orig_path;
 		mutex_unlock(ghost_file_mutex);
 	}
 
@@ -620,20 +659,7 @@ static int open_path(struct file_desc *d,
 	return tmp;
 }
 
-int open_path_by_id(u32 id, int (*open_cb)(struct reg_file_info *, void *), void *arg)
-{
-	struct file_desc *fd;
-
-	fd = find_file_desc_raw(FD_TYPES__REG, id);
-	if (fd == NULL) {
-		pr_err("Can't find regfile for %#x\n", id);
-		return -1;
-	}
-
-	return open_path(fd, open_cb, arg);
-}
-
-static int do_open_reg(struct reg_file_info *rfi, void *arg)
+static int do_open_reg_noseek(struct reg_file_info *rfi, void *arg)
 {
 	int fd;
 
@@ -642,6 +668,17 @@ static int do_open_reg(struct reg_file_info *rfi, void *arg)
 		pr_perror("Can't open file %s on restore", rfi->path);
 		return fd;
 	}
+
+	return fd;
+}
+
+static int do_open_reg(struct reg_file_info *rfi, void *arg)
+{
+	int fd;
+
+	fd = do_open_reg_noseek(rfi, arg);
+	if (fd < 0)
+		return fd;
 
 	if ((rfi->rfe->pos != -1ULL) &&
 			lseek(fd, rfi->rfe->pos, SEEK_SET) < 0) {
@@ -653,20 +690,90 @@ static int do_open_reg(struct reg_file_info *rfi, void *arg)
 	return fd;
 }
 
+int open_reg_by_id(u32 id)
+{
+	struct file_desc *fd;
+
+	/*
+	 * This one gets called by exe link, chroot and cwd
+	 * restoring code. No need in calling lseek on either
+	 * of them.
+	 */
+
+	fd = find_file_desc_raw(FD_TYPES__REG, id);
+	if (fd == NULL) {
+		pr_err("Can't find regfile for %#x\n", id);
+		return -1;
+	}
+
+	return open_path(fd, do_open_reg_noseek, NULL);
+}
+
+int get_filemap_fd(struct vma_area *vma)
+{
+	/*
+	 * Thevma->fd should have been assigned in collect_filemap
+	 *
+	 * We open file w/o lseek, as mappings don't care about it
+	 */
+
+	BUG_ON(vma->fd == NULL);
+	return open_path(vma->fd, do_open_reg_noseek, NULL);
+}
+
+static void remap_get(struct file_desc *fdesc, char typ)
+{
+	struct reg_file_info *rfi;
+
+	rfi = container_of(fdesc, struct reg_file_info, d);
+	if (rfi->remap) {
+		pr_debug("One more remap user (%c) for %s\n",
+				typ, rfi->remap->path);
+		/* No lock, we're still sngle-process here */
+		rfi->remap->users++;
+	}
+}
+
+static void collect_reg_fd(struct file_desc *fdesc,
+		struct fdinfo_list_entry *fle, struct rst_info *ri)
+{
+	if (list_empty(&fdesc->fd_info_head))
+		remap_get(fdesc, 'f');
+
+	collect_gen_fd(fle, ri);
+}
+
 static int open_fe_fd(struct file_desc *fd)
 {
 	return open_path(fd, do_open_reg, NULL);
 }
 
-int open_reg_by_id(u32 id)
-{
-	return open_path_by_id(id, do_open_reg, NULL);
-}
-
 static struct file_desc_ops reg_desc_ops = {
 	.type = FD_TYPES__REG,
 	.open = open_fe_fd,
+	.collect_fd = collect_reg_fd,
 };
+
+struct file_desc *collect_special_file(u32 id)
+{
+	struct file_desc *fdesc;
+
+	/*
+	 * Files dumped for vmas/exe links can have remaps
+	 * configured. Need to bump-up users for them, otherwise
+	 * the open_path() would unlink the remap file after
+	 * the very first open.
+	 */
+
+	fdesc = find_file_desc_raw(FD_TYPES__REG, id);
+	if (fdesc == NULL) {
+		pr_err("No entry for reg-file-ID %#x\n", id);
+		return NULL;
+	}
+
+	remap_get(fdesc, 's');
+	return fdesc;
+}
 
 static int collect_one_regfile(void *o, ProtobufCMessage *base)
 {

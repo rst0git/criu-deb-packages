@@ -74,8 +74,18 @@ int open_mount(unsigned int s_dev)
 	struct mount_info *i;
 
 	for (i = mntinfo; i != NULL; i = i->next)
-		if (s_dev == i->s_dev)
-			return open(i->mountpoint, O_RDONLY);
+		if (s_dev == i->s_dev) {
+			if (mntns_root == -1) {
+				pr_debug("mpopen %s\n", i->mountpoint);
+				return open(i->mountpoint, O_RDONLY);
+			} else if (i->mountpoint[1] == '\0') {
+				pr_debug("mpopen root\n");
+				return dup(mntns_root);
+			} else {
+				pr_debug("mpopen %d:%s\n", mntns_root, i->mountpoint + 1);
+				return openat(mntns_root, i->mountpoint + 1, O_RDONLY);
+			}
+		}
 
 	return -ENOENT;
 }
@@ -514,7 +524,6 @@ static int close_mountpoint(DIR *dfd)
 static DIR *open_mountpoint(struct mount_info *pm)
 {
 	int fd = -1, ns_old = -1;
-	char buf[PATH_MAX];
 	char mnt_path[] = "/tmp/cr-tmpfs.XXXXXX";
 
 	/*
@@ -542,8 +551,7 @@ static DIR *open_mountpoint(struct mount_info *pm)
 		goto out;
 	}
 
-	snprintf(buf, sizeof(buf), "/proc/self/root/%s", pm->mountpoint);
-	if (mount(buf, mnt_path, NULL, MS_BIND, NULL)) {
+	if (mount(pm->mountpoint, mnt_path, NULL, MS_BIND, NULL)) {
 		pr_perror("Can't bind-mount %d:%s to %s",
 				pm->mnt_id, pm->mountpoint, mnt_path);
 		rmdir(mnt_path);

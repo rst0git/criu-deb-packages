@@ -145,7 +145,7 @@ static void ns_sig_hand(int signo)
 	return;
 write_out:
 	/* fprintf can't be used in a sighandler due to glibc locks */
-	write(STDERR_FILENO, buf, MAX(len, sizeof(buf)));
+	write(STDERR_FILENO, buf, MIN(len, sizeof(buf)));
 }
 
 #define STATUS_FD 255
@@ -199,10 +199,6 @@ int ns_init(int argc, char **argv)
 		fprintf(stderr, "Can't set SIGTERM handler: %m\n");
 		exit(1);
 	}
-	if (sigaction(SIGCHLD, &sa, NULL)) {
-		fprintf(stderr, "Can't set SIGCHLD handler: %m\n");
-		exit(1);
-	}
 
 	/* Start test */
 	pid = fork();
@@ -214,9 +210,12 @@ int ns_init(int argc, char **argv)
 		fprintf(stderr, "exec(%s) failed: %m\n", argv[0]);
 		return ret;
 	}
-	ret = 1;
-	waitpid(pid, &ret, 0);
 
+	ret = -1;
+	if (waitpid(pid, &ret, 0) < 0)
+		fprintf(stderr, "waitpid() failed: %m\n");
+	else if (ret)
+		fprintf(stderr, "The test returned non-zero code %d\n", ret);
 
 	pid = fork();
 	if (pid == 0) {
@@ -225,6 +224,25 @@ int ns_init(int argc, char **argv)
 		exit(1);
 	} else if (pid > 0)
 		waitpid(pid, NULL, 0);
+
+	if (sigaction(SIGCHLD, &sa, NULL)) {
+		fprintf(stderr, "Can't set SIGCHLD handler: %m\n");
+		exit(1);
+	}
+
+	while (1) {
+		int status;
+
+		pid = waitpid(-1, &status, WNOHANG);
+		if (pid == 0)
+			break;
+		if (pid < 0) {
+			fprintf(stderr, "waitpid() failed: %m\n");
+			exit (1);
+		}
+		if (status)
+			fprintf(stderr, "%d return %d\n", pid, status);
+	}
 
 	/* Daemonize */
 	write(status_pipe, &ret, sizeof(ret));
@@ -293,15 +311,21 @@ void ns_create(int argc, char **argv)
 
 	status = 1;
 	ret = read(args.status_pipe[0], &status, sizeof(status));
-	if (ret != sizeof(status) || status)
+	if (ret != sizeof(status) || status) {
+		fprintf(stderr, "The test failed (%d, %d)\n", ret, status);
 		exit(1);
+	}
 	ret = read(args.status_pipe[0], &status, sizeof(status));
-	if (ret != 0)
+	if (ret != 0) {
+		fprintf(stderr, "Unexpected message from test\n");
 		exit(1);
+	}
 
 	pidfile = getenv("ZDTM_PIDFILE");
-	if (pidfile == NULL)
+	if (pidfile == NULL) {
+		fprintf(stderr, "ZDTM_PIDFILE isn't defined");
 		exit(1);
+	}
 	fd = open(pidfile, O_CREAT | O_EXCL | O_WRONLY, 0666);
 	if (fd == -1) {
 		fprintf(stderr, "Can't create the file %s: %m\n", pidfile);
