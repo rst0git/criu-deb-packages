@@ -441,27 +441,33 @@ void release_skopts(SkOptsEntry *soe)
 int dump_socket(struct fd_parms *p, int lfd, const int fdinfo)
 {
 	int family;
+	const struct fdtype_ops *ops;
 
 	if (dump_opt(lfd, SOL_SOCKET, SO_DOMAIN, &family))
 		return -1;
 
 	switch (family) {
 	case AF_UNIX:
-		return dump_one_unix(p, lfd, fdinfo);
+		ops = &unix_dump_ops;
+		break;
 	case AF_INET:
-		return dump_one_inet(p, lfd, fdinfo);
+		ops = &inet_dump_ops;
+		break;
 	case AF_INET6:
-		return dump_one_inet6(p, lfd, fdinfo);
+		ops = &inet6_dump_ops;
+		break;
 	case AF_PACKET:
-		return dump_one_packet_sk(p, lfd, fdinfo);
+		ops = &packet_dump_ops;
+		break;
 	case AF_NETLINK:
-		return dump_one_netlink(p, lfd, fdinfo);
+		ops = &netlink_dump_ops;
+		break;
 	default:
 		pr_err("BUG! Unknown socket collected (family %d)\n", family);
-		break;
+		return -1;
 	}
 
-	return -1;
+	return do_dump_gen_file(p, lfd, ops, fdinfo);
 }
 
 static int inet_receive_one(struct nlmsghdr *h, void *arg)
@@ -612,21 +618,16 @@ int collect_sockets(int pid)
 			err = tmp;
 	}
 
-	if (pid == 0 && opts.check_ms_kernel) {
-		pr_warn("Skipping netling diag check (not yet merged)\n");
-		goto skip;
-	}
-
 	req.r.n.sdiag_family	= AF_NETLINK;
 	req.r.n.sdiag_protocol	= NDIAG_PROTO_ALL;
 	req.r.n.ndiag_show	= NDIAG_SHOW_GROUPS;
 	tmp = do_collect_req(nl, &req, sizeof(req), netlink_receive_one, NULL);
 	if (tmp) {
 		pr_warn("The current kernel doesn't support netlink_diag\n");
-		if (pid == 0 || tmp != -ENOENT) /* Going to be in 3.10 */
+		if (pid == 0 || tmp != -ENOENT) /* Fedora 19 */
 			err = tmp;
 	}
-skip:
+
 	close(nl);
 out:
 	if (rst >= 0) {

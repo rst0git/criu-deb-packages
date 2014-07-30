@@ -2,6 +2,7 @@
 #define __CR_ASM_RESTORER_H__
 
 #include "asm/types.h"
+#include "asm/fpu.h"
 #include "protobuf/core.pb-c.h"
 
 struct pt_regs {
@@ -68,7 +69,7 @@ struct rt_sigframe {
 	struct rt_ucontext	uc;
 	struct rt_siginfo	info;
 
-	/* fp state follows here */
+	fpu_state_t		fpu_state;
 };
 
 
@@ -130,13 +131,15 @@ struct rt_sigframe {
 		     : "memory")
 
 #define RT_SIGFRAME_UC(rt_sigframe) rt_sigframe->uc
+#define RT_SIGFRAME_REGIP(rt_sigframe) (rt_sigframe)->uc.uc_mcontext.rip
 
 #define SIGFRAME_OFFSET 8
 
 
 int restore_gpregs(struct rt_sigframe *f, UserX86RegsEntry *r);
+int restore_nonsigframe_gpregs(UserX86RegsEntry *r);
 
-int restore_fpu(struct rt_sigframe *sigframe, struct thread_restore_args *args);
+int sigreturn_prep_fpu_frame(struct rt_sigframe *sigframe, fpu_state_t *fpu_state);
 
 static inline void restore_tls(u32 tls) { }
 

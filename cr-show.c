@@ -37,7 +37,7 @@
 #include "protobuf/pipe.pb-c.h"
 #include "protobuf/pipe-data.pb-c.h"
 #include "protobuf/sa.pb-c.h"
-#include "protobuf/itimer.pb-c.h"
+#include "protobuf/timer.pb-c.h"
 #include "protobuf/mm.pb-c.h"
 #include "protobuf/vma.pb-c.h"
 #include "protobuf/creds.pb-c.h"
@@ -260,6 +260,11 @@ void show_itimers(int fd)
 	pb_show_plain_pretty(fd, PB_ITIMERS, "*:%Lu");
 }
 
+void show_posix_timers(int fd)
+{
+	pb_show_plain_pretty(fd, PB_POSIX_TIMERS, "*:%d 5:%Lu 7:%Lu 8:%lu 9:%Lu 10:%Lu");
+}
+
 void show_creds(int fd)
 {
 	pb_show_vertical(fd, PB_CREDS);
@@ -400,14 +405,14 @@ static void try_hint_magic(u32 magic)
 			pr_msg("This can be %s\n", magic_hints[i].hint);
 }
 
-static int cr_parse_file(struct cr_options *opts)
+static int cr_parse_file(void)
 {
 	u32 magic;
 	int fd = -1, ret = -1, i;
 
-	fd = open(opts->show_dump_file, O_RDONLY);
+	fd = open(opts.show_dump_file, O_RDONLY);
 	if (fd < 0) {
-		pr_perror("Can't open %s", opts->show_dump_file);
+		pr_perror("Can't open %s", opts.show_dump_file);
 		goto err;
 	}
 
@@ -420,14 +425,14 @@ static int cr_parse_file(struct cr_options *opts)
 
 	if (i == CR_FD_MAX) {
 		pr_err("Unknown magic %#x in %s\n",
-				magic, opts->show_dump_file);
+				magic, opts.show_dump_file);
 		try_hint_magic(magic);
 		goto err;
 	}
 
 	if (!fdset_template[i].show) {
 		pr_err("No handler for %#x/%s\n",
-				magic, opts->show_dump_file);
+				magic, opts.show_dump_file);
 		goto err;
 	}
 
@@ -438,7 +443,7 @@ err:
 	return ret;
 }
 
-static int cr_show_pstree_item(struct cr_options *opts, struct pstree_item *item)
+static int cr_show_pstree_item(struct pstree_item *item)
 {
 	int ret = -1, i;
 	struct cr_fdset *cr_fdset = NULL;
@@ -507,7 +512,7 @@ out:
 	return ret;
 }
 
-static int cr_show_pid(struct cr_options *opts, int pid)
+static int cr_show_pid(int pid)
 {
 	int fd, ret;
 	struct pstree_item item;
@@ -536,10 +541,10 @@ static int cr_show_pid(struct cr_options *opts, int pid)
 
 	close(fd);
 
-	return cr_show_pstree_item(opts, &item);
+	return cr_show_pstree_item(&item);
 }
 
-static int cr_show_all(struct cr_options *opts)
+static int cr_show_all(void)
 {
 	struct pstree_item *item = NULL, *tmp;
 	int ret = -1, fd, pid;
@@ -558,12 +563,12 @@ static int cr_show_all(struct cr_options *opts)
 	close(fd);
 
 	pid = list_first_entry(&pstree_list, struct pstree_item, sibling)->pid.virt;
-	ret = try_show_namespaces(pid, opts);
+	ret = try_show_namespaces(pid);
 	if (ret)
 		goto out;
 
 	list_for_each_entry(item, &pstree_list, sibling)
-		if (cr_show_pstree_item(opts, item))
+		if (cr_show_pstree_item(item))
 			break;
 
 out:
@@ -575,13 +580,13 @@ out:
 	return ret;
 }
 
-int cr_show(struct cr_options *opts, int pid)
+int cr_show(int pid)
 {
-	if (opts->show_dump_file)
-		return cr_parse_file(opts);
+	if (opts.show_dump_file)
+		return cr_parse_file();
 
 	if (pid)
-		return cr_show_pid(opts, pid);
+		return cr_show_pid(pid);
 
-	return cr_show_all(opts);
+	return cr_show_all();
 }

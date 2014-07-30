@@ -209,6 +209,7 @@ typedef struct {
 
 #define REG_RES(regs) ((regs).ARM_r0)
 #define REG_IP(regs)  ((regs).ARM_pc)
+#define REG_SYSCALL_NR(regs) ((regs).ARM_r7)
 
 #define TASK_SIZE 0xbf000000
 
@@ -230,6 +231,8 @@ static inline uint64_t encode_pointer(void *p) { return (uint32_t)p; }
 typedef struct {
 	struct user_vfp		ufp;
 	struct user_vfp_exc	ufp_exc;
+
+	bool has_fpu;
 } fpu_state_t;
 
 #endif /* __CR_ASM_TYPES_H__ */

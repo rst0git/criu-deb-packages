@@ -9,6 +9,7 @@
 #ifndef __ASSEMBLY__
 
 #include <sys/un.h>
+#include <time.h>
 
 #include "image.h"
 #include "util-net.h"
@@ -18,8 +19,18 @@
 #define __head __used __section(.head.text)
 
 enum {
+	PARASITE_CMD_IDLE		= 0,
+	PARASITE_CMD_ACK,
+
 	PARASITE_CMD_INIT,
 	PARASITE_CMD_INIT_THREAD,
+
+	/*
+	 * These two must be greater than INITs.
+	 */
+	PARASITE_CMD_DAEMONIZE,
+	PARASITE_CMD_DAEMONIZED,
+
 	PARASITE_CMD_CFG_LOG,
 	PARASITE_CMD_FINI,
 	PARASITE_CMD_FINI_THREAD,
@@ -29,24 +40,37 @@ enum {
 
 	PARASITE_CMD_DUMP_SIGACTS,
 	PARASITE_CMD_DUMP_ITIMERS,
+	PARASITE_CMD_DUMP_POSIX_TIMERS,
 	PARASITE_CMD_DUMP_MISC,
 	PARASITE_CMD_DUMP_CREDS,
 	PARASITE_CMD_DUMP_THREAD,
 	PARASITE_CMD_DRAIN_FDS,
 	PARASITE_CMD_GET_PROC_FD,
 	PARASITE_CMD_DUMP_TTY,
+	PARASITE_CMD_CHECK_VDSO_MARK,
 
 	PARASITE_CMD_MAX,
 };
+
+struct ctl_msg {
+	unsigned int	cmd;			/* command itself */
+	unsigned int	ack;			/* ack on command */
+	int		err;			/* error code on reply */
+};
+
+#define ctl_msg_cmd(_cmd)		\
+	(struct ctl_msg){.cmd = _cmd, }
+
+#define ctl_msg_ack(_cmd, _err)	\
+	(struct ctl_msg){.cmd = _cmd, .ack = _cmd, .err = _err, }
 
 struct parasite_init_args {
 	int			h_addr_len;
 	struct sockaddr_un	h_addr;
 
-	int			p_addr_len;
-	struct sockaddr_un	p_addr;
+	k_rtsigset_t		sig_blocked;
 
-	int			nr_threads;
+	struct rt_sigframe	*sigframe;
 };
 
 struct parasite_log_args {
@@ -58,6 +82,13 @@ struct parasite_vma_entry
 	unsigned long	start;
 	unsigned long	len;
 	int		prot;
+};
+
+struct parasite_vdso_vma_entry {
+	unsigned long	start;
+	unsigned long	len;
+	unsigned long	proxy_addr;
+	int		is_marked;
 };
 
 struct parasite_dump_pages_args {
@@ -88,6 +119,22 @@ struct parasite_dump_itimers_args {
 	struct itimerval prof;
 };
 
+struct posix_timer {
+	int it_id;
+	struct itimerspec val;
+	int overrun;
+};
+
+struct parasite_dump_posix_timers_args {
+	int timer_n;
+	struct posix_timer timer[0];
+};
+
+static inline int posix_timers_dump_size(int timer_n)
+{
+	return sizeof(int) + sizeof(struct posix_timer) * timer_n;
+}
+
 /*
  * Misc sfuff, that is too small for separate file, but cannot
  * be read w/o using parasite
@@ -95,7 +142,6 @@ struct parasite_dump_itimers_args {
 
 struct parasite_dump_misc {
 	unsigned long		brk;
-	k_rtsigset_t		blocked;
 
 	u32 pid;
 	u32 sid;

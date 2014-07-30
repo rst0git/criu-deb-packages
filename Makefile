@@ -1,5 +1,5 @@
 VERSION_MAJOR		:= 0
-VERSION_MINOR		:= 5
+VERSION_MINOR		:= 6
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -26,12 +26,12 @@ include Makefile.config
 FIND		:= find
 CSCOPE		:= cscope
 RM		:= rm -f
-LD		:= ld
-CC		?= gcc
-NM		:= nm
+LD		:= $(CROSS_COMPILE)ld
+CC		:= $(CROSS_COMPILE)gcc
+NM		:= $(CROSS_COMPILE)nm
 SH		:= bash
 MAKE		:= make
-OBJCOPY		:= objcopy
+OBJCOPY		:= $(CROSS_COMPILE)objcopy
 
 #
 # Fetch ARCH from the uname if not yet set
@@ -142,9 +142,17 @@ pie: arch/$(ARCH)
 built-in.o: $(VERSION_HEADER) pie
 	$(Q) $(MAKE) $(build-crtools)=. $@
 
-$(PROGRAM): $(SYSCALL-LIB) $(ARCH-LIB) pie/util-net.o protobuf/built-in.o built-in.o
+PROGRAM-BUILTINS	+= pie/util-net.o
+PROGRAM-BUILTINS	+= protobuf/built-in.o
+PROGRAM-BUILTINS	+= built-in.o
+
+$(ARCH_DIR)/vdso-pie.o: pie
+	$(Q) $(MAKE) $(build)=pie $(ARCH_DIR)/vdso-pie.o
+PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-pie.o
+
+$(PROGRAM): $(SYSCALL-LIB) $(ARCH-LIB) $(PROGRAM-BUILTINS)
 	$(E) "  LINK    " $@
-	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) -o $@
+	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(LDFLAGS) -o $@
 
 zdtm: all
 	$(Q) $(MAKE) -C test/zdtm all

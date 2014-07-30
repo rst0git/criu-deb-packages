@@ -62,6 +62,8 @@ struct sigframe {
 struct rt_sigframe {
 	struct rt_siginfo info;
 	struct sigframe sig;
+
+	fpu_state_t fpu_state;
 };
 
 
@@ -122,13 +124,15 @@ struct rt_sigframe {
 
 
 #define RT_SIGFRAME_UC(rt_sigframe) rt_sigframe->sig.uc
+#define RT_SIGFRAME_REGIP(rt_sigframe) (rt_sigframe)->sig.uc.uc_mcontext.arm_ip
 
 #define SIGFRAME_OFFSET 0
 
 
 int restore_gpregs(struct rt_sigframe *f, UserArmRegsEntry *r);
+int restore_nonsigframe_gpregs(UserArmRegsEntry *r);
 
-int restore_fpu(struct rt_sigframe *sigframe, struct thread_restore_args *args);
+int sigreturn_prep_fpu_frame(struct rt_sigframe *sigframe, fpu_state_t *fpu_state);
 
 static inline void restore_tls(u32 tls) {
 	asm (

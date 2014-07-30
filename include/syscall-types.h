@@ -31,6 +31,8 @@ struct rusage;
 struct file_handle;
 struct robust_list_head;
 
+struct itimerspec;
+
 #ifndef F_GETFD
 #define F_GETFD 1
 #endif
@@ -60,6 +62,7 @@ struct robust_list_head;
 #define setns	sys_setns
 
 struct rlimit;
+struct rlimit64;
 
 struct krlimit {
 	unsigned long rlim_cur;

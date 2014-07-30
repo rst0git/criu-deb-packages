@@ -212,15 +212,10 @@ int dump_one_ns_file(int lfd, u32 id, const struct fd_parms *p)
 	return pb_write_one(fd, &nfe, PB_NS_FILES);
 }
 
-static const struct fdtype_ops nsfile_ops = {
+const struct fdtype_ops nsfile_dump_ops = {
 	.type		= FD_TYPES__NS,
 	.dump		= dump_one_ns_file,
 };
-
-int dump_ns_file(struct fd_parms *p, int lfd, const int fdinfo)
-{
-	return do_dump_gen_file(p, lfd, &nsfile_ops, fdinfo);
-}
 
 struct ns_file_info {
 	struct file_desc	d;
@@ -470,7 +465,7 @@ int prepare_namespace(int pid, unsigned long clone_flags)
 	return 0;
 }
 
-int try_show_namespaces(int ns_pid, struct cr_options *o)
+int try_show_namespaces(int ns_pid)
 {
 	struct cr_fdset *fdset;
 	int i;

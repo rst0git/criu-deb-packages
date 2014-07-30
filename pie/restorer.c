@@ -258,14 +258,9 @@ static int restore_thread_common(struct rt_sigframe *sigframe,
 		}
 	}
 
-	if (args->has_blk_sigset)
-		RT_SIGFRAME_UC(sigframe).uc_sigmask = args->blk_sigset;
-
 	restore_sched_info(&args->sp);
-	if (restore_fpu(sigframe, args))
-		return -1;
 
-	if (restore_gpregs(sigframe, &args->gpregs))
+	if (restore_nonsigframe_gpregs(&args->gpregs))
 		return -1;
 
 	restore_tls(args->tls);
@@ -289,7 +284,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 		goto core_restore_end;
 	}
 
-	rt_sigframe = (void *)args->mem_zone.rt_sigframe + 8;
+	rt_sigframe = (void *)args->mem_zone.rt_sigframe;
 
 	if (restore_thread_common(rt_sigframe, args))
 		goto core_restore_end;
@@ -333,11 +328,11 @@ static long restore_self_exe_late(struct task_restore_core_args *args)
 	return 0;
 }
 
-static u64 restore_mapping(const VmaEntry *vma_entry)
+static unsigned long restore_mapping(const VmaEntry *vma_entry)
 {
 	int prot	= vma_entry->prot;
 	int flags	= vma_entry->flags | MAP_FIXED;
-	u64 addr;
+	unsigned long addr;
 
 	if (vma_entry_is(vma_entry, VMA_AREA_SYSVIPC))
 		return sys_shmat(vma_entry->fd, decode_pointer(vma_entry->start),
@@ -478,6 +473,57 @@ static int vma_remap(unsigned long src, unsigned long dst, unsigned long len)
 	return 0;
 }
 
+static int create_posix_timers(struct task_restore_core_args *args)
+{
+	int ret, i;
+	timer_t next_id;
+	struct sigevent sev;
+
+	for (i = 0; i < args->timer_n; i++) {
+		sev.sigev_notify = args->posix_timers[i].spt.it_sigev_notify;
+		sev.sigev_signo = args->posix_timers[i].spt.si_signo;
+		sev.sigev_value.sival_ptr = args->posix_timers[i].spt.sival_ptr;
+
+		while (1) {
+			ret = sys_timer_create(args->posix_timers[i].spt.clock_id, &sev, &next_id);
+			if (ret < 0) {
+				pr_err("Can't create posix timer - %d\n", i);
+				return ret;
+			}
+
+			if ((long)next_id == args->posix_timers[i].spt.it_id)
+				break;
+
+			ret = sys_timer_delete(next_id);
+			if (ret < 0) {
+				pr_err("Can't remove temporaty posix timer %lx\n", (long) next_id);
+				return ret;
+			}
+
+			if ((long)next_id > args->posix_timers[i].spt.it_id) {
+				pr_err("Can't create timers, kernel don't give them consequently");
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static void restore_posix_timers(struct task_restore_core_args *args)
+{
+	int i;
+	struct restore_posix_timer *rt;
+
+	for (i = 0; i < args->timer_n; i++) {
+		rt = &args->posix_timers[i];
+		sys_timer_settime((timer_t)rt->spt.it_id, 0, &rt->val, NULL);
+	}
+
+	if (args->timer_n)
+		sys_munmap(args->posix_timers, args->timers_sz);
+}
+
 /*
  * The main routine to restore task via sigreturn.
  * This one is very special, we never return there
@@ -489,7 +535,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 {
 	long ret = -1;
 	VmaEntry *vma_entry;
-	u64 va;
+	unsigned long va;
 	unsigned long premmapped_end = args->premmapped_addr + args->premmapped_len;
 
 	struct rt_sigframe *rt_sigframe;
@@ -520,6 +566,24 @@ long __export_restore_task(struct task_restore_core_args *args)
 			continue;
 
 		pr_debug("Examine %"PRIx64"-%"PRIx64"\n", vma_entry->start, vma_entry->end);
+
+		/*
+		 * Park runtime vdso at safe place, thus we can access it
+		 * during restore of targets vma, it's quite important to
+		 * remap it instead of copying to save page frame number
+		 * associated with vdso, we will use it if there is subsequent
+		 * checkpoint done on previously restored program.
+		 */
+		if (vma_entry_is(vma_entry, VMA_AREA_VDSO)) {
+			BUG_ON(vma_entry->start != args->vdso_sym_rt.vma_start);
+			BUG_ON(vma_entry_len(vma_entry) != vdso_vma_size(&args->vdso_sym_rt));
+
+			if (vdso_remap("rt-vdso", vma_entry->start,
+				       args->vdso_rt_parked_at,
+				       vdso_vma_size(&args->vdso_sym_rt)))
+				goto core_restore_end;
+			continue;
+		}
 
 		if (addr < args->premmapped_addr) {
 			if (vma_entry->end >= args->premmapped_addr)
@@ -566,6 +630,12 @@ long __export_restore_task(struct task_restore_core_args *args)
 		if (vma_remap(vma_premmaped_start(vma_entry),
 				vma_entry->start, vma_entry_len(vma_entry)))
 			goto core_restore_end;
+
+		if (vma_entry_is(vma_entry, VMA_AREA_VDSO)) {
+			if (vdso_proxify("left dumpee", &args->vdso_sym_rt,
+					 vma_entry, args->vdso_rt_parked_at))
+				goto core_restore_end;
+		}
 	}
 
 	/* Shift private vma-s to the right */
@@ -586,6 +656,12 @@ long __export_restore_task(struct task_restore_core_args *args)
 		if (vma_remap(vma_premmaped_start(vma_entry),
 				vma_entry->start, vma_entry_len(vma_entry)))
 			goto core_restore_end;
+
+		if (vma_entry_is(vma_entry, VMA_AREA_VDSO)) {
+			if (vdso_proxify("right dumpee", &args->vdso_sym_rt,
+					 vma_entry, args->vdso_rt_parked_at))
+				goto core_restore_end;
+		}
 	}
 
 	/*
@@ -601,7 +677,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 		va = restore_mapping(vma_entry);
 
 		if (va != vma_entry->start) {
-			pr_err("Can't restore %"PRIx64" mapping with %"PRIx64"\n", vma_entry->start, va);
+			pr_err("Can't restore %"PRIx64" mapping with %lx\n", vma_entry->start, va);
 			goto core_restore_end;
 		}
 	}
@@ -702,7 +778,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 	 * registers from the frame, set them up and
 	 * finally pass execution to the new IP.
 	 */
-	rt_sigframe = (void *)args->t->mem_zone.rt_sigframe + 8;
+	rt_sigframe = (void *)args->t->mem_zone.rt_sigframe;
 
 	if (restore_thread_common(rt_sigframe, args->t))
 		goto core_restore_end;
@@ -814,6 +890,12 @@ long __export_restore_task(struct task_restore_core_args *args)
 		}
 	}
 
+	ret = create_posix_timers(args);
+	if (ret < 0) {
+		pr_err("Can't restore posix timers %ld\n", ret);
+		goto core_restore_end;
+	}
+
 	rst_tcp_socks_all(args->rst_tcp_socks, args->rst_tcp_socks_size);
 
 	/* 
@@ -851,6 +933,8 @@ long __export_restore_task(struct task_restore_core_args *args)
 		sys_setitimer(ITIMER_VIRTUAL, &args->itimers[1], NULL);
 	if (itimer_armed(args, 2))
 		sys_setitimer(ITIMER_PROF, &args->itimers[2], NULL);
+
+	restore_posix_timers(args);
 
 	ret = sys_munmap(args->task_entries, TASK_ENTRIES_SIZE);
 	if (ret < 0) {

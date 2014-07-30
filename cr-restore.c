@@ -26,6 +26,7 @@
 
 #include "compiler.h"
 #include "asm/types.h"
+#include "asm/restorer.h"
 
 #include "image.h"
 #include "util.h"
@@ -57,10 +58,11 @@
 #include "file-lock.h"
 #include "page-read.h"
 #include "sysctl.h"
+#include "vdso.h"
 
 #include "protobuf.h"
 #include "protobuf/sa.pb-c.h"
-#include "protobuf/itimer.pb-c.h"
+#include "protobuf/timer.pb-c.h"
 #include "protobuf/vma.pb-c.h"
 #include "protobuf/rlimit.pb-c.h"
 #include "protobuf/pagemap.pb-c.h"
@@ -90,7 +92,7 @@ static int shmem_remap(void *old_addr, void *new_addr, unsigned long size)
 	return 0;
 }
 
-static int crtools_prepare_shared(struct cr_options *opts)
+static int crtools_prepare_shared(void)
 {
 	if (prepare_shared_fdinfo())
 		return -1;
@@ -99,7 +101,7 @@ static int crtools_prepare_shared(struct cr_options *opts)
 	if (collect_inet_sockets())
 		return -1;
 
-	if (tty_prep_fds(opts))
+	if (tty_prep_fds())
 		return -1;
 
 	return 0;
@@ -929,6 +931,14 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 
 	exit = (siginfo->si_code == CLD_EXITED);
 	status = siginfo->si_status;
+
+	/* skip scripts */
+	if (!current && root_item->pid.real != pid) {
+		pid = waitpid(root_item->pid.real, &status, WNOHANG);
+		if (pid <= 0)
+			return;
+	}
+
 	if (!current || status)
 		goto err;
 
@@ -1089,6 +1099,8 @@ static int restore_task_with_children(void *_arg)
 		if (mount_proc())
 			exit(1);
 
+		restore_finish_stage(CR_STATE_RESTORE_NS);
+
 		if (root_prepare_shared())
 			exit(1);
 	}
@@ -1156,6 +1168,8 @@ static int restore_task_with_children(void *_arg)
 static inline int stage_participants(int next_stage)
 {
 	switch (next_stage) {
+	case CR_STATE_RESTORE_NS:
+		return 1;
 	case CR_STATE_FORKING:
 		return task_entries->nr_tasks + task_entries->nr_helpers;
 	case CR_STATE_RESTORE_PGID:
@@ -1171,7 +1185,7 @@ static inline int stage_participants(int next_stage)
 	return -1;
 }
 
-static int restore_switch_stage(int next_stage)
+static int restore_wait_inprogress_tasks()
 {
 	int ret;
 	futex_t *np = &task_entries->nr_in_progress;
@@ -1181,12 +1195,24 @@ static int restore_switch_stage(int next_stage)
 	if (ret < 0)
 		return ret;
 
-	futex_set(np, stage_participants(next_stage));
+	return 0;
+}
+
+static int restore_switch_stage(int next_stage)
+{
+	int ret;
+
+	ret = restore_wait_inprogress_tasks();
+	if (ret)
+		return ret;
+
+	futex_set(&task_entries->nr_in_progress,
+			stage_participants(next_stage));
 	futex_set_and_wake(&task_entries->start, next_stage);
 	return 0;
 }
 
-static int restore_root_task(struct pstree_item *init, struct cr_options *opts)
+static int restore_root_task(struct pstree_item *init)
 {
 	int ret;
 	struct sigaction act, old_act;
@@ -1228,11 +1254,25 @@ static int restore_root_task(struct pstree_item *init, struct cr_options *opts)
 		return -1;
 	}
 
-	futex_set(&task_entries->nr_in_progress, stage_participants(CR_STATE_FORKING));
+	futex_set(&task_entries->nr_in_progress,
+			stage_participants(CR_STATE_RESTORE_NS));
 
 	ret = fork_with_pid(init);
 	if (ret < 0)
 		return -1;
+
+	pr_info("Wait until namespaces are created\n");
+	ret = restore_wait_inprogress_tasks();
+	if (ret)
+		goto out;
+
+	ret = run_scripts("setup-namespaces");
+	if (ret)
+		goto out;
+
+	ret = restore_switch_stage(CR_STATE_FORKING);
+	if (ret < 0)
+		goto out;
 
 	pr_info("Wait until all tasks are forked\n");
 	ret = restore_switch_stage(CR_STATE_RESTORE_PGID);
@@ -1286,7 +1326,7 @@ out:
 	pr_info("Restore finished successfully. Resuming tasks.\n");
 	futex_set_and_wake(&task_entries->start, CR_STATE_COMPLETE);
 
-	if (!opts->restore_detach)
+	if (!opts.restore_detach)
 		wait(NULL);
 	return 0;
 }
@@ -1301,18 +1341,21 @@ static int prepare_task_entries()
 	task_entries->nr_threads = 0;
 	task_entries->nr_tasks = 0;
 	task_entries->nr_helpers = 0;
-	futex_set(&task_entries->start, CR_STATE_FORKING);
+	futex_set(&task_entries->start, CR_STATE_RESTORE_NS);
 	mutex_init(&task_entries->zombie_lock);
 
 	return 0;
 }
 
-int cr_restore_tasks(struct cr_options *opts)
+int cr_restore_tasks(void)
 {
 	if (check_img_inventory() < 0)
 		return -1;
 
 	if (cpu_init() < 0)
+		return -1;
+
+	if (vdso_init())
 		return -1;
 
 	if (prepare_task_entries() < 0)
@@ -1321,10 +1364,10 @@ int cr_restore_tasks(struct cr_options *opts)
 	if (prepare_pstree() < 0)
 		return -1;
 
-	if (crtools_prepare_shared(opts) < 0)
+	if (crtools_prepare_shared() < 0)
 		return -1;
 
-	return restore_root_task(root_item, opts);
+	return restore_root_task(root_item);
 }
 
 static long restorer_get_vma_hint(pid_t pid, struct list_head *tgt_vma_list,
@@ -1451,6 +1494,102 @@ static int prepare_itimers(int pid, struct task_restore_core_args *args)
 	if (ret < 0)
 		goto out;
 out:
+	close_safe(&fd);
+	return ret;
+}
+
+static inline int timespec_valid(struct timespec *ts)
+{
+	return (ts->tv_sec >= 0) && ((unsigned long)ts->tv_nsec < NSEC_PER_SEC);
+}
+
+static inline int posix_timer_restore_and_fix(PosixTimerEntry *pte,
+		struct restore_posix_timer *pt)
+{
+	pt->val.it_interval.tv_sec = pte->isec;
+	pt->val.it_interval.tv_nsec = pte->insec;
+
+	if (!timespec_valid(&pt->val.it_interval)) {
+		pr_err("Invalid timer interval(posix)\n");
+		return -1;
+	}
+
+	if (pte->vsec == 0 && pte->vnsec == 0) {
+		// Remaining time was too short. Set it to
+		// interval to make the timer armed and work.
+		pt->val.it_value.tv_sec = pte->isec;
+		pt->val.it_value.tv_nsec = pte->insec;
+	} else {
+		pt->val.it_value.tv_sec = pte->vsec;
+		pt->val.it_value.tv_nsec = pte->vnsec;
+	}
+
+	if (!timespec_valid(&pt->val.it_value)) {
+		pr_err("Invalid timer value(posix)\n");
+		return -1;
+	}
+
+	pt->spt.it_id = pte->it_id;
+	pt->spt.clock_id = pte->clock_id;
+	pt->spt.si_signo = pte->si_signo;
+	pt->spt.it_sigev_notify = pte->it_sigev_notify;
+	pt->spt.sival_ptr = decode_pointer(pte->sival_ptr);
+	pt->overrun = pte->overrun;
+
+	return 0;
+}
+
+static int cmp_posix_timer_proc_id(const void *p1, const void *p2)
+{
+	return ((struct restore_posix_timer *)p1)->spt.it_id - ((struct restore_posix_timer *)p2)->spt.it_id;
+}
+
+static int open_posix_timers_image(int pid, struct restore_posix_timer **rpt,
+				unsigned long *size, int *nr)
+{
+	int fd;
+	int ret = -1;
+
+	fd = open_image(CR_FD_POSIX_TIMERS, O_RSTR, pid);
+	if (fd < 0)
+		return fd;
+
+	while (1) {
+		PosixTimerEntry *pte;
+
+		ret = pb_read_one_eof(fd, &pte, PB_POSIX_TIMERS);
+		if (ret <= 0) {
+			goto out;
+		}
+
+		if ((*nr + 1) * sizeof(struct restore_posix_timer) > *size) {
+			unsigned long new_size = *size + PAGE_SIZE;
+
+			if (*rpt == NULL)
+				*rpt = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
+					MAP_PRIVATE | MAP_ANON, 0, 0);
+			else
+				*rpt = mremap(*rpt, *size, new_size, MREMAP_MAYMOVE);
+			if (*rpt == MAP_FAILED) {
+				pr_perror("Can't allocate memory for posix timers");
+				ret = -1;
+				goto out;
+			}
+
+			*size = new_size;
+		}
+
+		ret = posix_timer_restore_and_fix(pte, *rpt + *nr);
+		if (ret < 0)
+			goto out;
+
+		posix_timer_entry__free_unpacked(pte, NULL);
+		(*nr)++;
+	}
+out:
+	if (*nr > 0) {
+		qsort(*rpt, *nr, sizeof(struct restore_posix_timer), cmp_posix_timer_proc_id);
+	}
 	close_safe(&fd);
 	return ret;
 }
@@ -1792,6 +1931,14 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	int *siginfo_priv_nr;
 	unsigned long siginfo_size = 0;
 
+	unsigned long vdso_rt_vma_size = 0;
+	unsigned long vdso_rt_size = 0;
+	unsigned long vdso_rt_delta = 0;
+
+	struct restore_posix_timer *posix_timers_info_chunk = NULL;
+	int posix_timers_nr = 0;
+	unsigned long posix_timers_size = 0;
+
 	struct vm_area_list self_vmas;
 	int i;
 
@@ -1844,13 +1991,31 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 		siginfo_priv_nr[i] = ret;
 	}
 
+	ret = open_posix_timers_image(pid, &posix_timers_info_chunk,
+			&posix_timers_size, &posix_timers_nr);
+	if (ret < 0) {
+		if (errno != ENOENT) /* backward compatibility */
+			goto err;
+		ret = 0;
+	}
+
 	restore_bootstrap_len = restorer_len +
 				restore_task_vma_len +
 				restore_thread_vma_len +
 				SHMEMS_SIZE + TASK_ENTRIES_SIZE +
 				self_vmas_len + vmas_len +
 				rst_tcp_socks_size +
-				siginfo_size;
+				siginfo_size +
+				posix_timers_size;
+
+	/*
+	 * Figure out how much memory runtime vdso will need.
+	 */
+	vdso_rt_vma_size = vdso_vma_size(&vdso_sym_rt);
+	if (vdso_rt_vma_size) {
+		vdso_rt_delta = ALIGN(restore_bootstrap_len, PAGE_SIZE) - restore_bootstrap_len;
+		vdso_rt_size = vdso_rt_vma_size + vdso_rt_delta;
+	}
 
 	/*
 	 * Restorer is a blob (code + args) that will get mapped in some
@@ -1864,15 +2029,16 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	 */
 
 	exec_mem_hint = restorer_get_vma_hint(pid, &rst_vmas.h, &self_vmas.h,
-					      restore_bootstrap_len);
+					      restore_bootstrap_len +
+					      vdso_rt_size);
 	if (exec_mem_hint == -1) {
 		pr_err("No suitable area for task_restore bootstrap (%ldK)\n",
-		       restore_bootstrap_len);
+		       restore_bootstrap_len + vdso_rt_size);
 		goto err;
 	}
 
 	pr_info("Found bootstrap VMA hint at: 0x%lx (needs ~%ldK)\n", exec_mem_hint,
-			KBYTES(restore_bootstrap_len));
+			KBYTES(restore_bootstrap_len + vdso_rt_size));
 
 	ret = remap_restorer_blob((void *)exec_mem_hint);
 	if (ret < 0)
@@ -1916,6 +2082,20 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	task_args->siginfo = siginfo_chunk;
 	siginfo_chunk += task_args->siginfo_nr;
 
+	mem += siginfo_size;
+	if (posix_timers_info_chunk) {
+		posix_timers_info_chunk = mremap(posix_timers_info_chunk,
+			posix_timers_size, posix_timers_size,
+			MREMAP_FIXED | MREMAP_MAYMOVE, mem);
+		if (posix_timers_info_chunk == MAP_FAILED) {
+			pr_perror("mremap");
+			goto err;
+		}
+	}
+	task_args->timer_n = posix_timers_nr;
+	task_args->posix_timers = posix_timers_info_chunk;
+	task_args->timers_sz = posix_timers_size;
+
 	/*
 	 * Get a reference to shared memory area which is
 	 * used to signal if shmem restoration complete
@@ -1927,7 +2107,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	 * address.
 	 */
 
-	mem += siginfo_size;
+	mem += posix_timers_size;
 	ret = shmem_remap(rst_shmems, mem, SHMEMS_SIZE);
 	if (ret < 0)
 		goto err;
@@ -1979,6 +2159,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	for (i = 0; i < current->nr_threads; i++) {
 		int fd_core;
 		CoreEntry *tcore;
+		struct rt_sigframe *sigframe;
 
 		thread_args[i].pid = current->threads[i].virt;
 		thread_args[i].siginfo_nr = siginfo_priv_nr[i];
@@ -2022,16 +2203,15 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 			thread_args[i].has_futex	= true;
 			thread_args[i].futex_rla	= tcore->thread_core->futex_rla;
 			thread_args[i].futex_rla_len	= tcore->thread_core->futex_rla_len;
-			thread_args[i].has_blk_sigset	= tcore->thread_core->has_blk_sigset;
-			memcpy(&thread_args[i].blk_sigset,
-				&tcore->thread_core->blk_sigset, sizeof(k_rtsigset_t));
 
 			ret = prep_sched_info(&thread_args[i].sp, tcore->thread_core);
 			if (ret)
 				goto err;
 		}
 
-		if (sigreturn_prep_fpu_frame(&thread_args[i], tcore))
+		sigframe = (struct rt_sigframe *)thread_args[i].mem_zone.rt_sigframe;
+
+		if (construct_sigframe(sigframe, sigframe, tcore))
 			goto err;
 
 		if (thread_args[i].pid != pid)
@@ -2044,8 +2224,15 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 	}
 
-	memcpy(&task_args->t->blk_sigset, &core->tc->blk_sigset, sizeof(k_rtsigset_t));
-	task_args->t->has_blk_sigset	= true;
+	/*
+	 * Restorer needs own copy of vdso parameters. Runtime
+	 * vdso must be kept non intersecting with anything else,
+	 * since we need it being accessible even when own
+	 * self-vmas are unmaped.
+	 */
+	mem += (unsigned long)rst_tcp_socks_size;
+	task_args->vdso_rt_parked_at = (unsigned long)mem + vdso_rt_delta;
+	task_args->vdso_sym_rt = vdso_sym_rt;
 
 	/*
 	 * Adjust stack.

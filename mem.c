@@ -16,11 +16,6 @@
 #include "protobuf.h"
 #include "protobuf/pagemap.pb-c.h"
 
-#define PME_PRESENT	(1ULL << 63)
-#define PME_SWAP	(1ULL << 62)
-#define PME_FILE	(1ULL << 61)
-#define PME_SOFT_DIRTY	(1Ull << 55)
-
 /*
  * On dump we suck in the whole parent pagemap. Then, when observing
  * a page with soft-dirty bit cleared (i.e. -- not modified) we check
@@ -90,8 +85,11 @@ static struct mem_snap_ctx *mem_snap_init(struct parasite_ctl *ctl)
 	}
 
 	pm_fd = open_image_at(p_fd, CR_FD_PAGEMAP, O_RSTR, ctl->pid.virt);
-	if (pm_fd < 0)
+	if (pm_fd < 0) {
+		if (errno == ENOENT)
+			return NULL;
 		return ERR_PTR(pm_fd);
+	}
 
 	ctx = xmalloc(sizeof(*ctx));
 	if (!ctx)
@@ -373,16 +371,19 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 
 	args->off = 0;
 	list_for_each_entry(ppb, &pp->bufs, l) {
-		ret = parasite_send_fd(ctl, ppb->p[1]);
-		if (ret)
-			goto out_pp;
-
 		args->nr_segs = ppb->nr_segs;
 		args->nr_pages = ppb->pages_in;
 		pr_debug("PPB: %d pages %d segs %u pipe %d off\n",
 				args->nr_pages, args->nr_segs, ppb->pipe_size, args->off);
 
-		ret = parasite_execute(PARASITE_CMD_DUMPPAGES, ctl);
+		ret = __parasite_execute_daemon(PARASITE_CMD_DUMPPAGES, ctl, false);
+		if (ret < 0)
+			goto out_pp;
+		ret = parasite_send_fd(ctl, ppb->p[1]);
+		if (ret)
+			goto out_pp;
+
+		ret = __parasite_execute_daemon_wait_ack(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret < 0)
 			goto out_pp;
 
@@ -416,7 +417,7 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 	 * Step 4 -- clean up
 	 */
 
-	task_reset_dirty_track(ctl->pid.real);
+	ret = task_reset_dirty_track(ctl->pid.real);
 out_pp:
 	if (ret || !pp_ret)
 		destroy_page_pipe(pp);
@@ -448,7 +449,7 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl,
 	 */
 
 	pargs->add_prot = PROT_READ;
-	ret = parasite_execute(PARASITE_CMD_MPROTECT_VMAS, ctl);
+	ret = parasite_execute_daemon(PARASITE_CMD_MPROTECT_VMAS, ctl);
 	if (ret) {
 		pr_err("Can't dump unprotect vmas with parasite\n");
 		return ret;
@@ -459,8 +460,7 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl,
 		pr_err("Can't dump page with parasite\n");
 
 	pargs->add_prot = 0;
-	ret = parasite_execute(PARASITE_CMD_MPROTECT_VMAS, ctl);
-	if (ret) {
+	if (parasite_execute_daemon(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
 		pr_err("Can't rollback unprotected vmas with parasite\n");
 		ret = -1;
 	}

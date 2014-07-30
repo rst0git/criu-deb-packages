@@ -3,9 +3,8 @@
 
 struct cr_fdset;
 struct fd_parms;
-struct cr_options;
 extern int is_signalfd_link(int lfd);
-extern int dump_signalfd(struct fd_parms *p, int lfd, const int fdinfo);
+extern const struct fdtype_ops signalfd_dump_ops;
 extern void show_signalfd(int fd);
 extern int collect_signalfd(void);
 

@@ -2,6 +2,7 @@
 #include <unistd.h>
 
 #include "asm/types.h"
+#include "asm/restorer.h"
 #include "compiler.h"
 #include "ptrace.h"
 #include "asm/processor-flags.h"
@@ -35,12 +36,11 @@ static inline void __check_code_syscall(void)
 }
 
 
-void parasite_setup_regs(unsigned long new_ip, user_regs_struct_t *regs)
+void parasite_setup_regs(unsigned long new_ip, void *stack, user_regs_struct_t *regs)
 {
 	regs->ARM_pc = new_ip;
-
-	/* Avoid end of syscall processing */
-	regs->ARM_ORIG_r0 = -1;
+	if (stack)
+		regs->ARM_sp = (unsigned long)stack;
 
 	/* Make sure flags are in known state */
 	regs->ARM_cpsr &= PSR_f | PSR_s | PSR_x | MODE32_BIT;
@@ -73,8 +73,9 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 	regs.ARM_r4 = arg5;
 	regs.ARM_r5 = arg6;
 
-	parasite_setup_regs(ctl->syscall_ip, &regs);
-	err = __parasite_execute(ctl, ctl->pid.real, &regs);
+	parasite_setup_regs(ctl->syscall_ip, 0, &regs);
+	err = __parasite_execute_trap(ctl, ctl->pid.real, &regs,
+					&ctl->regs_orig, 0);
 	if (err)
 		return err;
 
@@ -85,25 +86,15 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 #define assign_reg(dst, src, e)		dst->e = (__typeof__(dst->e))src.ARM_##e
 
 #define PTRACE_GETVFPREGS 27
-int get_task_regs(pid_t pid, CoreEntry *core, const struct parasite_ctl *ctl)
+int get_task_regs(pid_t pid, user_regs_struct_t regs, CoreEntry *core)
 {
-	user_regs_struct_t regs = {{-1}};
 	struct user_vfp vfp;
 	int ret = -1;
 
 	pr_info("Dumping GP/FPU registers for %d\n", pid);
 
-	if (ctl)
-		regs = ctl->regs_orig;
-	else {
-		if (ptrace(PTRACE_GETREGS, pid, NULL, &regs)) {
-			pr_err("Can't obtain GP registers for %d\n", pid);
-			goto err;
-		}
-	}
-
 	if (ptrace(PTRACE_GETVFPREGS, pid, NULL, &vfp)) {
-		pr_err("Can't obtain FPU registers for %d\n", pid);
+		pr_perror("Can't obtain FPU registers for %d", pid);
 		goto err;
 	}
 
@@ -206,11 +197,13 @@ void arch_free_thread_info(CoreEntry *core)
 	}
 }
 
-int sigreturn_prep_fpu_frame(struct thread_restore_args *args, CoreEntry *core)
+int restore_fpu(struct rt_sigframe *sigframe, CoreEntry *core)
 {
-	memcpy(args->fpu_state.ufp.fpregs, CORE_THREAD_ARCH_INFO(core)->fpstate->vfp_regs,
-		sizeof(args->fpu_state.ufp.fpregs));
-	args->fpu_state.ufp.fpscr = CORE_THREAD_ARCH_INFO(core)->fpstate->fpscr;
+	struct aux_sigframe *aux = (struct aux_sigframe *)&sigframe->sig.uc.uc_regspace;
+	fpu_state_t *fpu_state = &sigframe->fpu_state;
+
+	memcpy(&aux->vfp.ufp, CORE_THREAD_ARCH_INFO(core)->fpstate->vfp_regs, sizeof(aux->vfp.ufp));
+	fpu_state->ufp.fpscr = CORE_THREAD_ARCH_INFO(core)->fpstate->fpscr;
 
 	return 0;
 }
@@ -231,4 +224,43 @@ void *mmap_seized(struct parasite_ctl *ctl,
 		map = 0;
 
 	return (void *)map;
+}
+
+int restore_gpregs(struct rt_sigframe *f, UserArmRegsEntry *r)
+{
+#define CPREG1(d)       f->sig.uc.uc_mcontext.arm_##d = r->d
+#define CPREG2(d, s)    f->sig.uc.uc_mcontext.arm_##d = r->s
+
+	CPREG1(r0);
+	CPREG1(r1);
+	CPREG1(r2);
+	CPREG1(r3);
+	CPREG1(r4);
+	CPREG1(r5);
+	CPREG1(r6);
+	CPREG1(r7);
+	CPREG1(r8);
+	CPREG1(r9);
+	CPREG1(r10);
+	CPREG1(fp);
+	CPREG1(ip);
+	CPREG1(sp);
+	CPREG1(lr);
+	CPREG1(pc);
+	CPREG1(cpsr);
+
+#undef CPREG1
+#undef CPREG2
+
+	return 0;
+}
+
+int sigreturn_prep_fpu_frame(struct rt_sigframe *sigframe, fpu_state_t *fpu_state)
+{
+	struct aux_sigframe *aux = (struct aux_sigframe *)&sigframe->sig.uc.uc_regspace;
+
+	aux->vfp.magic = VFP_MAGIC;
+	aux->vfp.size = VFP_STORAGE_SIZE;
+
+	return 0;
 }

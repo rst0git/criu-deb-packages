@@ -10,9 +10,13 @@ parasite-libs-e		+= $(SYSCALL-LIB)
 
 restorer-obj-y		+= restorer.o
 restorer-obj-e		+= $(ARCH_DIR)/restorer.o
+restorer-obj-e		+= $(ARCH_DIR)/vdso-pie.o
 restorer-libs-e		+= $(SYSCALL-LIB)
 
 cflags-y		+= -DCR_NOGLIBC -fpie  -Wa,--noexecstack -fno-stack-protector
+ifeq ($(ARCH), arm)
+	cflags-y	+= -marm
+endif
 ASMFLAGS		+= -D__ASSEMBLY__
 
 GEN-OFFSETS		:= gen-offsets.sh
@@ -37,7 +41,7 @@ $(obj)/%.built-in.bin: $(obj)/%.built-in.bin.o
 
 $(obj)/%-blob.h: $(obj)/%.built-in.bin $(obj)/$(GEN-OFFSETS)
 	$(E) "  GEN     " $@
-	$(Q) $(SH) $(obj)/$(GEN-OFFSETS) $(@:-blob.h=) $(notdir $(@:-blob.h=)) > $@
+	$(Q) $(SH) $(obj)/$(GEN-OFFSETS) $(@:-blob.h=) $(notdir $(@:-blob.h=)) $(CROSS_COMPILE) > $@
 
 $(BLOBS): $(obj)/$(PIELDS)
 _all += $(BLOBS)

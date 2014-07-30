@@ -6,6 +6,7 @@
 
 #include "asm/bitops.h"
 #include "asm/int.h"
+#include "asm/prlimit.h"
 
 #include "protobuf/core.pb-c.h"
 
@@ -236,6 +237,7 @@ typedef uint64_t auxv_t;
 
 #define REG_RES(regs) ((regs).ax)
 #define REG_IP(regs)  ((regs).ip)
+#define REG_SYSCALL_NR(regs)	((regs).orig_ax)
 
 #define CORE_ENTRY__MARCH CORE_ENTRY__MARCH__X86_64
 

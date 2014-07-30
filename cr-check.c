@@ -469,11 +469,6 @@ int check_ptrace_peeksiginfo()
 	siginfo_t siginfo;
 	pid_t pid, ret = 0;
 
-	if (opts.check_ms_kernel) {
-		pr_warn("Skipping peeking siginfos check (not yet merged)\n");
-		return 0;
-	}
-
 	pid = fork();
 	if (pid < 0)
 		pr_perror("fork");
@@ -517,6 +512,18 @@ static int check_mem_dirty_track(void)
 	return 0;
 }
 
+static int check_posix_timers(void)
+{
+	int ret;
+
+	ret = access("/proc/self/timers", R_OK);
+	if (!ret)
+		return 0;
+
+	pr_msg("/proc/<pid>/timers file is missing.\n");
+	return -1;
+}
+
 int cr_check(void)
 {
 	int ret = 0;
@@ -545,6 +552,7 @@ int cr_check(void)
 	ret |= check_sigqueuinfo();
 	ret |= check_ptrace_peeksiginfo();
 	ret |= check_mem_dirty_track();
+	ret |= check_posix_timers();
 
 	if (!ret)
 		pr_msg("Looks good.\n");
