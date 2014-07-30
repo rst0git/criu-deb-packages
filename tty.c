@@ -28,6 +28,10 @@
 
 #include "protobuf.h"
 #include "protobuf/tty.pb-c.h"
+#include "protobuf/creds.pb-c.h"
+
+#include "parasite-syscall.h"
+#include "parasite.h"
 
 #include "pstree.h"
 #include "tty.h"
@@ -78,8 +82,21 @@ struct tty_info {
 	bool				create;
 };
 
+struct tty_dump_info {
+	struct list_head		list;
+
+	u32				id;
+	pid_t				sid;
+	pid_t				pgrp;
+	int				fd;
+	int				major;
+};
+
 static LIST_HEAD(all_tty_info_entries);
 static LIST_HEAD(all_ttys);
+static int self_stdin = -1;
+
+#define INHERIT_SID			(-1)
 
 /*
  * Usually an application has not that many ttys opened.
@@ -122,9 +139,10 @@ int prepare_shared_tty(void)
 
 #define termios_copy(d, s)				\
 	do {						\
+		struct termios __t;			\
+							\
 		memcpy((d)->c_cc, (s)->c_cc,		\
-		       min(sizeof((s)->c_cc),		\
-			   sizeof((d)->c_cc)));		\
+		       sizeof(__t.c_cc));		\
 							\
 		ASSIGN_MEMBER((d),(s), c_iflag);	\
 		ASSIGN_MEMBER((d),(s), c_oflag);	\
@@ -146,15 +164,30 @@ static int tty_get_index(u32 id)
 /* Make sure the active pairs do exist */
 int tty_verify_active_pairs(void)
 {
-	int i;
+	unsigned long i, unpaired_slaves = 0;
 
-	for (i = 0; i < (MAX_TTYS << 1); i += 2) {
-		if (test_bit(i, tty_active_pairs) &&
-		    !test_bit(i + 1, tty_active_pairs)) {
-			pr_err("Found slave peer index %d without "
-				"correspond master peer\n",
-				tty_get_index(i));
-			return -1;
+	for_each_bit(i, tty_active_pairs) {
+		if ((i % 2) == 0) {
+			if (test_bit(i + 1, tty_active_pairs)) {
+				i++;
+				continue;
+			}
+
+			if (!opts.shell_job) {
+				pr_err("Found slave peer index %d without "
+				       "correspond master peer\n",
+				       tty_get_index(i));
+				return -1;
+			}
+
+			pr_debug("Unpaired slave %d\n", tty_get_index(i));
+
+			if (++unpaired_slaves > 1) {
+				pr_err("Only one slave external peer "
+				       "is allowed (index %d)\n",
+				       tty_get_index(i));
+				return -1;
+			}
 		}
 	}
 
@@ -264,21 +297,6 @@ static int pty_open_ptmx_index(int flags, int index)
 	return ret;
 }
 
-static int try_open_pts(int index, int flags, bool report)
-{
-	char path[64];
-	int fd;
-
-	snprintf(path, sizeof(path), PTS_FMT, index);
-	fd = open(path, flags);
-	if (fd < 0 && report) {
-		pr_err("Can't open terminal %s\n", path);
-		return -1;
-	}
-
-	return fd;
-}
-
 static int unlock_pty(int fd)
 {
 	const int lock = 0;
@@ -305,39 +323,6 @@ static int lock_pty(int fd)
 		return -1;
 	}
 
-	return 0;
-}
-
-static int tty_get_sid_pgrp(int fd, int *sid, int *pgrp, bool *hangup)
-{
-	int ret;
-
-	ret = ioctl(fd, TIOCGSID, sid);
-	if (ret < 0) {
-		if (errno != ENOTTY)
-			goto err;
-		*sid = 0;
-	}
-
-	ret = ioctl(fd, TIOCGPGRP, pgrp);
-	if (ret < 0) {
-		if (errno != ENOTTY)
-			goto err;
-		*pgrp = 0;
-	}
-
-	*hangup = false;
-	return 0;
-
-err:
-	if (errno != EIO) {
-		pr_perror("Can't get sid/pgrp on %d", fd);
-		return -1;
-	}
-
-	/* kernel reports EIO for get ioctls on pair-less ptys */
-	*sid = *pgrp = 0;
-	*hangup = true;
 	return 0;
 }
 
@@ -390,7 +375,7 @@ static int tty_restore_ctl_terminal(struct file_desc *d, int fd)
 	return ret;
 }
 
-static char *tty_type(struct tty_info *info)
+static char *tty_type(int major)
 {
 	static char *tty_types[] = {
 		[UNIX98_PTY_SLAVE_MAJOR]	= "pts",
@@ -398,10 +383,10 @@ static char *tty_type(struct tty_info *info)
 	};
 	static char tty_unknown[]		= "unknown";
 
-	switch (info->major) {
+	switch (major) {
 	case UNIX98_PTY_SLAVE_MAJOR:
 	case TTYAUX_MAJOR:
-		return tty_types[info->major];
+		return tty_types[major];
 	}
 
 	return tty_unknown;
@@ -412,10 +397,23 @@ static bool pty_is_master(struct tty_info *info)
 	return info->major == TTYAUX_MAJOR;
 }
 
+static bool pty_is_hung(struct tty_info *info)
+{
+	return info->tie->termios == NULL;
+}
+
+static bool tty_has_active_pair(struct tty_info *info)
+{
+	int d = pty_is_master(info) ? -1 : + 1;
+
+	return test_bit(info->tfe->tty_info_id + d,
+			tty_active_pairs);
+}
+
 static void tty_show_pty_info(char *prefix, struct tty_info *info)
 {
 	pr_info("%s type %s id %#x index %d (master %d sid %d pgrp %d)\n",
-		prefix, tty_type(info), info->tfe->id, info->tie->pty->index,
+		prefix, tty_type(info->major), info->tfe->id, info->tie->pty->index,
 		pty_is_master(info), info->tie->sid, info->tie->pgrp);
 }
 
@@ -478,7 +476,7 @@ static int pty_open_slaves(struct tty_info *info)
 	list_for_each_entry(slave, &info->sibling, sibling) {
 		BUG_ON(pty_is_master(slave));
 
-		fd = open(pts_name, slave->tfe->flags);
+		fd = open(pts_name, slave->tfe->flags | O_NOCTTY);
 		if (fd < 0) {
 			pr_perror("Can't open slave %s", pts_name);
 			goto err;
@@ -529,30 +527,61 @@ static int receive_tty(struct tty_info *info)
 	return fd;
 }
 
-static int pty_open_fake_ptmx(struct tty_info *slave)
+static int pty_open_unpaired_slave(struct file_desc *d, struct tty_info *slave)
 {
 	int master = -1, ret = -1, fd = -1;
-	char pts_name[64];
 
-	snprintf(pts_name, sizeof(pts_name), PTS_FMT, slave->tie->pty->index);
+	/*
+	 * We may have 2 cases here: the slave either need to
+	 * be inherited, either it requires a fake master.
+	 */
 
-	master = pty_open_ptmx_index(O_RDONLY, slave->tie->pty->index);
-	if (master < 0) {
-		pr_perror("Can't open fale %x (index %d)",
-			  slave->tfe->id, slave->tie->pty->index);
-		return -1;
-	}
+	if (likely(slave->tie->sid == INHERIT_SID)) {
+		fd = dup(get_service_fd(SELF_STDIN_OFF));
+		if (fd < 0) {
+			pr_perror("Can't dup SELF_STDIN_OFF");
+			return -1;
+		}
+		pr_info("Migrated slave peer %x -> to fd %d\n",
+			slave->tfe->id, fd);
+	} else {
+		char pts_name[64];
 
-	unlock_pty(master);
+		snprintf(pts_name, sizeof(pts_name), PTS_FMT, slave->tie->pty->index);
 
-	fd = open(pts_name, slave->tfe->flags);
-	if (fd < 0) {
-		pr_perror("Can't open slave %s", pts_name);
-		goto err;
+		master = pty_open_ptmx_index(O_RDONLY, slave->tie->pty->index);
+		if (master < 0) {
+			pr_perror("Can't open fale %x (index %d)",
+				  slave->tfe->id, slave->tie->pty->index);
+			return -1;
+		}
+
+		unlock_pty(master);
+
+		fd = open(pts_name, slave->tfe->flags);
+		if (fd < 0) {
+			pr_perror("Can't open slave %s", pts_name);
+			goto err;
+		}
+
 	}
 
 	if (restore_tty_params(fd, slave))
 		goto err;
+
+	/*
+	 * If tty is migrated we need to set its group
+	 * to the parent group, because signals on key
+	 * presses are delivered to a group of terminal.
+	 *
+	 * Note, at this point the group/session should
+	 * be already restored properly thus we can simply
+	 * use syscalls intead of lookup via process tree.
+	 */
+	if (likely(slave->tie->sid == INHERIT_SID)) {
+		if (tty_set_prgp(fd, getpgid(getppid())))
+			goto err;
+	}
 
 	if (pty_open_slaves(slave))
 		goto err;
@@ -616,7 +645,7 @@ static int tty_open(struct file_desc *d)
 		return receive_tty(info);
 
 	if (!pty_is_master(info))
-		return pty_open_fake_ptmx(info);
+		return pty_open_unpaired_slave(d, info);
 
 	return pty_open_ptmx(info);
 
@@ -649,24 +678,100 @@ static struct file_desc_ops tty_desc_ops = {
 	.select_ps_list	= tty_select_pslist,
 };
 
+static struct pstree_item *find_first_sid(int sid)
+{
+	struct pstree_item *item;
+
+	for_each_pstree_item(item) {
+		if (item->sid == sid)
+			return item;
+	}
+
+	return NULL;
+}
+
 static int tty_find_restoring_task(struct tty_info *info)
 {
 	struct pstree_item *item;
 
-	if (info->tie->sid == 0)
+	/*
+	 * The overall scenario is the following (note
+	 * we might have corrupted image so don't believe
+	 * anything).
+	 *
+	 * SID is present on a peer
+	 * ------------------------
+	 *
+	 *  - if it's master peer and we have as well a slave
+	 *    peer then prefer restore controlling terminal
+	 *    via slave peer
+	 *
+	 *  - if it's master peer without slave, there must be
+	 *    a SID leader who will be restoring the peer
+	 *
+	 *  - if it's a slave peer and no session leader found
+	 *    than we need an option to inherit terminal
+	 *
+	 * No SID present on a peer
+	 * ------------------------
+	 *
+	 *  - if it's a master peer than we are in good shape
+	 *    and continue in a normal way, we're the peer keepers
+	 *
+	 *  - if it's a slave peer and no appropriate master peer
+	 *    found we need an option to inherit terminal
+	 *
+	 * In any case if it's hungup peer, then we jump out
+	 * early since it will require fake master peer and
+	 * rather non-usable anyway.
+	 */
+
+	if (pty_is_hung(info)) {
+		pr_debug("Hungup terminal found id %x\n", info->tfe->id);
 		return 0;
+	}
 
-	pr_info("Set a control terminal to %d\n", info->tie->sid);
+	if (info->tie->sid) {
+		if (pty_is_master(info)) {
+			if (tty_has_active_pair(info))
+				return 0;
+		}
 
-	for_each_pstree_item(item)
-		if (item->sid == info->tie->sid)
-			return prepare_ctl_tty(item->pid.virt, item->rst, info->tfe->id);
+		/*
+		 * Find out the task which is session leader
+		 * and it can restore the controlling terminal
+		 * for us.
+		 */
+		item = find_first_sid(info->tie->sid);
+		if (item && item->pid.virt == item->sid) {
+			pr_info("Set a control terminal %x to %d\n",
+				info->tfe->id, info->tie->sid);
+			return prepare_ctl_tty(item->pid.virt,
+					       item->rst,
+					       info->tfe->id);
+		}
 
+		if (pty_is_master(info))
+			goto notask;
+	} else {
+		if (pty_is_master(info))
+			return 0;
+		if (tty_has_active_pair(info))
+			return 0;
+	}
+
+	if (opts.shell_job) {
+		pr_info("Inherit terminal for id %x\n", info->tfe->id);
+		info->tie->sid = info->tie->pgrp = INHERIT_SID;
+		return 0;
+	}
+
+notask:
 	pr_err("No task found with sid %d\n", info->tie->sid);
 	return -1;
 }
 
-static void tty_setup_orphan_slavery(void)
+static int tty_setup_orphan_slavery(void)
 {
 	struct tty_info *info, *peer, *m;
 
@@ -704,21 +809,25 @@ static void tty_setup_orphan_slavery(void)
 				 m->tfe->id);
 		}
 	}
+
+	return 0;
 }
 
-void tty_setup_slavery(void)
+int tty_setup_slavery(void)
 {
 	struct tty_info *info, *peer, *m;
 
 	list_for_each_entry(info, &all_ttys, list) {
-		tty_find_restoring_task(info);
+		if (tty_find_restoring_task(info))
+			return -1;
 
 		peer = info;
 		list_for_each_entry_safe_continue(peer, m, &all_ttys, list) {
 			if (peer->tie->pty->index != info->tie->pty->index)
 				continue;
 
-			tty_find_restoring_task(peer);
+			if (tty_find_restoring_task(peer))
+				return -1;
 
 			list_add(&peer->sibling, &info->sibling);
 			list_del(&peer->list);
@@ -734,7 +843,7 @@ void tty_setup_slavery(void)
 			tty_show_pty_info("    `- sibling", peer);
 	}
 
-	tty_setup_orphan_slavery();
+	return tty_setup_orphan_slavery();
 }
 
 static int verify_termios(u32 id, TermiosEntry *e)
@@ -778,14 +887,6 @@ static int verify_info(struct tty_info *info)
 	if (verify_termios(info->tfe->id, info->tie->termios_locked) ||
 	    verify_termios(info->tfe->id, info->tie->termios))
 		return -1;
-
-	if (!pty_is_master(info)) {
-		if (info->tie->sid || info->tie->pgrp) {
-			pr_err("Found sid %d pgrp %d on slave peer %x\n",
-			       info->tie->sid, info->tie->pgrp, info->tfe->id);
-			return -1;
-		}
-	}
 
 	return 0;
 }
@@ -846,6 +947,16 @@ static int collect_one_tty(void *obj, ProtobufCMessage *msg)
 	if (verify_info(info))
 		return -1;
 
+	/*
+	 * The tty peers which have no @termios are hunged up,
+	 * so don't mark them as active, we create them with
+	 * faked master and they are rather a rudiment which
+	 * can't be used. Most likely they appear if a user has
+	 * dumped program when it was closing a peer.
+	 */
+	if (info->tie->termios)
+		tty_test_and_set(info->tfe->tty_info_id, tty_active_pairs);
+
 	pr_info("Collected tty ID %#x\n", info->tfe->id);
 
 	list_add(&info->list, &all_ttys);
@@ -865,52 +976,55 @@ int collect_tty(void)
 		ret = collect_image(CR_FD_TTY, PB_TTY,
 				sizeof(struct tty_info),
 				collect_one_tty);
+	if (!ret)
+		ret = tty_verify_active_pairs();
+
 	return ret;
 }
 
-static int pty_get_flags(int lfd, int major, int index, TtyInfoEntry *e)
+/* Make sure the ttys we're dumping do belong our process tree */
+int dump_verify_tty_sids(void)
 {
-	int slave;
-
-	e->locked	= false;
-	e->exclusive	= false;
+	struct tty_dump_info *dinfo, *n;
+	int ret = 0;
 
 	/*
-	 * FIXME
+	 * There might be a cases where we get sid/pgid on
+	 * slave peer. For example the application is running
+	 * with redirection and we're migrating shell job.
 	 *
-	 * PTYs are safe to use packet mode. While there
-	 * is no way to fetch packet mode settings from
-	 * the kernel, without it we see echos missing
-	 * in `screen' application restore. So, just set
-	 * it here for a while.
+	 * # ./app < /dev/zero > /dev/zero &2>1
+	 *
+	 * Which produce a tree like
+	 *          PID   PPID  PGID  SID
+	 * root     23786 23784 23786 23786 pts/0 \_ -bash
+	 * root     24246 23786 24246 23786 pts/0   \_ ./app
+	 *
+	 * And the application goes background, then we dump
+	 * it from the same shell.
+	 *
+	 * In this case we simply zap sid/pgid and inherit
+	 * the peer from the current terminal on restore.
 	 */
-	e->packet_mode	= true;
+	list_for_each_entry_safe(dinfo, n, &all_ttys, list) {
+		if (!ret && dinfo->sid) {
+			struct pstree_item *item = find_first_sid(dinfo->sid);
 
-	/*
-	 * FIXME
-	 *
-	 * At moment we fetch only locked flag which
-	 * make sense on master peer only.
-	 *
-	 * For exclusive and packet mode the kernel
-	 * patching is needed.
-	 */
-	if (major != TTYAUX_MAJOR)
-		return 0;
-
-	slave = try_open_pts(index, O_RDONLY, false);
-	if (slave < 0) {
-		if (errno == EIO) {
-			e->locked = true;
-			return 0;
-		} else {
-			pr_err("Can't fetch flags on slave peer (index %d)\n", index);
-			return -1;
+			if (!item || item->pid.virt != dinfo->sid) {
+				if (!opts.shell_job) {
+					pr_err("Found sid %d pgid %d (%s) on peer fd %d. "
+					       "Missing option?\n",
+					       dinfo->sid, dinfo->pgrp,
+					       tty_type(dinfo->major),
+					       dinfo->fd);
+					ret = -1;
+				}
+			}
 		}
+		xfree(dinfo);
 	}
 
-	close(slave);
-	return 0;
+	return ret;
 }
 
 static int dump_pty_info(int lfd, u32 id, const struct fd_parms *p, int major, int index)
@@ -920,22 +1034,48 @@ static int dump_pty_info(int lfd, u32 id, const struct fd_parms *p, int major, i
 	TermiosEntry termios_locked	= TERMIOS_ENTRY__INIT;
 	WinsizeEntry winsize		= WINSIZE_ENTRY__INIT;
 	TtyPtyEntry pty			= TTY_PTY_ENTRY__INIT;
+	struct parasite_tty_args *pti;
+	struct tty_dump_info *dinfo;
 
-	bool hangup = false;
 	struct termios t;
 	struct winsize w;
 
-	int ret = -1, sid, pgrp;
+	int ret = -1;
 
-	if (tty_get_sid_pgrp(lfd, &sid, &pgrp, &hangup))
+	/*
+	 * Make sure the structures the system provides us
+	 * correlates well with protobuf templates.
+	 */
+	BUILD_BUG_ON(ARRAY_SIZE(t.c_cc) < TERMIOS_NCC);
+	BUILD_BUG_ON(sizeof(termios.c_cc) != sizeof(void *));
+	BUILD_BUG_ON((sizeof(termios.c_cc) * TERMIOS_NCC) < sizeof(t.c_cc));
+
+	pti = parasite_dump_tty(p->ctl, p->fd);
+	if (!pti)
 		return -1;
+
+	dinfo = xmalloc(sizeof(*dinfo));
+	if (!dinfo)
+		return -1;
+
+	dinfo->id		= id;
+	dinfo->sid		= pti->sid;
+	dinfo->pgrp		= pti->pgrp;
+	dinfo->fd		= p->fd;
+	dinfo->major		= major;
+
+	list_add_tail(&dinfo->list, &all_ttys);
 
 	info.id			= id;
 	info.type		= TTY_TYPE__PTY;
-	info.sid		= sid;
-	info.pgrp		= pgrp;
+	info.sid		= pti->sid;
+	info.pgrp		= pti->pgrp;
 	info.rdev		= p->stat.st_rdev;
 	info.pty		= &pty;
+
+	info.locked		= pti->st_lock;
+	info.exclusive		= pti->st_excl;
+	info.packet_mode	= pti->st_pckt;
 
 	pty.index		= index;
 
@@ -944,7 +1084,7 @@ static int dump_pty_info(int lfd, u32 id, const struct fd_parms *p, int major, i
 	 * just write out minimum information we can
 	 * gather.
 	 */
-	if (hangup)
+	if (pti->hangup)
 		return pb_write_one(fdset_fd(glob_fdset, CR_FD_TTY_INFO), &info, PB_TTY_INFO);
 
 	/*
@@ -955,9 +1095,6 @@ static int dump_pty_info(int lfd, u32 id, const struct fd_parms *p, int major, i
 	 * inform a user about such situatio,
 	 */
 	tty_test_and_set(id, tty_active_pairs);
-
-	if (pty_get_flags(lfd, major, index, &info))
-		goto out;
 
 	info.termios		= &termios;
 	info.termios_locked	= &termios_locked;
@@ -1025,8 +1162,17 @@ static int dump_one_pty(int lfd, u32 id, const struct fd_parms *p)
 	 * we don't check for errors here since it makes
 	 * no sense anyway, the buffered data is not handled
 	 * properly yet.
+	 *
+	 * Note as well that if we have only one peer here
+	 * the external end might be sending the data to us
+	 * again and again while kernel buffer is not full,
+	 * this might lead to endless SIGTTOU signal delivery
+	 * to the dumpee, ruining checkpoint procedure.
+	 *
+	 * So simply do not flush the line while we dump
+	 * parameters tty never was being a guaranteed delivery
+	 * transport anyway.
 	 */
-	ioctl(lfd, TCFLSH, TCIOFLUSH);
 
 	if (!tty_test_and_set(e.tty_info_id, tty_bitmap))
 		ret = dump_pty_info(lfd, e.tty_info_id, p, major, index);
@@ -1044,4 +1190,27 @@ static const struct fdtype_ops tty_ops = {
 int dump_tty(struct fd_parms *p, int lfd, const struct cr_fdset *set)
 {
 	return do_dump_gen_file(p, lfd, &tty_ops, set);
+}
+
+int tty_prep_fds(void)
+{
+	self_stdin = get_service_fd(SELF_STDIN_OFF);
+
+	if (!isatty(STDIN_FILENO)) {
+		pr_err("Standart stream is not a terminal, aborting\n");
+		return -1;
+	}
+
+	if (dup2(STDIN_FILENO, self_stdin) < 0) {
+		self_stdin = -1;
+		pr_perror("Can't dup stdin to SELF_STDIN_OFF");
+		return -1;
+	}
+
+	return 0;
+}
+
+void tty_fini_fds(void)
+{
+	close_safe(&self_stdin);
 }

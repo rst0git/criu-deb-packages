@@ -56,30 +56,50 @@ void mark_stack_vma(unsigned long sp, struct list_head *vma_area_list)
 	BUG();
 }
 
+#define VMA_OPT_LEN	128
+
+static void vma_opt_str(const struct vma_area *v, char *opt)
+{
+	int p = 0;
+
+#define opt2s(_o, _s)	do {				\
+		if (v->vma.status & _o)			\
+			p += sprintf(opt + p, _s " ");	\
+	} while (0)
+
+	opt[p] = '\0';
+	opt2s(VMA_AREA_REGULAR, "reg");
+	opt2s(VMA_AREA_STACK, "stk");
+	opt2s(VMA_AREA_VSYSCALL, "vsys");
+	opt2s(VMA_AREA_VDSO, "vdso");
+	opt2s(VMA_FORCE_READ, "frd");
+	opt2s(VMA_AREA_HEAP, "heap");
+	opt2s(VMA_FILE_PRIVATE, "fp");
+	opt2s(VMA_FILE_SHARED, "fs");
+	opt2s(VMA_ANON_SHARED, "as");
+	opt2s(VMA_ANON_PRIVATE, "ap");
+	opt2s(VMA_AREA_SYSVIPC, "sysv");
+	opt2s(VMA_AREA_SOCKET, "sk");
+
+#undef opt2s
+}
+
 void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
 {
+	char opt[VMA_OPT_LEN];
+
 	if (!vma_area)
 		return;
 
-	print_on_level(loglevel, "s: 0x%16lx e: 0x%16lx l: %8liK p: 0x%8x f: 0x%8x pg: 0x%8lx "
-		       "vf: %s st: %s spc: %-8s shmid: 0x%8lx\n",
-		       vma_area->vma.start, vma_area->vma.end,
-		       KBYTES(vma_area_len(vma_area)),
-		       vma_area->vma.prot,
-		       vma_area->vma.flags,
-		       vma_area->vma.pgoff,
-		       vma_area->vm_file_fd < 0 ? "n" : "y",
-		       !vma_area->vma.status ? "--" :
-		       ((vma_area->vma.status & VMA_FILE_PRIVATE) ? "FP" :
-			((vma_area->vma.status & VMA_FILE_SHARED) ? "FS" :
-			 ((vma_area->vma.status & VMA_ANON_SHARED) ? "AS" :
-			  ((vma_area->vma.status & VMA_ANON_PRIVATE) ? "AP" : "--")))),
-		       !vma_area->vma.status ? "--" :
-		       ((vma_area->vma.status & VMA_AREA_STACK) ? "stack" :
-			((vma_area->vma.status & VMA_AREA_HEAP) ? "heap" :
-			 ((vma_area->vma.status & VMA_AREA_VSYSCALL) ? "vsyscall" :
-			  ((vma_area->vma.status & VMA_AREA_VDSO) ? "vdso" : "n")))),
-			vma_area->vma.shmid);
+	vma_opt_str(vma_area, opt);
+	print_on_level(loglevel, "%#lx-%#lx (%liK) prot %#x flags %#x off %#lx "
+			"%s shmid: %#lx\n",
+			vma_area->vma.start, vma_area->vma.end,
+			KBYTES(vma_area_len(vma_area)),
+			vma_area->vma.prot,
+			vma_area->vma.flags,
+			vma_area->vma.pgoff,
+			opt, vma_area->vma.shmid);
 }
 
 int close_safe(int *fd)
@@ -206,7 +226,7 @@ int set_proc_mountpoint(char *path)
 	sfd = dup2(fd, sfd);
 	close(fd);
 	if (sfd < 0) {
-		pr_err("Can't set proc fd");
+		pr_err("Can't set proc fd\n");
 		return -1;
 	}
 
@@ -281,10 +301,21 @@ int init_service_fd(void)
 	return 0;
 }
 
+static int __get_service_fd(enum sfd_type type)
+{
+	return service_fd_rlim_cur - type;
+}
+
 int get_service_fd(enum sfd_type type)
 {
 	BUG_ON((int)type <= SERVICE_FD_MIN || (int)type >= SERVICE_FD_MAX);
-	return service_fd_rlim_cur - type;
+	return __get_service_fd(type);
+}
+
+bool is_any_service_fd(int fd)
+{
+	return fd > __get_service_fd(SERVICE_FD_MAX) &&
+		fd < __get_service_fd(SERVICE_FD_MIN);
 }
 
 bool is_service_fd(int fd, enum sfd_type type)
@@ -402,5 +433,111 @@ int run_scripts(char *action)
 		ret |= system(script->path);
 
 	unsetenv("CRTOOLS_SCRIPT_ACTION");
+	return ret;
+}
+
+#define DUP_SAFE(fd, out)						\
+	({							\
+		int ret__;					\
+		ret__ = dup(fd);				\
+		if (ret__ == -1) {				\
+			pr_perror("dup(%d) failed", fd);	\
+			goto out;				\
+		}						\
+		ret__;						\
+	})
+
+/*
+ * If "in" is negative, stdin will be closed.
+ * If "out" or "err" are negative, a log file descriptor will be used.
+ */
+int cr_system(int in, int out, int err, char *cmd, char *const argv[])
+{
+	sigset_t blockmask, oldmask;
+	int ret = -1, status;
+	pid_t pid;
+
+	sigemptyset(&blockmask);
+	sigaddset(&blockmask, SIGCHLD);
+	if (sigprocmask(SIG_BLOCK, &blockmask, &oldmask) == -1) {
+		pr_perror("Can not set mask of blocked signals");
+		return -1;
+	}
+
+	pid = fork();
+	if (pid == -1) {
+		pr_perror("fork() failed\n");
+		goto out;
+	} else if (pid == 0) {
+		if (out < 0)
+			out = log_get_fd();
+		if (err < 0)
+			err = log_get_fd();
+
+		/*
+		 * out, err, in should be a separate fds,
+		 * because reopen_fd_as() closes an old fd
+		 */
+		if (err == out || err == in)
+			err = DUP_SAFE(err, out_chld);
+
+		if (out == in)
+			out = DUP_SAFE(out, out_chld);
+
+		if (in < 0) {
+			close(STDIN_FILENO);
+		} else {
+			if (move_img_fd(&out, STDIN_FILENO) ||
+			    move_img_fd(&err, STDIN_FILENO))
+				goto out_chld;
+
+			if (reopen_fd_as_nocheck(STDIN_FILENO, in))
+				goto out_chld;
+		}
+
+		if (move_img_fd(&err, STDOUT_FILENO))
+			goto out_chld;
+
+		if (reopen_fd_as_nocheck(STDOUT_FILENO, out))
+			goto out_chld;
+
+		if (reopen_fd_as_nocheck(STDERR_FILENO, err))
+			goto out_chld;
+
+		execvp(cmd, argv);
+
+		pr_perror("exec failed");
+out_chld:
+		_exit(1);
+	}
+
+	while (1) {
+		ret = waitpid(pid, &status, 0);
+		if (ret == -1) {
+			pr_perror("waitpid() failed");
+			goto out;
+		}
+
+		if (WIFEXITED(status)) {
+			if (WEXITSTATUS(status))
+				pr_err("exited, status=%d\n", WEXITSTATUS(status));
+			break;
+		} else if (WIFSIGNALED(status)) {
+			pr_err("killed by signal %d\n", WTERMSIG(status));
+			break;
+		} else if (WIFSTOPPED(status)) {
+			pr_err("stopped by signal %d\n", WSTOPSIG(status));
+		} else if (WIFCONTINUED(status)) {
+			pr_err("continued\n");
+		}
+	}
+
+	ret = status ? -1 : 0;
+out:
+	if (sigprocmask(SIG_SETMASK, &oldmask, NULL) == -1) {
+		pr_perror("Can not unset mask of blocked signals");
+		BUG();
+	}
+
 	return ret;
 }

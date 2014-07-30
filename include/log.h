@@ -8,10 +8,13 @@ extern void log_fini(void);
 extern int log_init_by_pid(void);
 extern void log_closedir(void);
 
+extern void log_set_fd(int fd);
 extern int log_get_fd(void);
 
 extern void log_set_loglevel(unsigned int loglevel);
 extern unsigned int log_get_loglevel(void);
+
+extern int vprint_num(char *buf, int blen, int num, char **ps);
 
 extern void print_on_level(unsigned int loglevel, const char *format, ...)
 	__attribute__ ((__format__ (__printf__, 2, 3)));
@@ -25,6 +28,14 @@ extern void print_on_level(unsigned int loglevel, const char *format, ...)
 
 #define pr_info(fmt, ...)	\
 	print_on_level(LOG_INFO,	LOG_PREFIX fmt, ##__VA_ARGS__)
+
+#define pr_err_once(fmt, ...) do {	\
+	static bool __printed;		\
+	if (!__printed) {		\
+		print_on_level(LOG_ERROR,	"Error (%s:%d): " LOG_PREFIX fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
+		__printed = 1;		\
+	}				\
+} while (0)
 
 #define pr_err(fmt, ...)	\
 	print_on_level(LOG_ERROR,	"Error (%s:%d): " LOG_PREFIX fmt, __FILE__, __LINE__, ##__VA_ARGS__)

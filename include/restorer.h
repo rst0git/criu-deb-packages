@@ -23,9 +23,6 @@
 struct task_restore_core_args;
 struct thread_restore_args;
 
-extern long __export_restore_task(struct task_restore_core_args *args);
-extern long __export_restore_thread(struct thread_restore_args *args);
-
 typedef long (*task_restore_fcall_t) (struct task_restore_core_args *args);
 typedef long (*thread_restore_fcall_t) (struct thread_restore_args *args);
 
@@ -56,29 +53,41 @@ struct restore_mem_zone {
 #define first_on_heap(ptr, heap)	((typeof(ptr))heap)
 #define next_on_heap(ptr, prev)		((typeof(ptr))((long)(prev) + sizeof(*(prev))))
 
+struct rst_sched_param {
+	int policy;
+	int nice;
+	int prio;
+};
+
+struct task_restore_core_args;
+
 /* Make sure it's pow2 in size */
 struct thread_restore_args {
 	struct restore_mem_zone		mem_zone;
 
 	int				pid;
-	mutex_t				*rst_lock;
 	UserX86RegsEntry		gpregs;
 	u64				clear_tid_addr;
 
 	bool				has_futex;
 	u64				futex_rla;
 	u32				futex_rla_len;
+
+	bool				has_blk_sigset;
+	u64				blk_sigset;
+
+	struct rst_sched_param		sp;
+
+	struct task_restore_core_args	*ta;
 } __aligned(sizeof(long));
 
 struct task_restore_core_args {
-	struct restore_mem_zone		mem_zone;
+	struct thread_restore_args	t;			/* thread group leader */
 
-	int				pid;			/* task pid */
 	int				fd_exe_link;		/* opened self->exe file */
-	int				fd_pages;		/* opened pages dump file */
 	int				logfd;
 	unsigned int			loglevel;
-	bool				restore_threads;	/* if to restore threads */
+
 	mutex_t				rst_lock;
 
 	/* threads restoration */
@@ -89,6 +98,9 @@ struct task_restore_core_args {
 	struct task_entries		*task_entries;
 	VmaEntry			*self_vmas;
 	VmaEntry			*tgt_vmas;
+	unsigned int			nr_vmas;
+	unsigned long			premmapped_addr;
+	unsigned long			premmapped_len;
 	rt_sigaction_t			sigchld_act;
 
 	struct itimerval		itimers[3];
@@ -101,15 +113,9 @@ struct task_restore_core_args {
 
 	MmEntry				mm;
 	u64				mm_saved_auxv[AT_VECTOR_SIZE];
-	u64				clear_tid_addr;
-	u64				blk_sigset;
+	u32				mm_saved_auxv_size;
 	char				comm[TASK_COMM_LEN];
 	TaskKobjIdsEntry		ids;
-	UserX86RegsEntry		gpregs;
-
-	bool				has_futex;
-	u64				futex_rla;
-	u32				futex_rla_len;
 
 	int				*rst_tcp_socks;
 	int				rst_tcp_socks_size;
@@ -246,7 +252,7 @@ enum {
 };
 
 struct task_entries {
-	int nr, nr_tasks, nr_helpers;
+	int nr_threads, nr_tasks, nr_helpers;
 	futex_t nr_in_progress;
 	futex_t start;
 };
@@ -265,5 +271,18 @@ find_shmem(struct shmems *shmems, unsigned long shmid)
 
 	return NULL;
 }
+
+#define restore_finish_stage(__stage) do {				\
+		futex_dec_and_wake(&task_entries->nr_in_progress);	\
+		futex_wait_while(&task_entries->start, __stage);	\
+	} while (0)
+
+
+/* the restorer_blob_offset__ prefix is added by gen_offsets.sh */
+#define restorer_sym(rblob, name)	((void *)(rblob) + restorer_blob_offset__##name)
+
+#define vma_priv(vma) ((vma_entry_is(vma, VMA_AREA_REGULAR)) &&	\
+			(vma_entry_is(vma, VMA_ANON_PRIVATE) || \
+			vma_entry_is(vma, VMA_FILE_PRIVATE)))
 
 #endif /* CR_RESTORER_H__ */

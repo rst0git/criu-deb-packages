@@ -15,7 +15,7 @@
 #define CR_FD_PERM_DUMP		(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)
 
 #define CRIU_VERSION_MAJOR	0
-#define CRIU_VERSION_MINOR	2
+#define CRIU_VERSION_MINOR	3
 
 enum {
 	CR_FD_INVENTORY,
@@ -93,8 +93,10 @@ struct cr_options {
 	bool			show_pages_content;
 	bool			restore_detach;
 	bool			ext_unix_sk;
+	bool			shell_job;
 	bool			tcp_established_ok;
 	bool			evasive_devices;
+	bool			link_remap_ok;
 	unsigned int		namespaces_flags;
 	bool			log_file_per_pid;
 	char			*output;
@@ -115,6 +117,7 @@ enum sfd_type {
 	SELF_EXE_FD_OFF,
 	PROC_FD_OFF,
 	CTL_TTY_OFF,
+	SELF_STDIN_OFF,
 
 	SERVICE_FD_MAX
 };
@@ -122,6 +125,7 @@ enum sfd_type {
 extern int init_service_fd(void);
 extern int get_service_fd(enum sfd_type type);
 extern bool is_service_fd(int fd, enum sfd_type type);
+extern bool is_any_service_fd(int fd);
 
 /* file descriptors template */
 struct cr_fd_desc_tmpl {
@@ -156,7 +160,7 @@ int check_img_inventory(void);
 int write_img_inventory(void);
 
 extern void print_data(unsigned long addr, unsigned char *data, size_t size);
-extern void print_image_data(int fd, unsigned int length);
+extern void print_image_data(int fd, unsigned int length, int show);
 extern struct cr_fd_desc_tmpl fdset_template[CR_FD_MAX];
 
 extern int open_image_dir(void);
@@ -207,7 +211,13 @@ void free_mappings(struct list_head *vma_area_list);
 struct vma_area {
 	struct list_head	list;
 	VmaEntry		vma;
-	int			vm_file_fd;
+
+	union {
+		int		vm_file_fd;
+		int		vm_socket_id;
+	};
+	unsigned long		*page_bitmap;  /* existent pages */
+	unsigned long		*ppage_bitmap; /* parent's existent pages */
 };
 
 #define vma_area_is(vma_area, s)	vma_entry_is(&((vma_area)->vma), s)
@@ -217,12 +227,9 @@ struct rst_info {
 	struct list_head	fds;
 	struct list_head	eventpoll;
 	struct list_head	tty_slaves;
-};
 
-struct pid
-{
-	pid_t real;		/* used to peek/poke tasks during dump stage */
-	pid_t virt;		/* used all over in the images and saved after restore */
+	void			*premmapped_addr;
+	unsigned long		premmapped_len;
 };
 
 static inline int in_vma_area(struct vma_area *vma, unsigned long addr)

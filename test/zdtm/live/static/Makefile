@@ -19,12 +19,16 @@ TST_NOFILE	=				\
 		mprotect00			\
 		timers				\
 		unbound_sock			\
+		sched_prio00			\
+		sched_policy00			\
 		socket_listen			\
+		socket_listen6			\
 		socket_udp			\
 		socket6_udp			\
 		socket_udplite			\
 		socket_aio			\
 		packet_sock			\
+		sock_filter			\
 		msgque				\
 		inotify_system			\
 		inotify_system_nodel		\
@@ -33,19 +37,30 @@ TST_NOFILE	=				\
 		pipe00				\
 		pipe01				\
 		pthread00			\
+		pthread01			\
 		vdso00				\
 		utsname				\
 		pstree				\
 		sockets00			\
+		sockets01			\
 		sockets_spair			\
 		sockets_dgram			\
 		socket_queues			\
+		socket_queues02			\
 		socket-tcp			\
+		socket-tcp6			\
+		socket-tcpbuf			\
+		socket-tcpbuf6			\
+		sock_opts00			\
+		sock_opts01			\
+		sk-unix-unconn			\
 		ipc_namespace			\
 		selfexe00			\
 		sem				\
 		maps01				\
+		maps02				\
 		xids00				\
+		groups				\
 		file_fown			\
 		eventfs00			\
 		signalfd00			\
@@ -58,11 +73,15 @@ TST_NOFILE	=				\
 		pty03				\
 		pty04				\
 		tty00				\
+		tty02				\
 		mountpoints			\
 		netns				\
 		session01			\
 		socket-ext			\
 		unhashed_proc			\
+		cow00				\
+		child_opened_proc		\
+		posix_timers			\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -78,6 +97,7 @@ TST_FILE	=				\
 		unlink_fstat00			\
 		unlink_fstat01			\
 		unlink_fstat02			\
+		unlink_fstat03			\
 		unlink_largefile		\
 		mtime_mmap			\
 		fifo				\
@@ -87,6 +107,7 @@ TST_FILE	=				\
 		unlink_fifo			\
 		unlink_fifo_wronly		\
 		file_shared			\
+		cow01				\
 
 TST_DIR		=				\
 		cwd00				\
@@ -186,9 +207,14 @@ uptime_grow:	override LDLIBS += -lrt -pthread
 unlink_largefile:	override CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
 inotify_system_nodel:	override CFLAGS += -DNODEL
 pthread00:		override LDLIBS += -pthread
+pthread01:		override LDLIBS += -pthread
 shm:			override CFLAGS += -DNEW_IPC_NS
 msgque:			override CFLAGS += -DNEW_IPC_NS
 sem:			override CFLAGS += -DNEW_IPC_NS
+posix_timers:		override LDLIBS += -lrt
+socket-tcp6: override CFLAGS += -D ZDTM_IPV6
+socket-tcpbuf6: override CFLAGS += -D ZDTM_IPV6
+socket_listen6: override CFLAGS += -D ZDTM_IPV6
 
 $(LIB):	force
 	$(MAKE) -C $(LIBDIR)

@@ -42,7 +42,8 @@ again:
 		if (!strcmp(mp, "/proc"))
 			continue;
 
-		umount(mp);
+		if (umount(mp))
+			test_msg("umount(`%s') failed: %m\n", mp);
 		fs_cnt++;
 	}
 
@@ -87,7 +88,7 @@ done:
 	}
 	if (mount("none", MPTS_ROOT"/kernel/sys/fs/binfmt_misc",
 					"binfmt_misc", 0, "") < 0) {
-		fail("Can't mount proc");
+		fail("Can't mount binfmt_misc");
 		return 1;
 	}
 

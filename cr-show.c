@@ -85,12 +85,7 @@ void show_ghost_file(int fd, struct cr_options *o)
 static void pipe_data_handler(int fd, void *obj, int show_pages_content)
 {
 	PipeDataEntry *e = obj;
-
-	if (show_pages_content) {
-		pr_msg("\n");
-		print_image_data(fd, e->bytes);
-	} else
-		lseek(fd, e->bytes, SEEK_CUR);
+	print_image_data(fd, e->bytes, show_pages_content);
 }
 
 void show_pipes_data(int fd, struct cr_options *o)
@@ -149,32 +144,54 @@ static int nice_width_for(unsigned long addr)
 void print_data(unsigned long addr, unsigned char *data, size_t size)
 {
 	int i, j, addr_len;
+	unsigned zero_line = 0;
 
 	addr_len = nice_width_for(addr + size);
 
 	for (i = 0; i < size; i += 16) {
+		if (*(u64 *)(data + i) == 0 && *(u64 *)(data + i + 8) == 0) {
+			if (zero_line == 0)
+				zero_line = 1;
+			else {
+				if (zero_line == 1) {
+					pr_msg("*\n");
+					zero_line = 2;
+				}
+
+				continue;
+			}
+		} else
+			zero_line = 0;
+
 		pr_msg("%#0*lx: ", addr_len, addr + i);
 		for (j = 0; j < 8; j++)
-			pr_msg("0x%02x ", data[i +  j]);
+			pr_msg("%02x ", data[i +  j]);
 		pr_msg(" ");
 		for (j = 8; j < 16; j++)
-			pr_msg("0x%02x ", data[i +  j]);
+			pr_msg("%02x ", data[i +  j]);
 
 		pr_msg(" |");
 		for (j = 0; j < 8; j++)
-			pr_msg("%c ", PR_SYMBOL(data[i + j]));
+			pr_msg("%c", PR_SYMBOL(data[i + j]));
 		pr_msg(" ");
 		for (j = 8; j < 16; j++)
-			pr_msg("%c ", PR_SYMBOL(data[i + j]));
+			pr_msg("%c", PR_SYMBOL(data[i + j]));
 
 		pr_msg("|\n");
 	}
 }
 
-void print_image_data(int fd, unsigned int length)
+void print_image_data(int fd, unsigned int length, int show)
 {
 	void *data;
 	int ret;
+
+	if (!show) {
+		lseek(fd, length, SEEK_CUR);
+		return;
+	}
+
+	pr_msg("\n");
 
 	data = xmalloc(length);
 	if (!data)
@@ -229,39 +246,9 @@ void show_sigacts(int fd_sigacts, struct cr_options *o)
 	pb_show_plain(fd_sigacts, PB_SIGACT);
 }
 
-static void show_itimer(char *n, ItimerEntry *ie)
-{
-	pr_msg("%s: int %lu.%lu val %lu.%lu\n", n,
-	       (unsigned long)ie->isec, (unsigned long)ie->iusec,
-	       (unsigned long)ie->vsec, (unsigned long)ie->vusec);
-}
-
 void show_itimers(int fd, struct cr_options *o)
 {
-	ItimerEntry *ie;
-	int ret;
-
-	pr_img_head(CR_FD_ITIMERS);
-
-	ret = pb_read_one(fd, &ie, PB_ITIMERS);
-	if (ret < 0)
-		goto out;
-	show_itimer("real", ie);
-	itimer_entry__free_unpacked(ie, NULL);
-
-	ret = pb_read_one(fd, &ie, PB_ITIMERS);
-	if (ret < 0)
-		goto out;
-	show_itimer("virt", ie);
-	itimer_entry__free_unpacked(ie, NULL);
-
-	ret = pb_read_one(fd, &ie, PB_ITIMERS);
-	if (ret < 0)
-		goto out;
-	show_itimer("prof", ie);
-	itimer_entry__free_unpacked(ie, NULL);
-out:
-	pr_img_tail(CR_FD_ITIMERS);
+	pb_show_plain_pretty(fd, PB_ITIMERS, "1:%Lu 2:%Lu 3:%Lu 4:%Lu");
 }
 
 void show_creds(int fd, struct cr_options *o)
@@ -289,7 +276,7 @@ static void pstree_handler(int fd, void *obj, int collect)
 		return;
 	}
 
-	list_add_tail(&item->list, &pstree_list);
+	list_add_tail(&item->sibling, &pstree_list);
 }
 
 void show_collect_pstree(int fd, int collect)
@@ -445,12 +432,12 @@ static int cr_show_all(struct cr_options *opts)
 	show_sk_queues(fd, opts);
 	close(fd);
 
-	pid = list_first_entry(&pstree_list, struct pstree_item, list)->pid.virt;
+	pid = list_first_entry(&pstree_list, struct pstree_item, sibling)->pid.virt;
 	ret = try_show_namespaces(pid, opts);
 	if (ret)
 		goto out;
 
-	list_for_each_entry(item, &pstree_list, list) {
+	list_for_each_entry(item, &pstree_list, sibling) {
 		struct cr_fdset *cr_fdset = NULL;
 
 		cr_fdset = cr_task_fdset_open(item->pid.virt, O_SHOW);
@@ -476,6 +463,7 @@ static int cr_show_all(struct cr_options *opts)
 				pr_msg("----------------------------------------\n");
 
 				show_core(fd_th, opts);
+				close_safe(&fd_th);
 
 				pr_msg("----------------------------------------\n");
 
@@ -490,8 +478,8 @@ static int cr_show_all(struct cr_options *opts)
 	}
 
 out:
-	list_for_each_entry_safe(item, tmp, &pstree_list, list) {
-		list_del(&item->list);
+	list_for_each_entry_safe(item, tmp, &pstree_list, sibling) {
+		list_del(&item->sibling);
 		xfree(item->threads);
 		xfree(item);
 	}

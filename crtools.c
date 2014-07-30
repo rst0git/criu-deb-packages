@@ -60,7 +60,7 @@ int main(int argc, char *argv[])
 	int log_inited = 0;
 	int log_level = 0;
 
-	static const char short_opts[] = "dsf:t:hcD:o:n:vxVr:";
+	static const char short_opts[] = "dsf:t:hcD:o:n:vxVr:j";
 
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 
@@ -98,6 +98,8 @@ int main(int argc, char *argv[])
 			{ "pidfile", required_argument, 0, 46},
 			{ "veth-pair", required_argument, 0, 47},
 			{ "action-script", required_argument, 0, 49},
+			{ LREMAP_PARAM, no_argument, 0, 41},
+			{ "shell-job", no_argument, 0, 'j'},
 			{ },
 		};
 
@@ -145,7 +147,7 @@ int main(int argc, char *argv[])
 				return -1;
 			break;
 		case 'v':
-			if (optind < argc - 1) {
+			if (optind < argc) {
 				char *opt = argv[optind];
 
 				if (isdigit(*opt)) {
@@ -159,6 +161,10 @@ int main(int argc, char *argv[])
 				if (log_level >= 0)
 					log_level++;
 			}
+			break;
+		case 41:
+			pr_info("Will allow link remaps on FS\n");
+			opts.link_remap_ok = true;
 			break;
 		case 42:
 			pr_info("Will dump TCP connections\n");
@@ -212,6 +218,9 @@ int main(int argc, char *argv[])
 				list_add(&script->node, &opts.scripts);
 			}
 			break;
+		case 'j':
+			opts.shell_job = true;
+			break;
 		case 'V':
 			pr_msg("Version: %d.%d\n", CRIU_VERSION_MAJOR, CRIU_VERSION_MINOR);
 			return 0;
@@ -244,7 +253,7 @@ int main(int argc, char *argv[])
 	    strcmp(argv[optind], "restore") &&
 	    strcmp(argv[optind], "show") &&
 	    strcmp(argv[optind], "check")) {
-		pr_err("Unknown command %s", argv[optind]);
+		pr_err("Unknown command %s\n", argv[optind]);
 		goto usage;
 	}
 
@@ -302,21 +311,27 @@ usage:
 	pr_msg("  -r|--root [PATH]	change the root filesystem (when run in mount namespace)\n");
 	pr_msg("  --evasive-devices	use any path to a device file if the original one is inaccessible\n");
 	pr_msg("  --veth-pair [IN=OUT]	correspondence between outside and inside names of veth devices\n");
+	pr_msg("  --link-remap          allow to link unlinked files back when possible (modifies FS till restore)\n");
 	pr_msg("  --action-script [SCR]	add an external action script\n");
 	pr_msg("			The environment variable CRTOOL_SCRIPT_ACTION contains one of the actions:\n");
-	pr_msg("			* network-lock - lock network in a target network namespace");
-	pr_msg("			* network-unlock - unlock network in a target network namespace");
+	pr_msg("			* network-lock - lock network in a target network namespace\n");
+	pr_msg("			* network-unlock - unlock network in a target network namespace\n");
+	pr_msg("  -j|--shell-job        allow to dump and restore shell jobs\n");
 
 	pr_msg("\n* Logging:\n");
 	pr_msg("  -o|--log-file [NAME]  log file name (relative path is relative to --images-dir)\n");
 	pr_msg("     --log-pid		if the -o option is in effect, each restored processes is\n");
 	pr_msg("			written to the [NAME].pid file\n");
 	pr_msg("  -v [num]              set logging level\n");
-	pr_msg("                          0 - silent (only error messages)\n");
-	pr_msg("                          1 - informative (default)\n");
-	pr_msg("                          2 - debug\n");
-	pr_msg("  -vv            same as -v 1\n");
-	pr_msg("  -vvv           same as -v 2\n");
+	pr_msg("                          0 - messages regardless of log level\n");
+	pr_msg("                          1 - errors, when we are in trouble\n");
+	pr_msg("                          2 - warnings (default)\n");
+	pr_msg("                          3 - informative, everything is fine\n");
+	pr_msg("                          4 - debug only\n");
+	pr_msg("  -v             same as -v 1\n");
+	pr_msg("  -vv            same as -v 2\n");
+	pr_msg("  -vvv           same as -v 3\n");
+	pr_msg("  -vvvv          same as -v 4\n");
 
 	pr_msg("\nShow options:\n");
 	pr_msg("  -f|--file             show contents of a checkpoint file\n");

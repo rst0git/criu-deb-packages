@@ -10,6 +10,7 @@ static/cwd00
 static/env00
 static/maps00
 static/maps01
+static/maps02
 static/mprotect00
 static/mtime_mmap
 static/sleeping00
@@ -19,31 +20,42 @@ static/write_read02
 static/write_read10
 static/wait00
 static/vdso00
+static/sched_prio00
+static/sched_policy00
 static/file_shared
 static/timers
 static/futex
 static/futex-rl
 static/xids00
+static/groups
 static/pthread00
+static/pthread01
 streaming/pipe_loop00
 streaming/pipe_shared00
 transition/file_read
 static/sockets00
+static/sockets01
+static/sock_opts00
+static/sock_opts01
 static/sockets_spair
 static/sockets_dgram
 static/socket_queues
+static/sk-unix-unconn
 static/pid00
 static/pstree
 static/caps00
 static/cmdlinenv00
 static/socket_listen
+static/socket_listen6
 static/packet_sock
 static/socket_udp
+static/sock_filter
 static/socket6_udp
 static/socket_udplite
 static/selfexe00
 static/unlink_fstat00
 static/unlink_fstat02
+static/unlink_fstat03
 static/eventfs00
 static/signalfd00
 static/inotify00
@@ -54,6 +66,12 @@ static/fifo
 static/fifo_wronly
 static/zombie00
 transition/fork
+static/pty00
+static/pty01
+static/pty04
+static/tty02
+static/child_opened_proc
+static/cow01
 "
 # Duplicate list with ns/ prefix
 TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#ns/#')
@@ -63,10 +81,12 @@ TEST_LIST="$TEST_LIST
 static/file_fown
 static/socket-ext
 static/socket-tcp
-static/pty00
-static/pty01
+static/socket-tcp6
+streaming/socket-tcp
+streaming/socket-tcp6
+static/socket-tcpbuf
+static/socket-tcpbuf6
 static/pty03
-static/pty04
 "
 
 MNT_TEST_LIST="
@@ -91,6 +111,19 @@ static/sem
 transition/ipc
 "
 
+TEST_CR_KERNEL="
+static/sock_opts01
+static/sockets01
+static/sock_filter
+static/socket-tcp6
+streaming/socket-tcp6
+static/socket-tcpbuf6
+static/eventfs00
+static/signalfd00
+static/inotify00
+$IPC_TEST_LIST
+"
+
 CRTOOLS=`pwd`/`dirname $0`/../crtools
 TINIT=`pwd`/`dirname $0`/zdtm/lib/test_init
 test -x $CRTOOLS || exit 1
@@ -99,6 +132,34 @@ ARGS=""
 
 PID=""
 PIDNS=""
+
+ITERATIONS=1
+
+check_mainstream()
+{
+	local -a ver_arr
+	local ver_str=`uname -r`
+
+	$CRTOOLS check && return 0
+	MAINSTREAM_KERNEL=1
+
+	cat >&2 <<EOF
+============================= WARNING =============================
+Not all C/R features are commited in the meainstream kernel.
+Linux C/R can be cloned from:
+git://git.kernel.org/pub/scm/linux/kernel/git/gorcunov/linux-cr.git
+===================================================================
+EOF
+
+	ver_arr=(`echo ${ver_str//./ }`)
+
+	[ "${ver_arr[0]}" -gt 3 ] && return 0
+	[[ "${ver_arr[0]}" -eq 3 && "${ver_arr[1]}" -ge 7 ]] && return 0
+
+	echo "A version of kernel should be greater or equal to 3.7"
+
+	return 1;
+}
 
 umount_zdtm_root()
 {
@@ -193,6 +254,11 @@ run_test()
 {
 	local test=$1
 
+	[ -n "$MAINSTREAM_KERNEL" ] && echo $TEST_CR_KERNEL | grep -q ${test#ns/} && {
+		echo "Skip $test"
+		return 0
+	}
+
 	expr "$test" : 'ns/' > /dev/null && PIDNS=1 || PIDNS=""
 	test=${ZP}/${test#ns/}
 
@@ -212,9 +278,6 @@ run_test()
 		return 1
 	}
 
-	ddump=dump/$tname/$PID
-	DUMP_PATH=`pwd`/$ddump
-
 	if [ -n "$PIDNS" ]; then
 		[ -z "$CR_IP_TOOL" ] && CR_IP_TOOL=ip
 		$CR_IP_TOOL a help 2>&1 | grep -q showdump || {
@@ -228,10 +291,15 @@ EOF
 		args="-n uts -n ipc -n net -n pid -n mnt --root $ZDTM_ROOT --pidfile $TPID $args"
 	fi
 
+	for i in `seq $ITERATIONS`; do
+
+	ddump=dump/$tname/$PID/$i
+	DUMP_PATH=`pwd`/$ddump
 	echo Dump $PID
 	mkdir -p $ddump
+
 	save_fds $PID  $ddump/dump.fd
-	setsid $CRTOOLS dump --tcp-established -x --evasive-devices -D $ddump -o dump.log -v 4 -t $PID $args $ARGS || {
+	setsid $CRTOOLS dump --tcp-established --link-remap -x --evasive-devices -D $ddump -o dump.log -v 4 -t $PID $args $ARGS || {
 		echo WARNING: process $tname is left running for your debugging needs
 		return 1
 	}
@@ -263,7 +331,10 @@ EOF
 			sleep 0.2
 		done
 		[ $i -eq 5 ] && return 2;
+		[ -n "$PIDNS" ] && PID=`cat $TPID`
 	fi
+
+	done
 
 	echo Check results $PID
 	stop_test $tdir $tname
@@ -272,10 +343,10 @@ EOF
 		test -f $test.out && break
 		echo Waiting...
 		sleep 0.$sltime
-		[ $sltime -le 9 ] && sltime=$((sltime+1))
+		[ $sltime -lt 9 ] && sltime=$((sltime+1))
 	done
 	cat $test.out
-	cat $test.out | grep PASS || return 2
+	cat $test.out | grep -q PASS || return 2
 }
 
 case_error()
@@ -303,12 +374,25 @@ case_error()
 
 cd `dirname $0` || exit 1
 
-if [ "$1" = "-d" ]; then
-	ARGS="-s"
-	shift
-fi
+while :; do
+	if [ "$1" = "-d" ]; then
+		ARGS="-s"
+		shift
+		continue
+	fi
+	if [ "$1" = "-i" ]; then
+		shift
+		ITERATIONS=$1
+		shift
+		continue
+	fi
+	break;
+done
 
 if [ $# -eq 0 ]; then
+
+	check_mainstream || exit 1
+
 	for t in $TEST_LIST; do
 		run_test $t || case_error $t
 	done
@@ -332,6 +416,7 @@ zdtm.sh [OPTIONS] [TEST NAME]
 Options:
 	-l : Show list of tests.
 	-d : Dump a test process and check that this process can continue working.
+	-i : Number of ITERATIONS of dump/restore
 EOF
 else
 	if echo $UTS_TEST_LIST | fgrep -qw $1; then

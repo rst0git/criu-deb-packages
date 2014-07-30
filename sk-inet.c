@@ -95,8 +95,23 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk)
 		return 0;
 	}
 
-	if (sk->type == SOCK_DGRAM)
+	if (sk->shutdown) {
+		pr_err("Can't dump shutdown inet socket\n");
+		return 0;
+	}
+
+	if (sk->type == SOCK_DGRAM) {
+		if (sk->wqlen != 0) {
+			pr_err("Can't dump corked dgram socket\n");
+			return 0;
+		}
+
+		if (sk->rqlen)
+			pr_warn("Read queue is dropped for socket %x\n",
+					sk->sd.ino);
+
 		return 1;
+	}
 
 	if (sk->type != SOCK_STREAM) {
 		pr_err("Only stream and dgram inet sockets for now\n");
@@ -145,13 +160,10 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk)
 	return 1;
 }
 
-#define tcp_connection(sk)	(((sk)->proto == IPPROTO_TCP) &&	\
-				 ((sk)->state == TCP_ESTABLISHED))
-
 static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p)
 {
 	struct inet_sk_desc *sk;
-	char address[128];
+	char address;
 	socklen_t aux;
 	int ret;
 
@@ -161,9 +173,14 @@ static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p)
 
 	/* It should has no peer name */
 	aux = sizeof(address);
-	ret = getsockopt(lfd, SOL_SOCKET, SO_PEERNAME, address, &aux);
-	if (ret != -1 || errno != ENOTCONN) {
-		pr_err("Errno %d returned from unconnected socket\n", errno);
+	ret = getsockopt(lfd, SOL_SOCKET, SO_PEERNAME, &address, &aux);
+	if (ret < 0) {
+		if (errno != ENOTCONN) {
+			pr_perror("Unexpected error returned from unconnected socket");
+			goto err;
+		}
+	} else if (ret == 0) {
+		pr_err("Name resolved on unconnected socket\n");
 		goto err;
 	}
 
@@ -273,11 +290,16 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	show_one_inet_img("Dumped", &ie);
 	sk->sd.already_dumped = 1;
 
-	if (tcp_connection(sk))
+	switch (sk->proto) {
+	case IPPROTO_TCP:
 		ret = dump_one_tcp(lfd, sk);
-	else
+		break;
+	default:
 		ret = 0;
+		break;
+	}
 err:
+	release_skopts(&skopts);
 	xfree(ie.src_addr);
 	xfree(ie.dst_addr);
 	return ret;
@@ -337,6 +359,11 @@ int inet_collect_one(struct nlmsghdr *h, int family, int type, int proto)
 	memcpy(d->src_addr, m->id.idiag_src, sizeof(u32) * 4);
 	memcpy(d->dst_addr, m->id.idiag_dst, sizeof(u32) * 4);
 
+	if (tb[INET_DIAG_SHUTDOWN])
+		d->shutdown = *(u8 *)RTA_DATA(tb[INET_DIAG_SHUTDOWN]);
+	else
+		pr_err_once("Can't check shutdown state of inet socket\n");
+
 	ret = sk_collect_one(m->idiag_inode, family, &d->sd);
 
 	show_one_inet("Collected", d);
@@ -352,6 +379,11 @@ static struct file_desc_ops inet_desc_ops = {
 	.open = open_inet_sk,
 	.post_open = post_open_inet_sk,
 };
+
+static inline int tcp_connection(InetSkEntry *ie)
+{
+	return (ie->proto == IPPROTO_TCP) && (ie->state == TCP_ESTABLISHED);
+}
 
 static int collect_one_inetsk(void *o, ProtobufCMessage *base)
 {

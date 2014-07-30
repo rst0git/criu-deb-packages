@@ -3,6 +3,10 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <netinet/tcp.h>
+#include <errno.h>
+#include <linux/if.h>
+#include <linux/filter.h>
+#include <string.h>
 
 #include "libnetlink.h"
 #include "sockets.h"
@@ -14,6 +18,7 @@
 #include "sk-packet.h"
 #include "namespaces.h"
 #include "crtools.h"
+#include "net.h"
 
 #ifndef NETLINK_SOCK_DIAG
 #define NETLINK_SOCK_DIAG NETLINK_INET_DIAG
@@ -28,6 +33,136 @@
 #endif
 
 #define SK_HASH_SIZE		32
+
+#ifndef SO_GET_FILTER
+#define SO_GET_FILTER	SO_ATTACH_FILTER
+#endif
+
+static int dump_bound_dev(int sk, SkOptsEntry *soe)
+{
+	int ret;
+	char dev[IFNAMSIZ];
+	socklen_t len = sizeof(dev);
+
+	ret = getsockopt(sk, SOL_SOCKET, SO_BINDTODEVICE, &dev, &len);
+	if (ret) {
+		if (errno == ENOPROTOOPT) {
+			pr_warn("Bound device may be missing for socket\n");
+			return 0;
+		}
+
+		pr_perror("Can't get bound dev");
+		return ret;
+	}
+
+	if (len == 0)
+		return 0;
+
+	pr_debug("\tDumping %s bound dev for sk\n", dev);
+	soe->so_bound_dev = xmalloc(len);
+	strcpy(soe->so_bound_dev, dev);
+	return 0;
+}
+
+static int restore_bound_dev(int sk, SkOptsEntry *soe)
+{
+	char *n = soe->so_bound_dev;
+
+	if (!n)
+		return 0;
+
+	pr_debug("\tBinding socket to %s dev\n", n);
+	return do_restore_opt(sk, SOL_SOCKET, SO_BINDTODEVICE, n, strlen(n));
+}
+
+/*
+ * Protobuf handles le/be himself, but the sock_filter is not just u64,
+ * it's a structure and we have to preserve the fields order to be able
+ * to move socket image across architectures.
+ */
+
+static void encode_filter(struct sock_filter *f, uint64_t *img, int n)
+{
+	int i;
+
+	BUILD_BUG_ON(sizeof(*f) != sizeof(*img));
+
+	for (i = 0; i < n; i++)
+		img[i] = ((uint64_t)f[i].code << 48) |
+			 ((uint64_t)f[i].jt << 40) |
+			 ((uint64_t)f[i].jf << 32) |
+			 ((uint64_t)f[i].k << 0);
+}
+
+static void decode_filter(uint64_t *img, struct sock_filter *f, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		f[i].code = img[i] >> 48;
+		f[i].jt = img[i] >> 40;
+		f[i].jf = img[i] >> 32;
+		f[i].k = img[i] >> 0;
+	}
+}
+
+static int dump_socket_filter(int sk, SkOptsEntry *soe)
+{
+	socklen_t len = 0;
+	int ret;
+	struct sock_filter *flt;
+
+	ret = getsockopt(sk, SOL_SOCKET, SO_GET_FILTER, NULL, &len);
+	if (ret && errno != ENOPROTOOPT) {
+		pr_perror("Can't get socket filter len");
+		return ret;
+	}
+
+	if (!len) {
+		pr_info("No filter for socket\n");
+		return 0;
+	}
+
+	flt = xmalloc(len * sizeof(*flt));
+	if (!flt)
+		return -1;
+
+	ret = getsockopt(sk, SOL_SOCKET, SO_GET_FILTER, flt, &len);
+	if (ret) {
+		pr_perror("Can't get socket filter\n");
+		return ret;
+	}
+
+	soe->so_filter = xmalloc(len * sizeof(*soe->so_filter));
+	if (!soe->so_filter)
+		return -1;
+
+	encode_filter(flt, soe->so_filter, len);
+	soe->n_so_filter = len;
+	xfree(flt);
+	return 0;
+}
+
+static int restore_socket_filter(int sk, SkOptsEntry *soe)
+{
+	int ret;
+	struct sock_fprog sfp;
+
+	if (!soe->n_so_filter)
+		return 0;
+
+	pr_info("Restoring socket filter\n");
+	sfp.len = soe->n_so_filter;
+	sfp.filter = xmalloc(soe->n_so_filter * sfp.len);
+	if (!sfp.filter)
+		return -1;
+
+	decode_filter(soe->so_filter, sfp.filter, sfp.len);
+	ret = restore_opt(sk, SOL_SOCKET, SO_ATTACH_FILTER, &sfp);
+	xfree(sfp.filter);
+
+	return ret;
+}
 
 static struct socket_desc *sockets[SK_HASH_SIZE];
 
@@ -70,13 +205,78 @@ int do_restore_opt(int sk, int level, int name, void *val, int len)
 	return 0;
 }
 
+/*
+ * Set sizes of buffers to maximum and prevent blocking
+ * Caller of this fn should call other socket restoring
+ * routines to drop the non-blocking and set proper send
+ * and receive buffers.
+ */
+int restore_prepare_socket(int sk)
+{
+	int flags;
+
+	/* In kernel a bufsize has type int and a value is doubled. */
+	u32 maxbuf = INT_MAX / 2;
+
+	if (restore_opt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &maxbuf))
+		return -1;
+	if (restore_opt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &maxbuf))
+		return -1;
+
+	/* Prevent blocking on restore */
+	flags = fcntl(sk, F_GETFL, 0);
+	if (flags == -1) {
+		pr_perror("Unable to get flags for %d", sk);
+		return -1;
+	}
+	if (fcntl(sk, F_SETFL, flags | O_NONBLOCK) ) {
+		pr_perror("Unable to set O_NONBLOCK for %d", sk);
+		return -1;
+	}
+
+	return 0;
+}
+
 int restore_socket_opts(int sk, SkOptsEntry *soe)
 {
-	int ret = 0;
+	int ret = 0, val;
 	struct timeval tv;
 
+	pr_info("%d restore sndbuf %d rcv buf %d\n", sk, soe->so_sndbuf, soe->so_rcvbuf);
 	ret |= restore_opt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &soe->so_sndbuf);
 	ret |= restore_opt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &soe->so_rcvbuf);
+	if (soe->has_so_priority) {
+		pr_debug("\trestore priority %d for socket\n", soe->so_priority);
+		ret |= restore_opt(sk, SOL_SOCKET, SO_PRIORITY, &soe->so_priority);
+	}
+	if (soe->has_so_rcvlowat) {
+		pr_debug("\trestore rcvlowat %d for socket\n", soe->so_rcvlowat);
+		ret |= restore_opt(sk, SOL_SOCKET, SO_RCVLOWAT, &soe->so_rcvlowat);
+	}
+	if (soe->has_so_mark) {
+		pr_debug("\trestore mark %d for socket\n", soe->so_mark);
+		ret |= restore_opt(sk, SOL_SOCKET, SO_MARK, &soe->so_mark);
+	}
+	if (soe->has_so_passcred && soe->so_passcred) {
+		val = 1;
+		pr_debug("\tset passcred for socket\n");
+		ret |= restore_opt(sk, SOL_SOCKET, SO_PASSCRED, &val);
+	}
+	if (soe->has_so_passsec && soe->so_passsec) {
+		val = 1;
+		pr_debug("\tset passsec for socket\n");
+		ret |= restore_opt(sk, SOL_SOCKET, SO_PASSSEC, &val);
+	}
+	if (soe->has_so_dontroute && soe->so_dontroute) {
+		val = 1;
+		pr_debug("\tset dontroute for socket\n");
+		ret |= restore_opt(sk, SOL_SOCKET, SO_DONTROUTE, &val);
+	}
+	if (soe->has_so_no_check && soe->so_no_check) {
+		val = 1;
+		pr_debug("\tset no_check for socket\n");
+		ret |= restore_opt(sk, SOL_SOCKET, SO_NO_CHECK, &val);
+	}
 
 	tv.tv_sec = soe->so_snd_tmo_sec;
 	tv.tv_usec = soe->so_snd_tmo_usec;
@@ -85,6 +285,9 @@ int restore_socket_opts(int sk, SkOptsEntry *soe)
 	tv.tv_sec = soe->so_rcv_tmo_sec;
 	tv.tv_usec = soe->so_rcv_tmo_usec;
 	ret |= restore_opt(sk, SOL_SOCKET, SO_RCVTIMEO, &tv);
+
+	ret |= restore_bound_dev(sk, soe);
+	ret |= restore_socket_filter(sk, soe);
 
 	/* The restore of SO_REUSEADDR depends on type of socket */
 
@@ -116,6 +319,12 @@ int dump_socket_opts(int sk, SkOptsEntry *soe)
 
 	ret |= dump_opt(sk, SOL_SOCKET, SO_SNDBUF, &soe->so_sndbuf);
 	ret |= dump_opt(sk, SOL_SOCKET, SO_RCVBUF, &soe->so_rcvbuf);
+	soe->has_so_priority = true;
+	ret |= dump_opt(sk, SOL_SOCKET, SO_PRIORITY, &soe->so_priority);
+	soe->has_so_rcvlowat = true;
+	ret |= dump_opt(sk, SOL_SOCKET, SO_RCVLOWAT, &soe->so_rcvlowat);
+	soe->has_so_mark = true;
+	ret |= dump_opt(sk, SOL_SOCKET, SO_MARK, &soe->so_mark);
 
 	ret |= dump_opt(sk, SOL_SOCKET, SO_SNDTIMEO, &tv);
 	soe->so_snd_tmo_sec = tv.tv_sec;
@@ -129,7 +338,32 @@ int dump_socket_opts(int sk, SkOptsEntry *soe)
 	soe->reuseaddr = val ? true : false;
 	soe->has_reuseaddr = true;
 
+	ret |= dump_opt(sk, SOL_SOCKET, SO_PASSCRED, &val);
+	soe->has_so_passcred = true;
+	soe->so_passcred = val ? true : false;
+
+	ret |= dump_opt(sk, SOL_SOCKET, SO_PASSSEC, &val);
+	soe->has_so_passsec = true;
+	soe->so_passsec = val ? true : false;
+
+	ret |= dump_opt(sk, SOL_SOCKET, SO_DONTROUTE, &val);
+	soe->has_so_dontroute = true;
+	soe->so_dontroute = val ? true : false;
+
+	ret |= dump_opt(sk, SOL_SOCKET, SO_NO_CHECK, &val);
+	soe->has_so_no_check = true;
+	soe->so_no_check = val ? true : false;
+
+	ret |= dump_bound_dev(sk, soe);
+	ret |= dump_socket_filter(sk, soe);
+
 	return ret;
+}
+
+void release_skopts(SkOptsEntry *soe)
+{
+	xfree(soe->so_filter);
+	xfree(soe->so_bound_dev);
 }
 
 int dump_socket(struct fd_parms *p, int lfd, const struct cr_fdset *cr_fdset)
@@ -254,7 +488,7 @@ int collect_sockets(int pid)
 	req.r.i.sdiag_protocol	= IPPROTO_TCP;
 	req.r.i.idiag_ext	= 0;
 	/* Only listening sockets supported yet */
-	req.r.i.idiag_states	= 1 << TCP_LISTEN;
+	req.r.i.idiag_states	= (1 << TCP_LISTEN) | (1 << TCP_ESTABLISHED);
 	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
@@ -341,16 +575,4 @@ char *skstate2s(u32 state)
 		return "listen";
 	else
 		return unknown(state);
-}
-
-void show_socket_opts(SkOptsEntry *soe)
-{
-	pr_msg("\t");
-
-	pr_msg("sndbuf: %u  ", soe->so_sndbuf);
-	pr_msg("rcvbuf: %u  ", soe->so_rcvbuf);
-	pr_msg("sndtmo: %lu.%lu  ", soe->so_snd_tmo_sec, soe->so_snd_tmo_usec);
-	pr_msg("rcvtmo: %lu.%lu  ", soe->so_rcv_tmo_sec, soe->so_rcv_tmo_usec);
-
-	pr_msg("\n");
 }

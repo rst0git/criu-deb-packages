@@ -36,6 +36,7 @@ struct unix_sk_desc {
 	char			*name;
 	unsigned int		nr_icons;
 	unsigned int		*icons;
+	unsigned char		shutdown;
 	struct list_head	list;
 };
 
@@ -91,15 +92,8 @@ static int can_dump_unix_sk(const struct unix_sk_desc *sk)
 
 	switch (sk->state) {
 	case TCP_LISTEN:
-		break;
 	case TCP_ESTABLISHED:
-		break;
 	case TCP_CLOSE:
-		if (sk->type != SOCK_DGRAM) {
-			pr_err("Unexpected state %d on type %d\n",
-				sk->state, sk->type);
-			return 0;
-		}
 		break;
 	default:
 		pr_err("Unknown state %d\n", sk->state);
@@ -138,6 +132,8 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 	ue.opts		= &skopts;
 	ue.uflags	= 0;
 
+	sk_encode_shutdown(&ue, sk->shutdown);
+
 	if (ue.peer) {
 		struct unix_sk_desc *peer;
 
@@ -167,6 +163,22 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 				show_one_unix("Add a peer", peer);
 				list_add_tail(&peer->list, &unix_sockets);
 			}
+		}
+
+		if ((ue.type != SOCK_DGRAM) && (
+				((ue.shutdown == SK_SHUTDOWN__READ)  &&
+				 (peer->shutdown != SK_SHUTDOWN__WRITE)) ||
+				((ue.shutdown == SK_SHUTDOWN__WRITE) &&
+				 (peer->shutdown != SK_SHUTDOWN__READ))  ||
+				((ue.shutdown == SK_SHUTDOWN__BOTH)  &&
+				 (peer->shutdown != SK_SHUTDOWN__BOTH)) )) {
+			/*
+			 * On restore we assume, that stream pairs must
+			 * be shut down from one end only
+			 */
+			pr_err("Shutdown mismatch %u:%d -> %u:%d\n",
+					ue.ino, ue.shutdown, peer->sd.ino, peer->shutdown);
+			goto err;
 		}
 	} else if (ue.state == TCP_ESTABLISHED) {
 		const struct unix_sk_listen_icon *e;
@@ -213,6 +225,7 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 	pr_info("Dumping unix socket at %d\n", p->fd);
 	show_one_unix("Dumping", sk);
 	show_one_unix_img("Dumped", &ue);
+	release_skopts(&skopts);
 
 	list_del_init(&sk->list);
 	sk->sd.already_dumped = 1;
@@ -220,6 +233,7 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 	return 0;
 
 err:
+	release_skopts(&skopts);
 	return -1;
 }
 
@@ -247,6 +261,11 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 	d->type	 = m->udiag_type;
 	d->state = m->udiag_state;
 	INIT_LIST_HEAD(&d->list);
+
+	if (tb[UNIX_DIAG_SHUTDOWN])
+		d->shutdown = *(u8 *)RTA_DATA(tb[UNIX_DIAG_SHUTDOWN]);
+	else
+		pr_err_once("No socket shutdown info\n");
 
 	if (tb[UNIX_DIAG_PEER])
 		d->peer_ino = *(int *)RTA_DATA(tb[UNIX_DIAG_PEER]);
@@ -456,12 +475,29 @@ void show_unixsk(int fd, struct cr_options *o)
 	pb_show_plain_pretty(fd, PB_UNIXSK, "1:%#x 2:%#x 3:%d 4:%d 5:%d 6:%d 7:%d 8:%#x 11:S");
 }
 
+static int shutdown_unix_sk(int sk, struct unix_sk_info *ui)
+{
+	int how;
+	UnixSkEntry *ue = ui->ue;
+
+	if (!ue->has_shutdown || ue->shutdown == SK_SHUTDOWN__NONE)
+		return 0;
+
+	how = sk_decode_shutdown(ue->shutdown);
+	if (shutdown(sk, how)) {
+		pr_perror("Can't shutdown unix socket");
+		return -1;
+	}
+
+	pr_debug("Socket %#x is shut down %d\n", ue->ino, how);
+	return 0;
+}
+
 static int post_open_unix_sk(struct file_desc *d, int fd)
 {
 	struct unix_sk_info *ui;
-		struct unix_sk_info *peer;
-		struct fdinfo_list_entry *fle;
-		struct sockaddr_un addr;
+	struct unix_sk_info *peer;
+	struct sockaddr_un addr;
 
 	ui = container_of(d, struct unix_sk_info, d);
 	if (ui->flags & (USK_PAIR_MASTER | USK_PAIR_SLAVE))
@@ -474,8 +510,6 @@ static int post_open_unix_sk(struct file_desc *d, int fd)
 
 	pr_info("\tConnect %#x to %#x\n", ui->ue->ino, peer->ue->ino);
 
-	fle = file_master(&ui->d);
-
 	/* Skip external sockets */
 	if (!list_empty(&peer->d.fd_info_head))
 		futex_wait_while(&peer->bound, 0);
@@ -484,20 +518,23 @@ static int post_open_unix_sk(struct file_desc *d, int fd)
 	addr.sun_family = AF_UNIX;
 	memcpy(&addr.sun_path, peer->name, peer->ue->name.len);
 
-	if (connect(fle->fe->fd, (struct sockaddr *)&addr,
+	if (connect(fd, (struct sockaddr *)&addr,
 				sizeof(addr.sun_family) +
 				peer->ue->name.len) < 0) {
 		pr_perror("Can't connect %#x socket", ui->ue->ino);
 		return -1;
 	}
 
-	if (restore_sk_queue(fle->fe->fd, peer->ue->id))
+	if (restore_sk_queue(fd, peer->ue->id))
 		return -1;
 
-	if (rst_file_params(fle->fe->fd, ui->ue->fown, ui->ue->flags))
+	if (rst_file_params(fd, ui->ue->fown, ui->ue->flags))
 		return -1;
 
-	if (restore_socket_opts(fle->fe->fd, ui->ue->opts))
+	if (restore_socket_opts(fd, ui->ue->opts))
+		return -1;
+
+	if (shutdown_unix_sk(fd, ui))
 		return -1;
 
 	return 0;
@@ -507,7 +544,7 @@ static int bind_unix_sk(int sk, struct unix_sk_info *ui)
 {
 	struct sockaddr_un addr;
 
-	if ((ui->ue->type == SOCK_STREAM) && (ui->ue->state != TCP_LISTEN))
+	if ((ui->ue->type == SOCK_STREAM) && (ui->ue->state == TCP_ESTABLISHED))
 		/*
 		 * FIXME this can be done, but for doing this properly we
 		 * need to bind socket to its name, then rename one to
@@ -566,6 +603,12 @@ static int open_unixsk_pair_master(struct unix_sk_info *ui)
 	if (rst_file_params(sk[0], ui->ue->fown, ui->ue->flags))
 		return -1;
 
+	if (restore_socket_opts(sk[0], ui->ue->opts))
+		return -1;
+
+	if (shutdown_unix_sk(sk[0], ui))
+		return -1;
+
 	tsk = socket(PF_UNIX, SOCK_DGRAM, 0);
 	if (tsk < 0) {
 		pr_perror("Can't make transport socket");
@@ -610,6 +653,14 @@ static int open_unixsk_pair_slave(struct unix_sk_info *ui)
 	if (restore_socket_opts(sk, ui->ue->opts))
 		return -1;
 
+	if (ui->ue->type == SOCK_DGRAM)
+		/*
+		 * Stream socket's "slave" end will be shut down
+		 * together with master
+		 */
+		if (shutdown_unix_sk(sk, ui))
+			return -1;
+
 	return sk;
 }
 
@@ -635,14 +686,13 @@ static int open_unixsk_standalone(struct unix_sk_info *ui)
 			pr_perror("Can't make usk listen");
 			return -1;
 		}
-
-		if (rst_file_params(sk, ui->ue->fown, ui->ue->flags))
-			return -1;
-
-		if (restore_socket_opts(sk, ui->ue->opts))
-			return -1;
-
 	}
+
+	if (rst_file_params(sk, ui->ue->fown, ui->ue->flags))
+		return -1;
+
+	if (restore_socket_opts(sk, ui->ue->opts))
+		return -1;
 
 	return sk;
 }

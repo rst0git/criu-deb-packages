@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <signal.h>
 
 #include "bitops.h"
 
@@ -60,7 +61,8 @@
 #define CLONE_CHILD_USEPID      0x02000000
 #define CLONE_VFORK		0x00004000
 
-#define SIGMAX			32
+#define SIGMAX			64
+#define SIGMAX_OLD		31
 
 #define ERESTARTSYS		512
 #define ERESTARTNOINTR		513
@@ -77,6 +79,7 @@ typedef unsigned char		u8;
 typedef signed char		s8;
 
 #define MAJOR(dev)		((dev)>>8)
+#define MINOR(dev)		((dev) & 0xff)
 
 #define _LINUX_CAPABILITY_VERSION_3	0x20080522
 #define _LINUX_CAPABILITY_U32S_3	2
@@ -87,8 +90,7 @@ typedef struct {
 	unsigned long sig[1];
 } rt_sigset_t;
 
-struct siginfo;
-typedef void rt_signalfn_t(int, struct siginfo *, void *);
+typedef void rt_signalfn_t(int, siginfo_t *, void *);
 typedef rt_signalfn_t *rt_sighandler_t;
 
 typedef void rt_restorefn_t(void);
@@ -226,5 +228,21 @@ typedef struct {
 	u32 type;
 	u64 __handle[16];
 } fh_t;
+
+#ifndef MAP_HUGETLB
+# define MAP_HUGETLB 0x40000
+#endif
+
+#ifndef MADV_HUGEPAGE
+# define MADV_HUGEPAGE 14
+#endif
+
+#ifndef MADV_NOHUGEPAGE
+# define MADV_NOHUGEPAGE 15
+#endif
+
+#ifndef MADV_DONTDUMP
+# define MADV_DONTDUMP 16
+#endif
 
 #endif /* CR_TYPES_H_ */

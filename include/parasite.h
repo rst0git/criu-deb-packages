@@ -19,8 +19,10 @@
 
 enum {
 	PARASITE_CMD_INIT,
-	PARASITE_CMD_SET_LOGFD,
+	PARASITE_CMD_INIT_THREAD,
+	PARASITE_CMD_CFG_LOG,
 	PARASITE_CMD_FINI,
+	PARASITE_CMD_FINI_THREAD,
 
 	PARASITE_CMD_DUMPPAGES_INIT,
 	PARASITE_CMD_DUMPPAGES,
@@ -29,9 +31,11 @@ enum {
 	PARASITE_CMD_DUMP_SIGACTS,
 	PARASITE_CMD_DUMP_ITIMERS,
 	PARASITE_CMD_DUMP_MISC,
-	PARASITE_CMD_DUMP_TID_ADDR,
+	PARASITE_CMD_DUMP_CREDS,
+	PARASITE_CMD_DUMP_THREAD,
 	PARASITE_CMD_DRAIN_FDS,
 	PARASITE_CMD_GET_PROC_FD,
+	PARASITE_CMD_DUMP_TTY,
 
 	PARASITE_CMD_MAX,
 };
@@ -42,6 +46,12 @@ struct parasite_init_args {
 
 	int			p_addr_len;
 	struct sockaddr_un	p_addr;
+
+	int			nr_threads;
+};
+
+struct parasite_log_args {
+	int log_level;
 };
 
 struct parasite_dump_pages_args {
@@ -67,7 +77,6 @@ struct parasite_dump_itimers_args {
  */
 
 struct parasite_dump_misc {
-	unsigned int		secbits;
 	unsigned long		brk;
 	k_rtsigset_t		blocked;
 
@@ -76,9 +85,18 @@ struct parasite_dump_misc {
 	u32 pgid;
 };
 
-struct parasite_dump_tid_info {
+#define PARASITE_MAX_GROUPS	(PAGE_SIZE / sizeof(unsigned int))
+
+struct parasite_dump_creds {
+	unsigned int		secbits;
+	unsigned int		ngroups;
+	unsigned int		groups[PARASITE_MAX_GROUPS];
+};
+
+struct parasite_dump_thread {
 	unsigned int		*tid_addr;
-	int			tid;
+	pid_t			tid;
+	k_rtsigset_t		blocked;
 };
 
 #define PARASITE_MAX_FDS	(PAGE_SIZE / sizeof(int))
@@ -93,16 +111,20 @@ static inline int drain_fds_size(struct parasite_drain_fd *dfds)
 	return sizeof(dfds->nr_fds) + dfds->nr_fds * sizeof(dfds->fds[0]);
 }
 
-/*
- * Some useful offsets
- */
+struct parasite_tty_args {
+	int	fd;
 
-#define PARASITE_ARGS_ADDR(start)				\
-	((start) + parasite_blob_offset____export_parasite_args)
-#define PARASITE_CMD_ADDR(start)				\
-	((start) + parasite_blob_offset____export_parasite_cmd)
-#define PARASITE_HEAD_ADDR(start)				\
-	((start) + parasite_blob_offset____export_parasite_head_start)
+	int	sid;
+	int	pgrp;
+	bool	hangup;
+
+	int	st_pckt;
+	int	st_lock;
+	int	st_excl;
+};
+
+/* the parasite prefix is added by gen_offsets.sh */
+#define parasite_sym(pblob, name) ((void *)(pblob) + parasite_blob_offset__##name)
 
 #endif /* !__ASSEMBLY__ */
 #endif /* CR_PARASITE_H_ */
