@@ -70,10 +70,16 @@ asm-e::
 lib-e::
 	Some extarnal library the 'built-in.o' should link with.
 
+lib-so::
+	Tells the make engine to build a shared library.
+
 incdeps::
 	A flag which tells the script to generate dependency (that named '*.d'
 	files)	for source code C files. To turn this functionality on just
 	type 'incdeps := y' somewhere in your Makefile.
+
+cleanup-y::
+	List of files to be cleaned up when 'clean' target is called.
 
 For example a simplified Makefile may look like
 

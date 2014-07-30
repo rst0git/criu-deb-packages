@@ -136,6 +136,18 @@ static int dump_posix_timers(struct parasite_dump_posix_timers_args *args)
 	return ret;
 }
 
+static int dump_thread_common(struct parasite_dump_thread *ti)
+{
+	int ret;
+
+	ti->tls = arch_get_tls();
+	ret = sys_prctl(PR_GET_TID_ADDRESS, (unsigned long) &ti->tid_addr, 0, 0, 0);
+	if (ret == 0)
+		ret = sys_sigaltstack(NULL, &ti->sas);
+
+	return ret;
+}
+
 static int dump_misc(struct parasite_dump_misc *args)
 {
 	args->brk = sys_brk(0);
@@ -143,11 +155,10 @@ static int dump_misc(struct parasite_dump_misc *args)
 	args->pid = sys_getpid();
 	args->sid = sys_getsid();
 	args->pgid = sys_getpgid(0);
-	args->tls = arch_get_tls();
 	args->umask = sys_umask(0);
 	sys_umask(args->umask); /* never fails */
 
-	return 0;
+	return dump_thread_common(&args->ti);
 }
 
 static int dump_creds(struct parasite_dump_creds *args)
@@ -197,82 +208,8 @@ static int drain_fds(struct parasite_drain_fd *args)
 
 static int dump_thread(struct parasite_dump_thread *args)
 {
-	pid_t tid = sys_gettid();
-	int ret;
-
-	ret = sys_prctl(PR_GET_TID_ADDRESS, (unsigned long) &args->tid_addr, 0, 0, 0);
-	if (ret)
-		return ret;
-
-	args->tid = tid;
-	args->tls = arch_get_tls();
-
-	return 0;
-}
-
-static int init_thread(struct parasite_dump_thread *args)
-{
-	k_rtsigset_t to_block;
-	pid_t tid = sys_gettid();
-	int ret;
-
-	ksigfillset(&to_block);
-	ret = sys_sigprocmask(SIG_SETMASK, &to_block,
-			      &args->blocked,
-			      sizeof(k_rtsigset_t));
-	if (ret)
-		return -1;
-
-	ret = sys_prctl(PR_GET_TID_ADDRESS, (unsigned long) &args->tid_addr, 0, 0, 0);
-	if (ret)
-		goto err;
-
-	args->tid = tid;
-	args->tls = arch_get_tls();
-
-
-	return ret;
-err:
-	sys_sigprocmask(SIG_SETMASK, &args->blocked,
-				NULL, sizeof(k_rtsigset_t));
-	return ret;
-}
-
-static int fini_thread(struct parasite_dump_thread *args)
-{
-	return sys_sigprocmask(SIG_SETMASK, &args->blocked,
-				NULL, sizeof(k_rtsigset_t));
-}
-
-static int init(struct parasite_init_args *args)
-{
-	k_rtsigset_t to_block;
-	int ret;
-
-	sigframe = args->sigframe;
-
-	ksigfillset(&to_block);
-	ret = sys_sigprocmask(SIG_SETMASK, &to_block,
-			      &args->sig_blocked,
-			      sizeof(k_rtsigset_t));
-	if (ret)
-		return -1;
-
-	tsock = sys_socket(PF_UNIX, SOCK_STREAM, 0);
-	if (tsock < 0) {
-		ret = tsock;
-		goto err;
-	}
-
-	ret = sys_connect(tsock, (struct sockaddr *)&args->h_addr, args->h_addr_len);
-	if (ret < 0)
-		goto err;
-
-	return 0;
-err:
-	sys_sigprocmask(SIG_SETMASK, &args->sig_blocked,
-				NULL, sizeof(k_rtsigset_t));
-	return ret;
+	args->tid = sys_gettid();
+	return dump_thread_common(args);
 }
 
 static char proc_mountpoint[] = "proc.crtools";
@@ -300,22 +237,11 @@ static int parasite_get_proc_fd()
 
 	if (sys_mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL)) {
 		pr_err("mount failed\n");
-		goto out_rmdir;
-	}
-
-	fd = sys_open(proc_mountpoint, O_RDONLY, 0);
-
-	if (sys_umount2(proc_mountpoint, MNT_DETACH)) {
-		pr_err("Can't umount procfs\n");
+		sys_rmdir(proc_mountpoint);
 		return -1;
 	}
 
-out_rmdir:
-	if (sys_rmdir(proc_mountpoint)) {
-		pr_err("Can't remove directory\n");
-		return -1;
-	}
-
+	fd = open_detach_mount(proc_mountpoint);
 out_send_fd:
 	if (fd < 0)
 		return fd;
@@ -391,20 +317,6 @@ err:
 	args->hangup = true;
 
 	return 0;
-}
-
-static int parasite_cfg_log(struct parasite_log_args *args)
-{
-	int ret;
-
-	ret = recv_fd(tsock);
-	if (ret >= 0) {
-		log_set_fd(ret);
-		log_set_loglevel(args->log_level);
-		ret = 0;
-	}
-
-	return ret;
 }
 
 static int parasite_check_vdso_mark(struct parasite_vdso_vma_entry *args)
@@ -495,7 +407,7 @@ static noinline __used int noinline parasite_daemon(void *args)
 	pr_debug("Running daemon thread leader\n");
 
 	/* Reply we're alive */
-	if (__parasite_daemon_reply_ack(PARASITE_CMD_DAEMONIZE, 0))
+	if (__parasite_daemon_reply_ack(PARASITE_CMD_INIT_DAEMON, 0))
 		goto out;
 
 	ret = 0;
@@ -512,9 +424,6 @@ static noinline __used int noinline parasite_daemon(void *args)
 		switch (m.cmd) {
 		case PARASITE_CMD_FINI:
 			goto out;
-		case PARASITE_CMD_DUMP_THREAD:
-			ret = dump_thread(args);
-			break;
 		case PARASITE_CMD_DUMPPAGES:
 			ret = dump_pages(args);
 			break;
@@ -569,21 +478,51 @@ out:
 	return 0;
 }
 
+static noinline __used int parasite_init_daemon(void *data)
+{
+	struct parasite_init_args *args = data;
+	int ret;
+
+	sigframe = args->sigframe;
+
+	tsock = sys_socket(PF_UNIX, SOCK_STREAM, 0);
+	if (tsock < 0) {
+		pr_err("Can't create socket: %d\n", tsock);
+		goto err;
+	}
+
+	ret = sys_connect(tsock, (struct sockaddr *)&args->h_addr, args->h_addr_len);
+	if (ret < 0) {
+		pr_err("Can't connect the control socket\n");
+		goto err;
+	}
+
+	ret = recv_fd(tsock);
+	if (ret >= 0) {
+		log_set_fd(ret);
+		log_set_loglevel(args->log_level);
+		ret = 0;
+	} else
+		goto err;
+
+	parasite_daemon(data);
+
+err:
+	fini();
+	BUG();
+
+	return -1;
+}
+
 int __used parasite_service(unsigned int cmd, void *args)
 {
 	pr_info("Parasite cmd %d/%x process\n", cmd, cmd);
 
 	switch (cmd) {
-	case PARASITE_CMD_INIT:
-		return init(args);
-	case PARASITE_CMD_INIT_THREAD:
-		return init_thread(args);
-	case PARASITE_CMD_FINI_THREAD:
-		return fini_thread(args);
-	case PARASITE_CMD_CFG_LOG:
-		return parasite_cfg_log(args);
-	case PARASITE_CMD_DAEMONIZE:
-		return parasite_daemon(args);
+	case PARASITE_CMD_DUMP_THREAD:
+		return dump_thread(args);
+	case PARASITE_CMD_INIT_DAEMON:
+		return parasite_init_daemon(args);
 	}
 
 	pr_err("Unknown command to parasite: %d\n", cmd);

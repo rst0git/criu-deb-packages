@@ -22,7 +22,7 @@
 #include "util.h"
 #include "log.h"
 #include "list.h"
-#include "util-net.h"
+#include "util-pie.h"
 #include "proc_parse.h"
 #include "file-ids.h"
 
@@ -938,6 +938,14 @@ static int collect_one_tty_info_entry(void *obj, ProtobufCMessage *msg)
 	return 0;
 }
 
+struct collect_image_info tty_info_cinfo = {
+	.fd_type = CR_FD_TTY_INFO,
+	.pb_type = PB_TTY_INFO,
+	.priv_size = sizeof(struct tty_info_entry),
+	.collect = collect_one_tty_info_entry,
+	.flags = COLLECT_OPTIONAL,
+};
+
 static int collect_one_tty(void *obj, ProtobufCMessage *msg)
 {
 	struct tty_info *info = obj;
@@ -972,29 +980,16 @@ static int collect_one_tty(void *obj, ProtobufCMessage *msg)
 	pr_info("Collected tty ID %#x\n", info->tfe->id);
 
 	list_add(&info->list, &all_ttys);
-	file_desc_add(&info->d, info->tfe->id, &tty_desc_ops);
-
-	return 0;
+	return file_desc_add(&info->d, info->tfe->id, &tty_desc_ops);
 }
 
-int collect_tty(void)
-{
-	int ret;
-
-	ret = collect_image(CR_FD_TTY_INFO, PB_TTY_INFO,
-			    sizeof(struct tty_info_entry),
-			    collect_one_tty_info_entry);
-	if (ret && errno == ENOENT)
-		return 0;
-	if (!ret)
-		ret = collect_image(CR_FD_TTY, PB_TTY,
-				sizeof(struct tty_info),
-				collect_one_tty);
-	if (!ret)
-		ret = tty_verify_active_pairs();
-
-	return ret;
-}
+struct collect_image_info tty_cinfo = {
+	.fd_type = CR_FD_TTY_FILES,
+	.pb_type = PB_TTY_FILE,
+	.priv_size = sizeof(struct tty_info),
+	.collect = collect_one_tty,
+	.flags = COLLECT_OPTIONAL,
+};
 
 /* Make sure the ttys we're dumping do belong our process tree */
 int dump_verify_tty_sids(void)
@@ -1192,7 +1187,7 @@ static int dump_one_pty(int lfd, u32 id, const struct fd_parms *p)
 		ret = dump_pty_info(lfd, e.tty_info_id, p, major, index);
 
 	if (!ret)
-		ret = pb_write_one(fdset_fd(glob_fdset, CR_FD_TTY), &e, PB_TTY);
+		ret = pb_write_one(fdset_fd(glob_fdset, CR_FD_TTY_FILES), &e, PB_TTY_FILE);
 	return ret;
 }
 

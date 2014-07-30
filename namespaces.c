@@ -13,7 +13,7 @@
 #include "protobuf.h"
 #include "protobuf/ns.pb-c.h"
 
-struct ns_desc *ns_desc_array[] = {
+static struct ns_desc *ns_desc_array[] = {
 	&net_ns_desc,
 	&uts_ns_desc,
 	&ipc_ns_desc,
@@ -209,7 +209,7 @@ int dump_one_ns_file(int lfd, u32 id, const struct fd_parms *p)
 	nfe.ns_cflag	= link->ns_d->cflag;
 	nfe.flags	= p->flags;
 
-	return pb_write_one(fd, &nfe, PB_NS_FILES);
+	return pb_write_one(fd, &nfe, PB_NS_FILE);
 }
 
 const struct fdtype_ops nsfile_dump_ops = {
@@ -293,23 +293,17 @@ static int collect_one_nsfile(void *o, ProtobufCMessage *base)
 	struct ns_file_info *nfi = o;
 
 	nfi->nfe = pb_msg(base, NsFileEntry);
-
 	pr_info("Collected ns file ID %#x NS-ID %#x\n", nfi->nfe->id, nfi->nfe->ns_id);
-	file_desc_add(&nfi->d, nfi->nfe->id, &ns_desc_ops);
-
-	return 0;
+	return file_desc_add(&nfi->d, nfi->nfe->id, &ns_desc_ops);
 }
 
-int collect_ns_files(void)
-{
-	int ret;
-
-	ret = collect_image(CR_FD_NS_FILES, PB_NS_FILES,
-			sizeof(struct ns_file_info), collect_one_nsfile);
-	if (ret < 0 && errno == ENOENT)
-		ret = 0;
-	return ret;
-}
+struct collect_image_info nsfile_cinfo = {
+	.fd_type = CR_FD_NS_FILES,
+	.pb_type = PB_NS_FILE,
+	.priv_size = sizeof(struct ns_file_info),
+	.collect = collect_one_nsfile,
+	.flags = COLLECT_OPTIONAL,
+};
 
 int dump_task_ns_ids(struct pstree_item *item)
 {
@@ -479,14 +473,11 @@ int try_show_namespaces(int ns_pid)
 	for (i = _CR_FD_NS_FROM + 1; i < _CR_FD_NS_TO; i++) {
 		int fd;
 
-		if (!fdset_template[i].show)
-			continue;
-
 		fd = fdset_fd(fdset, i);
 		if (fd == -1)
 			continue;
 
-		fdset_template[i].show(fdset_fd(fdset, i));
+		cr_parse_fd(fd, fdset_template[i].magic);
 	}
 	pr_msg("---[ end of %d namespaces ]---\n", ns_pid);
 	close_cr_fdset(&fdset);

@@ -187,9 +187,6 @@ static void restore_sched_info(struct rst_sched_param *p)
 {
 	struct sched_param parm;
 
-	if ((p->policy == SCHED_OTHER) && (p->nice == 0))
-		return;
-
 	pr_info("Restoring scheduler params %d.%d.%d\n",
 			p->policy, p->nice, p->prio);
 
@@ -289,8 +286,6 @@ long __export_restore_thread(struct thread_restore_args *args)
 	if (restore_thread_common(rt_sigframe, args))
 		goto core_restore_end;
 
-	mutex_unlock(&args->ta->rst_lock);
-
 	ret = restore_creds(&args->ta->creds);
 	if (ret)
 		goto core_restore_end;
@@ -384,17 +379,12 @@ static void rst_tcp_repair_off(struct rst_tcp_sock *rts)
 		pr_perror("Failed to restore of SO_REUSEADDR on socket (%d)", ret);
 }
 
-static void rst_tcp_socks_all(struct rst_tcp_sock *arr, int size)
+static void rst_tcp_socks_all(struct task_restore_core_args *ta)
 {
 	int i;
 
-	if (size == 0)
-		return;
-
-	for (i =0; arr[i].sk >= 0; i++)
-		rst_tcp_repair_off(arr + i);
-
-	sys_munmap(arr, size);
+	for (i = 0; i < ta->tcp_socks_nr; i++)
+		rst_tcp_repair_off(&ta->tcp_socks[i]);
 }
 
 static int vma_remap(unsigned long src, unsigned long dst, unsigned long len)
@@ -519,9 +509,6 @@ static void restore_posix_timers(struct task_restore_core_args *args)
 		rt = &args->posix_timers[i];
 		sys_timer_settime((timer_t)rt->spt.it_id, 0, &rt->val, NULL);
 	}
-
-	if (args->timer_n)
-		sys_munmap(args->posix_timers, args->timers_sz);
 }
 
 /*
@@ -828,8 +815,6 @@ long __export_restore_task(struct task_restore_core_args *args)
 			if (thread_args[i].pid == args->t->pid)
 				continue;
 
-			mutex_lock(&args->rst_lock);
-
 			new_sp =
 				RESTORE_ALIGN_STACK((long)thread_args[i].mem_zone.stack,
 						    sizeof(thread_args[i].mem_zone.stack));
@@ -882,21 +867,13 @@ long __export_restore_task(struct task_restore_core_args *args)
 
 	restore_finish_stage(CR_STATE_RESTORE_SIGCHLD);
 
-	if (args->siginfo_size) {
-		ret = sys_munmap(args->siginfo, args->siginfo_size);
-		if (ret < 0) {
-			pr_err("Can't unmap signals %ld\n", ret);
-			goto core_restore_failed;
-		}
-	}
-
 	ret = create_posix_timers(args);
 	if (ret < 0) {
 		pr_err("Can't restore posix timers %ld\n", ret);
 		goto core_restore_end;
 	}
 
-	rst_tcp_socks_all(args->rst_tcp_socks, args->rst_tcp_socks_size);
+	rst_tcp_socks_all(args);
 
 	/* 
 	 * Writing to last-pid is CAP_SYS_ADMIN protected,
@@ -941,6 +918,8 @@ long __export_restore_task(struct task_restore_core_args *args)
 		ret = ((long)__LINE__ << 16) | ((-ret) & 0xffff);
 		goto core_restore_failed;
 	}
+
+	sys_munmap(args->rst_mem, args->rst_mem_size);
 
 	/*
 	 * Sigframe stack.

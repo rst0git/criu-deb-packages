@@ -165,47 +165,38 @@ static int open_remap_linked(struct reg_file_info *rfi,
 	return 0;
 }
 
-static int collect_remaps(void)
+static int collect_one_remap(void *obj, ProtobufCMessage *msg)
 {
-	int fd, ret = 0;
+	int ret = -1;
+	RemapFilePathEntry *rfe;
+	struct file_desc *fdesc;
+	struct reg_file_info *rfi;
 
-	fd = open_image(CR_FD_REMAP_FPATH, O_RSTR);
-	if (fd < 0)
-		return -1;
+	rfe = pb_msg(msg, RemapFilePathEntry);
 
-	while (1) {
-		RemapFilePathEntry *rfe = NULL;
-		struct file_desc *fdesc;
-		struct reg_file_info *rfi;
-
-		ret = pb_read_one_eof(fd, &rfe, PB_REMAP_FPATH);
-		if (ret <= 0)
-			break;
-
-		ret = -1;
-		fdesc = find_file_desc_raw(FD_TYPES__REG, rfe->orig_id);
-		if (fdesc == NULL) {
-			pr_err("Remap for non existing file %#x\n",
-					rfe->orig_id);
-			goto tail;
-		}
-
-		rfi = container_of(fdesc, struct reg_file_info, d);
-		pr_info("Configuring remap %#x -> %#x\n", rfi->rfe->id, rfe->remap_id);
-
-		if (rfe->remap_id & REMAP_GHOST)
-			ret = open_remap_ghost(rfi, rfe);
-		else
-			ret = open_remap_linked(rfi, rfe);
-tail:
-		remap_file_path_entry__free_unpacked(rfe, NULL);
-		if (ret)
-			break;
+	fdesc = find_file_desc_raw(FD_TYPES__REG, rfe->orig_id);
+	if (fdesc == NULL) {
+		pr_err("Remap for non existing file %#x\n",
+				rfe->orig_id);
+		goto out;
 	}
 
-	close(fd);
+	rfi = container_of(fdesc, struct reg_file_info, d);
+	pr_info("Configuring remap %#x -> %#x\n", rfi->rfe->id, rfe->remap_id);
+
+	if (rfe->remap_id & REMAP_GHOST)
+		ret = open_remap_ghost(rfi, rfe);
+	else
+		ret = open_remap_linked(rfi, rfe);
+out:
 	return ret;
 }
+
+struct collect_image_info remap_cinfo = {
+	.fd_type = CR_FD_REMAP_FPATH,
+	.pb_type = PB_REMAP_FPATH,
+	.collect = collect_one_remap,
+};
 
 static int dump_ghost_file(int _fd, u32 id, const struct stat *st)
 {
@@ -362,7 +353,7 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp)
 		return -1;
 	}
 
-	return pb_write_one(fdset_fd(glob_fdset, CR_FD_REG_FILES), &rfe, PB_REG_FILES);
+	return pb_write_one(fdset_fd(glob_fdset, CR_FD_REG_FILES), &rfe, PB_REG_FILE);
 }
 
 static int dump_linked_remap(char *path, int len, const struct stat *ost, int lfd, u32 id)
@@ -397,7 +388,7 @@ static int check_path_remap(char *rpath, int plen, const struct stat *ost, int l
 	ret = fstatat(mntns_root, rpath, &pst, 0);
 	if (ret < 0) {
 		/*
-		 * FIXME linked file, but path is not accessible (unless any
+		 * Linked file, but path is not accessible (unless any
 		 * other error occurred). We can create a temporary link to it
 		 * uning linkat with AT_EMPTY_PATH flag and remap it to this
 		 * name.
@@ -468,7 +459,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 
 	rfd = fdset_fd(glob_fdset, CR_FD_REG_FILES);
 
-	return pb_write_one(rfd, &rfe, PB_REG_FILES);
+	return pb_write_one(rfd, &rfe, PB_REG_FILE);
 }
 
 const struct fdtype_ops regfile_dump_ops = {
@@ -538,7 +529,8 @@ static int do_open_reg(struct reg_file_info *rfi, void *arg)
 		return fd;
 	}
 
-	if (lseek(fd, rfi->rfe->pos, SEEK_SET) < 0) {
+	if ((rfi->rfe->pos != -1ULL) &&
+			lseek(fd, rfi->rfe->pos, SEEK_SET) < 0) {
 		pr_perror("Can't restore file pos");
 		close(fd);
 		return -1;
@@ -571,10 +563,15 @@ static int collect_one_regfile(void *o, ProtobufCMessage *base)
 	rfi->remap = NULL;
 
 	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
-	file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);
-
-	return 0;
+	return file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);
 }
+
+struct collect_image_info reg_file_cinfo = {
+	.fd_type = CR_FD_REG_FILES,
+	.pb_type = PB_REG_FILE,
+	.priv_size = sizeof(struct reg_file_info),
+	.collect = collect_one_regfile,
+};
 
 int prepare_shared_reg_files(void)
 {
@@ -584,16 +581,4 @@ int prepare_shared_reg_files(void)
 
 	mutex_init(ghost_file_mutex);
 	return 0;
-}
-
-int collect_reg_files(void)
-{
-	int ret;
-
-	ret = collect_image(CR_FD_REG_FILES, PB_REG_FILES,
-			sizeof(struct reg_file_info), collect_one_regfile);
-	if (!ret)
-		ret = collect_remaps();
-
-	return ret;
 }

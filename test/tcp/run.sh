@@ -1,5 +1,7 @@
 #!/bin/bash
 
+source ../env.sh || exit 1
+
 set -x
 
 PORT=12345
@@ -7,7 +9,6 @@ CLN_PIPE="./clnt_pipe"
 SRV_LOG="./srv.log"
 CLN_LOG="./cln.log"
 DDIR="dump"
-CRIU="../../criu"
 
 TEXT=$(hexdump -C /dev/urandom | head -n 1)
 
@@ -34,11 +35,20 @@ echo "Make it run"
 echo "${TEXT}" >&3
 
 function fail {
+	echo FAIL
+
+(	exec >&2
+
 	echo "$@"
 	kill -9 ${CLN_PID}
 	kill -9 ${SRV_PID}
+	echo ${CLN_LOG}:
+	cat ${CLN_LOG}
+)
 	exit 1
 }
+
+kill -s 0 ${CLN_PID} || fail "Client is dead"
 
 echo "Suspend server"
 ${CRIU} dump -D ${DDIR} -o dump.log -t ${SRV_PID} --tcp-established -vvvv || fail "Fail to dump server"
@@ -51,5 +61,7 @@ echo "${TEXT}" >&3
 
 echo "Collect results"
 exec 3>&-
-wait ${CLN_PID}
+wait ${CLN_PID} || fail "Client exits abruptly"
 kill -9 ${SRV_PID}
+
+echo PASS

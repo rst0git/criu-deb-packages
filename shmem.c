@@ -44,7 +44,7 @@ static int collect_shmem(int pid, VmaEntry *vi)
 		 * will wait until the kernel propagate this mapping
 		 * into /proc
 		 */
-		if (si->pid <= pid)
+		if (!pid_rst_prio(pid, si->pid))
 			return 0;
 
 		si->pid	 = pid;
@@ -92,7 +92,7 @@ int prepare_shmem_pid(int pid)
 	}
 
 	while (1) {
-		ret = pb_read_one_eof(fd, &vi, PB_VMAS);
+		ret = pb_read_one_eof(fd, &vi, PB_VMA);
 		if (ret <= 0)
 			break;
 

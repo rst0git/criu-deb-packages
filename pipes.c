@@ -9,7 +9,7 @@
 #include "image.h"
 #include "files.h"
 #include "pipes.h"
-#include "util-net.h"
+#include "util-pie.h"
 
 #include "protobuf.h"
 #include "protobuf/pipe.pb-c.h"
@@ -84,7 +84,7 @@ int collect_pipe_data(int img_type, struct pipe_data_rst **hash)
 		if (!r)
 			break;
 
-		ret = pb_read_one_eof(fd, &r->pde, PB_PIPES_DATA);
+		ret = pb_read_one_eof(fd, &r->pde, PB_PIPE_DATA);
 		if (ret <= 0)
 			break;
 
@@ -375,8 +375,6 @@ static int collect_one_pipe(void *o, ProtobufCMessage *base)
 	pr_info("Collected pipe entry ID %#x PIPE ID %#x\n",
 			pi->pe->id, pi->pe->pipe_id);
 
-	file_desc_add(&pi->d, pi->pe->id, &pipe_desc_ops);
-
 	list_for_each_entry(tmp, &pipes, list)
 		if (pi->pe->pipe_id == tmp->pe->pipe_id)
 			break;
@@ -387,20 +385,20 @@ static int collect_one_pipe(void *o, ProtobufCMessage *base)
 		list_add(&pi->pipe_list, &tmp->pipe_list);
 
 	list_add_tail(&pi->list, &pipes);
+	return file_desc_add(&pi->d, pi->pe->id, &pipe_desc_ops);
 
-	return 0;
 }
+
+struct collect_image_info pipe_cinfo = {
+	.fd_type = CR_FD_PIPES,
+	.pb_type = PB_PIPE,
+	.priv_size = sizeof(struct pipe_info),
+	.collect = collect_one_pipe,
+};
 
 int collect_pipes(void)
 {
-	int ret;
-
-	ret = collect_image(CR_FD_PIPES, PB_PIPES,
-			sizeof(struct pipe_info), collect_one_pipe);
-	if (!ret)
-		ret = collect_pipe_data(CR_FD_PIPES_DATA, pd_hash_pipes);
-
-	return ret;
+	return collect_pipe_data(CR_FD_PIPES_DATA, pd_hash_pipes);
 }
 
 int dump_one_pipe_data(struct pipe_data_dump *pd, int lfd, const struct fd_parms *p)
@@ -456,7 +454,7 @@ int dump_one_pipe_data(struct pipe_data_dump *pd, int lfd, const struct fd_parms
 	pde.has_size	= true;
 	pde.size	= pipe_size;
 
-	if (pb_write_one(img, &pde, PB_PIPES_DATA))
+	if (pb_write_one(img, &pde, PB_PIPE_DATA))
 		goto err_close;
 
 	if (bytes) {
@@ -501,7 +499,7 @@ static int dump_one_pipe(int lfd, u32 id, const struct fd_parms *p)
 	pe.flags	= p->flags;
 	pe.fown		= (FownEntry *)&p->fown;
 
-	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_PIPES), &pe, PB_PIPES))
+	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_PIPES), &pe, PB_PIPE))
 		return -1;
 
 	return dump_one_pipe_data(&pd_pipes, lfd, p);

@@ -19,10 +19,9 @@ extern int is_inotify_link(int lfd);
 extern int is_fanotify_link(int lfd);
 extern const struct fdtype_ops inotify_dump_ops;
 extern const struct fdtype_ops fanotify_dump_ops;
-extern int collect_inotify(void);
-extern void show_inotify_wd(int fd);
-extern void show_inotify(int fd);
-extern void show_fanotify_mark(int fd);
-extern void show_fanotify(int fd);
+extern struct collect_image_info inotify_cinfo;
+extern struct collect_image_info inotify_mark_cinfo;
+extern struct collect_image_info fanotify_cinfo;
+extern struct collect_image_info fanotify_mark_cinfo;
 
 #endif /* __CR_FSNOTIFY_H__ */

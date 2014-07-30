@@ -6,25 +6,52 @@
 #include <net/if_arp.h>
 #include <sys/wait.h>
 #include <sched.h>
+#include <sys/mount.h>
+
 #include "syscall-types.h"
 #include "namespaces.h"
 #include "net.h"
 #include "libnetlink.h"
 #include "crtools.h"
 #include "sk-inet.h"
+#include "tun.h"
+#include "util-pie.h"
 
 #include "protobuf.h"
 #include "protobuf/netdev.pb-c.h"
 
 static int ns_fd = -1;
+static int ns_sysfs_fd = -1;
 
-void show_netdevices(int fd)
+int read_ns_sys_file(char *path, char *buf, int len)
 {
-	pb_show_plain_pretty(fd, PB_NETDEV, "2:%d");
+	int fd, rlen;
+
+	BUG_ON(ns_sysfs_fd == -1);
+
+	fd = openat(ns_sysfs_fd, path, O_RDONLY, 0);
+	if (fd < 0) {
+		pr_perror("Can't open ns' %s", path);
+		return -1;
+	}
+
+	rlen = read(fd, buf, len);
+	close(fd);
+
+	if (rlen >= 0)
+		buf[rlen] = '\0';
+
+	return rlen;
+}
+
+int write_netdev_img(NetDeviceEntry *nde, struct cr_fdset *fds)
+{
+	return pb_write_one(fdset_fd(fds, CR_FD_NETDEV), nde, PB_NETDEV);
 }
 
 static int dump_one_netdev(int type, struct ifinfomsg *ifi,
-		struct rtattr **tb, struct cr_fdset *fds)
+		struct rtattr **tb, struct cr_fdset *fds,
+		int (*dump)(NetDeviceEntry *, struct cr_fdset *))
 {
 	NetDeviceEntry netdev = NET_DEVICE_ENTRY__INIT;
 
@@ -39,7 +66,19 @@ static int dump_one_netdev(int type, struct ifinfomsg *ifi,
 	netdev.flags = ifi->ifi_flags;
 	netdev.name = RTA_DATA(tb[IFLA_IFNAME]);
 
-	return pb_write_one(fdset_fd(fds, CR_FD_NETDEV), &netdev, PB_NETDEV);
+	if (tb[IFLA_ADDRESS] && (type != ND_TYPE__LOOPBACK)) {
+		netdev.has_address = true;
+		netdev.address.data = RTA_DATA(tb[IFLA_ADDRESS]);
+		netdev.address.len = RTA_PAYLOAD(tb[IFLA_ADDRESS]);
+		pr_info("Found ll addr (%02x:../%d) for %s\n",
+				(int)netdev.address.data[0],
+				(int)netdev.address.len, netdev.name);
+	}
+
+	if (!dump)
+		dump = write_netdev_img;
+
+	return dump(&netdev, fds);
 }
 
 static char *link_kind(struct ifinfomsg *ifi, struct rtattr **tb)
@@ -78,9 +117,28 @@ static int dump_one_ethernet(struct ifinfomsg *ifi,
 		 * Sigh... we have to assume, that the veth device is a
 		 * connection to the outer world and just dump this end :(
 		 */
-		return dump_one_netdev(ND_TYPE__VETH, ifi, tb, fds);
+		return dump_one_netdev(ND_TYPE__VETH, ifi, tb, fds, NULL);
+	if (!strcmp(kind, "tun"))
+		return dump_one_netdev(ND_TYPE__TUN, ifi, tb, fds, dump_tun_link);
 unk:
 	pr_err("Unknown eth kind %s link %d\n", kind, ifi->ifi_index);
+	return -1;
+}
+
+static int dump_one_gendev(struct ifinfomsg *ifi,
+		struct rtattr **tb, struct cr_fdset *fds)
+{
+	char *kind;
+
+	kind = link_kind(ifi, tb);
+	if (!kind)
+		goto unk;
+
+	if (!strcmp(kind, "tun"))
+		return dump_one_netdev(ND_TYPE__TUN, ifi, tb, fds, dump_tun_link);
+
+unk:
+	pr_err("Unknown ARPHRD_NONE kind %s link %d\n", kind, ifi->ifi_index);
 	return -1;
 }
 
@@ -104,10 +162,13 @@ static int dump_one_link(struct nlmsghdr *hdr, void *arg)
 
 	switch (ifi->ifi_type) {
 	case ARPHRD_LOOPBACK:
-		ret = dump_one_netdev(ND_TYPE__LOOPBACK, ifi, tb, fds);
+		ret = dump_one_netdev(ND_TYPE__LOOPBACK, ifi, tb, fds, NULL);
 		break;
 	case ARPHRD_ETHER:
 		ret = dump_one_ethernet(ifi, tb, fds);
+		break;
+	case ARPHRD_NONE:
+		ret = dump_one_gendev(ifi, tb, fds);
 		break;
 	default:
 		pr_err("Unsupported link type %d, kind %s\n",
@@ -166,7 +227,7 @@ struct newlink_req {
 	char buf[1024];
 };
 
-static int restore_one_link(NetDeviceEntry *nde, int nlsk,
+static int do_rtm_link_req(int msg_type, NetDeviceEntry *nde, int nlsk,
 		int (*link_info)(NetDeviceEntry *, struct newlink_req *))
 {
 	struct newlink_req req;
@@ -175,7 +236,7 @@ static int restore_one_link(NetDeviceEntry *nde, int nlsk,
 
 	req.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
 	req.h.nlmsg_flags = NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE;
-	req.h.nlmsg_type = RTM_NEWLINK;
+	req.h.nlmsg_type = msg_type;
 	req.h.nlmsg_seq = CR_NLMSG_SEQ;
 	req.i.ifi_family = AF_PACKET;
 	req.i.ifi_index = nde->ifindex;
@@ -183,6 +244,13 @@ static int restore_one_link(NetDeviceEntry *nde, int nlsk,
 
 	addattr_l(&req.h, sizeof(req), IFLA_IFNAME, nde->name, strlen(nde->name));
 	addattr_l(&req.h, sizeof(req), IFLA_MTU, &nde->mtu, sizeof(nde->mtu));
+
+	if (nde->has_address) {
+		pr_debug("Restore ll addr (%02x:../%d) for device\n",
+				(int)nde->address.data[0], (int)nde->address.len);
+		addattr_l(&req.h, sizeof(req), IFLA_ADDRESS,
+				nde->address.data, nde->address.len);
+	}
 
 	if (link_info) {
 		struct rtattr *linkinfo;
@@ -198,8 +266,19 @@ static int restore_one_link(NetDeviceEntry *nde, int nlsk,
 		linkinfo->rta_len = (void *)NLMSG_TAIL(&req.h) - (void *)linkinfo;
 	}
 
-	pr_info("Restoring netdev idx %d\n", nde->ifindex);
 	return do_rtnl_req(nlsk, &req, req.h.nlmsg_len, restore_link_cb, NULL);
+}
+
+int restore_link_parms(NetDeviceEntry *nde, int nlsk)
+{
+	return do_rtm_link_req(RTM_SETLINK, nde, nlsk, NULL);
+}
+
+static int restore_one_link(NetDeviceEntry *nde, int nlsk,
+		int (*link_info)(NetDeviceEntry *, struct newlink_req *))
+{
+	pr_info("Restoring netdev idx %d\n", nde->ifindex);
+	return do_rtm_link_req(RTM_NEWLINK, nde, nlsk, link_info);
 }
 
 #ifndef VETH_INFO_MAX
@@ -253,6 +332,8 @@ static int restore_link(NetDeviceEntry *nde, int nlsk)
 		return restore_one_link(nde, nlsk, NULL);
 	case ND_TYPE__VETH:
 		return restore_one_link(nde, nlsk, veth_link_info);
+	case ND_TYPE__TUN:
+		return restore_one_tun(nde, nlsk);
 	default:
 		pr_err("Unsupported link type %d\n", nde->type);
 		break;
@@ -347,17 +428,62 @@ static inline int restore_route(int pid)
 	return restore_ip_dump(CR_FD_ROUTE, pid, "route");
 }
 
+static int mount_ns_sysfs(void)
+{
+	char sys_mount[] = "crtools-sys.XXXXXX";
+
+	BUG_ON(ns_sysfs_fd != -1);
+
+	/*
+	 * A new mntns is required to avoid the race between
+	 * open_detach_mount and creating mntns.
+	 */
+	if (unshare(CLONE_NEWNS)) {
+		pr_perror("Can't create new mount namespace");
+		return -1;
+	}
+
+	if (mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL)) {
+		pr_perror("Can't mark the root mount as private");
+		return -1;
+	}
+
+	if (mkdtemp(sys_mount) == NULL) {
+		pr_perror("mkdtemp failed %s", sys_mount);
+		return -1;
+	}
+
+	/*
+	 * The setns() is called, so we're in proper context,
+	 * no need in pulling the mountpoint from parasite.
+	 */
+	pr_info("Mount ns' sysfs in %s\n", sys_mount);
+	if (mount("sysfs", sys_mount, "sysfs", MS_MGC_VAL, NULL)) {
+		pr_perror("mount failed");
+		rmdir(sys_mount);
+		return -1;
+	}
+
+	ns_sysfs_fd = open_detach_mount(sys_mount);
+	return ns_sysfs_fd >= 0 ? 0 : -1;
+}
+
 int dump_net_ns(int pid, struct cr_fdset *fds)
 {
 	int ret;
 
 	ret = switch_ns(pid, &net_ns_desc, NULL);
 	if (!ret)
+		ret = mount_ns_sysfs();
+	if (!ret)
 		ret = dump_links(fds);
 	if (!ret)
 		ret = dump_ifaddr(fds);
 	if (!ret)
 		ret = dump_route(fds);
+
+	close(ns_sysfs_fd);
+	ns_sysfs_fd = -1;
 
 	return ret;
 }

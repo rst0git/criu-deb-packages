@@ -40,7 +40,8 @@ struct cr_options {
 	struct list_head	veth_pairs;
 	struct list_head	scripts;
 	bool			use_page_server;
-	struct sockaddr_in	ps_addr;
+	unsigned short		ps_port;
+	char			*addr;
 	bool			track_mem;
 	char			*img_parent;
 };
@@ -73,7 +74,6 @@ extern int close_service_fd(enum sfd_type type);
 extern bool is_service_fd(int fd, enum sfd_type type);
 extern bool is_any_service_fd(int fd);
 
-void show_posix_timers(int fd);
 int check_img_inventory(void);
 int write_img_inventory(void);
 void kill_inventory(void);
@@ -187,6 +187,16 @@ static inline int in_vma_area(struct vma_area *vma, unsigned long addr)
 {
 	return addr >= (unsigned long)vma->vma.start &&
 		addr < (unsigned long)vma->vma.end;
+}
+
+/*
+ * When we have to restore a shared resource, we mush select which
+ * task should do it, and make other(s) wait for it. In order to
+ * avoid deadlocks, always make task with lower pid be the restorer.
+ */
+static inline bool pid_rst_prio(unsigned pid_a, unsigned pid_b)
+{
+	return pid_a < pid_b;
 }
 
 #endif /* __CR_CRTOOLS_H__ */

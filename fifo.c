@@ -125,8 +125,6 @@ static int collect_one_fifo(void *o, ProtobufCMessage *base)
 	pr_info("Collected fifo entry ID %#x PIPE ID %#x\n",
 			info->fe->id, info->fe->pipe_id);
 
-	file_desc_add(&info->d, info->fe->id, &fifo_desc_ops);
-
 	/* check who will restore the fifo data */
 	list_for_each_entry(f, &fifo_head, list)
 		if (f->fe->pipe_id == info->fe->pipe_id)
@@ -140,17 +138,18 @@ static int collect_one_fifo(void *o, ProtobufCMessage *base)
 		info->restore_data = false;
 	}
 
-	return 0;
+	return file_desc_add(&info->d, info->fe->id, &fifo_desc_ops);
+
 }
+
+struct collect_image_info fifo_cinfo = {
+	.fd_type = CR_FD_FIFO,
+	.pb_type = PB_FIFO,
+	.priv_size = sizeof(struct fifo_info),
+	.collect = collect_one_fifo,
+};
 
 int collect_fifo(void)
 {
-	int ret;
-
-	ret = collect_image(CR_FD_FIFO, PB_FIFO,
-			sizeof(struct fifo_info), collect_one_fifo);
-	if (!ret)
-		ret = collect_pipe_data(CR_FD_FIFO_DATA, pd_hash_fifo);
-
-	return ret;
+	return collect_pipe_data(CR_FD_FIFO_DATA, pd_hash_fifo);
 }

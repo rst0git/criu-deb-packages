@@ -29,7 +29,6 @@ struct parasite_ctl {
 	user_regs_struct_t	regs_orig;				/* original registers */
 
 	k_rtsigset_t		sig_blocked;
-	bool			use_sig_blocked;
 
 	void			*rstack;				/* thread leader stack*/
 	struct rt_sigframe	*sigframe;
@@ -63,17 +62,23 @@ extern int parasite_dump_posix_timers_seized(struct proc_posix_timers_stat *proc
 	})
 
 extern void *parasite_args_s(struct parasite_ctl *ctl, int args_size);
-extern int parasite_execute_daemon(unsigned int cmd, struct parasite_ctl *ctl);
 extern int parasite_send_fd(struct parasite_ctl *ctl, int fd);
-extern int __parasite_execute_daemon(unsigned int cmd,
-				     struct parasite_ctl *ctl, bool wait_ack);
-extern int __parasite_execute_daemon_wait_ack(unsigned int cmd,
+
+/*
+ * Execute a command in parasite when it's in daemon mode.
+ * The __-ed version is asyncronous (doesn't wait for ack).
+ */
+extern int parasite_execute_daemon(unsigned int cmd, struct parasite_ctl *ctl);
+extern int __parasite_execute_daemon(unsigned int cmd, struct parasite_ctl *ctl);
+
+extern int __parasite_wait_daemon_ack(unsigned int cmd,
 					      struct parasite_ctl *ctl);
 
 extern int parasite_dump_misc_seized(struct parasite_ctl *ctl, struct parasite_dump_misc *misc);
 extern int parasite_dump_creds(struct parasite_ctl *ctl, struct _CredsEntry *ce);
 extern int parasite_dump_thread_seized(struct parasite_ctl *ctl, int id,
 					struct pid *tid, struct _CoreEntry *core);
+extern int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread *dt);
 
 extern int parasite_drain_fds_seized(struct parasite_ctl *ctl,
 					struct parasite_drain_fd *dfds,
@@ -102,10 +107,8 @@ extern int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 			  unsigned long arg3, unsigned long arg4,
 			  unsigned long arg5, unsigned long arg6);
 
-extern int __parasite_execute_trap(struct parasite_ctl *ctl, pid_t pid,
-				   user_regs_struct_t *regs,
-				   user_regs_struct_t *regs_orig,
-				   bool signals_blocked);
+extern int __parasite_execute_syscall(struct parasite_ctl *ctl,
+				user_regs_struct_t *regs);
 extern bool arch_can_dump_task(pid_t pid);
 
 extern int parasite_fixup_vdso(struct parasite_ctl *ctl, pid_t pid,

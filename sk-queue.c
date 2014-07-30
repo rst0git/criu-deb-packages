@@ -15,7 +15,7 @@
 #include "image.h"
 #include "crtools.h"
 #include "util.h"
-#include "util-net.h"
+#include "util-pie.h"
 #include "sockets.h"
 
 #include "sk-queue.h"
@@ -127,7 +127,13 @@ int dump_sk_queue(int sock_fd, int sock_id)
 		};
 
 		ret = pe.length = recvmsg(sock_fd, &msg, MSG_DONTWAIT | MSG_PEEK);
-		if (ret < 0) {
+		if (!ret)
+			/*
+			 * It means, that peer has performed an
+			 * orderly shutdown, so we're done.
+			 */
+			break;
+		else if (ret < 0) {
 			if (errno == EAGAIN)
 				break; /* we're done */
 			pr_perror("recvmsg fail: error");
@@ -170,15 +176,10 @@ err_brk:
 	return ret;
 }
 
-static void sk_queue_data_handler(int fd, void *obj)
+void sk_queue_data_handler(int fd, void *obj)
 {
 	SkPacketEntry *e = obj;
 	print_image_data(fd, e->length, opts.show_pages_content);
-}
-
-void show_sk_queues(int fd)
-{
-	pb_show_plain_payload(fd, PB_SK_QUEUES, sk_queue_data_handler);
 }
 
 int restore_sk_queue(int fd, unsigned int peer_id)

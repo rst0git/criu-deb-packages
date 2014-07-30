@@ -382,7 +382,7 @@ static int dump_task_mappings(pid_t pid, const struct vm_area_list *vma_area_lis
 			ret = 0;
 
 		if (!ret)
-			ret = pb_write_one(fd, vma, PB_VMAS);
+			ret = pb_write_one(fd, vma, PB_VMA);
 		if (ret)
 			goto err;
 	}
@@ -463,12 +463,11 @@ err:
 	return ret;
 }
 
-static int dump_task_mm(struct parasite_ctl *ctl, const struct proc_pid_stat *stat,
+static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
 		const struct parasite_dump_misc *misc, const struct cr_fdset *fdset)
 {
 	MmEntry mme = MM_ENTRY__INIT;
 	int ret = -1;
-	pid_t pid = ctl->pid.real;
 
 	mme.mm_start_code = stat->start_code;
 	mme.mm_end_code = stat->end_code;
@@ -626,28 +625,35 @@ static int dump_task_ids(struct pstree_item *item, const struct cr_fdset *cr_fds
 	return pb_write_one(fdset_fd(cr_fdset, CR_FD_IDS), item->ids, PB_IDS);
 }
 
-static int dump_task_core_all(struct parasite_ctl *ctl,
-		CoreEntry *core,
+int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread *ti)
+{
+	int ret;
+	ThreadCoreEntry *tc = core->thread_core;
+
+	ret = get_task_futex_robust_list(pid, tc);
+	if (!ret)
+		ret = dump_sched_info(pid, tc);
+	if (!ret) {
+		core_put_tls(core, ti->tls);
+		CORE_THREAD_ARCH_INFO(core)->clear_tid_addr = encode_pointer(ti->tid_addr);
+		BUG_ON(!tc->sas);
+		copy_sas(tc->sas, &ti->sas);
+	}
+
+	return ret;
+}
+
+static int dump_task_core_all(pid_t pid, CoreEntry *core,
 		const struct proc_pid_stat *stat,
 		const struct parasite_dump_misc *misc,
-		struct vm_area_list *vma_area_list,
 		const struct cr_fdset *cr_fdset)
 {
 	int fd_core = fdset_fd(cr_fdset, CR_FD_CORE);
 	int ret = -1;
-	pid_t pid = ctl->pid.real;
 
 	pr_info("\n");
 	pr_info("Dumping core (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
-
-	ret = dump_task_mm(ctl, stat, misc, cr_fdset);
-	if (ret)
-		goto err;
-
-	ret = get_task_futex_robust_list(pid, core->thread_core);
-	if (ret)
-		goto err;
 
 	ret = get_task_personality(pid, &core->tc->personality);
 	if (ret)
@@ -655,15 +661,12 @@ static int dump_task_core_all(struct parasite_ctl *ctl,
 
 	strncpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
 	core->tc->flags = stat->flags;
-
 	core->tc->task_state = TASK_ALIVE;
 	core->tc->exit_code = 0;
 
-	ret = dump_sched_info(pid, core->thread_core);
+	ret = dump_thread_core(pid, core, &misc->ti);
 	if (ret)
 		goto err;
-
-	core_put_tls(core, misc->tls);
 
 	ret = pb_write_one(fd_core, core, PB_CORE);
 	if (ret < 0)
@@ -1087,19 +1090,11 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl,
 	pr_info("Dumping core for thread (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
 
-	ret = get_task_futex_robust_list(pid, core->thread_core);
-	if (ret)
-		goto err;
-
 	ret = parasite_dump_thread_seized(parasite_ctl, id, tid, core);
 	if (ret) {
 		pr_err("Can't dump thread for pid %d\n", pid);
 		goto err;
 	}
-
-	ret = dump_sched_info(pid, core->thread_core);
-	if (ret)
-		goto err;
 
 	fd_core = open_image(CR_FD_CORE, O_DUMP, tid->virt);
 	if (fd_core < 0)
@@ -1123,6 +1118,7 @@ static int dump_one_zombie(const struct pstree_item *item,
 	if (!core)
 		return -1;
 
+	strncpy((char *)core->tc->comm, pps->comm, TASK_COMM_LEN);
 	core->tc->task_state = TASK_DEAD;
 	core->tc->exit_code = pps->exit_code;
 
@@ -1196,6 +1192,26 @@ static int dump_thread_signals(struct pid *tid)
 	return ret;
 }
 
+static int dump_task_signals(pid_t pid, struct pstree_item *item,
+		struct cr_fdset *cr_fdset)
+{
+	int i, ret;
+
+	ret = dump_signal_queue(pid, fdset_fd(cr_fdset, CR_FD_SIGNAL), true);
+	if (ret) {
+		pr_err("Can't dump pending signals (pid: %d)\n", pid);
+		return -1;
+	}
+
+	for (i = 0; i < item->nr_threads; i++) {
+		ret = dump_thread_signals(&item->threads[i]);
+		if (ret)
+			return -1;
+	}
+
+	return 0;
+}
+
 static struct proc_pid_stat pps_buf;
 
 static int dump_task_threads(struct parasite_ctl *parasite_ctl,
@@ -1258,14 +1274,11 @@ static int fill_zombies_pids(struct pstree_item *item)
 static int dump_zombies(void)
 {
 	struct pstree_item *item;
-	int oldfd, ret = -1;
+	int ret = -1;
 	int pidns = current_ns_mask & CLONE_NEWPID;
 
-	if (pidns) {
-		oldfd = set_proc_fd(pidns_proc);
-		if (oldfd < 0)
-			return -1;
-	}
+	if (pidns && set_proc_fd(pidns_proc))
+		return -1;
 
 	for_each_pstree_item(item) {
 		if (item->state != TASK_DEAD)
@@ -1365,7 +1378,7 @@ static int dump_one_task(struct pstree_item *item)
 	pid_t pid = item->pid.real;
 	struct vm_area_list vmas;
 	struct parasite_ctl *parasite_ctl;
-	int i, ret = -1;
+	int ret = -1;
 	struct parasite_dump_misc misc;
 	struct cr_fdset *cr_fdset = NULL;
 	struct parasite_drain_fd *dfds;
@@ -1501,7 +1514,13 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure;
 	}
 
-	ret = dump_task_core_all(parasite_ctl, item->core[0], &pps_buf, &misc, &vmas, cr_fdset);
+	ret = dump_task_mm(pid, &pps_buf, &misc, cr_fdset);
+	if (ret) {
+		pr_err("Dump mm (pid: %d) failed with %d\n", pid, ret);
+		goto err_cure;
+	}
+
+	ret = dump_task_core_all(pid, item->core[0], &pps_buf, &misc, cr_fdset);
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
@@ -1543,16 +1562,10 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
-	ret = dump_signal_queue(pid, fdset_fd(cr_fdset, CR_FD_SIGNAL), true);
+	ret = dump_task_signals(pid, item, cr_fdset);
 	if (ret) {
-		pr_err("Can't dump pending signals (pid: %d)\n", pid);
-		goto err_cure;
-	}
-
-	for (i = 0; i < item->nr_threads; i++) {
-		ret = dump_thread_signals(&item->threads[i]);
-		if (ret)
-			goto err;
+		pr_err("Dump %d signals failed %d\n", pid, ret);
+		goto err;
 	}
 
 	close_cr_fdset(&cr_fdset);
@@ -1577,6 +1590,9 @@ int cr_pre_dump_tasks(pid_t pid)
 	LIST_HEAD(ctls);
 	struct parasite_ctl *ctl, *n;
 
+	if (init_stats(DUMP_STATS))
+		goto err;
+
 	if (kerndat_init())
 		goto err;
 
@@ -1592,6 +1608,9 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	ret = 0;
 err:
+	if (disconnect_from_page_server())
+		ret = -1;
+
 	pstree_switch_state(root_item,
 			ret ? TASK_ALIVE : opts.final_state);
 	free_pstree(root_item);
@@ -1631,11 +1650,15 @@ err:
 int cr_dump_tasks(pid_t pid)
 {
 	struct pstree_item *item;
+	int post_dump_ret = 0;
 	int ret = -1;
 
 	pr_info("========================================\n");
 	pr_info("Dumping processes (pid: %d)\n", pid);
 	pr_info("========================================\n");
+
+	if (init_stats(DUMP_STATS))
+		goto err;
 
 	if (kerndat_init())
 		goto err;
@@ -1709,17 +1732,39 @@ int cr_dump_tasks(pid_t pid)
 
 	fd_id_show_tree();
 err:
+	if (disconnect_from_page_server())
+		ret = -1;
+
 	close_cr_fdset(&glob_fdset);
+
+	if (!ret) {
+		/*
+		 * It might be a migration case, where we're asked
+		 * to dump everything, then some script transfer
+		 * image on a new node and we're supposed to kill
+		 * dumpee because it continue running somewhere
+		 * else.
+		 *
+		 * Thus ask user via script if we're to break
+		 * checkpoint.
+		 */
+		post_dump_ret = run_scripts("post-dump");
+		if (post_dump_ret) {
+			post_dump_ret = WEXITSTATUS(post_dump_ret);
+			pr_info("Post dump script passed with %d\n", post_dump_ret);
+		}
+	}
 
 	/*
 	 * If we've failed to do anything -- unlock all TCP sockets
 	 * so that the connections can go on. But if we succeeded --
 	 * don't, just close them silently.
 	 */
-	if (ret)
+	if (ret || post_dump_ret)
 		network_unlock();
 	pstree_switch_state(root_item,
-			ret ? TASK_ALIVE : opts.final_state);
+			    (ret || post_dump_ret) ?
+			    TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
 	free_pstree(root_item);
 	free_file_locks();
@@ -1734,5 +1779,5 @@ err:
 		pr_info("Dumping finished successfully\n");
 	}
 
-	return ret;
+	return post_dump_ret ? : ret;
 }

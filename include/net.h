@@ -3,8 +3,6 @@
 
 #include "list.h"
 
-void show_netdevices(int fd);
-
 struct cr_fdset;
 int dump_net_ns(int pid, struct cr_fdset *);
 int prepare_net_ns(int pid);
@@ -20,5 +18,10 @@ extern int network_lock(void);
 extern void network_unlock(void);
 
 extern struct ns_desc net_ns_desc;
+
+#include "protobuf/netdev.pb-c.h"
+int write_netdev_img(NetDeviceEntry *nde, struct cr_fdset *fds);
+int read_ns_sys_file(char *path, char *buf, int len);
+int restore_link_parms(NetDeviceEntry *nde, int nlsk);
 
 #endif /* __CR_NET_H__ */

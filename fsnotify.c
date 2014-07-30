@@ -77,26 +77,6 @@ int is_fanotify_link(int lfd)
 	return is_anon_link_type(lfd, "[fanotify]");
 }
 
-void show_inotify_wd(int fd_inotify_wd)
-{
-	pb_show_plain(fd_inotify_wd, PB_INOTIFY_WD);
-}
-
-void show_inotify(int fd_inotify)
-{
-	pb_show_plain(fd_inotify, PB_INOTIFY);
-}
-
-void show_fanotify_mark(int fd)
-{
-	pb_show_plain(fd, PB_FANOTIFY_MARK);
-}
-
-void show_fanotify(int fd)
-{
-	pb_show_plain(fd, PB_FANOTIFY);
-}
-
 static int dump_inotify_entry(union fdinfo_entries *e, void *arg)
 {
 	InotifyWdEntry *we = &e->ify;
@@ -119,7 +99,7 @@ static int dump_one_inotify(int lfd, u32 id, const struct fd_parms *p)
 	ie.fown = (FownEntry *)&p->fown;
 
 	pr_info("id 0x%08x flags 0x%08x\n", ie.id, ie.flags);
-	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_INOTIFY), &ie, PB_INOTIFY))
+	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_INOTIFY_FILE), &ie, PB_INOTIFY_FILE))
 		return -1;
 
 	return parse_fdinfo(lfd, FD_TYPES__INOTIFY, dump_inotify_entry, &id);
@@ -187,7 +167,7 @@ static int dump_one_fanotify(int lfd, u32 id, const struct fd_parms *p)
 	fe.faflags = fsn_params.faflags;
 	fe.evflags = fsn_params.evflags;
 
-	return pb_write_one(fdset_fd(glob_fdset, CR_FD_FANOTIFY), &fe, PB_FANOTIFY);
+	return pb_write_one(fdset_fd(glob_fdset, CR_FD_FANOTIFY_FILE), &fe, PB_FANOTIFY_FILE);
 }
 
 const struct fdtype_ops fanotify_dump_ops = {
@@ -455,11 +435,17 @@ static int collect_one_inotify(void *o, ProtobufCMessage *msg)
 	info->ife = pb_msg(msg, InotifyFileEntry);
 	INIT_LIST_HEAD(&info->marks);
 	list_add(&info->list, &inotify_info_head);
-	file_desc_add(&info->d, info->ife->id, &inotify_desc_ops);
 	pr_info("Collected id 0x%08x flags 0x%08x\n", info->ife->id, info->ife->flags);
-
-	return 0;
+	return file_desc_add(&info->d, info->ife->id, &inotify_desc_ops);
 }
+
+struct collect_image_info inotify_cinfo = {
+	.fd_type = CR_FD_INOTIFY_FILE,
+	.pb_type = PB_INOTIFY_FILE,
+	.priv_size = sizeof(struct fsnotify_file_info),
+	.collect = collect_one_inotify,
+	.flags = COLLECT_OPTIONAL,
+};
 
 static int collect_one_fanotify(void *o, ProtobufCMessage *msg)
 {
@@ -468,11 +454,17 @@ static int collect_one_fanotify(void *o, ProtobufCMessage *msg)
 	info->ffe = pb_msg(msg, FanotifyFileEntry);
 	INIT_LIST_HEAD(&info->marks);
 	list_add(&info->list, &fanotify_info_head);
-	file_desc_add(&info->d, info->ffe->id, &fanotify_desc_ops);
 	pr_info("Collected id 0x%08x flags 0x%08x\n", info->ffe->id, info->ffe->flags);
-
-	return 0;
+	return file_desc_add(&info->d, info->ffe->id, &fanotify_desc_ops);
 }
+
+struct collect_image_info fanotify_cinfo = {
+	.fd_type = CR_FD_FANOTIFY_FILE,
+	.pb_type = PB_FANOTIFY_FILE,
+	.priv_size = sizeof(struct fsnotify_file_info),
+	.collect = collect_one_fanotify,
+	.flags = COLLECT_OPTIONAL,
+};
 
 static int collect_one_inotify_mark(void *o, ProtobufCMessage *msg)
 {
@@ -485,6 +477,14 @@ static int collect_one_inotify_mark(void *o, ProtobufCMessage *msg)
 	return collect_inotify_mark(mark);
 }
 
+struct collect_image_info inotify_mark_cinfo = {
+	.fd_type = CR_FD_INOTIFY_WD,
+	.pb_type = PB_INOTIFY_WD,
+	.priv_size = sizeof(struct fsnotify_mark_info),
+	.collect = collect_one_inotify_mark,
+	.flags = COLLECT_OPTIONAL,
+};
+
 static int collect_one_fanotify_mark(void *o, ProtobufCMessage *msg)
 {
 	struct fsnotify_mark_info *mark = o;
@@ -496,27 +496,10 @@ static int collect_one_fanotify_mark(void *o, ProtobufCMessage *msg)
 	return collect_fanotify_mark(mark);
 }
 
-int collect_inotify(void)
-{
-	int ret;
-
-	ret = collect_image(CR_FD_INOTIFY, PB_INOTIFY,
-			sizeof(struct fsnotify_file_info), collect_one_inotify);
-	if (ret && errno == ENOENT)
-		return 0;
-	if (!ret)
-		ret = collect_image(CR_FD_INOTIFY_WD, PB_INOTIFY_WD,
-				sizeof(struct fsnotify_mark_info),
-				collect_one_inotify_mark);
-	if (!ret)
-		ret = collect_image(CR_FD_FANOTIFY, PB_FANOTIFY,
-				    sizeof(struct fsnotify_file_info),
-				    collect_one_fanotify);
-	if (ret && errno == ENOENT)
-		return 0;
-	if (!ret)
-		ret = collect_image(CR_FD_FANOTIFY_MARK, PB_FANOTIFY_MARK,
-				    sizeof(struct fsnotify_mark_info),
-				    collect_one_fanotify_mark);
-	return ret;
-}
+struct collect_image_info fanotify_mark_cinfo = {
+	.fd_type = CR_FD_FANOTIFY_MARK,
+	.pb_type = PB_FANOTIFY_MARK,
+	.priv_size = sizeof(struct fsnotify_mark_info),
+	.collect = collect_one_fanotify_mark,
+	.flags = COLLECT_OPTIONAL,
+};

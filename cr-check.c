@@ -17,7 +17,7 @@
 #include "sockets.h"
 #include "crtools.h"
 #include "log.h"
-#include "util-net.h"
+#include "util-pie.h"
 #include "syscall.h"
 #include "files.h"
 #include "sk-inet.h"
@@ -26,6 +26,7 @@
 #include "tty.h"
 #include "ptrace.h"
 #include "kerndat.h"
+#include "tun.h"
 
 static int check_tty(void)
 {
@@ -468,6 +469,7 @@ int check_ptrace_peeksiginfo()
 	struct ptrace_peeksiginfo_args arg;
 	siginfo_t siginfo;
 	pid_t pid, ret = 0;
+	k_rtsigset_t mask;
 
 	pid = fork();
 	if (pid < 0)
@@ -492,6 +494,11 @@ int check_ptrace_peeksiginfo()
 		ret = -1;
 	}
 
+	if (ptrace(PTRACE_GETSIGMASK, pid, sizeof(mask), &mask) != 0) {
+		pr_perror("Unable to dump signal blocking mask");
+		ret = -1;
+	}
+
 	ptrace(PTRACE_KILL, pid, NULL, NULL);
 
 	return ret;
@@ -499,11 +506,6 @@ int check_ptrace_peeksiginfo()
 
 static int check_mem_dirty_track(void)
 {
-	if (opts.check_ms_kernel) {
-		pr_warn("Skipping dirty tracking check (not yet merged)\n");
-		return 0;
-	}
-
 	if (kerndat_get_dirty_track() < 0)
 		return -1;
 
@@ -553,6 +555,7 @@ int cr_check(void)
 	ret |= check_ptrace_peeksiginfo();
 	ret |= check_mem_dirty_track();
 	ret |= check_posix_timers();
+	ret |= check_tun();
 
 	if (!ret)
 		pr_msg("Looks good.\n");

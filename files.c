@@ -21,7 +21,7 @@
 #include "image.h"
 #include "list.h"
 #include "util.h"
-#include "util-net.h"
+#include "util-pie.h"
 #include "lock.h"
 #include "sockets.h"
 #include "pstree.h"
@@ -33,6 +33,7 @@
 #include "fsnotify.h"
 #include "signalfd.h"
 #include "namespaces.h"
+#include "tun.h"
 
 #include "parasite.h"
 #include "parasite-syscall.h"
@@ -41,34 +42,36 @@
 #include "protobuf/fs.pb-c.h"
 
 #define FDESC_HASH_SIZE	64
-static struct list_head file_desc_hash[FDESC_HASH_SIZE];
+static struct hlist_head file_desc_hash[FDESC_HASH_SIZE];
 
 int prepare_shared_fdinfo(void)
 {
 	int i;
 
 	for (i = 0; i < FDESC_HASH_SIZE; i++)
-		INIT_LIST_HEAD(&file_desc_hash[i]);
+		INIT_HLIST_HEAD(&file_desc_hash[i]);
 
 	return 0;
 }
 
-void file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops)
+int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops)
 {
 	d->id = id;
 	d->ops = ops;
 	INIT_LIST_HEAD(&d->fd_info_head);
 
-	list_add_tail(&d->hash, &file_desc_hash[id % FDESC_HASH_SIZE]);
+	hlist_add_head(&d->hash, &file_desc_hash[id % FDESC_HASH_SIZE]);
+
+	return 0; /* this is to make tail-calls in collect_one_foo look nice */
 }
 
 struct file_desc *find_file_desc_raw(int type, u32 id)
 {
 	struct file_desc *d;
-	struct list_head *chain;
+	struct hlist_head *chain;
 
 	chain = &file_desc_hash[id % FDESC_HASH_SIZE];
-	list_for_each_entry(d, chain, hash)
+	hlist_for_each_entry(d, chain, hash)
 		if (d->ops->type == type && d->id == id)
 			return d;
 
@@ -98,7 +101,7 @@ void show_saved_files(void)
 
 	pr_info("File descs:\n");
 	for (i = 0; i < FDESC_HASH_SIZE; i++)
-		list_for_each_entry(fd, &file_desc_hash[i], hash) {
+		hlist_for_each_entry(fd, &file_desc_hash[i], hash) {
 			struct fdinfo_list_entry *le;
 
 			pr_info(" `- type %d ID %#x\n", fd->ops->type, fd->id);
@@ -130,7 +133,7 @@ int do_dump_gen_file(struct fd_parms *p, int lfd,
 	if (ret < 0)
 		return -1;
 
-	pr_info("fdinfo: type: 0x%2x flags: %#o/%#o pos: 0x%8lx fd: %d\n",
+	pr_info("fdinfo: type: 0x%2x flags: %#o/%#o pos: 0x%8"PRIx64" fd: %d\n",
 		ops->type, p->flags, (int)p->fd_flags, p->pos, p->fd);
 
 	return pb_write_one(fdinfo, &e, PB_FDINFO);
@@ -138,7 +141,7 @@ int do_dump_gen_file(struct fd_parms *p, int lfd,
 
 int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
 {
-	size_t len;
+	int len;
 
 	link->name[0] = '.';
 
@@ -176,7 +179,7 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 
 	fown_entry__init(&p->fown);
 
-	pr_info("%d fdinfo %d: pos: 0x%16lx flags: %16o/%#x\n",
+	pr_info("%d fdinfo %d: pos: 0x%16"PRIx64" flags: %16o/%#x\n",
 		ctl->pid.real, fd, p->pos, p->flags, (int)p->fd_flags);
 
 	ret = fcntl(lfd, F_GETSIG, 0);
@@ -204,6 +207,16 @@ static int dump_unsupp_fd(const struct fd_parms *p)
 	return -1;
 }
 
+static const struct fdtype_ops *get_misc_dev_ops(int minor)
+{
+	switch (minor) {
+	case TUN_MINOR:
+		return &tunfile_dump_ops;
+	};
+
+	return NULL;
+}
+
 static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
 {
 	int maj = major(p->stat.st_rdev);
@@ -218,6 +231,11 @@ static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
 	case UNIX98_PTY_SLAVE_MAJOR:
 		ops = &tty_dump_ops;
 		break;
+	case MISC_MAJOR:
+		ops = get_misc_dev_ops(minor(p->stat.st_rdev));
+		if (ops)
+			break;
+		/* fallthrough */
 	default:
 		return dump_unsupp_fd(p);
 	}
@@ -425,10 +443,9 @@ static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 		return -1;
 	}
 
-	list_for_each_entry(le, &fdesc->fd_info_head, desc_list) {
-		if (le->pid > new_le->pid)
+	list_for_each_entry(le, &fdesc->fd_info_head, desc_list)
+		if (pid_rst_prio(new_le->pid, le->pid))
 			break;
-	}
 
 	list_add_tail(&new_le->desc_list, &le->desc_list);
 	new_le->desc = fdesc;
@@ -532,6 +549,36 @@ err:
 	return -1;
 }
 
+struct fd_open_state {
+	char *name;
+	int (*cb)(int, struct fdinfo_list_entry *);
+
+	/*
+	 * Two last stages -- receive fds and post-open them -- are
+	 * not required always. E.g. if no fd sharing takes place
+	 * or task doens't have any files that need to be post-opened.
+	 *
+	 * Thus, in order not to scan through fdinfo-s lists in vain
+	 * and speed things up a little bit, we may want to skeep these.
+	 */
+	bool required;
+};
+
+static int open_transport_fd(int pid, struct fdinfo_list_entry *fle);
+static int open_fd(int pid, struct fdinfo_list_entry *fle);
+static int receive_fd(int pid, struct fdinfo_list_entry *fle);
+static int post_open_fd(int pid, struct fdinfo_list_entry *fle);
+
+static struct fd_open_state states[] = {
+	{ "prepare",		open_transport_fd,	true,},
+	{ "create",		open_fd,		true,},
+	{ "receive",		receive_fd,		false,},
+	{ "post_create",	post_open_fd,		false,},
+};
+
+#define want_recv_stage()	do { states[2].required = true; } while (0)
+#define want_post_open_stage()	do { states[3].required = true; } while (0)
+
 static void transport_name_gen(struct sockaddr_un *addr, int *len,
 		int pid, int fd)
 {
@@ -595,6 +642,7 @@ static int open_transport_fd(int pid, struct fdinfo_list_entry *fle)
 
 	pr_info("\t\tWake up fdinfo pid=%d fd=%d\n", fle->pid, fle->fe->fd);
 	futex_set_and_wake(&fle->real_pid, getpid());
+	want_recv_stage();
 
 	return 0;
 }
@@ -687,6 +735,9 @@ static int open_fd(int pid, struct fdinfo_list_entry *fle)
 	struct file_desc *d = fle->desc;
 	int new_fd;
 
+	if (d->ops->post_open)
+		want_post_open_stage();
+
 	if (fle != file_master(d))
 		return 0;
 
@@ -733,18 +784,6 @@ static int receive_fd(int pid, struct fdinfo_list_entry *fle)
 
 	return 0;
 }
-
-struct fd_open_state {
-	char *name;
-	int (*cb)(int, struct fdinfo_list_entry *);
-};
-
-static struct fd_open_state states[] = {
-	{ "prepare",		open_transport_fd, },
-	{ "create",		open_fd, },
-	{ "receive",		receive_fd, },
-	{ "post_create",	post_open_fd, },
-};
 
 static int open_fdinfo(int pid, struct fdinfo_list_entry *fle, int state)
 {
@@ -823,6 +862,11 @@ int prepare_fds(struct pstree_item *me)
 	}
 
 	for (state = 0; state < ARRAY_SIZE(states); state++) {
+		if (!states[state].required) {
+			pr_debug("Skipping %s fd stage\n", states[state].name);
+			continue;
+		}
+
 		ret = open_fdinfos(me->pid.virt, &me->rst->fds, state);
 		if (ret)
 			break;
@@ -927,7 +971,7 @@ int shared_fdt_prepare(struct pstree_item *item)
 	item->rst->fdt = fdt;
 	item->rst->service_fd_id = fdt->nr;
 	fdt->nr++;
-	if (fdt->pid > item->pid.virt)
+	if (pid_rst_prio(item->pid.virt, fdt->pid))
 		fdt->pid = item->pid.virt;
 
 	return 0;

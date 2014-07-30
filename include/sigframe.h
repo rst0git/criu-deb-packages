@@ -1,7 +1,14 @@
+/*
+ * Generic sigframe bits.
+ */
+
 #ifndef __CR_SIGFRAME_H__
 #define __CR_SIGFRAME_H__
 
-// Generic sigframe bits
+#include "asm/types.h"
+#include "protobuf/core.pb-c.h"
+
+struct rt_sigframe;
 
 #ifndef __ARCH_SI_PREAMBLE_SIZE
 #define __ARCH_SI_PREAMBLE_SIZE	(3 * sizeof(int))
@@ -35,8 +42,22 @@ struct rt_ucontext {
 	unsigned long           uc_regspace[128] __attribute__((__aligned__(8)));
 };
 
-struct rt_sigframe;
-int construct_sigframe(struct rt_sigframe *sigframe,
-				     struct rt_sigframe *rsigframe,
-				     CoreEntry *core);
-#endif
+extern int construct_sigframe(struct rt_sigframe *sigframe,
+			      struct rt_sigframe *rsigframe,
+			      CoreEntry *core);
+
+/*
+ * FIXME Convert it to inline helper, which requires
+ *	 to unweave types mess we've generated for
+ *	 run-time data.
+ */
+#define setup_sas(sigframe, sas)											\
+do {															\
+	if ((sas)) {													\
+		RT_SIGFRAME_UC((sigframe)).uc_stack.ss_sp	= (void *)decode_pointer((sas)->ss_sp);			\
+		RT_SIGFRAME_UC((sigframe)).uc_stack.ss_flags	= (int)(sas)->ss_flags;					\
+		RT_SIGFRAME_UC((sigframe)).uc_stack.ss_size	= (size_t)(sas)->ss_size;				\
+	}														\
+} while (0)
+
+#endif /* __CR_SIGFRAME_H__ */

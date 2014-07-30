@@ -39,15 +39,17 @@ extern void do_pb_show_plain(int fd, int type, int single_entry,
 #define pb_show_plain_pretty(__fd, __proto_message_name, __pretty)		\
 	pb_show_plain_payload_pretty(__fd, __proto_message_name, NULL, __pretty)
 
-#define pb_show_plain(__fd, __type)							\
-	pb_show_plain_payload(__fd, __type, NULL)
+struct collect_image_info {
+	int fd_type;
+	int pb_type;
+	unsigned int priv_size;
+	int (*collect)(void *, ProtobufCMessage *);
+	unsigned flags;
+};
 
-#define pb_show_vertical(__fd, __type)							\
-	do_pb_show_plain(__fd, __type, 1, NULL, NULL)
+#define COLLECT_SHARED		0x1	/* use shared memory for obj-s */
+#define COLLECT_OPTIONAL	0x2	/* image file may be missing */
 
-int collect_image(int fd_t, int obj_t, unsigned size,
-		int (*collect)(void *obj, ProtobufCMessage *msg));
-int collect_image_sh(int fd_t, int obj_t, unsigned size,
-		int (*collect)(void *obj, ProtobufCMessage *msg));
+int collect_image(struct collect_image_info *);
 
 #endif /* __CR_PROTOBUF_H__ */

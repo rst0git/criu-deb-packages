@@ -132,7 +132,7 @@ $(1)-all-objs += $(all-objs)
 
 $$(obj)/$(1).built-in.o: $$($(1)-all-objs) $$($(1)-libs-e) $(libs-e)
 	$$(E) "  LINK    " $$@
-	$$(Q) $$(LD) -r -o $$@ $$^
+	$$(Q) $$(LD) $$(LDFLAGS) -r -o $$@ $$^
 
 _all += $$(obj)/$(1).built-in.o
 endef
@@ -152,10 +152,20 @@ ifeq ($(targets),)
 ifneq ($(all-objs),)
 $(obj)/built-in.o: $(all-objs) $(libs-e)
 	$(E) "  LINK    " $@
-	$(Q) $(LD) -r -o $@ $^
+	$(Q) $(LD) $(LDFLAGS) -r -o $@ $^
 
 _all += $(obj)/built-in.o
 endif
+endif
+
+##
+## A rule for building library.
+ifneq ($(lib-so),)
+$(obj)/$(lib-so).so: $(all-objs) $(libs-e)
+	$(E) "  LINK    " $@
+	$(Q) $(CC) -shared $(cflags-so) -o $@ $^
+
+_all += $(obj)/$(lib-so).so
 endif
 
 ##
@@ -175,6 +185,7 @@ cleanup-y += $(obj)/*.o $(obj)/*.d
 cleanup-y += $(obj)/*.i $(obj)/*.s
 cleanup-y += $(obj)/*.built-in.o
 cleanup-y += $(obj)/built-in.o
+cleanup-y += $(obj)/*.so
 
 ##
 ## Predefined .PHONY targets

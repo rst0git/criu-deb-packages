@@ -13,6 +13,7 @@
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <sys/prctl.h>
 
 #include "zdtmtst.h"
 #include "lock.h"
@@ -32,17 +33,9 @@ TEST_OPTION(pidfile, string, "file to store pid", 1);
 
 static pid_t master_pid = 0;
 
-int proc_id = 0;
-static int proc_id_cur = 0;
-
 int test_fork_id(int id)
 {
-	pid_t pid = fork();
-	if (id < 0)
-		id = ++proc_id_cur;
-	if (pid == 0)
-		proc_id = id;
-	return pid;
+	return fork();
 }
 
 #define INPROGRESS ".inprogress"
@@ -135,6 +128,11 @@ void test_init(int argc, char **argv)
 	val = getenv("ZDTM_UID");
 	if (val && (setuid(atoi(val)) == -1)) {
 		fprintf(stderr, "Can't set gid: %m");
+		exit(1);
+	}
+
+	if (prctl(PR_SET_DUMPABLE, 1)) {
+		fprintf(stderr, "Can't set the dumpable flag");
 		exit(1);
 	}
 

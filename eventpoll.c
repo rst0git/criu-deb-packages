@@ -56,16 +56,6 @@ static void pr_info_eventpoll(char *action, EventpollFileEntry *e)
 	pr_info("%seventpoll: id %#08x flags %#04x\n", action, e->id, e->flags);
 }
 
-void show_eventpoll_tfd(int fd)
-{
-	pb_show_plain(fd, PB_EVENTPOLL_TFD);
-}
-
-void show_eventpoll(int fd)
-{
-	pb_show_plain(fd, PB_EVENTPOLL);
-}
-
 static int dump_eventpoll_entry(union fdinfo_entries *e, void *arg)
 {
 	EventpollTfdEntry *efd = &e->epl;
@@ -85,8 +75,8 @@ static int dump_one_eventpoll(int lfd, u32 id, const struct fd_parms *p)
 	e.fown = (FownEntry *)&p->fown;
 
 	pr_info_eventpoll("Dumping ", &e);
-	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_EVENTPOLL),
-		     &e, PB_EVENTPOLL))
+	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_EVENTPOLL_FILE),
+		     &e, PB_EVENTPOLL_FILE))
 		return -1;
 
 	return parse_fdinfo(lfd, FD_TYPES__EVENTPOLL, dump_eventpoll_entry, &id);
@@ -176,28 +166,25 @@ static int collect_one_epoll_tfd(void *o, ProtobufCMessage *msg)
 	return 0;
 }
 
+struct collect_image_info epoll_tfd_cinfo = {
+	.fd_type = CR_FD_EVENTPOLL_TFD,
+	.pb_type = PB_EVENTPOLL_TFD,
+	.priv_size = sizeof(struct eventpoll_tfd_file_info),
+	.collect = collect_one_epoll_tfd,
+};
+
 static int collect_one_epoll(void *o, ProtobufCMessage *msg)
 {
 	struct eventpoll_file_info *info = o;
 
 	info->efe = pb_msg(msg, EventpollFileEntry);
-	file_desc_add(&info->d, info->efe->id, &desc_ops);
 	pr_info_eventpoll("Collected ", info->efe);
-
-	return 0;
+	return file_desc_add(&info->d, info->efe->id, &desc_ops);
 }
 
-int collect_eventpoll(void)
-{
-	int ret;
-
-	ret = collect_image(CR_FD_EVENTPOLL_TFD, PB_EVENTPOLL_TFD,
-			sizeof(struct eventpoll_tfd_file_info),
-			collect_one_epoll_tfd);
-	if (!ret)
-		ret = collect_image(CR_FD_EVENTPOLL, PB_EVENTPOLL,
-				sizeof(struct eventpoll_file_info),
-				collect_one_epoll);
-
-	return ret;
-}
+struct collect_image_info epoll_cinfo = {
+	.fd_type = CR_FD_EVENTPOLL_FILE,
+	.pb_type = PB_EVENTPOLL_FILE,
+	.priv_size = sizeof(struct eventpoll_file_info),
+	.collect = collect_one_epoll,
+};
