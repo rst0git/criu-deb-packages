@@ -1,15 +1,15 @@
-#ifndef PROC_PARSE_H__
-#define PROC_PARSE_H__
+#ifndef __CR_PROC_PARSE_H__
+#define __CR_PROC_PARSE_H__
 
 #include <sys/types.h>
-#include "types.h"
+#include "asm/types.h"
 #include "image.h"
 #include "list.h"
 
-#include "../protobuf/eventfd.pb-c.h"
-#include "../protobuf/eventpoll.pb-c.h"
-#include "../protobuf/signalfd.pb-c.h"
-#include "../protobuf/inotify.pb-c.h"
+#include "protobuf/eventfd.pb-c.h"
+#include "protobuf/eventpoll.pb-c.h"
+#include "protobuf/signalfd.pb-c.h"
+#include "protobuf/fsnotify.pb-c.h"
 
 #define PROC_TASK_COMM_LEN	32
 #define PROC_TASK_COMM_LEN_FMT	"(%31s"
@@ -134,9 +134,12 @@ union fdinfo_entries {
 	EventpollTfdEntry epl;
 	SignalfdEntry sfd;
 	InotifyWdEntry ify;
+	FanotifyMarkEntry ffy;
 };
 
 extern int parse_fdinfo(int fd, int type,
 		int (*cb)(union fdinfo_entries *e, void *arg), void *arg);
+extern int parse_cpuinfo_features(int (*handler)(char *tok));
+extern int parse_file_locks(void);
 
-#endif /* PROC_PARSE_H__ */
+#endif /* __CR_PROC_PARSE_H__ */

@@ -1,5 +1,5 @@
-#ifndef MOUNT_H__
-#define MOUNT_H__
+#ifndef __CR_MOUNT_H__
+#define __CR_MOUNT_H__
 
 extern int mntns_root;
 int mntns_collect_root(pid_t pid);
@@ -17,4 +17,11 @@ extern void show_mountpoints(int fd, struct cr_options *);
 int prepare_mnt_ns(int pid);
 
 extern int pivot_root(const char *new_root, const char *put_old);
-#endif /* MOUNT_H__ */
+
+struct mount_info;
+extern struct mount_info *lookup_mnt_id(unsigned int id);
+extern struct mount_info *lookup_mnt_sdev(unsigned int s_dev);
+
+extern struct ns_desc mnt_ns_desc;
+
+#endif /* __CR_MOUNT_H__ */

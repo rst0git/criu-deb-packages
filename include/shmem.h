@@ -1,7 +1,7 @@
 #ifndef __CR_SHMEM_H__
 #define __CR_SHMEM_H__
 
-#include "../protobuf/vma.pb-c.h"
+#include "protobuf/vma.pb-c.h"
 
 int prepare_shmem_pid(int pid);
 int prepare_shmem_restore(void);
@@ -13,4 +13,5 @@ extern struct shmems *rst_shmems;
 
 int cr_dump_shmem(void);
 int add_shmem_area(pid_t pid, VmaEntry *vma);
-#endif
+
+#endif /* __CR_SHMEM_H__ */

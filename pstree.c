@@ -5,6 +5,9 @@
 #include "pstree.h"
 #include "restorer.h"
 #include "util.h"
+#include "lock.h"
+#include "namespaces.h"
+#include "files.h"
 
 #include "protobuf.h"
 #include "protobuf/pstree.pb-c.h"
@@ -177,7 +180,7 @@ static int prepare_pstree_for_shell_job(void)
 
 static int read_pstree_image(void)
 {
-	int ret = 0, i, ps_fd;
+	int ret = 0, i, ps_fd, fd;
 	struct pstree_item *pi, *parent = NULL;
 
 	pr_info("Reading image tree\n");
@@ -260,6 +263,18 @@ static int read_pstree_image(void)
 		task_entries->nr_tasks++;
 
 		pstree_entry__free_unpacked(e, NULL);
+
+		fd = open_image_ro(CR_FD_IDS, pi->pid.virt);
+		if (fd < 0) {
+			if (errno == ENOENT)
+				continue;
+			return -1;
+		}
+		ret = pb_read_one(fd, &pi->ids, PB_IDS);
+		close(fd);
+		if (ret != 1)
+			goto err;
+
 	}
 err:
 	close(ps_fd);
@@ -289,7 +304,7 @@ static int prepare_pstree_ids(void)
 		if (item->sid == root_item->sid || item->sid == item->pid.virt)
 			continue;
 
-		helper = alloc_pstree_item();
+		helper = alloc_pstree_item_with_rst();
 		if (helper == NULL)
 			return -1;
 		helper->sid = item->sid;
@@ -407,7 +422,7 @@ static int prepare_pstree_ids(void)
 		if (current_pgid == item->pgid)
 			continue;
 
-		helper = alloc_pstree_item();
+		helper = alloc_pstree_item_with_rst();
 		if (helper == NULL)
 			return -1;
 		helper->sid = item->sid;
@@ -420,6 +435,82 @@ static int prepare_pstree_ids(void)
 
 		pr_info("Add a helper %d for restoring PGID %d\n",
 				helper->pid.virt, helper->pgid);
+	}
+
+	return 0;
+}
+
+static unsigned long get_clone_mask(TaskKobjIdsEntry *i,
+		TaskKobjIdsEntry *p)
+{
+	unsigned long mask = 0;
+
+	if (i->files_id == p->files_id)
+		mask |= CLONE_FILES;
+	if (i->pid_ns_id != p->pid_ns_id)
+		mask |= CLONE_NEWPID;
+	if (i->net_ns_id != p->net_ns_id)
+		mask |= CLONE_NEWNET;
+	if (i->ipc_ns_id != p->ipc_ns_id)
+		mask |= CLONE_NEWIPC;
+	if (i->uts_ns_id != p->uts_ns_id)
+		mask |= CLONE_NEWUTS;
+	if (i->mnt_ns_id != p->mnt_ns_id)
+		mask |= CLONE_NEWNS;
+
+	return mask;
+}
+
+static int prepare_pstree_kobj_ids(void)
+{
+	struct pstree_item *item;
+
+	/* Find a process with minimal pid for shared fd tables */
+	for_each_pstree_item(item) {
+		struct pstree_item *parent = item->parent;
+		TaskKobjIdsEntry *ids;
+		unsigned long cflags;
+
+		if (!item->ids) {
+			if (item == root_item) {
+				cflags = opts.rst_namespaces_flags;
+				goto set_mask;
+			}
+
+			continue;
+		}
+
+		if (parent)
+			ids = parent->ids;
+		else
+			ids = root_ids;
+
+		cflags = get_clone_mask(item->ids, ids);
+
+		if (cflags & CLONE_FILES) {
+			int ret;
+
+			ret = shared_fdt_prepare(item);
+			if (ret)
+				return ret;
+		}
+
+set_mask:
+		item->rst->clone_flags = cflags;
+
+		/*
+		 * Workaround for current namespaces model --
+		 * all tasks should be in one namespace. And
+		 * this namespace is either inherited from the
+		 * crtools or is created for the init task (only)
+		 */
+		if (item == root_item) {
+			pr_info("Will restore in %lx namespaces\n", cflags);
+			current_ns_mask = cflags & CLONE_ALLNS;
+		} else if (cflags & CLONE_ALLNS) {
+			pr_err("Can't restore sub-task in NS\n");
+			return -1;
+		}
 	}
 
 	return 0;
@@ -438,6 +529,12 @@ int prepare_pstree(void)
 		ret = prepare_pstree_for_shell_job();
 	if (!ret)
 		/*
+		 * Walk the collected tree and prepare for restoring
+		 * of shared objects at clone time
+		 */
+		ret = prepare_pstree_kobj_ids();
+	if (!ret)
+		/*
 		 * Session/Group leaders might be dead. Need to fix
 		 * pstree with properly injected helper tasks.
 		 */
@@ -452,6 +549,18 @@ bool restore_before_setsid(struct pstree_item *child)
 
 	if (child->parent->born_sid == csid)
 		return true;
+
+	return false;
+}
+
+bool pid_in_pstree(pid_t pid)
+{
+	struct pstree_item *item;
+
+	for_each_pstree_item(item) {
+		if (item->pid.real == pid)
+			return true;
+	}
 
 	return false;
 }

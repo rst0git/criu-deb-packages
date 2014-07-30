@@ -4,7 +4,7 @@
 #include "image.h"
 #include "eventpoll.h"
 #include "signalfd.h"
-#include "inotify.h"
+#include "fsnotify.h"
 #include "sockets.h"
 #include "uts_ns.h"
 #include "ipc_ns.h"
@@ -12,8 +12,12 @@
 #include "sk-packet.h"
 #include "mount.h"
 #include "net.h"
+#include "pstree.h"
 #include "protobuf.h"
 #include "protobuf/inventory.pb-c.h"
+
+bool fdinfo_per_id = false;
+TaskKobjIdsEntry *root_ids;
 
 int check_img_inventory(void)
 {
@@ -29,8 +33,18 @@ int check_img_inventory(void)
 	if (ret < 0)
 		return ret;
 
+	fdinfo_per_id = he->has_fdinfo_per_id ?  he->fdinfo_per_id : false;
+
 	ret = he->img_version;
-	inventory_entry__free_unpacked(he, NULL);
+
+	if (he->root_ids) {
+		root_ids = xmalloc(sizeof(*root_ids));
+		if (!root_ids)
+			return -1;
+
+		memcpy(root_ids, he->root_ids, sizeof(*root_ids));
+		inventory_entry__free_unpacked(he, NULL);
+	}
 
 	if (ret != CRTOOLS_IMAGES_V1) {
 		pr_err("Not supported images version %u\n", ret);
@@ -44,6 +58,7 @@ int write_img_inventory(void)
 {
 	int fd;
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
+	struct pstree_item crt = { };
 
 	pr_info("Writing image inventory (version %u)\n", CRTOOLS_IMAGES_V1);
 
@@ -52,23 +67,26 @@ int write_img_inventory(void)
 		return -1;
 
 	he.img_version = CRTOOLS_IMAGES_V1;
+	he.fdinfo_per_id = true;
+	he.has_fdinfo_per_id = true;
+
+	crt.pid.real = getpid();
+	if (get_task_ids(&crt))
+		return -1;
+
+	he.root_ids = crt.ids;
 
 	if (pb_write_one(fd, &he, PB_INVENTORY) < 0)
 		return -1;
 
+	xfree(crt.ids);
 	close(fd);
 	return 0;
 }
 
 static void show_inventory(int fd, struct cr_options *o)
 {
-	InventoryEntry *he;
-
-	if (pb_read_one(fd, &he, PB_INVENTORY) < 0)
-		return;
-
-	pr_msg("Version: %u\n", he->img_version);
-	inventory_entry__free_unpacked(he, NULL);
+	pb_show_vertical(fd, PB_INVENTORY);
 }
 
 /*
@@ -99,7 +117,10 @@ struct cr_fd_desc_tmpl fdset_template[CR_FD_MAX] = {
 	FD_ENTRY(SIGNALFD,	"signalfd",	 show_signalfd),
 	FD_ENTRY(INOTIFY,	"inotify",	 show_inotify),
 	FD_ENTRY(INOTIFY_WD,	"inotify-wd",	 show_inotify_wd),
+	FD_ENTRY(FANOTIFY,	"fanotify",	 show_fanotify),
+	FD_ENTRY(FANOTIFY_MARK,	"fanotify-mark", show_fanotify_mark),
 	FD_ENTRY(CORE,		"core-%d",	 show_core),
+	FD_ENTRY(IDS,		"ids-%d",	 show_ids),
 	FD_ENTRY(MM,		"mm-%d",	 show_mm),
 	FD_ENTRY(VMAS,		"vmas-%d",	 show_vmas),
 	FD_ENTRY(PIPES,		"pipes",	 show_pipes),
@@ -130,6 +151,8 @@ struct cr_fd_desc_tmpl fdset_template[CR_FD_MAX] = {
 	FD_ENTRY(TMPFS,		"tmpfs-%d.tar.gz", show_raw_image),
 	FD_ENTRY(TTY,		"tty",		 show_tty),
 	FD_ENTRY(TTY_INFO,	"tty-info",	 show_tty_info),
+	FD_ENTRY(FILE_LOCKS,	"filelocks-%d",	 show_file_locks),
+	FD_ENTRY(RLIMIT,	"rlimit",	 show_rlimit),
 };
 
 static struct cr_fdset *alloc_cr_fdset(int nr)
@@ -227,10 +250,9 @@ struct cr_fdset *cr_glob_fdset_open(int mode)
 	return cr_fdset_open(-1 /* ignored */, _CR_FD_GLOB_FROM, _CR_FD_GLOB_TO, mode);
 }
 
-static int image_dir_fd = -1;
-
 int open_image(int type, unsigned long flags, ...)
 {
+	int dfd = get_service_fd(IMG_FD_OFF);
 	char path[PATH_MAX];
 	va_list args;
 	int ret;
@@ -240,14 +262,14 @@ int open_image(int type, unsigned long flags, ...)
 	va_end(args);
 
 	if (flags & O_EXCL) {
-		ret = unlinkat(image_dir_fd, path, 0);
+		ret = unlinkat(dfd, path, 0);
 		if (ret && errno != ENOENT) {
 			pr_perror("Unable to unlink %s", path);
 			goto err;
 		}
 	}
 
-	ret = openat(image_dir_fd, path, flags, CR_FD_PERM);
+	ret = openat(dfd, path, flags, CR_FD_PERM);
 	if (ret < 0) {
 		pr_perror("Unable to open %s", path);
 		goto err;
@@ -278,13 +300,7 @@ err:
 
 int open_image_dir(void)
 {
-	int fd;
-
-	image_dir_fd = get_service_fd(IMG_FD_OFF);
-	if (image_dir_fd < 0) {
-		pr_perror("Can't get image fd");
-		return -1;
-	}
+	int fd, ret;
 
 	fd = open(".", O_RDONLY);
 	if (fd < 0) {
@@ -292,13 +308,14 @@ int open_image_dir(void)
 		return -1;
 	}
 
-	pr_info("Image dir fd is %d\n", image_dir_fd);
+	ret = install_service_fd(IMG_FD_OFF, fd);
 
-	return reopen_fd_as(image_dir_fd, fd);
+	close(fd);
+
+	return ret;
 }
 
 void close_image_dir(void)
 {
-	close(image_dir_fd);
-	image_dir_fd = -1;
+	close_service_fd(IMG_FD_OFF);
 }

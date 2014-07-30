@@ -12,7 +12,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include "types.h"
+#include "asm/types.h"
 
 #include "compiler.h"
 #include "crtools.h"
@@ -21,6 +21,7 @@
 #include "files.h"
 #include "sk-inet.h"
 #include "net.h"
+#include "version.h"
 
 struct cr_options opts;
 
@@ -32,15 +33,15 @@ static int parse_ns_string(const char *ptr)
 		if (ptr[3] != ',' && ptr[3] != '\0')
 			goto bad_ns;
 		if (!strncmp(ptr, "uts", 3))
-			opts.namespaces_flags |= CLONE_NEWUTS;
+			opts.rst_namespaces_flags |= CLONE_NEWUTS;
 		else if (!strncmp(ptr, "ipc", 3))
-			opts.namespaces_flags |= CLONE_NEWIPC;
+			opts.rst_namespaces_flags |= CLONE_NEWIPC;
 		else if (!strncmp(ptr, "mnt", 3))
-			opts.namespaces_flags |= CLONE_NEWNS;
+			opts.rst_namespaces_flags |= CLONE_NEWNS;
 		else if (!strncmp(ptr, "pid", 3))
-			opts.namespaces_flags |= CLONE_NEWPID;
+			opts.rst_namespaces_flags |= CLONE_NEWPID;
 		else if (!strncmp(ptr, "net", 3))
-			opts.namespaces_flags |= CLONE_NEWNET;
+			opts.rst_namespaces_flags |= CLONE_NEWNET;
 		else
 			goto bad_ns;
 		ptr += 4;
@@ -60,7 +61,7 @@ int main(int argc, char *argv[])
 	int log_inited = 0;
 	int log_level = 0;
 
-	static const char short_opts[] = "dsf:t:hcD:o:n:vxVr:j";
+	static const char short_opts[] = "dsf:t:hcD:o:n:vxVr:jl";
 
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 
@@ -100,6 +101,7 @@ int main(int argc, char *argv[])
 			{ "action-script", required_argument, 0, 49},
 			{ LREMAP_PARAM, no_argument, 0, 41},
 			{ "shell-job", no_argument, 0, 'j'},
+			{ "file-locks", no_argument, 0, 'l'},
 			{ },
 		};
 
@@ -221,8 +223,11 @@ int main(int argc, char *argv[])
 		case 'j':
 			opts.shell_job = true;
 			break;
+		case 'l':
+			opts.handle_file_locks = true;
+			break;
 		case 'V':
-			pr_msg("Version: %d.%d\n", CRIU_VERSION_MAJOR, CRIU_VERSION_MINOR);
+			pr_msg("Version: %s\n", version);
 			return 0;
 		case 'h':
 		default:
@@ -252,7 +257,8 @@ int main(int argc, char *argv[])
 	if (strcmp(argv[optind], "dump") &&
 	    strcmp(argv[optind], "restore") &&
 	    strcmp(argv[optind], "show") &&
-	    strcmp(argv[optind], "check")) {
+	    strcmp(argv[optind], "check") &&
+	    strcmp(argv[optind], "exec")) {
 		pr_err("Unknown command %s\n", argv[optind]);
 		goto usage;
 	}
@@ -274,6 +280,11 @@ int main(int argc, char *argv[])
 	case 'c':
 		ret = cr_check();
 		break;
+	case 'e':
+		if (!pid)
+			goto opt_pid_missing;
+		ret = cr_exec(pid, argv + optind + 1);
+		break;
 	default:
 		goto usage;
 		break;
@@ -287,12 +298,19 @@ usage:
 	pr_msg("  %s restore -t pid [<options>]\n", argv[0]);
 	pr_msg("  %s show (-D dir)|(-f file) [<options>]\n", argv[0]);
 	pr_msg("  %s check\n", argv[0]);
+	pr_msg("  %s exec -t pid <syscall-string>\n", argv[0]);
 
 	pr_msg("\nCommands:\n");
 	pr_msg("  dump           checkpoint a process/tree identified by pid\n");
 	pr_msg("  restore        restore a process/tree identified by pid\n");
 	pr_msg("  show           show dump file(s) contents\n");
 	pr_msg("  check          checks whether the kernel support is up-to-date\n");
+	pr_msg("  exec           execute a system call by other task\n");
+
+	if (argc < 2) {
+		pr_msg("\nTry -h|--help for more info\n");
+		return -1;
+	}
 
 	pr_msg("\nDump/Restore options:\n");
 
@@ -317,6 +335,7 @@ usage:
 	pr_msg("			* network-lock - lock network in a target network namespace\n");
 	pr_msg("			* network-unlock - unlock network in a target network namespace\n");
 	pr_msg("  -j|--shell-job        allow to dump and restore shell jobs\n");
+	pr_msg("  -l|--file-locks	handle file locks, for safety, only used for container\n");
 
 	pr_msg("\n* Logging:\n");
 	pr_msg("  -o|--log-file [NAME]  log file name (relative path is relative to --images-dir)\n");

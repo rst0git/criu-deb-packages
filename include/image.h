@@ -1,7 +1,7 @@
-#ifndef CR_IMAGE_H
-#define CR_IMAGE_H
+#ifndef __CR_IMAGE_H__
+#define __CR_IMAGE_H__
 
-#include "types.h"
+#include "asm/types.h"
 #include "compiler.h"
 
 /*
@@ -28,6 +28,7 @@
 #define PAGES_MAGIC		0x56084025 /* Vladimir */
 #define SHMEM_PAGES_MAGIC	PAGES_MAGIC
 #define CORE_MAGIC		0x55053847 /* Kolomna */
+#define IDS_MAGIC		0x54432030 /* Konigsberg */
 #define VMAS_MAGIC		0x54123737 /* Tula */
 #define PIPES_MAGIC		0x56513555 /* Tver */
 #define PIPES_DATA_MAGIC	0x56453709 /* Dubna */
@@ -61,6 +62,10 @@
 #define NETDEV_MAGIC		0x57373951 /* Yaroslavl */
 #define TTY_MAGIC		0x59433025 /* Pushkin */
 #define TTY_INFO_MAGIC		0x59453036 /* Kolpino */
+#define FILE_LOCKS_MAGIC	0x54323616 /* Kaluga */
+#define RLIMIT_MAGIC		0x57113925 /* Rostov */
+#define FANOTIFY_MAGIC		0x55096122 /* Chelyabinsk */
+#define FANOTIFY_MARK_MAGIC	0x56506035 /* Yekaterinburg */
 
 #define IFADDR_MAGIC		RAW_IMAGE_MAGIC
 #define ROUTE_MAGIC		RAW_IMAGE_MAGIC
@@ -105,25 +110,15 @@ struct page_entry {
 
 #define CR_CAP_SIZE	2
 
-#ifdef CONFIG_X86_64
-
 #define GDT_ENTRY_TLS_ENTRIES 3
 #define TASK_COMM_LEN 16
 
 #define TASK_PF_USED_MATH		0x00002000
 
-#ifdef CONFIG_X86_64
-# define AT_VECTOR_SIZE 44
-#else
-# define AT_VECTOR_SIZE 22		/* Not needed at moment */
-#endif
-
 #define TASK_ALIVE		0x1
 #define TASK_DEAD		0x2
 #define TASK_STOPPED		0x3 /* FIXME - implement */
 #define TASK_HELPER		0x4
-
-#endif /* CONFIG_X86_64 */
 
 /*
  * There are always 4 magic bytes at the
@@ -133,4 +128,6 @@ struct page_entry {
 #define GET_FILE_OFF(s, m)	(offsetof(s,m) + MAGIC_OFFSET)
 #define GET_FILE_OFF_AFTER(s)	(sizeof(s) + MAGIC_OFFSET)
 
-#endif /* CR_IMAGE_H */
+extern bool fdinfo_per_id;
+
+#endif /* __CR_IMAGE_H__ */

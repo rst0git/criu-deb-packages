@@ -1,5 +1,5 @@
-#ifndef CR_UTS_NS_H_
-#define CR_UTS_NS_H_
+#ifndef __CR_UTS_NS_H__
+#define __CR_UTS_NS_H__
 
 #include "crtools.h"
 
@@ -8,4 +8,6 @@ struct cr_options;
 void show_utsns(int fd, struct cr_options *);
 int prepare_utsns(int pid);
 
-#endif /* CR_UTS_NS_H_ */
+extern struct ns_desc uts_ns_desc;
+
+#endif /* __CR_UTS_NS_H__ */

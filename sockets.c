@@ -46,11 +46,6 @@ static int dump_bound_dev(int sk, SkOptsEntry *soe)
 
 	ret = getsockopt(sk, SOL_SOCKET, SO_BINDTODEVICE, &dev, &len);
 	if (ret) {
-		if (errno == ENOPROTOOPT) {
-			pr_warn("Bound device may be missing for socket\n");
-			return 0;
-		}
-
 		pr_perror("Can't get bound dev");
 		return ret;
 	}
@@ -113,7 +108,7 @@ static int dump_socket_filter(int sk, SkOptsEntry *soe)
 	struct sock_filter *flt;
 
 	ret = getsockopt(sk, SOL_SOCKET, SO_GET_FILTER, NULL, &len);
-	if (ret && errno != ENOPROTOOPT) {
+	if (ret) {
 		pr_perror("Can't get socket filter len");
 		return ret;
 	}
@@ -366,7 +361,7 @@ void release_skopts(SkOptsEntry *soe)
 	xfree(soe->so_bound_dev);
 }
 
-int dump_socket(struct fd_parms *p, int lfd, const struct cr_fdset *cr_fdset)
+int dump_socket(struct fd_parms *p, int lfd, const int fdinfo)
 {
 	int family;
 
@@ -375,15 +370,15 @@ int dump_socket(struct fd_parms *p, int lfd, const struct cr_fdset *cr_fdset)
 
 	switch (family) {
 	case AF_UNIX:
-		return dump_one_unix(p, lfd, cr_fdset);
+		return dump_one_unix(p, lfd, fdinfo);
 	case AF_INET:
-		return dump_one_inet(p, lfd, cr_fdset);
+		return dump_one_inet(p, lfd, fdinfo);
 	case AF_INET6:
-		return dump_one_inet6(p, lfd, cr_fdset);
+		return dump_one_inet6(p, lfd, fdinfo);
 	case AF_PACKET:
-		return dump_one_packet_sk(p, lfd, cr_fdset);
+		return dump_one_packet_sk(p, lfd, fdinfo);
 	default:
-		pr_err("BUG! Unknown socket collected\n");
+		pr_err("BUG! Unknown socket collected (family %d)\n", family);
 		break;
 	}
 
@@ -425,10 +420,10 @@ int collect_sockets(int pid)
 		} r;
 	} req;
 
-	if (opts.namespaces_flags & CLONE_NEWNET) {
+	if (current_ns_mask & CLONE_NEWNET) {
 		pr_info("Switching to %d's net for collecting sockets\n", pid);
 
-		if (switch_ns(pid, CLONE_NEWNET, "net", &rst))
+		if (switch_ns(pid, &net_ns_desc, &rst))
 			return -1;
 	}
 
@@ -521,8 +516,18 @@ int collect_sockets(int pid)
 
 	close(nl);
 out:
-	if (rst > 0 && restore_ns(rst, CLONE_NEWNET) < 0)
-		err = -1;
+	if (rst >= 0) {
+		if (restore_ns(rst, &net_ns_desc) < 0)
+			err = -1;
+	} else {
+		/*
+		 * If netns isn't dumped, crtools will fail only
+		 * if an unsupported socket will be really dumped.
+		 */
+		pr_info("Uncollected sockets! Will probably fail later.\n");
+		err = 0;
+	}
+
 	return err;
 }
 

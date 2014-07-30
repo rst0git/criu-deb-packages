@@ -1,3 +1,5 @@
+include ../Makefile.inc
+
 CFLAGS	= -g -O2 -Wall -Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
 
 LIB	= libzdtmtst.a
@@ -15,13 +17,11 @@ install: all
 
 $(LIB):	$(LIB)(${LIBOBJ})
 
-test_init: test_init.c
-
 clean:
-	$(RM) $(LIBOBJ) $(LIB) test_init *~
+	$(RM) -f $(LIBOBJ) $(LIB) *~
 
 cleandep:
-	$(RM) $(LIBDEP)
+	$(RM) -f $(LIBDEP)
 
 realclean:	clean cleandep
 

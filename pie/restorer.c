@@ -14,7 +14,7 @@
 #include <sys/resource.h>
 
 #include "compiler.h"
-#include "types.h"
+#include "asm/types.h"
 #include "syscall.h"
 #include "log.h"
 #include "util.h"
@@ -25,7 +25,9 @@
 #include "lock.h"
 #include "restorer.h"
 
-#include "creds.pb-c.h"
+#include "protobuf/creds.pb-c.h"
+
+#include "asm/restorer.h"
 
 #define sys_prctl_safe(opcode, val1, val2, val3)			\
 	({								\
@@ -141,71 +143,44 @@ static void restore_sched_info(struct rst_sched_param *p)
 	sys_sched_setscheduler(0, p->policy, &parm);
 }
 
-static int restore_gpregs(struct rt_sigframe *f, UserX86RegsEntry *r)
+static void restore_rlims(struct task_restore_core_args *ta)
 {
-	long ret;
-	unsigned long fsgs_base;
+	int r;
 
-#define CPREG1(d)	f->uc.uc_mcontext.d = r->d
-#define CPREG2(d, s)	f->uc.uc_mcontext.d = r->s
+	for (r = 0; r < ta->nr_rlim; r++) {
+		struct krlimit krlim;
 
-	CPREG1(r8);
-	CPREG1(r9);
-	CPREG1(r10);
-	CPREG1(r11);
-	CPREG1(r12);
-	CPREG1(r13);
-	CPREG1(r14);
-	CPREG1(r15);
-	CPREG2(rdi, di);
-	CPREG2(rsi, si);
-	CPREG2(rbp, bp);
-	CPREG2(rbx, bx);
-	CPREG2(rdx, dx);
-	CPREG2(rax, ax);
-	CPREG2(rcx, cx);
-	CPREG2(rsp, sp);
-	CPREG2(rip, ip);
-	CPREG2(eflags, flags);
-	CPREG1(cs);
-	CPREG1(gs);
-	CPREG1(fs);
-
-	fsgs_base = r->fs_base;
-	ret = sys_arch_prctl(ARCH_SET_FS, fsgs_base);
-	if (ret) {
-		pr_info("SET_FS fail %ld\n", ret);
-		return -1;
+		krlim.rlim_cur = ta->rlims[r].rlim_cur;
+		krlim.rlim_max = ta->rlims[r].rlim_max;
+		sys_setrlimit(r, &krlim);
 	}
-
-	fsgs_base = r->gs_base;
-	ret = sys_arch_prctl(ARCH_SET_GS, fsgs_base);
-	if (ret) {
-		pr_info("SET_GS fail %ld\n", ret);
-		return -1;
-	}
-
-	return 0;
 }
 
 static int restore_thread_common(struct rt_sigframe *sigframe,
 		struct thread_restore_args *args)
 {
-	sys_set_tid_address((int *)args->clear_tid_addr);
+	sys_set_tid_address((int *)decode_pointer(args->clear_tid_addr));
 
 	if (args->has_futex) {
-		if (sys_set_robust_list((void *)args->futex_rla, args->futex_rla_len)) {
+		if (sys_set_robust_list(decode_pointer(args->futex_rla), args->futex_rla_len)) {
 			pr_err("Robust list err\n");
 			return -1;
 		}
 	}
 
 	if (args->has_blk_sigset)
-		sigframe->uc.uc_sigmask.sig[0] = args->blk_sigset;
+		RT_SIGFRAME_UC(sigframe).uc_sigmask.sig[0] = args->blk_sigset;
 
 	restore_sched_info(&args->sp);
+	if (restore_fpu(sigframe, args))
+		return -1;
 
-	return restore_gpregs(sigframe, &args->gpregs);
+	if (restore_gpregs(sigframe, &args->gpregs))
+		return -1;
+
+	restore_tls(args->tls);
+
+	return 0;
 }
 
 /*
@@ -240,15 +215,9 @@ long __export_restore_thread(struct thread_restore_args *args)
 
 	futex_dec_and_wake(&thread_inprogress);
 
-	new_sp = (long)rt_sigframe + 8;
-	asm volatile(
-		"movq %0, %%rax					\n"
-		"movq %%rax, %%rsp				\n"
-		"movl $"__stringify(__NR_rt_sigreturn)", %%eax	\n"
-		"syscall					\n"
-		:
-		: "r"(new_sp)
-		: "rax","rsp","memory");
+	new_sp = (long)rt_sigframe + SIGFRAME_OFFSET;
+	ARCH_RT_SIGRETURN(new_sp);
+
 core_restore_end:
 	pr_err("Restorer abnormal termination for %ld\n", sys_getpid());
 	sys_exit_group(1);
@@ -274,7 +243,7 @@ static u64 restore_mapping(const VmaEntry *vma_entry)
 	u64 addr;
 
 	if (vma_entry_is(vma_entry, VMA_AREA_SYSVIPC))
-		return sys_shmat(vma_entry->fd, (void *)vma_entry->start,
+		return sys_shmat(vma_entry->fd, decode_pointer(vma_entry->start),
 				 (vma_entry->prot & PROT_WRITE) ? 0 : SHM_RDONLY);
 
 	/*
@@ -290,7 +259,7 @@ static u64 restore_mapping(const VmaEntry *vma_entry)
 	if (vma_entry->fd == -1 || !(vma_entry->flags & MAP_SHARED))
 		prot |= PROT_WRITE;
 
-	pr_debug("\tmmap(%lx -> %lx, %x %x %d\n",
+	pr_debug("\tmmap(%"PRIx64" -> %"PRIx64", %x %x %d\n",
 			vma_entry->start, vma_entry->end,
 			prot, flags, (int)vma_entry->fd);
 	/*
@@ -298,7 +267,7 @@ static u64 restore_mapping(const VmaEntry *vma_entry)
 	 * writable since we're going to restore page
 	 * contents.
 	 */
-	addr = sys_mmap((void *)vma_entry->start,
+	addr = sys_mmap(decode_pointer(vma_entry->start),
 			vma_entry_len(vma_entry),
 			prot, flags,
 			vma_entry->fd,
@@ -310,15 +279,26 @@ static u64 restore_mapping(const VmaEntry *vma_entry)
 	return addr;
 }
 
-static void rst_tcp_socks_all(int *arr, int size)
+static void rst_tcp_repair_off(struct rst_tcp_sock *rts)
+{
+	int aux;
+
+	tcp_repair_off(rts->sk);
+
+	aux = rts->reuseaddr;
+	if (sys_setsockopt(rts->sk, SOL_SOCKET, SO_REUSEADDR, &aux, sizeof(aux)) < 0)
+		pr_perror("Failed to restore of SO_REUSEADDR on socket");
+}
+
+static void rst_tcp_socks_all(struct rst_tcp_sock *arr, int size)
 {
 	int i;
 
 	if (size == 0)
 		return;
 
-	for (i =0; arr[i] >= 0; i++)
-		tcp_repair_off(arr[i]);
+	for (i =0; arr[i].sk >= 0; i++)
+		rst_tcp_repair_off(arr + i);
 
 	sys_munmap(arr, size);
 }
@@ -435,7 +415,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
 			continue;
 
-		pr_debug("Examine %lx-%lx\n", vma_entry->start, vma_entry->end);
+		pr_debug("Examine %"PRIx64"-%"PRIx64"\n", vma_entry->start, vma_entry->end);
 
 		if (addr < args->premmapped_addr) {
 			if (vma_entry->end >= args->premmapped_addr)
@@ -447,6 +427,9 @@ long __export_restore_task(struct task_restore_core_args *args)
 				goto core_restore_end;
 			}
 		}
+
+		if (vma_entry->end >= TASK_SIZE)
+			continue;
 
 		if (vma_entry->end > premmapped_end) {
 			if (vma_entry->start < premmapped_end)
@@ -470,6 +453,9 @@ long __export_restore_task(struct task_restore_core_args *args)
 		if (!vma_priv(vma_entry))
 			continue;
 
+		if (vma_entry->end >= TASK_SIZE)
+			continue;
+
 		if (vma_entry->start > vma_entry->shmid)
 			break;
 
@@ -485,6 +471,9 @@ long __export_restore_task(struct task_restore_core_args *args)
 			continue;
 
 		if (!vma_priv(vma_entry))
+			continue;
+
+		if (vma_entry->start > TASK_SIZE)
 			continue;
 
 		if (vma_entry->start < vma_entry->shmid)
@@ -508,7 +497,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 		va = restore_mapping(vma_entry);
 
 		if (va != vma_entry->start) {
-			pr_err("Can't restore %lx mapping with %lx\n", vma_entry->start, va);
+			pr_err("Can't restore %"PRIx64" mapping with %"PRIx64"\n", vma_entry->start, va);
 			goto core_restore_end;
 		}
 	}
@@ -534,7 +523,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 		if (vma_entry->prot & PROT_WRITE)
 			continue;
 
-		sys_mprotect((void *)vma_entry->start,
+		sys_mprotect(decode_pointer(vma_entry->start),
 			     vma_entry_len(vma_entry),
 			     vma_entry->prot);
 	}
@@ -553,7 +542,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 						  vma_entry_len(vma_entry),
 						  i);
 				if (ret) {
-					pr_err("madvise(%lx, %ld, %ld) "
+					pr_err("madvise(%"PRIx64", %"PRIu64", %ld) "
 					       "failed with %ld\n",
 						vma_entry->start,
 						vma_entry_len(vma_entry),
@@ -609,9 +598,9 @@ long __export_restore_task(struct task_restore_core_args *args)
 	 * registers from the frame, set them up and
 	 * finally pass execution to the new IP.
 	 */
-	rt_sigframe = (void *)args->t.mem_zone.rt_sigframe + 8;
+	rt_sigframe = (void *)args->t->mem_zone.rt_sigframe + 8;
 
-	if (restore_thread_common(rt_sigframe, &args->t))
+	if (restore_thread_common(rt_sigframe, args->t))
 		goto core_restore_end;
 
 	/*
@@ -656,7 +645,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 			char last_pid_buf[16], *s;
 
 			/* skip self */
-			if (thread_args[i].pid == args->t.pid)
+			if (thread_args[i].pid == args->t->pid)
 				continue;
 
 			mutex_lock(&args->rst_lock);
@@ -678,41 +667,8 @@ long __export_restore_task(struct task_restore_core_args *args)
 			 * thread will run with own stack and we must not
 			 * have any additional instructions... oh, dear...
 			 */
-			asm volatile(
-				"clone_emul:				\n"
-				"movq %2, %%rsi				\n"
-				"subq $16, %%rsi			\n"
-				"movq %6, %%rdi				\n"
-				"movq %%rdi, 8(%%rsi)			\n"
-				"movq %5, %%rdi				\n"
-				"movq %%rdi, 0(%%rsi)			\n"
-				"movq %1, %%rdi				\n"
-				"movq %3, %%rdx				\n"
-				"movq %4, %%r10				\n"
-				"movl $"__stringify(__NR_clone)", %%eax	\n"
-				"syscall				\n"
 
-				"testq %%rax,%%rax			\n"
-				"jz thread_run				\n"
-
-				"movq %%rax, %0				\n"
-				"jmp clone_end				\n"
-
-				"thread_run:				\n"	/* new stack here */
-				"xorq %%rbp, %%rbp			\n"	/* clear ABI frame pointer */
-				"popq %%rax				\n"	/* clone_restore_fn  -- restore_thread */
-				"popq %%rdi				\n"	/* arguments */
-				"callq *%%rax				\n"
-
-				"clone_end:				\n"
-				: "=r"(ret)
-				:	"g"(clone_flags),
-					"g"(new_sp),
-					"g"(&parent_tid),
-					"g"(&thread_args[i].pid),
-					"g"(args->clone_restore_fn),
-					"g"(&thread_args[i])
-				: "rax", "rdi", "rsi", "rdx", "r10", "memory");
+			RUN_CLONE_RESTORE_FN(ret, clone_flags, new_sp, parent_tid, thread_args, args->clone_restore_fn);
 		}
 
 		ret = sys_flock(fd, LOCK_UN);
@@ -723,6 +679,8 @@ long __export_restore_task(struct task_restore_core_args *args)
 
 		sys_close(fd);
 	}
+
+	restore_rlims(args);
 
 	/* 
 	 * Writing to last-pid is CAP_SYS_ADMIN protected, thus restore
@@ -766,28 +724,21 @@ long __export_restore_task(struct task_restore_core_args *args)
 
 	ret = sys_munmap(args->task_entries, TASK_ENTRIES_SIZE);
 	if (ret < 0) {
-		ret = ((long)__LINE__ << 32) | -ret;
+		ret = ((long)__LINE__ << 16) | ((-ret) & 0xffff);
 		goto core_restore_failed;
 	}
 
 	/*
 	 * Sigframe stack.
 	 */
-	new_sp = (long)rt_sigframe + 8;
+	new_sp = (long)rt_sigframe + SIGFRAME_OFFSET;
 
 	/*
 	 * Prepare the stack and call for sigreturn,
 	 * pure assembly since we don't need any additional
 	 * code insns from gcc.
 	 */
-	asm volatile(
-		"movq %0, %%rax					\n"
-		"movq %%rax, %%rsp				\n"
-		"movl $"__stringify(__NR_rt_sigreturn)", %%eax	\n"
-		"syscall					\n"
-		:
-		: "r"(new_sp)
-		: "rax","rsp","memory");
+	ARCH_RT_SIGRETURN(new_sp);
 
 core_restore_end:
 	pr_err("Restorer fail %ld\n", sys_getpid());
@@ -795,12 +746,7 @@ core_restore_end:
 	return -1;
 
 core_restore_failed:
-	asm volatile(
-		"movq %0, %%rsp				\n"
-		"movq 0, %%rax				\n"
-		"jmp *%%rax				\n"
-		:
-		: "r"(ret)
-		: "memory");
+	ARCH_FAIL_CORE_RESTORE;
+
 	return ret;
 }

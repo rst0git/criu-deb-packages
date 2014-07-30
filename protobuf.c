@@ -10,7 +10,7 @@
 
 #include "crtools.h"
 #include "compiler.h"
-#include "types.h"
+#include "asm/types.h"
 #include "log.h"
 #include "util.h"
 #include "string.h"
@@ -22,7 +22,7 @@
 #include "protobuf/eventfd.pb-c.h"
 #include "protobuf/eventpoll.pb-c.h"
 #include "protobuf/signalfd.pb-c.h"
-#include "protobuf/inotify.pb-c.h"
+#include "protobuf/fsnotify.pb-c.h"
 #include "protobuf/core.pb-c.h"
 #include "protobuf/mm.pb-c.h"
 #include "protobuf/pipe.pb-c.h"
@@ -49,6 +49,8 @@
 #include "protobuf/netdev.pb-c.h"
 #include "protobuf/tcp-stream.pb-c.h"
 #include "protobuf/tty.pb-c.h"
+#include "protobuf/file-lock.pb-c.h"
+#include "protobuf/rlimit.pb-c.h"
 
 typedef size_t (*pb_getpksize_t)(void *obj);
 typedef size_t (*pb_pack_t)(void *obj, void *where);
@@ -96,7 +98,10 @@ void cr_pb_init(void)
 	CR_PB_DESC(SIGNALFD,		Signalfd,	signalfd);
 	CR_PB_DESC(INOTIFY,		InotifyFile,	inotify_file);
 	CR_PB_DESC(INOTIFY_WD,		InotifyWd,	inotify_wd);
+	CR_PB_DESC(FANOTIFY,		FanotifyFile,	fanotify_file);
+	CR_PB_DESC(FANOTIFY_MARK,	FanotifyMark,	fanotify_mark);
 	CR_PB_DESC(CORE,		Core,		core);
+	CR_PB_DESC(IDS,			TaskKobjIds,	task_kobj_ids);
 	CR_PB_DESC(MM,			Mm,		mm);
 	CR_PB_DESC(VMAS,		Vma,		vma);
 	CR_PB_DESC(PIPES,		Pipe,		pipe);
@@ -125,6 +130,8 @@ void cr_pb_init(void)
 	CR_PB_DESC(PACKETSK,		PacketSock,	packet_sock);
 	CR_PB_DESC(TTY,			TtyFile,	tty_file);
 	CR_PB_DESC(TTY_INFO,		TtyInfo,	tty_info);
+	CR_PB_DESC(FILE_LOCK,		FileLock,	file_lock);
+	CR_PB_DESC(RLIMIT,		Rlimit,		rlimit);
 }
 
 /*

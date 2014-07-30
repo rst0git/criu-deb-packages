@@ -3,7 +3,7 @@
 #include <sys/signalfd.h>
 
 #include "compiler.h"
-#include "types.h"
+#include "asm/types.h"
 #include "signalfd.h"
 #include "proc_parse.h"
 #include "crtools.h"
@@ -65,9 +65,9 @@ static const struct fdtype_ops signalfd_ops = {
 	.dump		= dump_one_signalfd,
 };
 
-int dump_signalfd(struct fd_parms *p, int lfd, const struct cr_fdset *set)
+int dump_signalfd(struct fd_parms *p, int lfd, const int fdinfo)
 {
-	return do_dump_gen_file(p, lfd, &signalfd_ops, set);
+	return do_dump_gen_file(p, lfd, &signalfd_ops, fdinfo);
 }
 
 static void sigset_fill(sigset_t *to, unsigned long long from)
@@ -129,6 +129,11 @@ static int collect_one_sigfd(void *o, ProtobufCMessage *msg)
 
 int collect_signalfd(void)
 {
-	return collect_image(CR_FD_SIGNALFD, PB_SIGNALFD,
+	int ret = collect_image(CR_FD_SIGNALFD, PB_SIGNALFD,
 			sizeof(struct signalfd_info), collect_one_sigfd);
+
+	if (ret < 0 && errno == ENOENT)
+		return 0;
+
+	return ret;
 }

@@ -12,7 +12,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include "types.h"
+#include "asm/types.h"
 #include "list.h"
 #include "namespaces.h"
 #include "compiler.h"
@@ -44,10 +44,6 @@
 #include "protobuf/tty.pb-c.h"
 
 #define DEF_PAGES_PER_LINE	6
-
-#ifndef CONFIG_X86_64
-# error No x86-32 support yet
-#endif
 
 
 #define PR_SYMBOL(sym)			\
@@ -119,6 +115,11 @@ void show_tty_info(int fd, struct cr_options *o)
 	pb_show_plain(fd, PB_TTY_INFO);
 }
 
+void show_file_locks(int fd, struct cr_options *o)
+{
+	pb_show_plain(fd, PB_FILE_LOCK);
+}
+
 void show_fs(int fd_fs, struct cr_options *o)
 {
 	pb_show_vertical(fd_fs, PB_FS);
@@ -127,6 +128,11 @@ void show_fs(int fd_fs, struct cr_options *o)
 void show_vmas(int fd_vma, struct cr_options *o)
 {
 	pb_show_plain(fd_vma, PB_VMAS);
+}
+
+void show_rlimit(int fd, struct cr_options *o)
+{
+	pb_show_plain(fd, PB_RLIMIT);
 }
 
 static int nice_width_for(unsigned long addr)
@@ -231,7 +237,7 @@ void show_pages(int fd_pages, struct cr_options *o)
 					goto out;
 				}
 
-				pr_msg("0x%16lx ", e.va);
+				pr_msg("0x%16"PRIx64" ", e.va);
 			}
 			pr_msg("\n");
 		}
@@ -305,19 +311,19 @@ static inline char *task_state_str(int state)
 static void show_core_regs(UserX86RegsEntry *regs)
 {
 #define pr_regs4(s, n1, n2, n3, n4)	\
-	pr_msg("\t%8s: 0x%-16lx "	\
-	       "%8s: 0x%-16lx "		\
-	       "%8s: 0x%-16lx "		\
-	       "%8s: 0x%-16lx\n",	\
+	pr_msg("\t%8s: 0x%-16"PRIx64" "	\
+	       "%8s: 0x%-16"PRIx64" "	\
+	       "%8s: 0x%-16"PRIx64" "	\
+	       "%8s: 0x%-16"PRIx64"\n",	\
 	       #n1, s->n1,		\
 	       #n2, s->n2,		\
 	       #n3, s->n3,		\
 	       #n4, s->n4)
 
 #define pr_regs3(s, n1, n2, n3)		\
-	pr_msg("\t%8s: 0x%-16lx "	\
-	       "%8s: 0x%-16lx "		\
-	       "%8s: 0x%-16lx\n",	\
+	pr_msg("\t%8s: 0x%-16"PRIx64" "	\
+	       "%8s: 0x%-16"PRIx64" "	\
+	       "%8s: 0x%-16"PRIx64"\n",	\
 	       #n1, s->n1,		\
 	       #n2, s->n2,		\
 	       #n3, s->n3)
@@ -340,7 +346,7 @@ void show_thread_info(ThreadInfoX86 *thread_info)
 		return;
 
 	pr_msg("\t---[ Thread info ]---\n");
-	pr_msg("\tclear_tid_addr:  0x%lx\n", thread_info->clear_tid_addr);
+	pr_msg("\tclear_tid_addr:  0x%"PRIx64"\n", thread_info->clear_tid_addr);
 	pr_msg("\n");
 
 	show_core_regs(thread_info->gpregs);
@@ -349,6 +355,11 @@ void show_thread_info(ThreadInfoX86 *thread_info)
 void show_core(int fd_core, struct cr_options *o)
 {
 	pb_show_vertical(fd_core, PB_CORE);
+}
+
+void show_ids(int fd_ids, struct cr_options *o)
+{
+	pb_show_vertical(fd_ids, PB_IDS);
 }
 
 void show_mm(int fd_mm, struct cr_options *o)

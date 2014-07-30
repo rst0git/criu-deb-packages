@@ -13,7 +13,7 @@
 #include <linux/major.h>
 
 #include "compiler.h"
-#include "types.h"
+#include "asm/types.h"
 
 #include "syscall.h"
 #include "files.h"
@@ -94,7 +94,6 @@ struct tty_dump_info {
 
 static LIST_HEAD(all_tty_info_entries);
 static LIST_HEAD(all_ttys);
-static int self_stdin = -1;
 
 #define INHERIT_SID			(-1)
 
@@ -972,6 +971,8 @@ int collect_tty(void)
 	ret = collect_image(CR_FD_TTY_INFO, PB_TTY_INFO,
 			    sizeof(struct tty_info_entry),
 			    collect_one_tty_info_entry);
+	if (ret && errno == ENOENT)
+		return 0;
 	if (!ret)
 		ret = collect_image(CR_FD_TTY, PB_TTY,
 				sizeof(struct tty_info),
@@ -1187,22 +1188,22 @@ static const struct fdtype_ops tty_ops = {
 	.dump	= dump_one_pty,
 };
 
-int dump_tty(struct fd_parms *p, int lfd, const struct cr_fdset *set)
+int dump_tty(struct fd_parms *p, int lfd, const int fdinfo)
 {
-	return do_dump_gen_file(p, lfd, &tty_ops, set);
+	return do_dump_gen_file(p, lfd, &tty_ops, fdinfo);
 }
 
-int tty_prep_fds(void)
+int tty_prep_fds(struct cr_options *opts)
 {
-	self_stdin = get_service_fd(SELF_STDIN_OFF);
+	if (!opts->shell_job)
+		return 0;
 
 	if (!isatty(STDIN_FILENO)) {
 		pr_err("Standart stream is not a terminal, aborting\n");
 		return -1;
 	}
 
-	if (dup2(STDIN_FILENO, self_stdin) < 0) {
-		self_stdin = -1;
+	if (install_service_fd(SELF_STDIN_OFF, STDIN_FILENO) < 0) {
 		pr_perror("Can't dup stdin to SELF_STDIN_OFF");
 		return -1;
 	}
@@ -1212,5 +1213,5 @@ int tty_prep_fds(void)
 
 void tty_fini_fds(void)
 {
-	close_safe(&self_stdin);
+	close_service_fd(SELF_STDIN_OFF);
 }

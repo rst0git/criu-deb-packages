@@ -1,13 +1,13 @@
-#ifndef CR_LOCK_H_
-#define CR_LOCK_H_
+#ifndef __CR_LOCK_H__
+#define __CR_LOCK_H__
 
 #include <linux/futex.h>
 #include <sys/time.h>
 #include <limits.h>
 #include <errno.h>
 
-#include "types.h"
-#include "atomic.h"
+#include "asm/types.h"
+#include "asm/atomic.h"
 #include "syscall.h"
 #include "util.h"
 
@@ -70,6 +70,13 @@ static inline void futex_dec_and_wake(futex_t *f)
 	BUG_ON(sys_futex(&f->raw.counter, FUTEX_WAKE, INT_MAX, NULL, NULL, 0) < 0);
 }
 
+/* Increment futex @f value and wake up all waiters */
+static inline void futex_inc_and_wake(futex_t *f)
+{
+	atomic_inc(&f->raw);
+	BUG_ON(sys_futex(&f->raw.counter, FUTEX_WAKE, INT_MAX, NULL, NULL, 0) < 0);
+}
+
 /* Plain increment futex @f value */
 static inline void futex_inc(futex_t *f) { atomic_inc(&f->raw); }
 
@@ -84,6 +91,10 @@ static inline void futex_wait_until(futex_t *f, u32 v)
 static inline void futex_wait_while_gt(futex_t *f, u32 v)
 { futex_wait_if_cond(f, v, <=); }
 
+/* Wait while futex @f value is less than @v */
+static inline void futex_wait_while_lt(futex_t *f, u32 v)
+{ futex_wait_if_cond(f, v, >=); }
+
 /* Wait while futex @f value is @v */
 static inline void futex_wait_while(futex_t *f, u32 v)
 {
@@ -97,13 +108,13 @@ typedef struct {
 	atomic_t	raw;
 } mutex_t;
 
-static void inline mutex_init(mutex_t *m)
+static inline void mutex_init(mutex_t *m)
 {
 	u32 c = 0;
 	atomic_set(&m->raw, c);
 }
 
-static void inline mutex_lock(mutex_t *m)
+static inline void mutex_lock(mutex_t *m)
 {
 	u32 c;
 	int ret;
@@ -114,11 +125,11 @@ static void inline mutex_lock(mutex_t *m)
 	}
 }
 
-static void inline mutex_unlock(mutex_t *m)
+static inline void mutex_unlock(mutex_t *m)
 {
 	u32 c = 0;
 	atomic_set(&m->raw, c);
 	BUG_ON(sys_futex(&m->raw.counter, FUTEX_WAKE, 1, NULL, NULL, 0) < 0);
 }
 
-#endif /* CR_LOCK_H_ */
+#endif /* __CR_LOCK_H__ */

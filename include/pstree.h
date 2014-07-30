@@ -1,7 +1,9 @@
-#ifndef PSTREE_H__
-#define PSTREE_H__
+#ifndef __CR_PSTREE_H__
+#define __CR_PSTREE_H__
+
 #include "list.h"
 #include "crtools.h"
+#include "protobuf/core.pb-c.h"
 
 /*
  * That's the init process which usually inherit
@@ -39,9 +41,18 @@ struct pstree_item {
 
 	int			nr_threads;	/* number of threads */
 	struct pid		*threads;	/* array of threads */
+	TaskKobjIdsEntry	*ids;
 
 	struct rst_info		rst[0];
 };
+
+static inline int shared_fdtable(struct pstree_item *item) {
+	return (item->parent && item->parent->state != TASK_HELPER &&
+		item->ids &&
+		item->parent->ids &&
+		item->ids->files_id &&
+		item->ids->files_id == item->parent->ids->files_id);
+}
 
 extern void free_pstree(struct pstree_item *root_item);
 extern struct pstree_item *__alloc_pstree_item(bool rst);
@@ -57,7 +68,12 @@ extern bool restore_before_setsid(struct pstree_item *child);
 extern int prepare_pstree(void);
 
 extern int dump_pstree(struct pstree_item *root_item);
+extern bool pid_in_pstree(pid_t pid);
 
 struct task_entries;
 extern struct task_entries *task_entries;
-#endif
+
+int get_task_ids(struct pstree_item *);
+extern struct _TaskKobjIdsEntry *root_ids;
+
+#endif /* __CR_PSTREE_H__ */

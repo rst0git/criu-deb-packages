@@ -1,15 +1,15 @@
-#ifndef FILES_H_
-#define FILES_H_
+#ifndef __CR_FILES_H__
+#define __CR_FILES_H__
 
 #include "compiler.h"
-#include "types.h"
+#include "asm/types.h"
 #include "lock.h"
 #include "list.h"
 #include "image.h"
 
-#include "../protobuf/fdinfo.pb-c.h"
-#include "../protobuf/fown.pb-c.h"
-#include "../protobuf/vma.pb-c.h"
+#include "protobuf/fdinfo.pb-c.h"
+#include "protobuf/fown.pb-c.h"
+#include "protobuf/vma.pb-c.h"
 
 struct pstree_item;
 struct file_desc;
@@ -74,7 +74,10 @@ struct fdtype_ops {
 
 extern int do_dump_gen_file(struct fd_parms *p, int lfd,
 			    const struct fdtype_ops *ops,
-			    const struct cr_fdset *cr_fdset);
+			    const int fdinfo);
+struct parasite_drain_fd;
+int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
+		struct parasite_drain_fd *dfds);
 
 extern void file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops);
 extern struct fdinfo_list_entry *file_master(struct file_desc *d);
@@ -87,17 +90,20 @@ extern int rst_file_params(int fd, FownEntry *fown, int flags);
 extern void show_saved_files(void);
 
 extern int prepare_fds(struct pstree_item *me);
-extern int prepare_fd_pid(int pid, struct rst_info *rst_info);
+extern int prepare_fd_pid(struct pstree_item *me);
 extern int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id);
 extern int prepare_shared_fdinfo(void);
 extern int get_filemap_fd(int pid, VmaEntry *vma_entry);
 extern int prepare_fs(int pid);
 extern int set_fd_flags(int fd, int flags);
 
+extern int close_old_fds(struct pstree_item *me);
 #ifndef AT_EMPTY_PATH
 #define AT_EMPTY_PATH 0x1000
 #endif
 
 #define LREMAP_PARAM	"link-remap"
 
-#endif /* FILES_H_ */
+int shared_fdt_prepare(struct pstree_item *item);
+
+#endif /* __CR_FILES_H__ */

@@ -1,5 +1,5 @@
-#ifndef CR_SYSCTL_H_
-#define CR_SYSCTL_H_
+#ifndef __CR_SYSCTL_H__
+#define __CR_SYSCTL_H__
 
 struct sysctl_req {
 	char	*name;
@@ -31,4 +31,4 @@ enum {
 #define CTL_LEN(t)	((t) >> CTL_SHIFT)
 #define CTL_TYPE(t)	((t) & ((1 << CTL_SHIFT) - 1))
 
-#endif /* CR_SYSCTL_H_ */
+#endif /* __CR_SYSCTL_H__ */

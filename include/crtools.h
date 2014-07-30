@@ -1,21 +1,18 @@
-#ifndef CRTOOLS_H_
-#define CRTOOLS_H_
+#ifndef __CR_CRTOOLS_H__
+#define __CR_CRTOOLS_H__
 
 #include <sys/types.h>
 
 #include "list.h"
-#include "types.h"
+#include "asm/types.h"
 #include "list.h"
 #include "util.h"
 #include "image.h"
+#include "lock.h"
 
-#include "../protobuf/vma.pb-c.h"
+#include "protobuf/vma.pb-c.h"
 
 #define CR_FD_PERM		(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH)
-#define CR_FD_PERM_DUMP		(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)
-
-#define CRIU_VERSION_MAJOR	0
-#define CRIU_VERSION_MINOR	3
 
 enum {
 	CR_FD_INVENTORY,
@@ -24,15 +21,17 @@ enum {
 	 */
 
 	_CR_FD_TASK_FROM,
-	CR_FD_FDINFO,
+	CR_FD_FILE_LOCKS,
 	CR_FD_PAGES,
 	CR_FD_CORE,
+	CR_FD_IDS,
 	CR_FD_MM,
 	CR_FD_VMAS,
 	CR_FD_SIGACT,
 	CR_FD_ITIMERS,
 	CR_FD_CREDS,
 	CR_FD_FS,
+	CR_FD_RLIMIT,
 	_CR_FD_TASK_TO,
 
 	/*
@@ -55,6 +54,7 @@ enum {
 	CR_FD_SHMEM_PAGES,
 	CR_FD_GHOST_FILE,
 	CR_FD_TCP_STREAM,
+	CR_FD_FDINFO,
 
 	_CR_FD_GLOB_FROM,
 	CR_FD_SK_QUEUES,
@@ -75,6 +75,8 @@ enum {
 	CR_FD_SIGNALFD,
 	CR_FD_INOTIFY,
 	CR_FD_INOTIFY_WD,
+	CR_FD_FANOTIFY,
+	CR_FD_FANOTIFY_MARK,
 	_CR_FD_GLOB_TO,
 
 	CR_FD_TMPFS,
@@ -94,10 +96,11 @@ struct cr_options {
 	bool			restore_detach;
 	bool			ext_unix_sk;
 	bool			shell_job;
+	bool			handle_file_locks;
 	bool			tcp_established_ok;
 	bool			evasive_devices;
 	bool			link_remap_ok;
-	unsigned int		namespaces_flags;
+	unsigned int		rst_namespaces_flags;
 	bool			log_file_per_pid;
 	char			*output;
 	char			*root;
@@ -122,8 +125,11 @@ enum sfd_type {
 	SERVICE_FD_MAX
 };
 
+extern int clone_service_fd(int id);
 extern int init_service_fd(void);
 extern int get_service_fd(enum sfd_type type);
+extern int install_service_fd(enum sfd_type type, int fd);
+extern int close_service_fd(enum sfd_type type);
 extern bool is_service_fd(int fd, enum sfd_type type);
 extern bool is_any_service_fd(int fd);
 
@@ -138,6 +144,7 @@ void show_files(int fd_files, struct cr_options *o);
 void show_pages(int fd_pages, struct cr_options *o);
 void show_reg_files(int fd_reg_files, struct cr_options *o);
 void show_core(int fd_core, struct cr_options *o);
+void show_ids(int fd_ids, struct cr_options *o);
 void show_mm(int fd_mm, struct cr_options *o);
 void show_vmas(int fd_vma, struct cr_options *o);
 void show_pipes(int fd_pipes, struct cr_options *o);
@@ -155,6 +162,8 @@ void show_fown_cont(void *p);
 void show_eventfds(int fd, struct cr_options *o);
 void show_tty(int fd, struct cr_options *o);
 void show_tty_info(int fd, struct cr_options *o);
+void show_file_locks(int fd, struct cr_options *o);
+void show_rlimit(int fd, struct cr_options *o);
 
 int check_img_inventory(void);
 int write_img_inventory(void);
@@ -196,6 +205,7 @@ int cr_restore_tasks(pid_t pid, struct cr_options *opts);
 int cr_show(struct cr_options *opts);
 int convert_to_elf(char *elf_path, int fd_core);
 int cr_check(void);
+int cr_exec(int pid, char **opts);
 
 #define O_DUMP	(O_RDWR | O_CREAT | O_EXCL)
 #define O_SHOW	(O_RDONLY)
@@ -206,6 +216,7 @@ struct cr_fdset *cr_glob_fdset_open(int mode);
 
 void close_cr_fdset(struct cr_fdset **cr_fdset);
 
+int collect_mappings(pid_t pid, struct list_head *vma_area_list);
 void free_mappings(struct list_head *vma_area_list);
 
 struct vma_area {
@@ -223,6 +234,16 @@ struct vma_area {
 #define vma_area_is(vma_area, s)	vma_entry_is(&((vma_area)->vma), s)
 #define vma_area_len(vma_area)		vma_entry_len(&((vma_area)->vma))
 
+struct fdt {
+	int			nr;		/* How many tasks share this fd table */
+	pid_t			pid;		/* Who should restore this fd table */
+	/*
+	 * The fd table is ready for restoing, if fdt_lock is equal to nr
+	 * The fdt table was restrored, if fdt_lock is equal to nr + 1
+	 */
+	futex_t			fdt_lock;
+};
+
 struct rst_info {
 	struct list_head	fds;
 	struct list_head	eventpoll;
@@ -230,6 +251,11 @@ struct rst_info {
 
 	void			*premmapped_addr;
 	unsigned long		premmapped_len;
+	unsigned long		clone_flags;
+
+	int service_fd_id;
+	struct fdt		*fdt;
+
 };
 
 static inline int in_vma_area(struct vma_area *vma, unsigned long addr)
@@ -238,4 +264,4 @@ static inline int in_vma_area(struct vma_area *vma, unsigned long addr)
 		addr < (unsigned long)vma->vma.end;
 }
 
-#endif /* CRTOOLS_H_ */
+#endif /* __CR_CRTOOLS_H__ */

@@ -10,13 +10,14 @@
 #include "util.h"
 #include "list.h"
 #include "log.h"
-#include "types.h"
+#include "asm/types.h"
 #include "files.h"
 #include "sockets.h"
 #include "files.h"
 #include "sk-inet.h"
 #include "netfilter.h"
 #include "image.h"
+#include "namespaces.h"
 
 #include "protobuf.h"
 #include "protobuf/tcp-stream.pb-c.h"
@@ -32,6 +33,10 @@ enum {
 	TCP_SEND_QUEUE,
 	TCP_QUEUES_NR,
 };
+
+#ifndef TCP_TIMESTAMP
+#define TCP_TIMESTAMP	24
+#endif
 
 #ifndef TCPOPT_SACK_PERM
 #define TCPOPT_SACK_PERM TCPOPT_SACK_PERMITTED
@@ -103,7 +108,7 @@ static int tcp_repair_establised(int fd, struct inet_sk_desc *sk)
 		goto err1;
 	}
 
-	if (!(opts.namespaces_flags & CLONE_NEWNET)) {
+	if (!(current_ns_mask & CLONE_NEWNET)) {
 		ret = nf_lock_connection(sk);
 		if (ret < 0)
 			goto err2;
@@ -122,7 +127,7 @@ static int tcp_repair_establised(int fd, struct inet_sk_desc *sk)
 	return 0;
 
 err3:
-	if (!(opts.namespaces_flags & CLONE_NEWNET))
+	if (!(current_ns_mask & CLONE_NEWNET))
 		nf_unlock_connection(sk);
 err2:
 	close(sk->rfd);
@@ -233,6 +238,7 @@ static int tcp_stream_get_options(int sk, TcpStreamEntry *tse)
 	int ret;
 	socklen_t auxl;
 	struct tcp_info ti;
+	int val;
 
 	auxl = sizeof(ti);
 	ret = getsockopt(sk, SOL_TCP, TCP_INFO, &ti, &auxl);
@@ -249,6 +255,21 @@ static int tcp_stream_get_options(int sk, TcpStreamEntry *tse)
 		tse->snd_wscale = ti.tcpi_snd_wscale;
 		tse->rcv_wscale = ti.tcpi_rcv_wscale;
 		tse->has_rcv_wscale = true;
+	}
+
+	if (ti.tcpi_options & TCPI_OPT_TIMESTAMPS) {
+		auxl = sizeof(val);
+		ret = getsockopt(sk, SOL_TCP, TCP_TIMESTAMP, &val, &auxl);
+		if (ret < 0) {
+			if (errno == ENOPROTOOPT)
+				pr_warn("The kernel doesn't support "
+					"the socket option TCP_TIMESTAMP\n");
+			else
+				goto err_sopt;
+		} else {
+			tse->has_timestamp = true;
+			tse->timestamp = val;
+		}
 	}
 
 	pr_info("\toptions: mss_clamp %x wscale %x tstamp %d sack %d\n",
@@ -473,6 +494,14 @@ static int restore_tcp_opts(int sk, TcpStreamEntry *tse)
 		return -1;
 	}
 
+	if (tse->has_timestamp) {
+		if (setsockopt(sk, SOL_TCP, TCP_TIMESTAMP,
+				&tse->timestamp, sizeof(tse->timestamp)) < 0) {
+			pr_perror("Can't set timestamp");
+			return -1;
+		}
+	}
+
 	return 0;
 }
 
@@ -520,7 +549,7 @@ err:
  * rst_tcp_socks contains sockets in repair mode,
  * which will be off in restorer before resuming.
  */
-static int *rst_tcp_socks = NULL;
+static struct rst_tcp_sock *rst_tcp_socks = NULL;
 static int rst_tcp_socks_num = 0;
 int rst_tcp_socks_size = 0;
 
@@ -532,7 +561,7 @@ int rst_tcp_socks_remap(void *addr)
 		return 0;
 	}
 
-	rst_tcp_socks[rst_tcp_socks_num] = -1;
+	rst_tcp_socks[rst_tcp_socks_num].sk = -1;
 
 	ret = mmap(addr, rst_tcp_socks_size, PROT_READ | PROT_WRITE,
 			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -547,17 +576,19 @@ int rst_tcp_socks_remap(void *addr)
 	return 0;
 }
 
-static int rst_tcp_socks_add(int fd)
+static int rst_tcp_socks_add(int fd, bool reuseaddr)
 {
 	/* + 2 = ( new one + guard (-1) ) */
-	if ((rst_tcp_socks_num + 2) * sizeof(int) > rst_tcp_socks_size) {
+	if ((rst_tcp_socks_num + 2) * sizeof(struct rst_tcp_sock) > rst_tcp_socks_size) {
 		rst_tcp_socks_size += PAGE_SIZE;
 		rst_tcp_socks = xrealloc(rst_tcp_socks, rst_tcp_socks_size);
 		if (rst_tcp_socks == NULL)
 			return -1;
 	}
 
-	rst_tcp_socks[rst_tcp_socks_num++] = fd;
+	rst_tcp_socks[rst_tcp_socks_num].sk = fd;
+	rst_tcp_socks[rst_tcp_socks_num].reuseaddr = reuseaddr;
+	rst_tcp_socks_num++;
 	return 0;
 }
 
@@ -568,7 +599,7 @@ int restore_one_tcp(int fd, struct inet_sk_info *ii)
 	if (tcp_repair_on(fd))
 		return -1;
 
-	if (rst_tcp_socks_add(fd))
+	if (rst_tcp_socks_add(fd, ii->ie->opts->reuseaddr))
 		return -1;
 
 	if (restore_tcp_conn_state(fd, ii))
@@ -640,9 +671,11 @@ out:
 	pr_img_tail(CR_FD_TCP_STREAM);
 }
 
-int check_tcp_repair(void)
+int check_tcp(void)
 {
+	socklen_t optlen;
 	int sk, ret;
+	int val;
 
 	sk = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sk < 0) {
@@ -651,6 +684,15 @@ int check_tcp_repair(void)
 	}
 
 	ret = tcp_repair_on(sk);
+	if (ret)
+		goto out;
+
+	optlen = sizeof(val);
+	ret = getsockopt(sk, SOL_TCP, TCP_TIMESTAMP, &val, &optlen);
+	if (ret)
+		pr_perror("Can't get TCP_TIMESTAMP");
+
+out:
 	close(sk);
 
 	return ret;

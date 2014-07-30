@@ -3,6 +3,7 @@
 #include <errno.h>
 
 #include <linux/limits.h>
+#include <linux/major.h>
 
 #include <sys/types.h>
 #include <sys/prctl.h>
@@ -15,6 +16,7 @@
 #include "crtools.h"
 
 #include "files.h"
+#include "file-ids.h"
 #include "files-reg.h"
 #include "image.h"
 #include "list.h"
@@ -24,6 +26,15 @@
 #include "sockets.h"
 #include "pstree.h"
 #include "tty.h"
+#include "pipes.h"
+#include "fifo.h"
+#include "eventfd.h"
+#include "eventpoll.h"
+#include "fsnotify.h"
+#include "signalfd.h"
+
+#include "parasite.h"
+#include "parasite-syscall.h"
 
 #include "protobuf.h"
 #include "protobuf/fs.pb-c.h"
@@ -93,6 +104,194 @@ void show_saved_files(void)
 			list_for_each_entry(le, &fd->fd_info_head, desc_list)
 				pr_info("   `- FD %d pid %d\n", le->fe->fd, le->pid);
 		}
+}
+
+static u32 make_gen_id(const struct fd_parms *p)
+{
+	return ((u32)p->stat.st_dev) ^ ((u32)p->stat.st_ino) ^ ((u32)p->pos);
+}
+
+int do_dump_gen_file(struct fd_parms *p, int lfd,
+		const struct fdtype_ops *ops, const int fdinfo)
+{
+	FdinfoEntry e = FDINFO_ENTRY__INIT;
+	int ret = -1;
+
+	e.type	= ops->type;
+	e.id	= make_gen_id(p);
+	e.fd	= p->fd;
+	e.flags = p->fd_flags;
+
+	ret = fd_id_generate(p->pid, &e);
+	if (ret == 1) /* new ID generated */
+		ret = ops->dump(lfd, e.id, p);
+
+	if (ret < 0)
+		return -1;
+
+	pr_info("fdinfo: type: 0x%2x flags: %#o/%#o pos: 0x%8lx fd: %d\n",
+		ops->type, p->flags, (int)p->fd_flags, p->pos, p->fd);
+
+	return pb_write_one(fdinfo, &e, PB_FDINFO);
+}
+
+static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
+				struct fd_opts *opts, struct fd_parms *p)
+{
+	if (fstat(lfd, &p->stat) < 0) {
+		pr_perror("Can't stat fd %d\n", lfd);
+		return -1;
+	}
+
+	p->ctl		= ctl;
+	p->fd		= fd;
+	p->pos		= lseek(lfd, 0, SEEK_CUR);
+	p->flags	= fcntl(lfd, F_GETFL);
+	p->pid		= ctl->pid;
+	p->fd_flags	= opts->flags;
+
+	fown_entry__init(&p->fown);
+
+	pr_info("%d fdinfo %d: pos: 0x%16lx flags: %16o/%#x\n",
+		ctl->pid, fd, p->pos, p->flags, (int)p->fd_flags);
+
+	p->fown.signum = fcntl(lfd, F_GETSIG, 0);
+	if (p->fown.signum < 0) {
+		pr_perror("Can't get owner signum on %d\n", lfd);
+		return -1;
+	}
+
+	if (opts->fown.pid == 0)
+		return 0;
+
+	p->fown.pid	 = opts->fown.pid;
+	p->fown.pid_type = opts->fown.pid_type;
+	p->fown.uid	 = opts->fown.uid;
+	p->fown.euid	 = opts->fown.euid;
+
+	return 0;
+}
+
+static int dump_unsupp_fd(const struct fd_parms *p)
+{
+	pr_err("Can't dump file %d of that type [%#x]\n",
+			p->fd, p->stat.st_mode);
+	return -1;
+}
+
+static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
+{
+	int maj = major(p->stat.st_rdev);
+
+	switch (maj) {
+	case MEM_MAJOR:
+		return dump_reg_file(p, lfd, fdinfo);
+	case TTYAUX_MAJOR:
+	case UNIX98_PTY_MASTER_MAJOR ... (UNIX98_PTY_MASTER_MAJOR + UNIX98_PTY_MAJOR_COUNT - 1):
+	case UNIX98_PTY_SLAVE_MAJOR:
+		return dump_tty(p, lfd, fdinfo);
+	}
+
+	return dump_unsupp_fd(p);
+}
+
+#ifndef PIPEFS_MAGIC
+#define PIPEFS_MAGIC	0x50495045
+#endif
+
+static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_opts *opts,
+		       const int fdinfo)
+{
+	struct fd_parms p;
+	struct statfs statfs;
+
+	if (fill_fd_params(ctl, fd, lfd, opts, &p) < 0) {
+		pr_perror("Can't get stat on %d", fd);
+		return -1;
+	}
+
+	if (S_ISSOCK(p.stat.st_mode))
+		return dump_socket(&p, lfd, fdinfo);
+
+	if (S_ISCHR(p.stat.st_mode))
+		return dump_chrdev(&p, lfd, fdinfo);
+
+	if (fstatfs(lfd, &statfs)) {
+		pr_perror("Can't obtain statfs on fd %d\n", fd);
+		return -1;
+	}
+
+	if (is_anon_inode(&statfs)) {
+		if (is_eventfd_link(lfd))
+			return dump_eventfd(&p, lfd, fdinfo);
+		else if (is_eventpoll_link(lfd))
+			return dump_eventpoll(&p, lfd, fdinfo);
+		else if (is_inotify_link(lfd))
+			return dump_inotify(&p, lfd, fdinfo);
+		else if (is_fanotify_link(lfd))
+			return dump_fanotify(&p, lfd, fdinfo);
+		else if (is_signalfd_link(lfd))
+			return dump_signalfd(&p, lfd, fdinfo);
+		else
+			return dump_unsupp_fd(&p);
+	}
+
+	if (S_ISREG(p.stat.st_mode) || S_ISDIR(p.stat.st_mode))
+		return dump_reg_file(&p, lfd, fdinfo);
+
+	if (S_ISFIFO(p.stat.st_mode)) {
+		if (statfs.f_type == PIPEFS_MAGIC)
+			return dump_pipe(&p, lfd, fdinfo);
+		else
+			return dump_fifo(&p, lfd, fdinfo);
+	}
+
+	return dump_unsupp_fd(&p);
+}
+
+int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
+		struct parasite_drain_fd *dfds)
+{
+	int *lfds, fdinfo;
+	struct fd_opts *opts;
+	int i, ret = -1;
+
+	pr_info("\n");
+	pr_info("Dumping opened files (pid: %d)\n", ctl->pid);
+	pr_info("----------------------------------------\n");
+
+	lfds = xmalloc(dfds->nr_fds * sizeof(int));
+	if (!lfds)
+		goto err;
+
+	opts = xmalloc(dfds->nr_fds * sizeof(struct fd_opts));
+	if (!opts)
+		goto err1;
+
+	ret = parasite_drain_fds_seized(ctl, dfds, lfds, opts);
+	if (ret)
+		goto err2;
+
+	fdinfo = open_image(CR_FD_FDINFO, O_DUMP, item->ids->files_id);
+	if (fdinfo < 0)
+		goto err2;
+
+	for (i = 0; i < dfds->nr_fds; i++) {
+		ret = dump_one_file(ctl, dfds->fds[i], lfds[i], opts + i, fdinfo);
+		close(lfds[i]);
+		if (ret)
+			break;
+	}
+
+	close(fdinfo);
+
+	pr_info("----------------------------------------\n");
+err2:
+	xfree(opts);
+err1:
+	xfree(lfds);
+err:
+	return ret;
 }
 
 int restore_fown(int fd, FownEntry *fown)
@@ -217,19 +416,32 @@ int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
 	return 0;
 }
 
-int prepare_fd_pid(int pid, struct rst_info *rst_info)
+int prepare_fd_pid(struct pstree_item *item)
 {
 	int fdinfo_fd, ret = 0;
+	pid_t pid = item->pid.virt;
+	struct rst_info *rst_info = item->rst;
 
 	INIT_LIST_HEAD(&rst_info->fds);
 	INIT_LIST_HEAD(&rst_info->eventpoll);
 	INIT_LIST_HEAD(&rst_info->tty_slaves);
 
-	fdinfo_fd = open_image_ro(CR_FD_FDINFO, pid);
-	if (fdinfo_fd < 0) {
-		if (errno == ENOENT)
+	if (!fdinfo_per_id) {
+		fdinfo_fd = open_image_ro(CR_FD_FDINFO, pid);
+		if (fdinfo_fd < 0) {
+			if (errno == ENOENT)
+				return 0;
+			return -1;
+		}
+	} else {
+		if (item->ids == NULL) /* zombie */
 			return 0;
-		else
+
+		if (item->rst->fdt && item->rst->fdt->pid != item->pid.virt)
+			return 0;
+
+		fdinfo_fd = open_image_ro(CR_FD_FDINFO, item->ids->files_id);
+		if (fdinfo_fd < 0)
 			return -1;
 	}
 
@@ -496,7 +708,7 @@ static int open_fdinfos(int pid, struct list_head *list, int state)
 	return ret;
 }
 
-static int close_old_fds(struct pstree_item *me)
+int close_old_fds(struct pstree_item *me)
 {
 	DIR *dir;
 	struct dirent *de;
@@ -528,14 +740,28 @@ static int close_old_fds(struct pstree_item *me)
 
 int prepare_fds(struct pstree_item *me)
 {
-	u32 ret;
+	u32 ret = 0;
 	int state;
 
-	ret = close_old_fds(me);
-	if (ret)
-		goto err;
-
 	pr_info("Opening fdinfo-s\n");
+
+	if (me->rst->fdt) {
+		struct fdt *fdt = me->rst->fdt;
+
+		/*
+		 * Wait all tasks, who share a current fd table.
+		 * We should be sure, that nobody use any file
+		 * descriptor while fdtable is being restored.
+		 */
+		futex_inc_and_wake(&fdt->fdt_lock);
+		futex_wait_while_lt(&fdt->fdt_lock, fdt->nr);
+
+		if (fdt->pid != me->pid.virt) {
+			pr_info("File descriptor talbe is shared with %d\n", fdt->pid);
+			futex_wait_until(&fdt->fdt_lock, fdt->nr + 1);
+			goto out;
+		}
+	}
 
 	for (state = 0; state < ARRAY_SIZE(states); state++) {
 		ret = open_fdinfos(me->pid.virt, &me->rst->fds, state);
@@ -560,7 +786,9 @@ int prepare_fds(struct pstree_item *me)
 			break;
 	}
 
-err:
+	if (me->rst->fdt)
+		futex_inc_and_wake(&me->rst->fdt->fdt_lock);
+out:
 	tty_fini_fds();
 	return ret;
 }
@@ -599,6 +827,11 @@ int prepare_fs(int pid)
 	 * by path thus exposing this (yet unclean) logic here.
 	 */
 
+	if (fe->has_umask) {
+		pr_info("Restoring umask to %o\n", fe->umask);
+		umask(fe->umask);
+	}
+
 	ret = 0;
 close:
 	close_safe(&cwd);
@@ -611,4 +844,31 @@ err:
 int get_filemap_fd(int pid, VmaEntry *vma_entry)
 {
 	return open_reg_by_id(vma_entry->shmid);
+}
+
+int shared_fdt_prepare(struct pstree_item *item)
+{
+	struct pstree_item *parent = item->parent;
+	struct fdt *fdt;
+
+	if (!parent->rst->fdt) {
+		fdt = shmalloc(sizeof(*item->rst->fdt));
+		if (fdt == NULL)
+			return -1;
+
+		parent->rst->fdt = fdt;
+
+		futex_init(&fdt->fdt_lock);
+		fdt->nr = 1;
+		fdt->pid = parent->pid.virt;
+	} else
+		fdt = parent->rst->fdt;
+
+	item->rst->fdt = fdt;
+	item->rst->service_fd_id = fdt->nr;
+	fdt->nr++;
+	if (fdt->pid > item->pid.virt)
+		fdt->pid = item->pid.virt;
+
+	return 0;
 }

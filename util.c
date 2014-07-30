@@ -30,7 +30,7 @@
 #include <sys/wait.h>
 
 #include "compiler.h"
-#include "types.h"
+#include "asm/types.h"
 #include "list.h"
 #include "util.h"
 
@@ -87,13 +87,14 @@ static void vma_opt_str(const struct vma_area *v, char *opt)
 void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
 {
 	char opt[VMA_OPT_LEN];
+	memset(opt, 0, VMA_OPT_LEN);
 
 	if (!vma_area)
 		return;
 
 	vma_opt_str(vma_area, opt);
-	print_on_level(loglevel, "%#lx-%#lx (%liK) prot %#x flags %#x off %#lx "
-			"%s shmid: %#lx\n",
+	print_on_level(loglevel, "%#"PRIx64"-%#"PRIx64" (%"PRIi64"K) prot %#x flags %#x off %#"PRIx64" "
+			"%s shmid: %#"PRIx64"\n",
 			vma_area->vma.start, vma_area->vma.end,
 			KBYTES(vma_area_len(vma_area)),
 			vma_area->vma.prot,
@@ -173,7 +174,6 @@ int move_img_fd(int *img_fd, int want_fd)
 
 static pid_t open_proc_pid = 0;
 static int open_proc_fd = -1;
-static int proc_dir_fd = -1;
 
 int close_pid_proc(void)
 {
@@ -191,30 +191,18 @@ int close_pid_proc(void)
 void close_proc()
 {
 	close_pid_proc();
-	if (proc_dir_fd > 0)
-		close(proc_dir_fd);
-	proc_dir_fd = -1;
+
+	close_service_fd(PROC_FD_OFF);
 }
 
 int set_proc_fd(int fd)
 {
-	int sfd = get_service_fd(PROC_FD_OFF);
-
-	sfd = dup2(fd, sfd);
-	if (sfd < 0) {
-		pr_perror("Can't set proc fd\n");
-		return -1;
-	}
-
-	proc_dir_fd = sfd;
-
-	return 0;
+	return install_service_fd(PROC_FD_OFF, fd);
 }
 
 int set_proc_mountpoint(char *path)
 {
-	int sfd = get_service_fd(PROC_FD_OFF), fd;
-
+	int fd, ret;
 	close_proc();
 
 	fd = open(path, O_DIRECTORY | O_RDONLY);
@@ -223,14 +211,10 @@ int set_proc_mountpoint(char *path)
 		return -1;
 	}
 
-	sfd = dup2(fd, sfd);
+	ret = install_service_fd(PROC_FD_OFF, fd);
 	close(fd);
-	if (sfd < 0) {
-		pr_err("Can't set proc fd\n");
+	if (ret < 0)
 		return -1;
-	}
-
-	proc_dir_fd = sfd;
 
 	return 0;
 }
@@ -239,20 +223,23 @@ inline int open_pid_proc(pid_t pid)
 {
 	char path[18];
 	int fd;
+	int dfd;
 
 	if (pid == open_proc_pid)
 		return open_proc_fd;
 
 	close_pid_proc();
 
-	if (proc_dir_fd == -1) {
-		fd = set_proc_mountpoint("/proc");
-		if (fd < 0)
-			return fd;
+	dfd = get_service_fd(PROC_FD_OFF);
+	if (dfd < 0) {
+		if (set_proc_mountpoint("/proc") < 0)
+			return -1;
+
+		dfd = get_service_fd(PROC_FD_OFF);
 	}
 
 	snprintf(path, sizeof(path), "%d", pid);
-	fd = openat(proc_dir_fd, path, O_RDONLY);
+	fd = openat(dfd, path, O_RDONLY);
 	if (fd < 0)
 		pr_perror("Can't open %s", path);
 	else {
@@ -280,6 +267,7 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...)
 }
 
 static int service_fd_rlim_cur;
+static int service_fd_id = 0;
 
 int init_service_fd(void)
 {
@@ -301,21 +289,82 @@ int init_service_fd(void)
 	return 0;
 }
 
-static int __get_service_fd(enum sfd_type type)
+static int __get_service_fd(enum sfd_type type, int service_fd_id)
 {
-	return service_fd_rlim_cur - type;
+	return service_fd_rlim_cur - type - SERVICE_FD_MAX * service_fd_id;
+}
+
+static DECLARE_BITMAP(sfd_map, SERVICE_FD_MAX);
+
+int install_service_fd(enum sfd_type type, int fd)
+{
+	int sfd = __get_service_fd(type, service_fd_id);
+
+	BUG_ON((int)type <= SERVICE_FD_MIN || (int)type >= SERVICE_FD_MAX);
+
+	if (dup2(fd, sfd) != sfd) {
+		pr_perror("Dup %d -> %d failed", fd, sfd);
+		return -1;
+	}
+
+	set_bit(type, sfd_map);
+	return sfd;
 }
 
 int get_service_fd(enum sfd_type type)
 {
 	BUG_ON((int)type <= SERVICE_FD_MIN || (int)type >= SERVICE_FD_MAX);
-	return __get_service_fd(type);
+
+	if (!test_bit(type, sfd_map))
+		return -1;
+
+	return __get_service_fd(type, service_fd_id);
+}
+
+int close_service_fd(enum sfd_type type)
+{
+	int fd;
+
+	fd = get_service_fd(type);
+	if (fd < 0)
+		return 0;
+
+	if (close_safe(&fd))
+		return -1;
+
+	clear_bit(type, sfd_map);
+	return 0;
+}
+
+int clone_service_fd(int id)
+{
+	int ret = -1, i;
+
+	if (service_fd_id == id)
+		return 0;
+
+	for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++) {
+		int old = __get_service_fd(i, service_fd_id);
+		int new = __get_service_fd(i, id);
+
+		ret = dup2(old, new);
+		if (ret == -1) {
+			if (errno == EBADF)
+				continue;
+			pr_perror("Unalbe to clone %d->%d\n", old, new);
+		}
+	}
+
+	service_fd_id = id;
+	ret = 0;
+
+	return ret;
 }
 
 bool is_any_service_fd(int fd)
 {
-	return fd > __get_service_fd(SERVICE_FD_MAX) &&
-		fd < __get_service_fd(SERVICE_FD_MIN);
+	return fd > __get_service_fd(SERVICE_FD_MAX, service_fd_id) &&
+		fd < __get_service_fd(SERVICE_FD_MIN, service_fd_id);
 }
 
 bool is_service_fd(int fd, enum sfd_type type)
@@ -339,7 +388,7 @@ int copy_file(int fd_in, int fd_out, size_t bytes)
 
 		if (ret == 0) {
 			if (bytes && (written != bytes)) {
-				pr_err("Ghost file size mismatch %lu/%lu\n",
+				pr_err("Ghost file size mismatch %zu/%zu\n",
 						written, bytes);
 				return -1;
 			}
@@ -387,7 +436,7 @@ void *shmalloc(size_t bytes)
 	void *ret;
 
 	if (bytes > SH_BUF_CHUNK) {
-		pr_err("Too big shared buffer requested %lu\n", bytes);
+		pr_err("Too big shared buffer requested %zu\n", bytes);
 		return NULL;
 	}
 
@@ -484,13 +533,13 @@ int cr_system(int in, int out, int err, char *cmd, char *const argv[])
 		if (out == in)
 			out = DUP_SAFE(out, out_chld);
 
+		if (move_img_fd(&out, STDIN_FILENO) ||
+		    move_img_fd(&err, STDIN_FILENO))
+			goto out_chld;
+
 		if (in < 0) {
 			close(STDIN_FILENO);
 		} else {
-			if (move_img_fd(&out, STDIN_FILENO) ||
-			    move_img_fd(&err, STDIN_FILENO))
-				goto out_chld;
-
 			if (reopen_fd_as_nocheck(STDIN_FILENO, in))
 				goto out_chld;
 		}

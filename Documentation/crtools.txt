@@ -31,6 +31,9 @@ OPTIONS
         * 'check'
                 to test whether the kernel support is up-to-date
 
+	* 'exec'
+		to execute a system call from other task\'s context
+
 -c::
     In case of 'show' command the dumped pages content will be shown in hex format.
 
@@ -56,7 +59,7 @@ OPTIONS
 
 -n|--namespaces <ns>::
     Checkpoint namespaces. Namespaces must be separated by comma.
-    Currently supported namespaces: uts, ipc, mnt, pid, net.
+    Currently supported namespaces: *uts*, *ipc*, *mnt*, *pid*, *net*.
 
 -r|--root <path>::
     Change the root filesystem (when run in mount namespace).
@@ -85,8 +88,8 @@ OPTIONS
     Write logging messages to 'file'.
 
 -v <num>::
-    Set logging level to 'num'. Valid options are: 0 - (silent, error messages
-    only), 1 - informative (default), 2 - debug messages.
+    Set logging level to 'num'. Valid options are: *0* - (silent, error messages
+    only), *1* - informative (default), *2* - debug messages.
 
 --log-pid::
     Write separate logging files per each pid.
@@ -103,11 +106,37 @@ OPTIONS
     Also this option allows to migrate a single external tty connection, in other
     words this option allows to migrate such application as 'top' and friends.
 
+-l|--file-locks::
+	Allow to dump and restore file locks. It\'s necessary to make sure that
+	all file lock users are taken into dump. So it\'s only safe to use this
+	for a container dump/restore.
+
 -V|--version::
     Print program version.
 
 -h|--help::
     Print inline help.
+
+SYSCALLS EXECUTION
+------------------
+
+To run a system call from another task\'s context use
+
+    crtools exec -t <pid> <syscall-string>
+
+command. The syscall string should look like
+
+    <syscall-name> <syscall-arguments>...
+
+Each command line argument is transformed into the system call argument by
+the following rules:
+
+* If one starts with '&', the rest of it gets copied to the target task\'s
+  address space and the respective syscall argument is the pointer to this
+  string;
+
+* Otherwise it\'s treated as a number (converted with strtol) and is directly
+  passed into the system call.
 
 EXAMPLES
 --------
@@ -120,6 +149,17 @@ directory 'checkpoint' one should type
 To restore this program detaching crtools itself, one should type
 
     crtools restore -d -D checkpoint -t 1234
+
+
+To close a file descriptor number '1' in task with pid '1234' run
+
+    crtools exec -t 1234 close 1
+
+To open a file named '/foo/bar' for read-write in the task with pid
+'1234' run
+
+    crtools exec -t 1234 open '&/foo/bar' 2
+
 
 AUTHOR
 ------

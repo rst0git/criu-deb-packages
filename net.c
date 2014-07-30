@@ -243,9 +243,11 @@ static int restore_link(NetDeviceEntry *nde, int nlsk)
 		return restore_one_link(nde, nlsk, NULL);
 	case ND_TYPE__VETH:
 		return restore_one_link(nde, nlsk, veth_link_info);
+	default:
+		pr_err("Unsupported link type %d\n", nde->type);
+		break;
 	}
 
-	BUG();
 	return -1;
 }
 
@@ -317,7 +319,7 @@ static int restore_ip_dump(int type, int pid, char *cmd)
 	int fd, ret;
 
 	ret = fd = open_image_ro(type, pid);
-	if (fd > 0) {
+	if (fd >= 0) {
 		ret = run_ip_tool(cmd, "restore", fd, -1);
 		close(fd);
 	}
@@ -339,7 +341,7 @@ int dump_net_ns(int pid, struct cr_fdset *fds)
 {
 	int ret;
 
-	ret = switch_ns(pid, CLONE_NEWNET, "net", NULL);
+	ret = switch_ns(pid, &net_ns_desc, NULL);
 	if (!ret)
 		ret = dump_links(fds);
 	if (!ret)
@@ -382,7 +384,7 @@ int network_lock(void)
 	pr_info("Lock network\n");
 
 	/* Each connection will be locked on dump */
-	if  (!(opts.namespaces_flags & CLONE_NEWNET))
+	if  (!(current_ns_mask & CLONE_NEWNET))
 		return 0;
 
 	return run_scripts("network-lock");
@@ -392,7 +394,7 @@ void network_unlock(void)
 {
 	pr_info("Unlock network\n");
 
-	if  (!(opts.namespaces_flags & CLONE_NEWNET)) {
+	if  (!(current_ns_mask & CLONE_NEWNET)) {
 		cpt_unlock_tcp_connections();
 		rst_unlock_tcp_connections();
 
@@ -402,3 +404,7 @@ void network_unlock(void)
 	run_scripts("network-unlock");
 }
 
+struct ns_desc net_ns_desc = {
+	.cflag = CLONE_NEWNET,
+	.str = "net",
+};

@@ -1,5 +1,5 @@
-#ifndef __PACKET_DIAG_H__
-#define __PACKET_DIAG_H__
+#ifndef __CR_PACKET_DIAG_H__
+#define __CR_PACKET_DIAG_H__
 
 #include <linux/types.h>
 
@@ -73,4 +73,4 @@ struct packet_diag_ring {
 	__u32   pdr_features;
 };
 
-#endif
+#endif /* __CR_PACKET_DIAG_H__ */

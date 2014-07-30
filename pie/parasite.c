@@ -12,9 +12,7 @@
 
 #include <string.h>
 
-#ifndef CONFIG_X86_64
-#error non-x86-64 mode not yet implemented
-#endif
+#include "asm/parasite.h"
 
 static void *brk_start, *brk_end, *brk_tail;
 
@@ -45,7 +43,7 @@ static int brk_init(void)
 	ret = sys_mmap(NULL, MAX_HEAP_SIZE,
 			    PROT_READ | PROT_WRITE,
 			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (ret < 0)
+	if (ret > TASK_SIZE)
 		return -ENOMEM;
 
 	brk_start = brk_tail = (void *)ret;
@@ -139,6 +137,7 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 {
 	unsigned long nrpages, pfn, length;
 	unsigned long prot_old, prot_new;
+	bool bigmap = false;
 	u64 *map, off;
 	int ret = -1;
 
@@ -156,8 +155,19 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 	 */
 	map = brk_alloc(length);
 	if (!map) {
-		ret = -ENOMEM;
-		goto err;
+		/*
+		 * Lets try allocate the bitmap inplace. If the VMA
+		 * is that big we assume the node has enough physical
+		 * memory.
+		 */
+		map = (u64 *)sys_mmap(NULL, length,
+				      PROT_READ | PROT_WRITE,
+				      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if ((long)(void *)map > TASK_SIZE) {
+			ret = -ENOMEM;
+			goto err;
+		}
+		bigmap = true;
 	}
 
 	off = pfn * sizeof(*map);
@@ -181,7 +191,7 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 	if (!(args->vma_entry.prot & PROT_READ)) {
 		prot_old = (unsigned long)args->vma_entry.prot;
 		prot_new = prot_old | PROT_READ;
-		ret = sys_mprotect((void *)args->vma_entry.start,
+		ret = sys_mprotect(decode_pointer(args->vma_entry.start),
 				   (unsigned long)vma_entry_len(&args->vma_entry),
 				   prot_new);
 		if (ret) {
@@ -192,7 +202,7 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 
 	ret = 0;
 	for (pfn = 0; pfn < nrpages; pfn++) {
-		unsigned long vaddr;
+		uint64_t vaddr;
 
 		if (should_dump_page(&args->vma_entry, map[pfn])) {
 			/*
@@ -204,7 +214,7 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 			ret = sys_write_safe(fd_pages, &vaddr, sizeof(vaddr));
 			if (ret)
 				return ret;
-			ret = sys_write_safe(fd_pages, (void *)vaddr, PAGE_SIZE);
+			ret = sys_write_safe(fd_pages, decode_pointer(vaddr), PAGE_SIZE);
 			if (ret)
 				return ret;
 
@@ -217,7 +227,7 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 	 * Don't left pages readable if they were not.
 	 */
 	if (prot_old != prot_new) {
-		ret = sys_mprotect((void *)args->vma_entry.start,
+		ret = sys_mprotect(decode_pointer(args->vma_entry.start),
 				   (unsigned long)vma_entry_len(&args->vma_entry),
 				   prot_old);
 		if (ret) {
@@ -228,7 +238,10 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 
 	ret = 0;
 err_free:
-	brk_free(length);
+	if (!bigmap)
+		brk_free(length);
+	else
+		sys_munmap(map, length);
 err:
 	return ret;
 }
@@ -286,7 +299,10 @@ static int dump_misc(struct parasite_dump_misc *args)
 
 	args->pid = sys_getpid();
 	args->sid = sys_getsid();
-	args->pgid = sys_getpgid();
+	args->pgid = sys_getpgid(0);
+	args->tls = arch_get_tls();
+	args->umask = sys_umask(0);
+	sys_umask(args->umask); /* never fails */
 
 	return 0;
 }
@@ -372,6 +388,7 @@ static int dump_thread(struct parasite_dump_thread *args)
 
 	args->blocked = s->sig_blocked;
 	args->tid = tid;
+	args->tls = arch_get_tls();
 
 	return 0;
 }
@@ -427,7 +444,7 @@ static int init(struct parasite_init_args *args)
 				     PROT_READ | PROT_WRITE,
 				     MAP_PRIVATE | MAP_ANONYMOUS,
 				     -1, 0);
-	if ((long)tid_state < 0)
+	if ((unsigned long)tid_state > TASK_SIZE)
 		return -ENOMEM;
 
 	nr_tid_state = args->nr_threads;

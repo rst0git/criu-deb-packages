@@ -1,7 +1,7 @@
-#ifndef PROTOBUF_H__
-#define PROTOBUF_H__
+#ifndef __CR_PROTOBUF_H__
+#define __CR_PROTOBUF_H__
 
-#include "types.h"
+#include "asm/types.h"
 #include "compiler.h"
 #include "util.h"
 
@@ -41,8 +41,13 @@ enum {
 	PB_SIGNALFD,
 	PB_INOTIFY,
 	PB_INOTIFY_WD,
+	PB_FANOTIFY,
+	PB_FANOTIFY_MARK,
 	PB_TTY,
 	PB_TTY_INFO,
+	PB_FILE_LOCK,
+	PB_RLIMIT,
+	PB_IDS,
 
 	PB_MAX
 };
@@ -73,7 +78,7 @@ extern int pb_write_one(int fd, void *obj, int type);
 	(__proto_message_name ##__get_packed_size(__obj) + sizeof(u32))
 
 #define pb_repeated_size(__obj, __member)						\
-	(sizeof(*(__obj)->__member) * (__obj)->n_ ##__member)
+	((size_t)(sizeof(*(__obj)->__member) * (__obj)->n_ ##__member))
 
 #define pb_msg(__base, __type)			\
 	container_of(__base, __type, base)
@@ -104,4 +109,5 @@ int collect_image(int fd_t, int obj_t, unsigned size,
 		int (*collect)(void *obj, ProtobufCMessage *msg));
 int collect_image_sh(int fd_t, int obj_t, unsigned size,
 		int (*collect)(void *obj, ProtobufCMessage *msg));
-#endif /* PROTOBUF_H__ */
+
+#endif /* __CR_PROTOBUF_H__ */
