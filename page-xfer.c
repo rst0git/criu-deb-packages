@@ -21,6 +21,8 @@ struct page_server_iov {
 	u64	dst_id;
 };
 
+static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, long id);
+
 #define PS_IOV_ADD	1
 #define PS_IOV_HOLE	2
 #define PS_IOV_OPEN	3
@@ -73,7 +75,7 @@ static int page_server_open(struct page_server_iov *pi)
 
 	page_server_close();
 
-	if (open_page_xfer(&cxfer.loc_xfer, type, id))
+	if (open_page_local_xfer(&cxfer.loc_xfer, type, id))
 		return -1;
 
 	cxfer.dst_id = pi->dst_id;
@@ -215,7 +217,7 @@ static int page_server_serve(int sk)
 	}
 
 	if (!flushed) {
-		pr_err("The data were not flushed");
+		pr_err("The data were not flushed\n");
 		ret = -1;
 	}
 
@@ -558,6 +560,7 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, long id)
 	if (opts.auto_dedup && !opts.use_page_server) {
 		int ret;
 		int pfd;
+
 		pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
 		if (pfd < 0 && errno == ENOENT)
 			goto out;
