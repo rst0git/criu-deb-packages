@@ -21,6 +21,7 @@
 #include "sockets.h"
 #include "sk-queue.h"
 #include "mount.h"
+#include "cr-service.h"
 
 #include "protobuf.h"
 #include "protobuf/sk-unix.pb-c.h"
@@ -89,9 +90,17 @@ static void show_one_unix_img(const char *act, const UnixSkEntry *e)
 
 static int can_dump_unix_sk(const struct unix_sk_desc *sk)
 {
+	/*
+	 * The last case in this "if" is seqpacket socket,
+	 * that is connected to cr_service. We will dump
+	 * it properly below.
+	 */
 	if (sk->type != SOCK_STREAM &&
-	    sk->type != SOCK_DGRAM) {
-		pr_err("Only stream/dgram sockets for now\n");
+	    sk->type != SOCK_DGRAM &&
+	    sk->type != SOCK_SEQPACKET) {
+		pr_err("Unsupported type (%d) on socket %x.\n"
+				"Only stream/dgram/seqpacket are supported.\n",
+				sk->type, sk->sd.ino);
 		return 0;
 	}
 
@@ -101,7 +110,8 @@ static int can_dump_unix_sk(const struct unix_sk_desc *sk)
 	case TCP_CLOSE:
 		break;
 	default:
-		pr_err("Unknown state %d\n", sk->state);
+		pr_err("Unknown state %d for unix socket %x\n",
+				sk->state, sk->sd.ino);
 		return 0;
 	}
 
@@ -116,8 +126,10 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 	FilePermsEntry perms = FILE_PERMS_ENTRY__INIT;
 
 	sk = (struct unix_sk_desc *)lookup_socket(p->stat.st_ino, PF_UNIX, 0);
-	if (IS_ERR_OR_NULL(sk))
+	if (IS_ERR_OR_NULL(sk)) {
+		pr_err("Unix socket %#x not found\n", (int)p->stat.st_ino);
 		goto err;
+	}
 
 	if (!can_dump_unix_sk(sk))
 		goto err;
@@ -137,6 +149,16 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 	ue.fown		= (FownEntry *)&p->fown;
 	ue.opts		= &skopts;
 	ue.uflags	= 0;
+
+	/*
+	 * Check if this socket is connected to criu service.
+	 * Dump it like closed one and mark it for restore.
+	 */
+	if (unlikely(ue.peer == service_sk_ino)) {
+		ue.state = TCP_CLOSE;
+		ue.peer = 0;
+		ue.uflags |= USK_SERVICE;
+	}
 
 	if (sk->namelen && *sk->name) {
 		ue.file_perms = &perms;
@@ -242,6 +264,12 @@ dump:
 	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_UNIXSK), &ue, PB_UNIX_SK))
 		goto err;
 
+	/*
+	 * If a stream listening socket has non-zero rqueue, this
+	 * means there are in-flight connections waiting to get
+	 * accept()-ed. We handle them separately with the "icons"
+	 * (i stands for in-flight, cons -- for connections) things.
+	 */
 	if (sk->rqlen != 0 && !(sk->type == SOCK_STREAM &&
 				sk->state == TCP_LISTEN))
 		if (dump_sk_queue(lfd, ue.id))
@@ -312,7 +340,7 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 			}
 
 			if (!tb[UNIX_DIAG_VFS]) {
-				pr_err("Bound socket w/o inode %d\n",
+				pr_err("Bound socket w/o inode %#x\n",
 						m->udiag_ino);
 				goto skip;
 			}
@@ -320,7 +348,7 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 			uv = RTA_DATA(tb[UNIX_DIAG_VFS]);
 			snprintf(rpath, sizeof(rpath), ".%s", name);
 			if (fstatat(mntns_root, rpath, &st, 0)) {
-				pr_perror("Can't stat socket %d(%s)",
+				pr_perror("Can't stat socket %#x(%s)",
 						m->udiag_ino, rpath);
 				goto skip;
 			}
@@ -716,7 +744,25 @@ static int open_unixsk_standalone(struct unix_sk_info *ui)
 	pr_info("Opening standalone socket (id %#x ino %#x peer %#x)\n",
 			ui->ue->id, ui->ue->ino, ui->ue->peer);
 
-	if ((ui->ue->state == TCP_ESTABLISHED) && !ui->ue->peer) {
+	/*
+	 * Check if this socket was connected to criu service.
+	 * If so, put response, that dumping and restoring
+	 * was successful.
+	 */
+	if (ui->ue->uflags & USK_SERVICE) {
+		int sks[2];
+
+		if (socketpair(PF_UNIX, ui->ue->type, 0, sks)) {
+			pr_perror("Can't create socketpair");
+			return -1;
+		}
+
+		if (send_criu_dump_resp(sks[1], true, true) == -1)
+			return -1;
+
+		close(sks[1]);
+		sk = sks[0];
+	} else if ((ui->ue->state == TCP_ESTABLISHED) && !ui->ue->peer) {
 		int ret, sks[2];
 
 		if (ui->ue->type != SOCK_STREAM) {

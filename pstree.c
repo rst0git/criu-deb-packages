@@ -134,9 +134,16 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 {
 	struct pstree_item *item;
 
-	item = xzalloc(sizeof(*item) + (rst ? sizeof(item->rst[0]) : 0));
-	if (!item)
-		return NULL;
+	if (!rst) {
+		item = xzalloc(sizeof(*item));
+		if (!item)
+			return NULL;
+	} else {
+		item = shmalloc(sizeof(*item) + sizeof(item->rst[0]));
+		if (!item)
+			return NULL;
+		memset(item, 0, sizeof(*item) + sizeof(item->rst[0]));
+	}
 
 	INIT_LIST_HEAD(&item->children);
 	INIT_LIST_HEAD(&item->sibling);
@@ -356,8 +363,10 @@ static int read_pstree_image(void)
 		if (!pi->threads)
 			break;
 
-		for (i = 0; i < e->n_threads; i++)
+		for (i = 0; i < e->n_threads; i++) {
+			pi->threads[i].real = -1;
 			pi->threads[i].virt = e->threads[i];
+		}
 
 		task_entries->nr_threads += e->n_threads;
 		task_entries->nr_tasks++;
@@ -511,8 +520,10 @@ static int prepare_pstree_ids(void)
 				break;
 		}
 
-		if (gleader)
+		if (gleader) {
+			item->rst->pgrp_leader = gleader;
 			continue;
+		}
 
 		/*
 		 * If the PGID is eq to current one -- this
@@ -532,6 +543,7 @@ static int prepare_pstree_ids(void)
 		helper->parent = item;
 		list_add(&helper->sibling, &item->children);
 		task_entries->nr_helpers++;
+		item->rst->pgrp_leader = helper;
 
 		pr_info("Add a helper %d for restoring PGID %d\n",
 				helper->pid.virt, helper->pgid);

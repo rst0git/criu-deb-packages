@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 ZP="zdtm/live"
 
@@ -24,6 +24,7 @@ static/vdso00
 static/sched_prio00
 static/sched_policy00
 static/file_shared
+static/file_append
 static/timers
 static/posix_timers
 static/futex
@@ -93,6 +94,9 @@ static/sk-netlink
 static/proc-self
 static/grow_map
 static/grow_map02
+static/stopped
+static/chroot
+static/chroot-file
 "
 # Duplicate list with ns/ prefix
 TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#ns/#')
@@ -119,6 +123,8 @@ static/msgque
 static/sem
 transition/ipc
 ns/static/tun
+static/netns-nf
+static/netns
 "
 
 TEST_CR_KERNEL="
@@ -139,6 +145,8 @@ packet_sock
 fanotify00
 sk-netlink
 tun
+chroot
+chroot-file
 "
 
 source $(readlink -f `dirname $0`/env.sh) || exit 1
@@ -184,8 +192,8 @@ EOF
 
 	cat >&2 <<EOF
 ============================= WARNING =============================
-Not all C/R features are commited in the meainstream kernel.
-Linux C/R can be cloned from:
+Not all features needed for CRIU are merged to upstream kernel yet,
+so for now we maintain our own branch which can be cloned from:
 git://git.kernel.org/pub/scm/linux/kernel/git/gorcunov/linux-cr.git
 ===================================================================
 EOF
@@ -197,16 +205,16 @@ EOF
 
 	echo "A version of kernel should be greater or equal to 3.11" >&2
 
-	return 1;
+	return 1
 }
 
 exit_callback()
 {
 	echo $@
-	[ -n "$ZDTM_ROOT" ] && {
+	if [ -n "$ZDTM_ROOT" ]; then
 		umount -l "$ZDTM_ROOT"
 		rmdir "$ZDTM_ROOT"
-	}
+	fi
 
 	[[ -n "$ZDTM_FAILED" && -n "$DUMP_ARCHIVE" ]] && tar -czf $DUMP_ARCHIVE dump
 	[ -n "$TMPFS_DUMP" ] &&
@@ -222,7 +230,7 @@ construct_root()
 	local libdir=$root/lib
 	local libdir2=$root/lib64
 	local tmpdir=$root/tmp
-	local lname, tname
+	local lname tname
 
 	mkdir -p $root/bin
 	cp $ps_path $root/bin
@@ -242,7 +250,7 @@ construct_root()
 	#	/lib/ld-linux-armhf.so.3 (0xb6f0b000)
 
 	for i in `ldd $test_path $ps_path | grep -P '^\s' | grep -v vdso | sed "s/.*=> //" | awk '{ print $1 }'`; do
-		local ldir, lib=`basename $i`
+		local ldir lib=`basename $i`
 
 		[ -f $libdir2/$lib ] && continue # fast path
 
@@ -256,8 +264,8 @@ construct_root()
 			lname=/lib/x86_64-linux-gnu/$i
 		elif [ -f /lib/arm-linux-gnueabi/$i ]; then
 			lname=/lib/arm-linux-gnueabi/$i
-		else 
-			echo "Failed at " $i;
+		else
+			echo "Failed at " $i
 			return 1
 		fi
 
@@ -292,11 +300,11 @@ start_test()
 	unset ZDTM_UID
 	unset ZDTM_GID
 
-	echo $TEST_SUID_LIST | grep -q $tname || {
+	if ! echo $TEST_SUID_LIST | grep -q $tname; then
 		export ZDTM_UID=18943
 		export ZDTM_GID=58467
 		chown $ZDTM_UID:$ZDTM_GID $tdir
-	}
+	fi
 
 	if [ -z "$PIDNS" ]; then
 		make -C $tdir $tname.pid || return 1
@@ -314,10 +322,10 @@ start_test()
 		export ZDTM_PIDFILE=$TPID
 		cd $ZDTM_ROOT
 		rm -f $ZDTM_PIDFILE
-		make -C $tdir $tname.pid || {
+		if ! make -C $tdir $tname.pid; then
 			echo ERROR: fail to start $tdir/$tname
-			return 1;
-		}
+			return 1
+		fi
 	)
 
 		PID=`cat "$TPID"`
@@ -336,11 +344,26 @@ save_fds()
 	ls -l /proc/$1/fd | sed 's/\(-> \(pipe\|socket\)\):.*/\1/' | awk '{ print $9,$10,$11; }' > $2
 }
 
+save_maps()
+{
+	cat /proc/$1/maps | python maps.py > $2
+}
+
+diff_maps()
+{
+	if ! diff -up $1 $2; then
+		echo ERROR: Sets of mappings differ:
+		echo $1
+		echo $2
+		return 1
+	fi
+}
+
 diff_fds()
 {
 	test -n "$PIDNS" && return 0
 	if ! diff -up $1 $2; then
-		echo ERROR: Sets of descriptors are differ:
+		echo ERROR: Sets of descriptors differ:
 		echo $1
 		echo $2
 		return 1
@@ -363,10 +386,10 @@ run_test()
 		linkremap="--link-remap"
 	fi
 
-	[ -n "$MAINSTREAM_KERNEL" ] && [ $COMPILE_ONLY -eq 0 ] && echo $TEST_CR_KERNEL | grep -q ${test#ns/} && {
+	if [ -n "$MAINSTREAM_KERNEL" ] && [ $COMPILE_ONLY -eq 0 ] && echo $TEST_CR_KERNEL | grep -q ${test#ns/}; then
 		echo "Skip $test"
 		return 0
-	}
+	fi
 
 	expr "$test" : 'ns/' > /dev/null && PIDNS=1 || PIDNS=""
 	test=${ZP}/${test#ns/}
@@ -387,21 +410,21 @@ run_test()
 	start_test $tdir $tname || return 1
 
 	local ddump
-	kill -s 0 "$PID" || {
-		echo "Get a wrong pid '$PID'"
+	if ! kill -s 0 "$PID"; then
+		echo "Got a wrong pid '$PID'"
 		return 1
-	}
+	fi
 
 	if [ -n "$PIDNS" ]; then
 		[ -z "$CR_IP_TOOL" ] && CR_IP_TOOL=ip
-		$CR_IP_TOOL a help 2>&1 | grep -q showdump || {
+		if ! $CR_IP_TOOL a help 2>&1 | grep -q showdump; then
 			cat >&2 <<EOF
 The util "ip" is incompatible. The good one can be cloned from
 git://git.criu.org/iproute2. It should be compiled and a path
 to ip is written in \$CR_IP_TOOL.
 EOF
-			exit 1;
-		}
+			exit 1
+		fi
 		args="--root $ZDTM_ROOT --pidfile $TPID $args"
 	fi
 
@@ -427,16 +450,17 @@ EOF
 
 		if [ -n "$SNAPSHOT" ]; then
 			snapopt=""
-			[ "$i" -ne "$ITERATIONS" ] && {
+			if [ "$i" -ne "$ITERATIONS" ]; then
 				snapopt="$snapopt -R --track-mem"
 				dump_only=1
-			}
+			fi
 			[ -n "$snappdir" ] && snapopt="$snapopt --prev-images-dir=$snappdir"
 		fi
 
 		[ -n "$dump_only" ] && postdump=$POSTDUMP
 
 		save_fds $PID  $ddump/dump.fd
+		save_maps $PID  $ddump/dump.maps
 		setsid $CRIU_CPT dump $opts --file-locks --tcp-established $linkremap \
 			-x --evasive-devices -D $ddump -o dump.log -v4 -t $PID $args $ARGS $snapopt $postdump
 		retcode=$?
@@ -461,7 +485,7 @@ EOF
 
 		if [ $PAGE_SERVER -eq 1 ]; then
 			while :; do
-				kill -0 $ps_pid > /dev/null 2>&1 || break;
+				kill -0 $ps_pid > /dev/null 2>&1 || break
 				echo Waiting the process $ps_pid
 				sleep 0.1
 			done
@@ -470,6 +494,10 @@ EOF
 		if [ -n "$dump_only" ]; then
 			save_fds $PID  $ddump/dump.fd.after
 			diff_fds $ddump/dump.fd $ddump/dump.fd.after || return 1
+
+			save_maps $PID  $ddump/dump.maps.after
+			diff_maps $ddump/dump.maps $ddump/dump.maps.after || return 1
+
 			if [[ $linkremap ]]; then
 				echo "remove ./$tdir/link_remap.*"
 				rm -f ./$tdir/link_remap.*
@@ -479,11 +507,11 @@ EOF
 			for i in $ddump/core-*.img; do
 				local pid
 
-				[ -n "$PIDNS" ] && break;
+				[ -n "$PIDNS" ] && break
 
 				pid=`expr "$i" : '.*/core-\([0-9]*\).img'`
 				while :; do
-					kill -0 $pid > /dev/null 2>&1 || break;
+					kill -0 $pid > /dev/null 2>&1 || break
 					echo Waiting the process $pid
 					sleep 0.1
 				done
@@ -492,26 +520,29 @@ EOF
 			echo Restore
 			setsid $CRIU restore --file-locks --tcp-established -x -D $ddump -o restore.log -v4 -d $args || return 2
 
+			[ -n "$PIDNS" ] && PID=`cat $TPID`
 			for i in `seq 5`; do
 				save_fds $PID  $ddump/restore.fd
 				diff_fds $ddump/dump.fd $ddump/restore.fd && break
 				sleep 0.2
 			done
-			[ $i -eq 5 ] && return 2;
-			[ -n "$PIDNS" ] && PID=`cat $TPID`
+			[ $i -eq 5 ] && return 2
+
+			save_maps $PID $ddump/restore.maps
+			diff_maps $ddump/dump.maps $ddump/restore.maps || return 2
 		fi
 
 	done
 
 	echo Check results $PID
-	stop_test $tdir $tname || {
+	if ! stop_test $tdir $tname; then
 		echo "Unable to stop $tname ($PID)"
 		return 2
-	}
+	fi
 
 	sltime=1
 	for i in `seq 50`; do
-		kill -0 $PID > /dev/null 2>&1 || break;
+		kill -0 $PID > /dev/null 2>&1 || break
 		echo Waiting...
 		sleep 0.$sltime
 		[ $sltime -lt 9 ] && sltime=$((sltime+1))
@@ -544,7 +575,7 @@ EOF
 EOF
 
 	if [ -n "$DUMP_PATH" ]; then
-		[ -e "$DUMP_PATH/dump.log" ] && {
+		if [ -e "$DUMP_PATH/dump.log" ]; then
 			echo "Dump log   : $DUMP_PATH/dump.log"
 			cat $DUMP_PATH/dump.log* | grep Error
 			cat <<EOF
@@ -554,8 +585,8 @@ EOF
 			cat <<EOF
 -------------------------------------------------------------------
 EOF
-		}
-		[ -e "$DUMP_PATH/restore.log" ] && {
+		fi
+		if [ -e "$DUMP_PATH/restore.log" ]; then
 			echo "Restore log: $DUMP_PATH/restore.log"
 			cat $DUMP_PATH/restore.log* | grep Error
 			cat <<EOF
@@ -565,15 +596,15 @@ EOF
 			cat <<EOF
 -------------------------------------------------------------------
 EOF
-		}
+		fi
 	fi
-	[ -e "$test_log" ] && {
+	if [ -e "$test_log" ]; then
 		echo "Output file: $test_log"
 		cat $test_log*
 		cat <<EOF
 -------------------------------------------------------------------
 EOF
-	}
+	fi
 
 	[ -n "$HEAD" ] &&
 		echo "The initial HEAD was $HEAD"
@@ -600,94 +631,8 @@ checkout()
 	make -C $TMP_TREE -j 32
 }
 
-cd `dirname $0` || exit 1
-
-while :; do
-	if [ "$1" = "-d" ]; then
-		DUMP_ONLY=1
-		shift
-		continue
-	fi
-	if [ "$1" = "-i" ]; then
-		shift
-		ITERATIONS=$1
-		shift
-		continue
-	fi
-	if [ "$1" = "-b" ]; then
-		shift
-		checkout $1 || exit 1
-		CRIU_CPT=$TMP_TREE/criu
-		shift
-		continue
-	fi
-	if [ "$1" = "-c" ]; then
-		shift
-		checkout $1 || exit 1
-		shift
-		$TMP_TREE/test/zdtm.sh "$@"
-		exit
-	fi
-	if [ "$1" = "-p" ]; then
-		shift
-		PAGE_SERVER=1
-		continue;
-	fi
-	if [ "$1" = "-C" ]; then
-		shift
-		CLEANUP=1
-		continue;
-	fi
-	if [ "$1" = "-x" ]; then
-		shift
-		EXCLUDE_PATTERN=$1
-		shift
-		continue;
-	fi
-	if [ "$1" = "-t" ]; then
-		shift
-		TMPFS_DUMP=dump
-		[ -d dump ] || mkdir -p $TMPFS_DUMP
-		mount -t tmpfs none $TMPFS_DUMP || exit 1
-		continue;
-	fi
-	if [ "$1" = "-a" ]; then
-		shift
-		DUMP_ARCHIVE=$1
-		shift
-		continue;
-	fi
-	if [ "$1" = "-s" ]; then
-		SNAPSHOT=1
-		shift
-		continue
-	fi
-	if [ "$1" = "-g" ]; then
-		COMPILE_ONLY=1
-		shift
-		continue
-	fi
-	if [ "$1" = "-n" ]; then
-		BATCH_TEST=1
-		shift
-		continue
-	fi
-	if [ "$1" = "-r" ]; then
-		SPECIFIED_NAME_USED=1
-		shift
-		continue
-	fi
-	break;
-done
-
-if [ $COMPILE_ONLY -eq 0 ]; then
-	check_criu || exit 1
-fi
-
-if [ "$1" = "-l" ]; then
-	echo $TEST_LIST | tr ' ' '\n'
-elif [ "$1" = "-h" ]; then
-	cat >&2 <<EOF
+usage() {
+	cat << EOF
 This script is used for executing unit tests.
 Usage:
 zdtm.sh [OPTIONS]
@@ -706,9 +651,103 @@ Options:
 	-n : Batch test
 	-r : Run test with specified name directly without match or check
 EOF
-elif [ "${1:0:1}" = '-' ]; then
-	echo "unrecognized option $1"
-elif [ $SPECIFIED_NAME_USED -eq 1 ]; then
+}
+
+cd `dirname $0` || exit 1
+
+while :; do
+	case $1 in
+	  -d)
+		DUMP_ONLY=1
+		shift
+		;;
+	  -i)
+		shift
+		ITERATIONS=$1
+		shift
+		;;
+	  -b)
+		shift
+		checkout $1 || exit 1
+		CRIU_CPT=$TMP_TREE/criu
+		shift
+		;;
+	  -c)
+		shift
+		checkout $1 || exit 1
+		shift
+		$TMP_TREE/test/zdtm.sh "$@"
+		exit
+		;;
+	  -p)
+		shift
+		PAGE_SERVER=1
+		;;
+	  -C)
+		shift
+		CLEANUP=1
+		;;
+	  -x)
+		shift
+		EXCLUDE_PATTERN=$1
+		shift
+		;;
+	  -t)
+		shift
+		TMPFS_DUMP=dump
+		[ -d dump ] || mkdir -p $TMPFS_DUMP
+		mount -t tmpfs none $TMPFS_DUMP || exit 1
+		;;
+	  -a)
+		shift
+		DUMP_ARCHIVE=$1
+		shift
+		;;
+	  -s)
+		SNAPSHOT=1
+		shift
+		;;
+	  -g)
+		COMPILE_ONLY=1
+		shift
+		;;
+	  -n)
+		BATCH_TEST=1
+		shift
+		;;
+	  -r)
+		SPECIFIED_NAME_USED=1
+		shift
+		;;
+	  -l)
+		echo $TEST_LIST | tr ' ' '\n'
+		exit 0
+		;;
+	  -h)
+		usage
+		exit 0
+		;;
+	  -*)
+		echo "Unrecognized option $1, aborting!" 1>&2
+		usage
+		exit 1
+		;;
+	  *)
+		break
+		;;
+	esac
+done
+
+if [ $# -gt 1 ]; then
+	echo "Too many arguments: $*" 1>&2
+	exit 1
+fi
+
+if [ $COMPILE_ONLY -eq 0 ]; then
+	check_criu || exit 1
+fi
+
+if [ $SPECIFIED_NAME_USED -eq 1 ]; then
 	if [ $# -eq 0 ]; then
 		echo "test name should be provided"
 		exit 1

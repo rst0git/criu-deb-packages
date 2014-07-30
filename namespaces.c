@@ -113,6 +113,7 @@ int restore_ns(int rst, struct ns_desc *nd)
 struct ns_id {
 	unsigned int kid;
 	unsigned int id;
+	pid_t pid;
 	struct ns_desc *nd;
 	struct ns_id *next;
 };
@@ -161,6 +162,7 @@ static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd
 	nsid->kid = kid;
 	nsid->nd = nd;
 	nsid->next = ns_ids;
+	nsid->pid = pid;
 	ns_ids = nsid;
 
 	pr_info("Collected %u.%s namespace\n", nsid->id, nd->str);
@@ -348,47 +350,47 @@ int dump_task_ns_ids(struct pstree_item *item)
 	return 0;
 }
 
-static int do_dump_namespaces(struct pid *ns_pid, unsigned int ns_flags)
+static int do_dump_namespaces(struct ns_id *ns)
 {
-	struct cr_fdset *fdset;
-	int ret = 0;
+	int ret = -1;
 
-	fdset = cr_ns_fdset_open(ns_pid->virt, O_DUMP);
-	if (fdset == NULL)
-		return -1;
+	switch (ns->nd->cflag) {
+	case CLONE_NEWPID:
+		ret = 0;
+		break;
+	case CLONE_NEWUTS:
+		pr_info("Dump UTS namespace %d via %d\n",
+				ns->id, ns->pid);
+		ret = dump_uts_ns(ns->pid, ns->id);
+		break;
+	case CLONE_NEWIPC:
+		pr_info("Dump IPC namespace %d via %d\n",
+				ns->id, ns->pid);
+		ret = dump_ipc_ns(ns->pid, ns->id);
+		break;
+	case CLONE_NEWNS:
+		pr_info("Dump MNT namespace (mountpoints) %d via %d\n",
+				ns->id, ns->pid);
+		ret = dump_mnt_ns(ns->pid, ns->id);
+		break;
+	case CLONE_NEWNET:
+		pr_info("Dump NET namespace info %d via %d\n",
+				ns->id, ns->pid);
+		ret = dump_net_ns(ns->pid, ns->id);
+		break;
+	default:
+		pr_err("Unknown namespace flag %x", ns->nd->cflag);
+		break;
+	}
 
-	if (ns_flags & CLONE_NEWUTS) {
-		pr_info("Dump UTS namespace\n");
-		ret = dump_uts_ns(ns_pid->real, fdset);
-		if (ret < 0)
-			goto err;
-	}
-	if (ns_flags & CLONE_NEWIPC) {
-		pr_info("Dump IPC namespace\n");
-		ret = dump_ipc_ns(ns_pid->real, fdset);
-		if (ret < 0)
-			goto err;
-	}
-	if (ns_flags & CLONE_NEWNS) {
-		pr_info("Dump MNT namespace (mountpoints)\n");
-		ret = dump_mnt_ns(ns_pid->real, fdset);
-		if (ret < 0)
-			goto err;
-	}
-	if (ns_flags & CLONE_NEWNET) {
-		pr_info("Dump NET namespace info\n");
-		ret = dump_net_ns(ns_pid->real, fdset);
-		if (ret < 0)
-			goto err;
-	}
-err:
-	close_cr_fdset(&fdset);
 	return ret;
 
 }
 
-int dump_namespaces(struct pid *ns_pid, unsigned int ns_flags)
+int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 {
+	struct pid *ns_pid = &item->pid;
+	struct ns_id *ns;
 	int pid, status;
 	int ret = 0;
 
@@ -410,36 +412,50 @@ int dump_namespaces(struct pid *ns_pid, unsigned int ns_flags)
 		return -1;
 	}
 
-	pid = fork();
-	if (pid < 0) {
-		pr_perror("Can't fork ns dumper");
-		return -1;
-	}
+	ns = ns_ids;
 
-	if (pid == 0) {
-		ret = do_dump_namespaces(ns_pid, ns_flags);
-		exit(ret);
-	}
+	while (ns) {
+		/* Skip current namespaces, which are in the list too  */
+		if (ns->pid == getpid()) {
+			ns = ns->next;
+			continue;
+		}
 
-	ret = waitpid(pid, &status, 0);
-	if (ret != pid) {
-		pr_perror("Can't wait ns dumper");
-		return -1;
-	}
+		pid = fork();
+		if (pid < 0) {
+			pr_perror("Can't fork ns dumper");
+			return -1;
+		}
 
-	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		pr_err("Namespaces dumping finished with error %d\n", status);
-		return -1;
+		if (pid == 0) {
+			ret = do_dump_namespaces(ns);
+			exit(ret);
+		}
+
+		ret = waitpid(pid, &status, 0);
+		if (ret != pid) {
+			pr_perror("Can't wait ns dumper");
+			return -1;
+		}
+
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			pr_err("Namespaces dumping finished with error %d\n", status);
+			return -1;
+		}
+		ns = ns->next;
 	}
 
 	pr_info("Namespaces dump complete\n");
 	return 0;
 }
 
-int prepare_namespace(int pid, unsigned long clone_flags)
+int prepare_namespace(struct pstree_item *item, unsigned long clone_flags)
 {
+	pid_t pid = item->pid.virt;
+	int id;
+
 	pr_info("Restoring namespaces %d flags 0x%lx\n",
-			pid, clone_flags);
+			item->pid.virt, clone_flags);
 
 	/*
 	 * On netns restore we launch an IP tool, thus we
@@ -447,13 +463,17 @@ int prepare_namespace(int pid, unsigned long clone_flags)
 	 * tree (i.e. -- mnt_ns restoring)
 	 */
 
-	if ((clone_flags & CLONE_NEWNET) && prepare_net_ns(pid))
+	id = ns_per_id ? item->ids->net_ns_id : pid;
+	if ((clone_flags & CLONE_NEWNET) && prepare_net_ns(id))
 		return -1;
-	if ((clone_flags & CLONE_NEWUTS) && prepare_utsns(pid))
+	id = ns_per_id ? item->ids->uts_ns_id : pid;
+	if ((clone_flags & CLONE_NEWUTS) && prepare_utsns(id))
 		return -1;
-	if ((clone_flags & CLONE_NEWIPC) && prepare_ipc_ns(pid))
+	id = ns_per_id ? item->ids->ipc_ns_id : pid;
+	if ((clone_flags & CLONE_NEWIPC) && prepare_ipc_ns(id))
 		return -1;
-	if ((clone_flags & CLONE_NEWNS)  && prepare_mnt_ns(pid))
+	id = ns_per_id ? item->ids->mnt_ns_id : pid;
+	if ((clone_flags & CLONE_NEWNS)  && prepare_mnt_ns(id))
 		return -1;
 
 	return 0;
@@ -462,25 +482,62 @@ int prepare_namespace(int pid, unsigned long clone_flags)
 int try_show_namespaces(int ns_pid)
 {
 	struct cr_fdset *fdset;
-	int i;
+	int i, fd, ret;
+	TaskKobjIdsEntry *ids;
 
 	pr_msg("Namespaces for %d:\n", ns_pid);
-	pr_msg("----------------------------------------\n");
-	fdset = cr_ns_fdset_open(ns_pid, O_SHOW);
-	if (!fdset)
+
+	fd = open_image(CR_FD_IDS, O_RSTR, ns_pid);
+	if (fd < 0)
+		return -1;
+	ret = pb_read_one(fd, &ids, PB_IDS);
+	close(fd);
+	if (ret < 0)
 		return -1;
 
-	for (i = _CR_FD_NS_FROM + 1; i < _CR_FD_NS_TO; i++) {
-		int fd;
+	fdset = cr_fdset_open(ids->net_ns_id, NETNS, O_SHOW);
+	if (fdset) {
+		pr_msg("-------------------NETNS---------------------\n");
+		for (i = _CR_FD_NETNS_FROM + 1; i < _CR_FD_NETNS_TO; i++) {
+			int fd;
 
-		fd = fdset_fd(fdset, i);
-		if (fd == -1)
-			continue;
+			fd = fdset_fd(fdset, i);
+			if (fd == -1)
+				continue;
 
-		cr_parse_fd(fd, fdset_template[i].magic);
+			cr_parse_fd(fd, fdset_template[i].magic);
+		}
+		close_cr_fdset(&fdset);
 	}
+
+	fdset = cr_fdset_open(ids->ipc_ns_id, IPCNS, O_SHOW);
+	if (fdset) {
+		pr_msg("-------------------IPCNS---------------------\n");
+		for (i = _CR_FD_IPCNS_FROM + 1; i < _CR_FD_IPCNS_TO; i++) {
+			fd = fdset_fd(fdset, i);
+			if (fd == -1)
+				continue;
+
+			cr_parse_fd(fd, fdset_template[i].magic);
+		}
+		close_cr_fdset(&fdset);
+	}
+
+	fd = open_image(CR_FD_UTSNS, O_SHOW, ids->uts_ns_id);
+	if (fd >= 0) {
+		pr_msg("-------------------UTSNS---------------------\n");
+		cr_parse_fd(fd, fdset_template[CR_FD_UTSNS].magic);
+		close(fd);
+	}
+
+	fd = open_image(CR_FD_MNTS, O_SHOW, ids->mnt_ns_id);
+	if (fd > 0) {
+		pr_msg("-------------------MNTNS---------------------\n");
+		cr_parse_fd(fd, fdset_template[CR_FD_MNTS].magic);
+		close(fd);
+	}
+
 	pr_msg("---[ end of %d namespaces ]---\n", ns_pid);
-	close_cr_fdset(&fdset);
 	return 0;
 }
 

@@ -70,7 +70,7 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 				SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
 	if (ret != PAGE_SIZE * args->nr_pages) {
 		sys_close(p);
-		pr_err("Can't splice pages ti pipe (%d/%d)", ret, args->nr_pages);
+		pr_err("Can't splice pages to pipe (%d/%d)", ret, args->nr_pages);
 		return -1;
 	}
 
@@ -90,7 +90,7 @@ static int dump_sigact(struct parasite_dump_sa_args *da)
 
 		ret = sys_sigaction(sig, NULL, &da->sas[i], sizeof(k_rtsigset_t));
 		if (ret < 0) {
-			pr_err("sys_sigaction failed\n");
+			pr_err("sys_sigaction failed (%d)\n", ret);
 			break;
 		}
 	}
@@ -109,7 +109,7 @@ static int dump_itimers(struct parasite_dump_itimers_args *args)
 		ret = sys_getitimer(ITIMER_PROF, &args->prof);
 
 	if (ret)
-		pr_err("getitimer failed\n");
+		pr_err("getitimer failed (%d)\n", ret);
 
 	return ret;
 }
@@ -122,13 +122,13 @@ static int dump_posix_timers(struct parasite_dump_posix_timers_args *args)
 	for(i = 0; i < args->timer_n; i++){
 		ret = sys_timer_gettime(args->timer[i].it_id, &args->timer[i].val);
 		if (ret < 0) {
-			pr_err("sys_timer_gettime failed\n");
+			pr_err("sys_timer_gettime failed (%d)\n", ret);
 			return ret;
 		}
 		args->timer[i].overrun = sys_timer_getoverrun(args->timer[i].it_id);
 		ret = args->timer[i].overrun;
 		if (ret < 0) {
-			pr_err("sys_timer_getoverrun failed\n");
+			pr_err("sys_timer_getoverrun failed (%d)\n", ret);
 			return ret;
 		}
 	}
@@ -201,7 +201,7 @@ static int drain_fds(struct parasite_drain_fd *args)
 	ret = send_fds(tsock, NULL, 0,
 		       args->fds, args->nr_fds, true);
 	if (ret)
-		pr_err("send_fds failed\n");
+		pr_err("send_fds failed (%d)\n", ret);
 
 	return ret;
 }
@@ -220,7 +220,7 @@ static int parasite_get_proc_fd()
 
 	ret = sys_readlink("/proc/self", buf, sizeof(buf));
 	if (ret < 0 && ret != -ENOENT) {
-		pr_err("Can't readlink /proc/self\n");
+		pr_err("Can't readlink /proc/self (%d)\n", ret);
 		return ret;
 	}
 
@@ -230,13 +230,15 @@ static int parasite_get_proc_fd()
 		goto out_send_fd;
 	}
 
-	if (sys_mkdir(proc_mountpoint, 0700)) {
-		pr_err("Can't create a directory\n");
+	ret = sys_mkdir(proc_mountpoint, 0700);
+	if (ret) {
+		pr_err("Can't create a directory (%d)\n", ret);
 		return -1;
 	}
 
-	if (sys_mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL)) {
-		pr_err("mount failed\n");
+	ret = sys_mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL);
+	if (ret) {
+		pr_err("mount failed (%d)\n", ret);
 		sys_rmdir(proc_mountpoint);
 		return -1;
 	}
@@ -478,6 +480,20 @@ out:
 	return 0;
 }
 
+static noinline int unmap_itself(void *data)
+{
+	struct parasite_unmap_args *args = data;
+
+	sys_munmap(args->parasite_start, args->parasite_len);
+	/*
+	 * sys_munmap never return back. The controll process must
+	 * trap us on the exit from munmap
+	 */
+
+	BUG();
+	return -1;
+}
+
 static noinline __used int parasite_init_daemon(void *data)
 {
 	struct parasite_init_args *args = data;
@@ -485,7 +501,7 @@ static noinline __used int parasite_init_daemon(void *data)
 
 	sigframe = args->sigframe;
 
-	tsock = sys_socket(PF_UNIX, SOCK_STREAM, 0);
+	tsock = sys_socket(PF_UNIX, SOCK_SEQPACKET, 0);
 	if (tsock < 0) {
 		pr_err("Can't create socket: %d\n", tsock);
 		goto err;
@@ -523,6 +539,8 @@ int __used parasite_service(unsigned int cmd, void *args)
 		return dump_thread(args);
 	case PARASITE_CMD_INIT_DAEMON:
 		return parasite_init_daemon(args);
+	case PARASITE_CMD_UNMAP:
+		return unmap_itself(args);
 	}
 
 	pr_err("Unknown command to parasite: %d\n", cmd);

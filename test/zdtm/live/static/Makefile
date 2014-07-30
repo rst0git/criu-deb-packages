@@ -102,6 +102,7 @@ TST_NOFILE	=				\
 		grow_map			\
 		grow_map02			\
 		tun				\
+		stopped				\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -127,12 +128,14 @@ TST_FILE	=				\
 		unlink_fifo			\
 		unlink_fifo_wronly		\
 		file_shared			\
+		file_append			\
 		cow01				\
 		fdt_shared			\
 		sockets00			\
 		sockets_dgram			\
 		file_locks00			\
 		file_locks01			\
+		netns-nf			\
 
 TST_DIR		=				\
 		cwd00				\
@@ -141,10 +144,15 @@ TST_DIR		=				\
 		overmount_fifo			\
 		overmount_sock			\
 
+TST_DIR_FILE	=				\
+		chroot				\
+		chroot-file
+
 TST		=				\
 		$(TST_NOFILE)			\
 		$(TST_FILE)			\
 		$(TST_DIR)			\
+		$(TST_DIR_FILE)			\
 		env00				\
 		fifo-rowo-pair			\
 		umask00				\
@@ -181,6 +189,9 @@ $(TST_FILE:%=%.pid):	%.pid:	%
 
 $(TST_DIR:%=%.pid):	%.pid:	%
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.test
+
+$(TST_DIR_FILE:%=%.pid):	%.pid:	%
+	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.dir.test --filename=$<.test
 
 cmdlinenv00.pid: cmdlinenv00
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --arg1=arg1 --arg2=arg2 --arg3=arg3

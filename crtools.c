@@ -29,6 +29,7 @@
 #include "page-xfer.h"
 #include "tty.h"
 #include "file-lock.h"
+#include "cr-service.h"
 
 struct cr_options opts;
 
@@ -71,6 +72,7 @@ int main(int argc, char *argv[])
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 
 	cr_pb_init();
+	restrict_uid(getuid(), getgid());
 
 	if (argc < 2)
 		goto usage;
@@ -160,7 +162,7 @@ int main(int argc, char *argv[])
 			}
 			break;
 		case 'o':
-			opts.output = strdup(optarg);
+			opts.output = optarg;
 			if (log_init(optarg))
 				return -1;
 			log_inited = 1;
@@ -170,9 +172,13 @@ int main(int argc, char *argv[])
 				return -1;
 			break;
 		case 'v':
-			if (optarg)
-				log_level = atoi(optarg);
-			else
+			if (optarg) {
+				if (optarg[0] == 'v')
+					/* handle -vvvvv */
+					log_level += strlen(optarg) + 1;
+				else
+					log_level = atoi(optarg);
+			} else
 				log_level++;
 			break;
 		case 41:
@@ -260,7 +266,9 @@ int main(int argc, char *argv[])
 			opts.check_ms_kernel = true;
 			break;
 		case 'V':
-			pr_msg("Version: %s\n", version);
+			pr_msg("Version: %s\n", CRIU_VERSION);
+			if (strcmp(CRIU_GITID, "0"))
+				pr_msg("GitID: %s\n", CRIU_GITID);
 			return 0;
 		case 'h':
 		default:
@@ -281,7 +289,7 @@ int main(int argc, char *argv[])
 
 	ret = open_image_dir();
 	if (ret < 0) {
-		pr_perror("can't open current directory");
+		pr_perror("Can't open current directory");
 		return -1;
 	}
 
@@ -334,6 +342,9 @@ int main(int argc, char *argv[])
 	if (!strcmp(argv[optind], "page-server"))
 		return cr_page_server(opts.restore_detach);
 
+	if (!strcmp(argv[optind], "service"))
+		return cr_service(opts.restore_detach);
+
 	pr_msg("Unknown command \"%s\"\n", argv[optind]);
 usage:
 	pr_msg("\n"
@@ -344,6 +355,7 @@ usage:
 "  criu check [--ms]\n"
 "  criu exec -p PID <syscall-string>\n"
 "  criu page-server\n"
+"  criu service [<options>]\n"
 "\n"
 "Commands:\n"
 "  dump           checkpoint a process/tree identified by pid\n"
@@ -353,6 +365,7 @@ usage:
 "  check          checks whether the kernel support is up-to-date\n"
 "  exec           execute a system call by other task\n"
 "  page-server    launch page server\n"
+"  service        launch service\n"
 	);
 
 	if (argc < 2) {
@@ -369,7 +382,8 @@ usage:
 "  -s|--leave-stopped    leave tasks in stopped state after checkpoint\n"
 "  -R|--leave-running    leave tasks in running state after checkpoint\n"
 "  -D|--images-dir DIR   directory for image files\n"
-"     --pidfile FILE     write a pid of a root task to this file\n"
+"     --pidfile FILE     write a pid of a root task, service or page-server\n"
+"                        to this file\n"
 "\n"
 "* Special resources support:\n"
 "  -x|--" USK_EXT_PARAM "      allow external unix connections\n"
@@ -386,7 +400,7 @@ usage:
 "* Logging:\n"
 "  -o|--log-file FILE    log file name (path is relative to --images-dir)\n"
 "     --log-pid          enable per-process logging to separate FILE.pid files\n"
-"  -v [NUM]              set logging level:\n"
+"  -v[NUM]               set logging level:\n"
 "                          -v0        - messages regardless of log level\n"
 "                          -v1, -v    - errors, when we are in trouble\n"
 "                          -v2, -vv   - warnings (default)\n"
@@ -398,8 +412,8 @@ usage:
 "  --prev-images-dir DIR path to images from previous dump (relative to -D)\n"
 "  --page-server         send pages to page server (see options below as well)\n"
 "\n"
-"Page server options\n"
-"  --address ADDR        address of page server\n"
+"Page/Service server options\n"
+"  --address ADDR        address of server or service\n"
 "  --port PORT           port of page server\n"
 "  -d|--daemon           run in the background after creating socket\n"
 "\n"

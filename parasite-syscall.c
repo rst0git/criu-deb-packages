@@ -307,14 +307,6 @@ int parasite_execute_daemon(unsigned int cmd, struct parasite_ctl *ctl)
 	return ret;
 }
 
-static int munmap_seized(struct parasite_ctl *ctl, void *addr, size_t length)
-{
-	unsigned long x;
-
-	return syscall_seized(ctl, __NR_munmap, &x,
-			(unsigned long)addr, length, 0, 0, 0, 0);
-}
-
 static int gen_parasite_saddr(struct sockaddr_un *saddr, int key)
 {
 	int sun_len;
@@ -338,6 +330,70 @@ int parasite_send_fd(struct parasite_ctl *ctl, int fd)
 	return 0;
 }
 
+/*
+ * We need to detect parasite crashes not to hang on socket operations.
+ * Since CRIU holds parasite with ptrace, it will receive SIGCHLD if the
+ * latter would crash.
+ *
+ * This puts a restriction on how to execute a sub-process on dump stage.
+ * One should use the cr_system helper, that blocks sigcild and waits
+ * for the spawned program to finish.
+ */
+static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
+{
+	int pid, status;
+
+	pr_err("si_code=%d si_pid=%d si_status=%d\n",
+		siginfo->si_code, siginfo->si_pid, siginfo->si_status);
+
+	pid = waitpid(0, &status, WNOHANG);
+	if (pid <= 0)
+		return;
+
+	if (WIFEXITED(status))
+		pr_err("%d exited with %d unexpectedly\n", pid, WEXITSTATUS(status));
+	else if (WIFSIGNALED(status))
+		pr_err("%d was killed by %d unexpectedly\n", pid, WTERMSIG(status));
+	else if (WIFSTOPPED(status))
+		pr_err("%d was stopped by %d unexpectedly\n", pid, WSTOPSIG(status));
+
+	exit(1);
+}
+
+static int setup_child_handler()
+{
+	struct sigaction sa = {
+		.sa_sigaction	= sigchld_handler,
+		.sa_flags	= SA_SIGINFO | SA_RESTART,
+	};
+
+	sigemptyset(&sa.sa_mask);
+	sigaddset(&sa.sa_mask, SIGCHLD);
+	if (sigaction(SIGCHLD, &sa, NULL)) {
+		pr_perror("Unable to setup SIGCHLD handler");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int restore_child_handler()
+{
+	struct sigaction sa = {
+		.sa_handler	= SIG_DFL,
+		.sa_flags	= SA_SIGINFO | SA_RESTART,
+	};
+
+	sigemptyset(&sa.sa_mask);
+	sigaddset(&sa.sa_mask, SIGCHLD);
+	if (sigaction(SIGCHLD, &sa, NULL)) {
+		pr_perror("Unable to setup SIGCHLD handler");
+		return -1;
+	}
+
+	return 0;
+}
+
 static int ssock = -1;
 
 static int prepare_tsock(struct parasite_ctl *ctl, pid_t pid,
@@ -356,7 +412,7 @@ static int prepare_tsock(struct parasite_ctl *ctl, pid_t pid,
 				return -1;
 		}
 
-		ssock = socket(PF_UNIX, SOCK_STREAM, 0);
+		ssock = socket(PF_UNIX, SOCK_SEQPACKET, 0);
 		if (ssock < 0)
 			pr_perror("Can't create socket");
 
@@ -411,6 +467,10 @@ static int parasite_init_daemon(struct parasite_ctl *ctl)
 
 	if (prepare_tsock(ctl, pid, args))
 		goto err;;
+
+	/* after this we can catch parasite errors in chld handler */
+	if (setup_child_handler())
+		goto err;
 
 	regs = ctl->regs_orig;
 	if (parasite_run(pid, ctl->parasite_ip, ctl->rstack,
@@ -716,6 +776,10 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 	user_regs_struct_t regs;
 	int status, ret = 0;
 
+	/* stop getting chld from parasite -- we're about to step-by-step it */
+	if (restore_child_handler())
+		return -1;
+
 	if (!ctl->daemonized)
 		return 0;
 
@@ -759,9 +823,34 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 	if (ret)
 		return -1;
 
+	if (parasite_stop_on_syscall(1, __NR_rt_sigreturn))
+		return -1;
+
+	/*
+	 * All signals are unblocked now. The kernel notifies about leaving
+	 * syscall before starting to deliver signals. All parasite code are
+	 * executed with blocked signals, so we can sefly unmap a parasite blob.
+	 */
+
+	return 0;
+}
+
+/*
+ * Trap tasks on the exit from the specified syscall
+ *
+ * tasks - number of processes, which should be trapped
+ * sys_nr - the required syscall number
+ */
+int parasite_stop_on_syscall(int tasks, const int sys_nr)
+{
+	user_regs_struct_t regs;
+	int status, ret;
+	pid_t pid;
+
 	/* Stop all threads on the enter point in sys_rt_sigreturn */
-	while (1) {
-		if (wait4(pid, &status, __WALL, NULL) < 0) {
+	while (tasks) {
+		pid = wait4(-1, &status, __WALL, NULL);
+		if (pid == -1) {
 			pr_perror("wait4 failed");
 			return -1;
 		}
@@ -783,9 +872,31 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 		}
 
 		pr_debug("%d is going to execute the syscall %lx\n", pid, REG_SYSCALL_NR(regs));
-		if (REG_SYSCALL_NR(regs) == __NR_rt_sigreturn) {
+		if (REG_SYSCALL_NR(regs) == sys_nr) {
+			/*
+			 * The process is going to execute the required syscall,
+			 * the next stop will be on the exit from this syscall
+			 */
+			ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+			if (ret) {
+				pr_perror("ptrace");
+				return -1;
+			}
+
+			pid = wait4(pid, &status, __WALL, NULL);
+			if (pid == -1) {
+				pr_perror("wait4 failed");
+				return -1;
+			}
+
+			if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
+				pr_err("Task is in unexpected state: %x\n", status);
+				return -1;
+			}
+
 			pr_debug("%d was stopped\n", pid);
-			break;
+			tasks--;
+			continue;
 		}
 
 		ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
@@ -795,24 +906,7 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 		}
 	}
 
-	ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
-	if (ret) {
-		pr_perror("ptrace");
-		return -1;
-	}
-
-	if (wait4(pid, &status, __WALL, NULL) != pid) {
-		pr_perror("wait4 failed");
-		return -1;
-	}
-
-	pr_debug("Trap %d\n", pid);
-	if (!WIFSTOPPED(status)) {
-		pr_err("%d\n", status);
-		return -1;
-	}
-
-	return ret;
+	return 0;
 }
 
 int parasite_cure_remote(struct parasite_ctl *ctl)
@@ -826,10 +920,15 @@ int parasite_cure_remote(struct parasite_ctl *ctl)
 	close_safe(&ctl->tsock);
 
 	if (ctl->remote_map) {
-		if (munmap_seized(ctl, (void *)ctl->remote_map, ctl->map_length)) {
-			pr_err("munmap_seized failed (pid: %d)\n", ctl->pid.real);
+		struct parasite_unmap_args *args;
+
+		*ctl->addr_cmd = PARASITE_CMD_UNMAP;
+
+		args = parasite_args(ctl, struct parasite_unmap_args);
+		args->parasite_start = ctl->remote_map;
+		args->parasite_len = ctl->map_length;
+		if (parasite_unmap(ctl, ctl->parasite_ip))
 			ret = -1;
-		}
 	}
 
 	return ret;
@@ -861,6 +960,54 @@ int parasite_cure_seized(struct parasite_ctl *ctl)
 	return ret;
 }
 
+/*
+ * parasite_unmap() is used for unmapping parasite and restorer blobs.
+ * A blob can contain code for unmapping itself, so the porcess is
+ * trapped on the exit from the munmap syscall.
+ */
+int parasite_unmap(struct parasite_ctl *ctl, unsigned long addr)
+{
+	user_regs_struct_t regs;
+	pid_t pid = ctl->pid.real;
+	k_rtsigset_t block;
+	int ret = -1;
+
+	ksigfillset(&block);
+
+	if (ptrace(PTRACE_SETSIGMASK, pid, sizeof(k_rtsigset_t), &block)) {
+		pr_perror("Can't block signals for %d", pid);
+		goto err;
+	}
+
+	regs = ctl->regs_orig;
+	parasite_setup_regs(addr, 0, &regs);
+	if (ptrace(PTRACE_SETREGS, pid, NULL, &regs)) {
+		pr_perror("Can't set registers for %d", pid);
+		goto err_sig;
+	}
+
+	if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL)) {
+		pr_perror("ptrace");
+		goto err_regs;
+	}
+
+	ret = parasite_stop_on_syscall(1, __NR_munmap);
+
+err_regs:
+	if (ptrace(PTRACE_SETREGS, pid, NULL, &ctl->regs_orig)) {
+		pr_perror("Can't restore regs for %d", pid);
+		ret = -1;
+	}
+err_sig:
+	if (ptrace(PTRACE_SETSIGMASK, pid, sizeof(k_rtsigset_t), &ctl->sig_blocked)) {
+		pr_perror("Can't restore sigmask for %d", pid);
+		ret = -1;
+	}
+err:
+	return ret;
+}
+
+/* If vma_area_list is NULL, a place for injecting syscall will not be set. */
 struct parasite_ctl *parasite_prep_ctl(pid_t pid, struct vm_area_list *vma_area_list)
 {
 	struct parasite_ctl *ctl = NULL;
@@ -890,6 +1037,13 @@ struct parasite_ctl *parasite_prep_ctl(pid_t pid, struct vm_area_list *vma_area_
 		goto err;
 	}
 
+	ctl->pid.real	= pid;
+	ctl->pid.virt	= 0;
+
+	if (vma_area_list == NULL)
+		return ctl;
+
+	/* Search a place for injecting syscall */
 	vma_area = get_vma_by_ip(&vma_area_list->h, REG_IP(ctl->regs_orig));
 	if (!vma_area) {
 		pr_err("No suitable VMA found to run parasite "
@@ -897,8 +1051,6 @@ struct parasite_ctl *parasite_prep_ctl(pid_t pid, struct vm_area_list *vma_area_
 		goto err;
 	}
 
-	ctl->pid.real	= pid;
-	ctl->pid.virt	= 0;
 	ctl->syscall_ip	= vma_area->vma.start;
 
 	return ctl;

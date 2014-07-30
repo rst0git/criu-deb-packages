@@ -211,14 +211,6 @@ static void restore_rlims(struct task_restore_core_args *ta)
 static int restore_signals(siginfo_t *ptr, int nr, bool group)
 {
 	int ret, i;
-	k_rtsigset_t to_block;
-
-	ksigfillset(&to_block);
-	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
-	if (ret) {
-		pr_err("Unable to block signals %d", ret);
-		return -1;
-	}
 
 	for (i = 0; i < nr; i++) {
 		siginfo_t *info = ptr + i;
@@ -272,12 +264,21 @@ static int restore_thread_common(struct rt_sigframe *sigframe,
 long __export_restore_thread(struct thread_restore_args *args)
 {
 	struct rt_sigframe *rt_sigframe;
+	k_rtsigset_t to_block;
 	unsigned long new_sp;
 	int my_pid = sys_gettid();
 	int ret;
 
 	if (my_pid != args->pid) {
 		pr_err("Thread pid mismatch %d/%d\n", my_pid, args->pid);
+		goto core_restore_end;
+	}
+
+	/* All signals must be handled by thread leader */
+	ksigfillset(&to_block);
+	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
+	if (ret) {
+		pr_err("Unable to block signals %d", ret);
 		goto core_restore_end;
 	}
 
@@ -510,6 +511,62 @@ static void restore_posix_timers(struct task_restore_core_args *args)
 		sys_timer_settime((timer_t)rt->spt.it_id, 0, &rt->val, NULL);
 	}
 }
+static void *bootstrap_start;
+static unsigned int bootstrap_len;
+
+void __export_unmap(void)
+{
+	sys_munmap(bootstrap_start, bootstrap_len);
+	/*
+	 * sys_munmap must not return here. The controll process must
+	 * trap us on the exit from sys_munmap.
+	 */
+}
+
+/*
+ * This function unmaps all VMAs, which don't belong to
+ * the restored process or the restorer
+ */
+static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len,
+		      void *bootstrap_start, unsigned long bootstrap_len)
+{
+	unsigned long s1, s2;
+	void *p1, *p2;
+	int ret;
+
+	if ((void *) premmapped_addr < bootstrap_start) {
+		p1 = premmapped_addr;
+		s1 = premmapped_len;
+		p2 = bootstrap_start;
+		s2 = bootstrap_len;
+	} else {
+		p2 = premmapped_addr;
+		s2 = premmapped_len;
+		p1 = bootstrap_start;
+		s1 = bootstrap_len;
+	}
+
+	ret = sys_munmap(NULL, p1 - NULL);
+	if (ret) {
+		pr_err("Unable to unmap (%p-%p): %d\n", NULL, p1, ret);
+		return -1;
+	}
+
+	ret = sys_munmap(p1 + s1, p2 - (p1 + s1));
+	if (ret) {
+		pr_err("Unable to unmap (%p-%p): %d\n", p1 + s1, p2, ret);
+		return -1;
+	}
+
+	ret = sys_munmap(p2 + s2, (void *) TASK_SIZE - (p2 + s2));
+	if (ret) {
+		pr_err("Unable to unmap (%p-%p): %d\n",
+				p2 + s2, (void *)TASK_SIZE, ret);
+		return -1;
+	}
+
+	return 0;
+}
 
 /*
  * The main routine to restore task via sigreturn.
@@ -523,12 +580,15 @@ long __export_restore_task(struct task_restore_core_args *args)
 	long ret = -1;
 	VmaEntry *vma_entry;
 	unsigned long va;
-	unsigned long premmapped_end = args->premmapped_addr + args->premmapped_len;
 
 	struct rt_sigframe *rt_sigframe;
 	unsigned long new_sp;
+	k_rtsigset_t to_block;
 	pid_t my_pid = sys_getpid();
 	rt_sigaction_t act;
+
+	bootstrap_start = args->bootstrap_start;
+	bootstrap_len	= args->bootstrap_len;
 
 	task_entries = args->task_entries;
 
@@ -545,60 +605,14 @@ long __export_restore_task(struct task_restore_core_args *args)
 
 	pr_info("Switched to the restorer %d\n", my_pid);
 
-	for (vma_entry = args->self_vmas; vma_entry->start != 0; vma_entry++) {
-		unsigned long addr = vma_entry->start;
-		unsigned long len;
+	if (vdso_remap("rt-vdso", args->vdso_sym_rt.vma_start,
+		       args->vdso_rt_parked_at,
+		       vdso_vma_size(&args->vdso_sym_rt)))
+		goto core_restore_end;
 
-		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
-			continue;
-
-		pr_debug("Examine %"PRIx64"-%"PRIx64"\n", vma_entry->start, vma_entry->end);
-
-		/*
-		 * Park runtime vdso at safe place, thus we can access it
-		 * during restore of targets vma, it's quite important to
-		 * remap it instead of copying to save page frame number
-		 * associated with vdso, we will use it if there is subsequent
-		 * checkpoint done on previously restored program.
-		 */
-		if (vma_entry_is(vma_entry, VMA_AREA_VDSO)) {
-			BUG_ON(vma_entry->start != args->vdso_sym_rt.vma_start);
-			BUG_ON(vma_entry_len(vma_entry) != vdso_vma_size(&args->vdso_sym_rt));
-
-			if (vdso_remap("rt-vdso", vma_entry->start,
-				       args->vdso_rt_parked_at,
-				       vdso_vma_size(&args->vdso_sym_rt)))
-				goto core_restore_end;
-			continue;
-		}
-
-		if (addr < args->premmapped_addr) {
-			if (vma_entry->end >= args->premmapped_addr)
-				len = args->premmapped_addr - addr;
-			else
-				len = vma_entry->end - vma_entry->start;
-			if (sys_munmap((void *) addr, len)) {
-				pr_err("munmap fail for %lx - %lx\n", addr, addr + len);
-				goto core_restore_end;
-			}
-		}
-
-		if (vma_entry->end >= TASK_SIZE)
-			continue;
-
-		if (vma_entry->end > premmapped_end) {
-			if (vma_entry->start < premmapped_end)
-				addr = premmapped_end;
-			len = vma_entry->end - addr;
-			if (sys_munmap((void *) addr, len)) {
-				pr_err("munmap fail for %lx - %lx\n", addr, addr + len);
-				goto core_restore_end;
-			}
-		}
-	}
-
-	sys_munmap(args->self_vmas,
-			((void *)(vma_entry + 1) - ((void *)args->self_vmas)));
+	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len,
+				bootstrap_start, bootstrap_len))
+		goto core_restore_end;
 
 	/* Shift private vma-s to the left */
 	for (vma_entry = args->tgt_vmas; vma_entry->start != 0; vma_entry++) {
@@ -796,12 +810,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 		long parent_tid;
 		int i, fd;
 
-		fd = sys_open(LAST_PID_PATH, O_RDWR, LAST_PID_PERM);
-		if (fd < 0) {
-			pr_err("Can't open last_pid %d\n", fd);
-			goto core_restore_end;
-		}
-
+		fd = args->fd_last_pid;
 		ret = sys_flock(fd, LOCK_EX);
 		if (ret) {
 			pr_err("Can't lock last_pid %d\n", fd);
@@ -842,10 +851,17 @@ long __export_restore_task(struct task_restore_core_args *args)
 			goto core_restore_end;
 		}
 
-		sys_close(fd);
 	}
 
+	sys_close(args->fd_last_pid);
+
 	restore_rlims(args);
+
+	ret = create_posix_timers(args);
+	if (ret < 0) {
+		pr_err("Can't restore posix timers %ld\n", ret);
+		goto core_restore_end;
+	}
 
 	pr_info("%ld: Restored\n", sys_getpid());
 
@@ -854,6 +870,13 @@ long __export_restore_task(struct task_restore_core_args *args)
 	restore_finish_stage(CR_STATE_RESTORE);
 
 	futex_wait_while_gt(&zombies_inprogress, 0);
+
+	ksigfillset(&to_block);
+	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
+	if (ret) {
+		pr_err("Unable to block signals %ld", ret);
+		goto core_restore_end;
+	}
 
 	sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(k_rtsigset_t));
 
@@ -866,12 +889,6 @@ long __export_restore_task(struct task_restore_core_args *args)
 		goto core_restore_end;
 
 	restore_finish_stage(CR_STATE_RESTORE_SIGCHLD);
-
-	ret = create_posix_timers(args);
-	if (ret < 0) {
-		pr_err("Can't restore posix timers %ld\n", ret);
-		goto core_restore_end;
-	}
 
 	rst_tcp_socks_all(args);
 
@@ -913,12 +930,7 @@ long __export_restore_task(struct task_restore_core_args *args)
 
 	restore_posix_timers(args);
 
-	ret = sys_munmap(args->task_entries, TASK_ENTRIES_SIZE);
-	if (ret < 0) {
-		ret = ((long)__LINE__ << 16) | ((-ret) & 0xffff);
-		goto core_restore_failed;
-	}
-
+	sys_munmap(args->task_entries, TASK_ENTRIES_SIZE);
 	sys_munmap(args->rst_mem, args->rst_mem_size);
 
 	/*
@@ -938,9 +950,4 @@ core_restore_end:
 	pr_err("Restorer fail %ld\n", sys_getpid());
 	sys_exit_group(1);
 	return -1;
-
-core_restore_failed:
-	ARCH_FAIL_CORE_RESTORE;
-
-	return ret;
 }

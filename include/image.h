@@ -17,7 +17,21 @@
  */
 #define REMAP_GHOST	(1 << 31)
 
+/*
+ * By-default, when dumping a unix socket, we should dump its peer
+ * as well. Which in turn means, we should dump the task(s) that have
+ * this peer opened.
+ *
+ * Sometimes, we can break this rule and dump only one end of the
+ * unix sockets pair, and on restore time connect() this end back to
+ * its peer.
+ *
+ * So, to resolve this situation we mark the peers we don't dump
+ * as "external" and require the --ext-unix-sk option.
+ */
+
 #define USK_EXTERN	(1 << 0)
+#define USK_SERVICE	(1 << 1)
 
 #define VMA_AREA_NONE		(0 <<  0)
 #define VMA_AREA_REGULAR	(1 <<  0)	/* Dumpable area */
@@ -49,5 +63,6 @@
 #define TASK_HELPER		0x4
 
 extern bool fdinfo_per_id;
+extern bool ns_per_id;
 
 #endif /* __CR_IMAGE_H__ */

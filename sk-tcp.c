@@ -20,6 +20,8 @@
 #include "namespaces.h"
 #include "xmalloc.h"
 #include "config.h"
+#include "cr-show.h"
+#include "kerndat.h"
 
 #include "protobuf.h"
 #include "protobuf/tcp-stream.pb-c.h"
@@ -300,7 +302,7 @@ err_sopt:
 
 static int dump_tcp_conn_state(struct inet_sk_desc *sk)
 {
-	int ret, img_fd;
+	int ret, img_fd, aux;
 	TcpStreamEntry tse = TCP_STREAM_ENTRY__INIT;
 	char *in_buf, *out_buf;
 
@@ -334,6 +336,26 @@ static int dump_tcp_conn_state(struct inet_sk_desc *sk)
 	ret = tcp_stream_get_options(sk->rfd, &tse);
 	if (ret < 0)
 		goto err_opt;
+
+	/*
+	 * TCP socket options
+	 */
+
+	if (dump_opt(sk->rfd, SOL_TCP, TCP_NODELAY, &aux))
+		goto err_opt;
+
+	if (aux) {
+		tse.has_nodelay = true;
+		tse.nodelay = true;
+	}
+
+	if (dump_opt(sk->rfd, SOL_TCP, TCP_CORK, &aux))
+		goto err_opt;
+
+	if (aux) {
+		tse.has_cork = true;
+		tse.cork = true;
+	}
 
 	/*
 	 * Push the stuff to image
@@ -423,6 +445,7 @@ static int restore_tcp_seqs(int sk, TcpStreamEntry *tse)
 static int send_tcp_queue(int sk, int queue, u32 len, int imgfd)
 {
 	int ret, err = -1;
+	int off, max;
 	char *buf;
 
 	pr_debug("\tRestoring TCP %d queue data %u bytes\n", queue, len);
@@ -439,11 +462,19 @@ static int send_tcp_queue(int sk, int queue, u32 len, int imgfd)
 	if (read_img_buf(imgfd, buf, len) < 0)
 		goto err;
 
-	ret = send(sk, buf, len, 0);
-	if (ret != len) {
-		pr_perror("Can't restore %d queue data (%d), want %d",
-				queue, ret, len);
-		goto err;
+	max = (queue == TCP_SEND_QUEUE) ? tcp_max_wshare : tcp_max_rshare;
+	off = 0;
+	while (len) {
+		int chunk = (len > max ? max : len);
+
+		ret = send(sk, buf + off, chunk, 0);
+		if (ret != chunk) {
+			pr_perror("Can't restore %d queue data (%d), want (%d:%d)",
+				  queue, ret, chunk, len);
+			goto err;
+		}
+		off += chunk;
+		len -= chunk;
 	}
 
 	err = 0;
@@ -521,7 +552,7 @@ static int restore_tcp_opts(int sk, TcpStreamEntry *tse)
 
 static int restore_tcp_conn_state(int sk, struct inet_sk_info *ii)
 {
-	int ifd;
+	int ifd, aux;
 	TcpStreamEntry *tse;
 
 	pr_info("Restoring TCP connection id %x ino %x\n", ii->ie->id, ii->ie->ino);
@@ -547,6 +578,18 @@ static int restore_tcp_conn_state(int sk, struct inet_sk_info *ii)
 
 	if (restore_tcp_queues(sk, tse, ifd))
 		goto err_c;
+
+	if (tse->has_nodelay && tse->nodelay) {
+		aux = 1;
+		if (restore_opt(sk, SOL_TCP, TCP_NODELAY, &aux))
+			goto err_c;
+	}
+
+	if (tse->has_cork && tse->cork) {
+		aux = 1;
+		if (restore_opt(sk, SOL_TCP, TCP_CORK, &aux))
+			goto err_c;
+	}
 
 	tcp_stream_entry__free_unpacked(tse, NULL);
 	close(ifd);
@@ -634,4 +677,15 @@ out:
 	close(sk);
 
 	return ret;
+}
+
+void show_tcp_stream(int fd, void *obj)
+{
+	TcpStreamEntry *e = obj;
+	if (opts.show_pages_content) {
+		pr_msg("In-queue:");
+		print_image_data(fd, e->inq_len, 1);
+		pr_msg("Out-queue:");
+		print_image_data(fd, e->outq_len, 1);
+	}
 }

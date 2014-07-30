@@ -148,6 +148,7 @@ static int dump_one_link(struct nlmsghdr *hdr, void *arg)
 	struct ifinfomsg *ifi;
 	int ret = 0, len = hdr->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
 	struct rtattr *tb[IFLA_MAX + 1];
+	char *kind;
 
 	ifi = NLMSG_DATA(hdr);
 
@@ -170,6 +171,18 @@ static int dump_one_link(struct nlmsghdr *hdr, void *arg)
 	case ARPHRD_NONE:
 		ret = dump_one_gendev(ifi, tb, fds);
 		break;
+	case ARPHRD_VOID:
+		/*
+		 * If we meet a link we know about, such as
+		 * OpenVZ's venet, save general parameters of
+		 * it as external link.
+		 */
+		kind = link_kind(ifi, tb);
+		if (kind && !strcmp(kind, "venet")) {
+			ret = dump_one_netdev(ND_TYPE__EXTLINK, ifi, tb, fds, NULL);
+			break;
+		}
+		/* Fall through otherwise! */
 	default:
 		pr_err("Unsupported link type %d, kind %s\n",
 				ifi->ifi_type, link_kind(ifi, tb));
@@ -180,13 +193,15 @@ static int dump_one_link(struct nlmsghdr *hdr, void *arg)
 	return ret;
 }
 
-static int do_dump_links(int (*cb)(struct nlmsghdr *h, void *), void *arg)
+static int dump_links(struct cr_fdset *fds)
 {
 	int sk, ret;
 	struct {
 		struct nlmsghdr nlh;
 		struct rtgenmsg g;
 	} req;
+
+	pr_info("Dumping netns links\n");
 
 	ret = sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (sk < 0) {
@@ -202,17 +217,10 @@ static int do_dump_links(int (*cb)(struct nlmsghdr *h, void *), void *arg)
 	req.nlh.nlmsg_seq = CR_NLMSG_SEQ;
 	req.g.rtgen_family = AF_PACKET;
 
-	ret = do_rtnl_req(sk, &req, sizeof(req), cb, arg);
+	ret = do_rtnl_req(sk, &req, sizeof(req), dump_one_link, fds);
 	close(sk);
 out:
 	return ret;
-}
-
-static int dump_links(struct cr_fdset *fds)
-{
-	pr_info("Dumping netns links\n");
-
-	return do_dump_links(dump_one_link, fds);
 }
 
 static int restore_link_cb(struct nlmsghdr *hdr, void *arg)
@@ -277,7 +285,7 @@ int restore_link_parms(NetDeviceEntry *nde, int nlsk)
 static int restore_one_link(NetDeviceEntry *nde, int nlsk,
 		int (*link_info)(NetDeviceEntry *, struct newlink_req *))
 {
-	pr_info("Restoring netdev idx %d\n", nde->ifindex);
+	pr_info("Restoring netdev %s idx %d\n", nde->name, nde->ifindex);
 	return do_rtm_link_req(RTM_NEWLINK, nde, nlsk, link_info);
 }
 
@@ -325,11 +333,14 @@ static int veth_link_info(NetDeviceEntry *nde, struct newlink_req *req)
 
 static int restore_link(NetDeviceEntry *nde, int nlsk)
 {
-	pr_info("Restoring link type %d\n", nde->type);
+	pr_info("Restoring link %s type %d\n", nde->name, nde->type);
 
 	switch (nde->type) {
 	case ND_TYPE__LOOPBACK:
 		return restore_one_link(nde, nlsk, NULL);
+	case ND_TYPE__EXTLINK:
+		/* see comment in protobuf/netdev.proto */
+		return restore_link_parms(nde, nlsk);
 	case ND_TYPE__VETH:
 		return restore_one_link(nde, nlsk, veth_link_info);
 	case ND_TYPE__TUN:
@@ -395,6 +406,22 @@ static int run_ip_tool(char *arg1, char *arg2, int fdin, int fdout)
 	return 0;
 }
 
+static int run_iptables_tool(char *def_cmd, int fdin, int fdout)
+{
+	int ret;
+	char *cmd;
+
+	cmd = getenv("CR_IPTABLES");
+	if (!cmd)
+		cmd = def_cmd;
+	pr_debug("\tRunning %s for %s\n", cmd, def_cmd);
+	ret = cr_system(fdin, fdout, -1, "sh", (char *[]) { "sh", "-c", cmd, NULL });
+	if (ret)
+		pr_err("%s failed\n", def_cmd);
+
+	return ret;
+}
+
 static inline int dump_ifaddr(struct cr_fdset *fds)
 {
 	return run_ip_tool("addr", "save", -1, fdset_fd(fds, CR_FD_IFADDR));
@@ -403,6 +430,11 @@ static inline int dump_ifaddr(struct cr_fdset *fds)
 static inline int dump_route(struct cr_fdset *fds)
 {
 	return run_ip_tool("route", "save", -1, fdset_fd(fds, CR_FD_ROUTE));
+}
+
+static inline int dump_iptables(struct cr_fdset *fds)
+{
+	return run_iptables_tool("iptables-save", -1, fdset_fd(fds, CR_FD_IPTABLES));
 }
 
 static int restore_ip_dump(int type, int pid, char *cmd)
@@ -426,6 +458,19 @@ static inline int restore_ifaddr(int pid)
 static inline int restore_route(int pid)
 {
 	return restore_ip_dump(CR_FD_ROUTE, pid, "route");
+}
+
+static inline int restore_iptables(int pid)
+{
+	int ret, fd;
+
+	ret = fd = open_image(CR_FD_IPTABLES, O_RSTR, pid);
+	if (fd >= 0) {
+		ret = run_iptables_tool("iptables-restore", fd, -1);
+		close(fd);
+	}
+
+	return ret;
 }
 
 static int mount_ns_sysfs(void)
@@ -468,9 +513,14 @@ static int mount_ns_sysfs(void)
 	return ns_sysfs_fd >= 0 ? 0 : -1;
 }
 
-int dump_net_ns(int pid, struct cr_fdset *fds)
+int dump_net_ns(int pid, int ns_id)
 {
+	struct cr_fdset *fds;
 	int ret;
+
+	fds = cr_fdset_open(ns_id, NETNS, O_DUMP);
+	if (fds == NULL)
+		return -1;
 
 	ret = switch_ns(pid, &net_ns_desc, NULL);
 	if (!ret)
@@ -481,10 +531,13 @@ int dump_net_ns(int pid, struct cr_fdset *fds)
 		ret = dump_ifaddr(fds);
 	if (!ret)
 		ret = dump_route(fds);
+	if (!ret)
+		ret = dump_iptables(fds);
 
 	close(ns_sysfs_fd);
 	ns_sysfs_fd = -1;
 
+	close_cr_fdset(&fds);
 	return ret;
 }
 
@@ -497,6 +550,8 @@ int prepare_net_ns(int pid)
 		ret = restore_ifaddr(pid);
 	if (!ret)
 		ret = restore_route(pid);
+	if (!ret)
+		ret = restore_iptables(pid);
 
 	close(ns_fd);
 
