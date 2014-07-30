@@ -39,6 +39,7 @@ TST_NOFILE	=				\
 		ptrace_sig			\
 		pipe00				\
 		pipe01				\
+		pipe02				\
 		pthread00			\
 		pthread01			\
 		vdso00				\
@@ -61,9 +62,11 @@ TST_NOFILE	=				\
 		maps01				\
 		maps02				\
 		maps03				\
+		maps04				\
 		xids00				\
 		groups				\
 		file_fown			\
+		proc-self			\
 		eventfs00			\
 		signalfd00			\
 		inotify00			\
@@ -78,14 +81,20 @@ TST_NOFILE	=				\
 		pty04				\
 		tty00				\
 		tty02				\
+		tty03				\
 		mountpoints			\
 		netns				\
 		session01			\
+		session02			\
+		session03			\
 		socket-ext			\
 		unhashed_proc			\
 		cow00				\
 		child_opened_proc		\
 		posix_timers			\
+		sigpending			\
+		sk-netlink			\
+		mem-touch			\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -217,6 +226,7 @@ unlink_largefile:	override CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURC
 inotify_system_nodel:	override CFLAGS += -DNODEL
 pthread00:		override LDLIBS += -pthread
 pthread01:		override LDLIBS += -pthread
+sigpending:		override LDLIBS += -pthread
 shm:			override CFLAGS += -DNEW_IPC_NS
 msgque:			override CFLAGS += -DNEW_IPC_NS
 sem:			override CFLAGS += -DNEW_IPC_NS
@@ -224,6 +234,7 @@ posix_timers:		override LDLIBS += -lrt
 socket-tcp6: override CFLAGS += -D ZDTM_IPV6
 socket-tcpbuf6: override CFLAGS += -D ZDTM_IPV6
 socket_listen6: override CFLAGS += -D ZDTM_IPV6
+sigpending:		override LDLIBS += -lrt
 
 $(LIB):	force
 	$(MAKE) -C $(LIBDIR)
@@ -238,7 +249,7 @@ cleanout:
 	$(RM) -f -r *.pid *.out* *.test* *.state
 
 %.cleanout: %
-	$(RM) -f -r $<.pid $<.out* $<.test* $<.*.test $<.state
+	$(RM) -f -r $<.pid $<.out* *$<.test* $<.*.test $<.state
 
 realclean:	cleandep cleanout
 

@@ -18,10 +18,19 @@
 #include "netfilter.h"
 #include "image.h"
 #include "namespaces.h"
+#include "config.h"
 
 #include "protobuf.h"
 #include "protobuf/tcp-stream.pb-c.h"
 
+#ifndef CONFIG_HAS_TCP_REPAIR
+/*
+ * It's been reported that both tcp_repair_opt
+ * and TCP_ enum already shipped in netinet/tcp.h
+ * system header by some distros thus we need a
+ * test if we can use predefined ones or provide
+ * our own.
+ */
 struct tcp_repair_opt {
 	u32	opt_code;
 	u32	opt_val;
@@ -33,6 +42,7 @@ enum {
 	TCP_SEND_QUEUE,
 	TCP_QUEUES_NR,
 };
+#endif
 
 #ifndef TCP_TIMESTAMP
 #define TCP_TIMESTAMP	24
@@ -62,7 +72,7 @@ static int refresh_inet_sk(struct inet_sk_desc *sk)
 	struct tcp_info info;
 
 	if (dump_opt(sk->rfd, SOL_TCP, TCP_INFO, &info)) {
-		pr_perror("Failt to obtain TCP_INFO");
+		pr_perror("Failed to obtain TCP_INFO");
 		return -1;
 	}
 
@@ -98,7 +108,7 @@ static int tcp_repair_establised(int fd, struct inet_sk_desc *sk)
 
 	pr_info("\tTurning repair on for socket %x\n", sk->sd.ino);
 	/*
-	 * Keep the socket open in crtools till the very end. In
+	 * Keep the socket open in criu till the very end. In
 	 * case we close this fd after one task fd dumping and
 	 * fail we'll have to turn repair mode off
 	 */
@@ -260,16 +270,11 @@ static int tcp_stream_get_options(int sk, TcpStreamEntry *tse)
 	if (ti.tcpi_options & TCPI_OPT_TIMESTAMPS) {
 		auxl = sizeof(val);
 		ret = getsockopt(sk, SOL_TCP, TCP_TIMESTAMP, &val, &auxl);
-		if (ret < 0) {
-			if (errno == ENOPROTOOPT)
-				pr_warn("The kernel doesn't support "
-					"the socket option TCP_TIMESTAMP\n");
-			else
-				goto err_sopt;
-		} else {
-			tse->has_timestamp = true;
-			tse->timestamp = val;
-		}
+		if (ret < 0)
+			goto err_sopt;
+
+		tse->has_timestamp = true;
+		tse->timestamp = val;
 	}
 
 	pr_info("\toptions: mss_clamp %x wscale %x tstamp %d sack %d\n",
@@ -317,7 +322,7 @@ static int dump_tcp_conn_state(struct inet_sk_desc *sk)
 	 * Initial options
 	 */
 
-	pr_info("Reasing options for socket\n");
+	pr_info("Reading options for socket\n");
 	ret = tcp_stream_get_options(sk->rfd, &tse);
 	if (ret < 0)
 		goto err_opt;
@@ -409,7 +414,7 @@ static int restore_tcp_seqs(int sk, TcpStreamEntry *tse)
 
 static int send_tcp_queue(int sk, int queue, u32 len, int imgfd)
 {
-	int ret;
+	int ret, err = -1;
 	char *buf;
 
 	pr_debug("\tRestoring TCP %d queue data %u bytes\n", queue, len);
@@ -424,19 +429,20 @@ static int send_tcp_queue(int sk, int queue, u32 len, int imgfd)
 		return -1;
 
 	if (read_img_buf(imgfd, buf, len) < 0)
-		return -1;
+		goto err;
 
 	ret = send(sk, buf, len, 0);
-
-	xfree(buf);
-
 	if (ret != len) {
 		pr_perror("Can't restore %d queue data (%d), want %d",
 				queue, ret, len);
-		return -1;
+		goto err;
 	}
 
-	return 0;
+	err = 0;
+err:
+	xfree(buf);
+
+	return err;
 }
 
 static int restore_tcp_queues(int sk, TcpStreamEntry *tse, int fd)
@@ -512,7 +518,7 @@ static int restore_tcp_conn_state(int sk, struct inet_sk_info *ii)
 
 	pr_info("Restoring TCP connection id %x ino %x\n", ii->ie->id, ii->ie->ino);
 
-	ifd = open_image_ro(CR_FD_TCP_STREAM, ii->ie->ino);
+	ifd = open_image(CR_FD_TCP_STREAM, O_RSTR, ii->ie->ino);
 	if (ifd < 0)
 		goto err;
 
@@ -567,7 +573,7 @@ int rst_tcp_socks_remap(void *addr)
 			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 
 	if (ret != addr) {
-		pr_perror("mmap() failed\n");
+		pr_perror("mmap() failed");
 		return -1;
 	}
 
@@ -576,7 +582,7 @@ int rst_tcp_socks_remap(void *addr)
 	return 0;
 }
 
-static int rst_tcp_socks_add(int fd, bool reuseaddr)
+int rst_tcp_socks_add(int fd, bool reuseaddr)
 {
 	/* + 2 = ( new one + guard (-1) ) */
 	if ((rst_tcp_socks_num + 2) * sizeof(struct rst_tcp_sock) > rst_tcp_socks_size) {
@@ -586,6 +592,7 @@ static int rst_tcp_socks_add(int fd, bool reuseaddr)
 			return -1;
 	}
 
+	pr_debug("Schedule %d socket for repair off\n", fd);
 	rst_tcp_socks[rst_tcp_socks_num].sk = fd;
 	rst_tcp_socks[rst_tcp_socks_num].reuseaddr = reuseaddr;
 	rst_tcp_socks_num++;
@@ -597,9 +604,6 @@ int restore_one_tcp(int fd, struct inet_sk_info *ii)
 	pr_info("Restoring TCP connection\n");
 
 	if (tcp_repair_on(fd))
-		return -1;
-
-	if (rst_tcp_socks_add(fd, ii->ie->opts->reuseaddr))
 		return -1;
 
 	if (restore_tcp_conn_state(fd, ii))
@@ -621,54 +625,9 @@ void rst_unlock_tcp_connections(void)
 		nf_unlock_connection_info(ii);
 }
 
-void show_tcp_stream(int fd, struct cr_options *opt)
+void show_tcp_stream(int fd)
 {
-	TcpStreamEntry *tse;
-	pr_img_head(CR_FD_TCP_STREAM);
-
-	if (pb_read_one_eof(fd, &tse, PB_TCP_STREAM) > 0) {
-		pr_msg("IN:   seq %10u len %10u\n", tse->inq_seq, tse->inq_len);
-		pr_msg("OUT:  seq %10u len %10u\n", tse->outq_seq, tse->outq_len);
-		pr_msg("OPTS: %#x\n", (int)tse->opt_mask);
-		pr_msg("\tmss_clamp %u\n", (int)tse->mss_clamp);
-		if (tse->opt_mask & TCPI_OPT_WSCALE)
-			pr_msg("\tsnd wscale %u\n", (int)tse->snd_wscale);
-			pr_msg("\trcv wscale %u\n", (int)tse->rcv_wscale);
-		if (tse->opt_mask & TCPI_OPT_TIMESTAMPS)
-			pr_msg("\ttimestamps\n");
-		if (tse->opt_mask & TCPI_OPT_SACK)
-			pr_msg("\tsack\n");
-
-		if (opt->show_pages_content) {
-			unsigned char *buf;
-
-			buf = xmalloc(max(tse->inq_len, tse->outq_len));
-			if (!buf)
-				goto out;
-
-			if (tse->inq_len && read_img_buf(fd,
-						buf, tse->inq_len) > 0) {
-				pr_msg("IN queue:\n");
-				print_data(0, buf, tse->inq_len);
-			}
-
-			if (tse->outq_len && read_img_buf(fd,
-						buf, tse->outq_len) > 0) {
-				pr_msg("OUT queue:\n");
-				print_data(0, buf, tse->outq_len);
-			}
-
-			xfree(buf);
-		}
-
-		tcp_stream_entry__free_unpacked(tse, NULL);
-		tse = NULL;
-	}
-
-out:
-	if (tse)
-		tcp_stream_entry__free_unpacked(tse, NULL);
-	pr_img_tail(CR_FD_TCP_STREAM);
+	pb_show_plain_pretty(fd, PB_TCP_STREAM, "1:%u 2:%u 3:%u 4:%u");
 }
 
 int check_tcp(void)
@@ -679,7 +638,7 @@ int check_tcp(void)
 
 	sk = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sk < 0) {
-		pr_perror("Can't create TCP socket :(\n");
+		pr_perror("Can't create TCP socket :(");
 		return -1;
 	}
 

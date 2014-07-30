@@ -7,6 +7,7 @@
 #include "protobuf/core.pb-c.h"
 
 #include "asm/bitops.h"
+#include "asm/int.h"
 
 /* prctl.h */
 #define PR_SET_NAME		15
@@ -61,15 +62,6 @@
 #define ERESTARTNOHAND		514
 #define ERESTART_RESTARTBLOCK	516
 
-typedef uint64_t		u64;
-typedef int64_t			s64;
-typedef unsigned int		u32;
-typedef signed int		s32;
-typedef unsigned short		u16;
-typedef signed short		s16;
-typedef unsigned char		u8;
-typedef signed char		s8;
-
 #define MAJOR(dev)		((dev)>>8)
 #define MINOR(dev)		((dev) & 0xff)
 
@@ -77,22 +69,11 @@ typedef signed char		s8;
 #define _LINUX_CAPABILITY_U32S_3	2
 
 
-typedef struct {
-	unsigned long sig[2];
-} rt_sigset_t;
-
 typedef void rt_signalfn_t(int, siginfo_t *, void *);
 typedef rt_signalfn_t *rt_sighandler_t;
 
 typedef void rt_restorefn_t(void);
 typedef rt_restorefn_t *rt_sigrestore_t;
-
-typedef struct {
-	rt_sighandler_t	rt_sa_handler;
-	unsigned long	rt_sa_flags;
-	rt_sigrestore_t	rt_sa_restorer;
-	rt_sigset_t	rt_sa_mask;
-} rt_sigaction_t;
 
 #define _KNSIG		64
 #define _NSIG_BPW	32
@@ -110,6 +91,14 @@ static inline void ksigfillset(k_rtsigset_t *set)
 		set->sig[i] = (unsigned long)-1;
 }
 
+#define SA_RESTORER	0x04000000
+
+typedef struct {
+	rt_sighandler_t	rt_sa_handler;
+	unsigned long	rt_sa_flags;
+	rt_sigrestore_t	rt_sa_restorer;
+	k_rtsigset_t	rt_sa_mask;
+} rt_sigaction_t;
 
 /*
  * Copied from the Linux kernel header arch/arm/include/asm/ptrace.h
@@ -237,8 +226,6 @@ typedef uint32_t auxv_t;
 
 static inline void *decode_pointer(uint64_t v) { return (void*)(uint32_t)v; }
 static inline uint64_t encode_pointer(void *p) { return (uint32_t)p; }
-
-#define BITS_PER_ULONG 32
 
 typedef struct {
 	struct user_vfp		ufp;

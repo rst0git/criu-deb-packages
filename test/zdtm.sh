@@ -11,6 +11,7 @@ static/env00
 static/maps00
 static/maps01
 static/maps02
+static/maps04
 static/mprotect00
 static/mtime_mmap
 static/sleeping00
@@ -60,6 +61,7 @@ static/unlink_fstat03
 static/eventfs00
 static/signalfd00
 static/inotify00
+static/fanotify00
 static/unbound_sock
 static/fifo-rowo-pair
 static/fifo-ghost
@@ -72,6 +74,7 @@ static/pty00
 static/pty01
 static/pty04
 static/tty02
+static/tty03
 static/child_opened_proc
 static/cow01
 static/fpu00
@@ -82,6 +85,9 @@ static/sse20
 static/fdt_shared
 static/file_locks00
 static/file_locks01
+static/sigpending
+static/sk-netlink
+static/proc-self
 "
 # Duplicate list with ns/ prefix
 TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#ns/#')
@@ -122,6 +128,23 @@ transition/ipc
 "
 
 TEST_CR_KERNEL="
+static/sigpending
+static/sk-netlink
+"
+
+TEST_SUID_LIST="
+pid00
+caps00
+maps01
+groups
+sched_prio00
+sched_policy00
+sock_opts00
+sock_opts01
+cmdlinenv00
+packet_sock
+fanotify00
+sk-netlink
 "
 
 CRTOOLS=$(readlink -f `dirname $0`/../crtools)
@@ -139,6 +162,10 @@ PID=""
 PIDNS=""
 
 ITERATIONS=1
+EXCLUDE_PATTERN=""
+CLEANUP=0
+PAGE_SERVER=0
+PS_PORT=12345
 
 check_mainstream()
 {
@@ -178,11 +205,15 @@ construct_root()
 {
 	local root=$1
 	local test_path=$2
+	local ps_path=`type -P ps`
 	local libdir=$root/lib
 	local libdir2=$root/lib64
 
+	mkdir $root/bin
+	cp $ps_path $root/bin
+
 	mkdir $libdir $libdir2
-	for i in `ldd $test_path | awk '{ print $1 }' | grep -v vdso`; do
+	for i in `ldd $test_path $ps_path | grep -P '^\s' | awk '{ print $1 }' | grep -v vdso`; do
 		local lib=`basename $i`
 		[ -f $libdir/$lib ] && continue ||
 		[ -f $i ] && cp $i $libdir && cp $i $libdir2 && continue ||
@@ -203,13 +234,22 @@ start_test()
 	killall -9 $tname > /dev/null 2>&1
 	make -C $tdir $tname.cleanout
 
+	unset ZDTM_UID
+	unset ZDTM_GID
+
+	echo $TEST_SUID_LIST | grep $tname || {
+		export ZDTM_UID=18943
+		export ZDTM_GID=58467
+		chown $ZDTM_UID:$ZDTM_GID $tdir
+	}
+
 	if [ -z "$PIDNS" ]; then
 		make -C $tdir $tname.pid
 		PID=`cat $test.pid` || return 1
 	else
 		if [ -z "$ZDTM_ROOT" ]; then
 			mkdir dump
-			ZDTM_ROOT=`mktemp -d dump/crtools-root.XXXXXX`
+			ZDTM_ROOT=`mktemp -d /tmp/crtools-root.XXXXXX`
 			ZDTM_ROOT=`readlink -f $ZDTM_ROOT`
 			mount --bind . $ZDTM_ROOT || return 1
 		fi
@@ -256,6 +296,8 @@ run_test()
 {
 	local test=$1
 	local linkremap=
+
+	[ -n "$EXCLUDE_PATTERN" ] && echo $test | grep "$EXCLUDE_PATTERN" && return 0
 
 	#
 	# add option for unlinked files test
@@ -307,12 +349,23 @@ EOF
 	echo Dump $PID
 	mkdir -p $ddump
 
+	if [ $PAGE_SERVER -eq 1 ]; then
+		$CRTOOLS page-server -D $ddump -o page_server.log -v 4 --port $PS_PORT --daemon
+		PS_PID=$!
+		opts="--page-server --address 127.0.0.1 --port $PS_PORT"
+	fi
+
+
 	save_fds $PID  $ddump/dump.fd
 	setsid $CRTOOLS_CPT dump $opts --file-locks --tcp-established $linkremap \
 		-x --evasive-devices -D $ddump -o dump.log -v 4 -t $PID $args $ARGS || {
 		echo WARNING: process $tname is left running for your debugging needs
 		return 1
 	}
+
+	if [ $PAGE_SERVER -eq 1 ]; then
+		wait $PS_PID
+	fi
 
 	if expr " $ARGS" : ' -s' > /dev/null; then
 		save_fds $PID  $ddump/dump.fd.after
@@ -337,8 +390,8 @@ EOF
 			done
 		done
 
-		echo Restore $PID
-		setsid $CRTOOLS restore --file-locks --tcp-established -x -D $ddump -o restore.log -v 4 -d -t $PID $args || return 2
+		echo Restore
+		setsid $CRTOOLS restore --file-locks --tcp-established -x -D $ddump -o restore.log -v 4 -d $args || return 2
 
 		for i in `seq 5`; do
 			save_fds $PID  $ddump/restore.fd
@@ -362,6 +415,8 @@ EOF
 	done
 	cat $test.out
 	cat $test.out | grep -q PASS || return 2
+	[ "$CLEANUP" -ne 0 ] && rm -rf `dirname $ddump`
+	return 0
 }
 
 case_error()
@@ -426,6 +481,22 @@ while :; do
 		$TMP_TREE/test/zdtm.sh "$@"
 		exit
 	fi
+	if [ "$1" = "-p" ]; then
+		shift
+		PAGE_SERVER=1
+		continue;
+	fi
+	if [ "$1" = "-C" ]; then
+		shift
+		CLEANUP=1
+		continue;
+	fi
+	if [ "$1" = "-x" ]; then
+		shift
+		EXCLUDE_PATTERN=$1
+		shift
+		continue;
+	fi
 	break;
 done
 
@@ -457,7 +528,10 @@ Options:
 	-l : Show list of tests.
 	-d : Dump a test process and check that this process can continue working.
 	-i : Number of ITERATIONS of dump/restore
+	-p : Test page server
+	-C : Delete dump files if a test completed successfully
 	-b <commit> : Check backward compatibility
+	-x <PATTERN>: Exclude pattern
 EOF
 elif [ "${1:0:1}" = '-' ]; then
 	echo "unrecognized option $1"

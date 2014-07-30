@@ -73,7 +73,7 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	if (!gf->remap.path)
 		goto err;
 
-	ifd = open_image_ro(CR_FD_GHOST_FILE, rfe->remap_id);
+	ifd = open_image(CR_FD_GHOST_FILE, O_RSTR, rfe->remap_id);
 	if (ifd < 0)
 		goto err;
 
@@ -92,7 +92,7 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 
 	if (S_ISFIFO(gfe->mode)) {
 		if (mknod(gf->remap.path, gfe->mode, 0)) {
-			pr_perror("Can't create node for ghost file\n");
+			pr_perror("Can't create node for ghost file");
 			goto close_ifd;
 		}
 		ghost_flags = O_RDWR; /* To not block */
@@ -106,7 +106,7 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	}
 
 	if (fchown(gfd, gfe->uid, gfe->gid) < 0) {
-		pr_perror("Can't reset user/group on ghost %#x\n", rfe->remap_id);
+		pr_perror("Can't reset user/group on ghost %#x", rfe->remap_id);
 		goto close_all;
 	}
 
@@ -169,7 +169,7 @@ static int collect_remaps(void)
 {
 	int fd, ret = 0;
 
-	fd = open_image_ro(CR_FD_REMAP_FPATH);
+	fd = open_image(CR_FD_REMAP_FPATH, O_RSTR);
 	if (fd < 0)
 		return -1;
 
@@ -231,7 +231,7 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st)
 		return -1;
 
 	if (S_ISREG(st->st_mode)) {
-		int fd;
+		int fd, ret;
 
 		/*
 		 * Reopen file locally since it may have no read
@@ -243,10 +243,10 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st)
 			pr_perror("Can't open ghost original file");
 			return -1;
 		}
-		if (copy_file(fd, img, st->st_size))
-			return -1;
-
+		ret = copy_file(fd, img, st->st_size);
 		close(fd);
+		if (ret)
+			return -1;
 	}
 
 	close(img);
@@ -432,31 +432,37 @@ static int check_path_remap(char *rpath, int plen, const struct stat *ost, int l
 
 int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 {
-	char fd_str[128];
-	char rpath[PATH_MAX + 1] = ".", *path = rpath + 1;
-	int len, rfd;
+	struct fd_link _link, *link;
+	int rfd;
 
 	RegFileEntry rfe = REG_FILE_ENTRY__INIT;
 
-	snprintf(fd_str, sizeof(fd_str), "/proc/self/fd/%d", lfd);
-	len = readlink(fd_str, path, sizeof(rpath) - 2);
-	if (len < 0) {
-		pr_perror("Can't readlink %s", fd_str);
-		return len;
+	if (!p->link) {
+		if (fill_fdlink(lfd, p, &_link))
+			return -1;
+		link = &_link;
+	} else
+		link = p->link;
+
+	pr_info("Dumping path for %d fd via self %d [%s]\n",
+			p->fd, lfd, &link->name[1]);
+
+	/*
+	 * The regular path we can handle should start with slash.
+	 */
+	if (link->name[1] != '/') {
+		pr_err("The path [%s] is not supported\n", &link->name[1]);
+		return -1;
 	}
 
-	path[len] = '\0';
-	pr_info("Dumping path for %d fd via self %d [%s]\n",
-			p->fd, lfd, path);
-
-	if (check_path_remap(rpath, len, &p->stat, lfd, id))
+	if (check_path_remap(link->name, link->len, &p->stat, lfd, id))
 		return -1;
 
 	rfe.id		= id;
 	rfe.flags	= p->flags;
 	rfe.pos		= p->pos;
 	rfe.fown	= (FownEntry *)&p->fown;
-	rfe.name	= path;
+	rfe.name	= &link->name[1];
 
 	rfd = fdset_fd(glob_fdset, CR_FD_REG_FILES);
 
@@ -485,7 +491,7 @@ static int open_path(struct file_desc *d,
 	if (rfi->remap) {
 		mutex_lock(ghost_file_mutex);
 		if (link(rfi->remap->path, rfi->path) < 0) {
-			pr_perror("Can't link %s -> %s\n",
+			pr_perror("Can't link %s -> %s",
 					rfi->remap->path, rfi->path);
 			return -1;
 		}
@@ -519,7 +525,7 @@ int open_path_by_id(u32 id, int (*open_cb)(struct reg_file_info *, void *), void
 
 	fd = find_file_desc_raw(FD_TYPES__REG, id);
 	if (fd == NULL) {
-		pr_perror("Can't find regfile for %#x\n", id);
+		pr_err("Can't find regfile for %#x\n", id);
 		return -1;
 	}
 
@@ -532,12 +538,13 @@ static int do_open_reg(struct reg_file_info *rfi, void *arg)
 
 	fd = open(rfi->path, rfi->rfe->flags);
 	if (fd < 0) {
-		pr_perror("Can't open file on restore");
+		pr_perror("Can't open file %s on restore", rfi->path);
 		return fd;
 	}
 
 	if (lseek(fd, rfi->rfe->pos, SEEK_SET) < 0) {
 		pr_perror("Can't restore file pos");
+		close(fd);
 		return -1;
 	}
 

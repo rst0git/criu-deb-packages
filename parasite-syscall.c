@@ -10,6 +10,7 @@
 #include "protobuf/itimer.pb-c.h"
 #include "protobuf/creds.pb-c.h"
 #include "protobuf/core.pb-c.h"
+#include "protobuf/pagemap.pb-c.h"
 
 #include "syscall.h"
 #include "ptrace.h"
@@ -21,6 +22,7 @@
 #include "namespaces.h"
 #include "pstree.h"
 #include "net.h"
+#include "mem.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -67,7 +69,7 @@ int __parasite_execute(struct parasite_ctl *ctl, pid_t pid, user_regs_struct_t *
 
 again:
 	if (ptrace(PTRACE_SETREGS, pid, NULL, regs)) {
-		pr_err("Can't set registers (pid: %d)\n", pid);
+		pr_perror("Can't set registers (pid: %d)", pid);
 		goto err;
 	}
 
@@ -77,12 +79,12 @@ again:
 	 */
 
 	if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
-		pr_err("Can't continue (pid: %d)\n", pid);
+		pr_perror("Can't continue (pid: %d)", pid);
 		goto err;
 	}
 
 	if (wait4(pid, &status, __WALL, NULL) != pid) {
-		pr_err("Waited pid mismatch (pid: %d)\n", pid);
+		pr_perror("Waited pid mismatch (pid: %d)", pid);
 		goto err;
 	}
 
@@ -92,12 +94,12 @@ again:
 	}
 
 	if (ptrace(PTRACE_GETSIGINFO, pid, NULL, &siginfo)) {
-		pr_err("Can't get siginfo (pid: %d)\n", pid);
+		pr_perror("Can't get siginfo (pid: %d)", pid);
 		goto err;
 	}
 
 	if (ptrace(PTRACE_GETREGS, pid, NULL, regs)) {
-		pr_err("Can't obtain registers (pid: %d)\n", pid);
+		pr_perror("Can't obtain registers (pid: %d)", pid);
 			goto err;
 	}
 
@@ -125,22 +127,22 @@ retry_signal:
 		 */
 
 		if (ptrace(PTRACE_SETREGS, pid, NULL, &ctl->regs_orig)) {
-			pr_err("Can't set registers (pid: %d)\n", pid);
+			pr_perror("Can't set registers (pid: %d)", pid);
 			goto err;
 		}
 
 		if (ptrace(PTRACE_INTERRUPT, pid, NULL, NULL)) {
-			pr_err("Can't interrupt (pid: %d)\n", pid);
+			pr_perror("Can't interrupt (pid: %d)", pid);
 			goto err;
 		}
 
 		if (ptrace(PTRACE_CONT, pid, NULL, (void *)(unsigned long)siginfo.si_signo)) {
-			pr_err("Can't continue (pid: %d)\n", pid);
+			pr_perror("Can't continue (pid: %d)", pid);
 			goto err;
 		}
 
 		if (wait4(pid, &status, __WALL, NULL) != pid) {
-			pr_err("Waited pid mismatch (pid: %d)\n", pid);
+			pr_perror("Waited pid mismatch (pid: %d)", pid);
 			goto err;
 		}
 
@@ -150,7 +152,7 @@ retry_signal:
 		}
 
 		if (ptrace(PTRACE_GETSIGINFO, pid, NULL, &siginfo)) {
-			pr_err("Can't get siginfo (pid: %d)\n", pid);
+			pr_perror("Can't get siginfo (pid: %d)", pid);
 			goto err;
 		}
 
@@ -164,7 +166,7 @@ retry_signal:
 		{
 			user_regs_struct_t r;
 			if (ptrace(PTRACE_GETREGS, pid, NULL, &r)) {
-				pr_err("Can't obtain registers (pid: %d)\n", pid);
+				pr_perror("Can't obtain registers (pid: %d)", pid);
 				goto err;
 			}
 			ctl->regs_orig = r;
@@ -174,7 +176,7 @@ retry_signal:
 	}
 
 	/*
-	 * We've reached this point iif int3 is triggered inside our
+	 * We've reached this point if int3 is triggered inside our
 	 * parasite code. So we're done.
 	 */
 	ret = 0;
@@ -182,14 +184,14 @@ err:
 	return ret;
 }
 
-static void *parasite_args_s(struct parasite_ctl *ctl, int args_size)
+void *parasite_args_s(struct parasite_ctl *ctl, int args_size)
 {
-	BUG_ON(args_size > PARASITE_ARG_SIZE);
+	BUG_ON(args_size > ctl->args_size);
 	return ctl->addr_args;
 }
 
 #define parasite_args(ctl, type) ({				\
-		BUILD_BUG_ON(sizeof(type) > PARASITE_ARG_SIZE);	\
+		BUILD_BUG_ON(sizeof(type) > PARASITE_ARG_SIZE_MIN);\
 		ctl->addr_args;					\
 	})
 
@@ -198,11 +200,11 @@ static int parasite_execute_by_pid(unsigned int cmd, struct parasite_ctl *ctl, p
 	int ret;
 	user_regs_struct_t regs_orig, regs;
 
-	if (ctl->pid == pid)
+	if (ctl->pid.real == pid)
 		regs = ctl->regs_orig;
 	else {
 		if (ptrace(PTRACE_GETREGS, pid, NULL, &regs_orig)) {
-			pr_err("Can't obtain registers (pid: %d)\n", pid);
+			pr_perror("Can't obtain registers (pid: %d)", pid);
 			return -1;
 		}
 		regs = regs_orig;
@@ -219,18 +221,18 @@ static int parasite_execute_by_pid(unsigned int cmd, struct parasite_ctl *ctl, p
 	if (ret)
 		pr_err("Parasite exited with %d\n", ret);
 
-	if (ctl->pid != pid)
+	if (ctl->pid.real != pid)
 		if (ptrace(PTRACE_SETREGS, pid, NULL, &regs_orig)) {
-			pr_err("Can't restore registers (pid: %d)\n", ctl->pid);
+			pr_perror("Can't restore registers (pid: %d)", pid);
 			return -1;
 		}
 
 	return ret;
 }
 
-static int parasite_execute(unsigned int cmd, struct parasite_ctl *ctl)
+int parasite_execute(unsigned int cmd, struct parasite_ctl *ctl)
 {
-	return parasite_execute_by_pid(cmd, ctl, ctl->pid);
+	return parasite_execute_by_pid(cmd, ctl, ctl->pid.real);
 }
 
 static int munmap_seized(struct parasite_ctl *ctl, void *addr, size_t length)
@@ -255,7 +257,7 @@ static int gen_parasite_saddr(struct sockaddr_un *saddr, int key)
 	return sun_len;
 }
 
-static int parasite_send_fd(struct parasite_ctl *ctl, int fd)
+int parasite_send_fd(struct parasite_ctl *ctl, int fd)
 {
 	if (send_fd(ctl->tsock, NULL, 0, fd) < 0) {
 		pr_perror("Can't send file descriptor");
@@ -306,18 +308,19 @@ static int parasite_init(struct parasite_ctl *ctl, pid_t pid, int nr_threads)
 		}
 
 		sock = socket(PF_UNIX, SOCK_DGRAM, 0);
-		if (sock < 0) {
+		if (sock < 0)
 			pr_perror("Can't create socket");
+
+		if (rst > 0 && restore_ns(rst, &net_ns_desc) < 0)
 			return -1;
-		}
+		if (sock < 0)
+			return -1;
 
 		if (bind(sock, (struct sockaddr *)&args->h_addr, args->h_addr_len) < 0) {
 			pr_perror("Can't bind socket");
 			goto err;
 		}
 
-		if (rst > 0 && restore_ns(rst, &net_ns_desc) < 0)
-			goto err;
 	} else {
 		struct sockaddr addr = { .sa_family = AF_UNSPEC, };
 
@@ -347,7 +350,7 @@ static int parasite_init(struct parasite_ctl *ctl, pid_t pid, int nr_threads)
 	ctl->tsock = sock;
 	return 0;
 err:
-	close(sock);
+	close_safe(&sock);
 	return -1;
 }
 
@@ -408,7 +411,7 @@ static int dump_one_timer(struct itimerval *v, int fd)
 	ie.isec = v->it_interval.tv_sec;
 	ie.iusec = v->it_interval.tv_usec;
 	ie.vsec = v->it_value.tv_sec;
-	ie.vusec = v->it_value.tv_sec;
+	ie.vusec = v->it_value.tv_usec;
 
 	return pb_write_one(fd, &ie, PB_ITIMERS);
 }
@@ -480,94 +483,6 @@ int parasite_dump_creds(struct parasite_ctl *ctl, CredsEntry *ce)
 	BUILD_BUG_ON(sizeof(ce->groups[0]) != sizeof(pc->groups[0]));
 	ce->groups = pc->groups;
 	return 0;
-}
-
-/*
- * This routine drives parasite code (been previously injected into a victim
- * process) and tells it to dump pages into the file.
- */
-int parasite_dump_pages_seized(struct parasite_ctl *ctl, struct list_head *vma_area_list,
-			       struct cr_fdset *cr_fdset)
-{
-	struct parasite_dump_pages_args *parasite_dumppages;
-	unsigned long nrpages_dumped = 0, nrpages_skipped = 0, nrpages_total = 0;
-	struct vma_area *vma_area;
-	int ret = -1;
-
-	pr_info("\n");
-	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, ctl->pid);
-	pr_info("----------------------------------------\n");
-
-	ret = parasite_send_fd(ctl, fdset_fd(cr_fdset, CR_FD_PAGES));
-	if (ret < 0)
-		goto out;
-
-	ret = parasite_execute(PARASITE_CMD_DUMPPAGES_INIT, ctl);
-	if (ret < 0) {
-		pr_err("Dumping pages failed with %i\n", ret);
-		goto out;
-	}
-
-	parasite_dumppages = parasite_args(ctl, struct parasite_dump_pages_args);
-
-	list_for_each_entry(vma_area, vma_area_list, list) {
-
-		/*
-		 * The special areas are not dumped.
-		 */
-		if (!(vma_area->vma.status & VMA_AREA_REGULAR))
-			continue;
-
-		/* No dumps for file-shared mappings */
-		if (vma_area->vma.status & VMA_FILE_SHARED)
-			continue;
-
-		/* No dumps for SYSV IPC mappings */
-		if (vma_area->vma.status & VMA_AREA_SYSVIPC)
-			continue;
-
-		if (vma_area_is(vma_area, VMA_ANON_SHARED))
-			continue;
-
-		parasite_dumppages->vma_entry = vma_area->vma;
-
-		if (!vma_area_is(vma_area, VMA_ANON_PRIVATE) &&
-		    !vma_area_is(vma_area, VMA_FILE_PRIVATE)) {
-			pr_warn("Unexpected VMA area found\n");
-			continue;
-		}
-
-		if (vma_area->vma.end > TASK_SIZE)
-			continue;
-
-		ret = parasite_execute(PARASITE_CMD_DUMPPAGES, ctl);
-		if (ret) {
-			pr_err("Dumping pages failed with %d\n", ret);
-			goto out_fini;
-		}
-
-		pr_info("vma %"PRIx64"-%"PRIx64"  dumped: %lu pages %lu skipped %lu total\n",
-				vma_area->vma.start, vma_area->vma.end,
-				parasite_dumppages->nrpages_dumped,
-				parasite_dumppages->nrpages_skipped,
-				parasite_dumppages->nrpages_total);
-
-		nrpages_dumped += parasite_dumppages->nrpages_dumped;
-		nrpages_skipped += parasite_dumppages->nrpages_skipped;
-		nrpages_total += parasite_dumppages->nrpages_total;
-	}
-
-	pr_info("\n");
-	pr_info("Summary: %lu dumped %lu skipped %lu total\n",
-			nrpages_dumped, nrpages_skipped, nrpages_total);
-	ret = 0;
-
-out_fini:
-	parasite_execute(PARASITE_CMD_DUMPPAGES_FINI, ctl);
-out:
-	pr_info("----------------------------------------\n");
-
-	return ret;
 }
 
 int parasite_drain_fds_seized(struct parasite_ctl *ctl,
@@ -667,7 +582,7 @@ int parasite_fini_threads_seized(struct parasite_ctl *ctl, struct pstree_item *i
 	return ret;
 }
 
-int parasite_cure_seized(struct parasite_ctl *ctl, struct pstree_item *item)
+int parasite_cure_remote(struct parasite_ctl *ctl, struct pstree_item *item)
 {
 	int ret = 0;
 
@@ -681,42 +596,58 @@ int parasite_cure_seized(struct parasite_ctl *ctl, struct pstree_item *item)
 
 	if (ctl->remote_map) {
 		if (munmap_seized(ctl, (void *)ctl->remote_map, ctl->map_length)) {
-			pr_err("munmap_seized failed (pid: %d)\n", ctl->pid);
+			pr_err("munmap_seized failed (pid: %d)\n", ctl->pid.real);
 			ret = -1;
 		}
 	}
+
+	if (ptrace_poke_area(ctl->pid.real, (void *)ctl->code_orig,
+			     (void *)ctl->syscall_ip, sizeof(ctl->code_orig))) {
+		pr_err("Can't restore syscall blob (pid: %d)\n", ctl->pid.real);
+		ret = -1;
+	}
+
+	if (ptrace(PTRACE_SETREGS, ctl->pid.real, NULL, &ctl->regs_orig)) {
+		pr_err("Can't restore registers (pid: %d)\n", ctl->pid.real);
+		ret = -1;
+	}
+
+	return ret;
+}
+
+int parasite_cure_local(struct parasite_ctl *ctl)
+{
+	int ret = 0;
 
 	if (ctl->local_map) {
 		if (munmap(ctl->local_map, ctl->map_length)) {
-			pr_err("munmap failed (pid: %d)\n", ctl->pid);
+			pr_err("munmap failed (pid: %d)\n", ctl->pid.real);
 			ret = -1;
 		}
-	}
-
-	if (ptrace_poke_area(ctl->pid, (void *)ctl->code_orig,
-			     (void *)ctl->syscall_ip, sizeof(ctl->code_orig))) {
-		pr_err("Can't restore syscall blob (pid: %d)\n", ctl->pid);
-		ret = -1;
-	}
-
-	if (ptrace(PTRACE_SETREGS, ctl->pid, NULL, &ctl->regs_orig)) {
-		pr_err("Can't restore registers (pid: %d)\n", ctl->pid);
-		ret = -1;
 	}
 
 	free(ctl);
 	return ret;
 }
 
-struct parasite_ctl *parasite_prep_ctl(pid_t pid, struct list_head *vma_area_list)
+int parasite_cure_seized(struct parasite_ctl *ctl, struct pstree_item *item)
+{
+	int ret;
+
+	ret = parasite_cure_remote(ctl, item);
+	if (!ret)
+		ret = parasite_cure_local(ctl);
+
+	return ret;
+}
+
+struct parasite_ctl *parasite_prep_ctl(pid_t pid, struct vm_area_list *vma_area_list)
 {
 	struct parasite_ctl *ctl = NULL;
 	struct vma_area *vma_area;
 
-	if (task_in_compat_mode(pid)) {
-		pr_err("Can't checkpoint task running in compat mode\n");
+	if (!arch_can_dump_task(pid))
 		goto err;
-	}
 
 	/*
 	 * Control block early setup.
@@ -734,14 +665,15 @@ struct parasite_ctl *parasite_prep_ctl(pid_t pid, struct list_head *vma_area_lis
 		goto err;
 	}
 
-	vma_area = get_vma_by_ip(vma_area_list, REG_IP(ctl->regs_orig));
+	vma_area = get_vma_by_ip(&vma_area_list->h, REG_IP(ctl->regs_orig));
 	if (!vma_area) {
 		pr_err("No suitable VMA found to run parasite "
 		       "bootstrap code (pid: %d)\n", pid);
 		goto err;
 	}
 
-	ctl->pid	= pid;
+	ctl->pid.real	= pid;
+	ctl->pid.virt	= 0;
 	ctl->syscall_ip	= vma_area->vma.start;
 
 	/*
@@ -749,7 +681,7 @@ struct parasite_ctl *parasite_prep_ctl(pid_t pid, struct list_head *vma_area_lis
 	 * we will need it to restore original program content.
 	 */
 	memcpy(ctl->code_orig, code_syscall, sizeof(ctl->code_orig));
-	if (ptrace_swap_area(ctl->pid, (void *)ctl->syscall_ip,
+	if (ptrace_swap_area(pid, (void *)ctl->syscall_ip,
 			     (void *)ctl->code_orig, sizeof(ctl->code_orig))) {
 		pr_err("Can't inject syscall blob (pid: %d)\n", pid);
 		goto err;
@@ -770,13 +702,13 @@ int parasite_map_exchange(struct parasite_ctl *ctl, unsigned long size)
 				      PROT_READ | PROT_WRITE | PROT_EXEC,
 				      MAP_ANONYMOUS | MAP_SHARED, -1, 0);
 	if (!ctl->remote_map) {
-		pr_err("Can't allocate memory for parasite blob (pid: %d)\n", ctl->pid);
+		pr_err("Can't allocate memory for parasite blob (pid: %d)\n", ctl->pid.real);
 		return -1;
 	}
 
 	ctl->map_length = round_up(size, PAGE_SIZE);
 
-	fd = open_proc_rw(ctl->pid, "map_files/%p-%p",
+	fd = open_proc_rw(ctl->pid.real, "map_files/%p-%p",
 		 ctl->remote_map, ctl->remote_map + ctl->map_length);
 	if (fd < 0)
 		return -1;
@@ -794,7 +726,19 @@ int parasite_map_exchange(struct parasite_ctl *ctl, unsigned long size)
 	return 0;
 }
 
-struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item, struct list_head *vma_area_list)
+static unsigned long parasite_args_size(struct vm_area_list *vmas, struct parasite_drain_fd *dfds)
+{
+	unsigned long size = PARASITE_ARG_SIZE_MIN;
+
+	if (dfds)
+		size = max(size, (unsigned long)drain_fds_size(dfds));
+	size = max(size, (unsigned long)dump_pages_args_size(vmas));
+
+	return size;
+}
+
+struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
+		struct vm_area_list *vma_area_list, struct parasite_drain_fd *dfds)
 {
 	int ret;
 	struct parasite_ctl *ctl;
@@ -810,7 +754,8 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	 * without using ptrace at all.
 	 */
 
-	ret = parasite_map_exchange(ctl, parasite_size);
+	ctl->args_size = parasite_args_size(vma_area_list, dfds);
+	ret = parasite_map_exchange(ctl, parasite_size + ctl->args_size);
 	if (ret)
 		goto err_restore;
 

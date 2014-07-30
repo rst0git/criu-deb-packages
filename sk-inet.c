@@ -88,7 +88,7 @@ static void show_one_inet_img(const char *act, const InetSkEntry *e)
 		e->state, src_addr);
 }
 
-static int can_dump_inet_sk(const struct inet_sk_desc *sk)
+static int can_dump_inet_sk(const struct inet_sk_desc *sk, int proto)
 {
 	if (sk->sd.family != AF_INET && sk->sd.family != AF_INET6) {
 		pr_err("Only IPv4/6 sockets for now\n");
@@ -146,21 +146,21 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk)
 	}
 
 	/* Make sure it's a proto we support */
-	switch (sk->proto) {
+	switch (proto) {
 	case IPPROTO_IP:
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
 	case IPPROTO_UDPLITE:
 		break;
 	default:
-		pr_err("Unsupported socket proto %d\n", sk->proto);
+		pr_err("Unsupported socket proto %d\n", proto);
 		return 0;
 	}
 
 	return 1;
 }
 
-static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p)
+static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p, int proto)
 {
 	struct inet_sk_desc *sk;
 	char address;
@@ -188,17 +188,16 @@ static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p)
 
 	ret  = do_dump_opt(lfd, SOL_SOCKET, SO_DOMAIN, &sk->sd.family, sizeof(sk->sd.family));
 	ret |= do_dump_opt(lfd, SOL_SOCKET, SO_TYPE, &sk->type, sizeof(sk->type));
-	ret |= do_dump_opt(lfd, SOL_SOCKET, SO_PROTOCOL, &sk->proto, sizeof(sk->proto));
 	if (ret)
 		goto err;
 
-	if (sk->proto == IPPROTO_TCP) {
+	if (proto == IPPROTO_TCP) {
 		struct tcp_info info;
 
 		aux = sizeof(info);
 		ret = getsockopt(lfd, SOL_TCP, TCP_INFO, &info, &aux);
 		if (ret) {
-			pr_perror("Failt to obtain TCP_INFO");
+			pr_perror("Failed to obtain TCP_INFO");
 			goto err;
 		}
 
@@ -226,16 +225,23 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	struct inet_sk_desc *sk;
 	InetSkEntry ie = INET_SK_ENTRY__INIT;
 	SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
-	int ret = -1;
+	int ret = -1, err = -1, proto;
 
-	sk = (struct inet_sk_desc *)lookup_socket(p->stat.st_ino, family);
+	ret = do_dump_opt(lfd, SOL_SOCKET, SO_PROTOCOL,
+					&proto, sizeof(proto));
+	if (ret)
+		goto err;
+
+	sk = (struct inet_sk_desc *)lookup_socket(p->stat.st_ino, family, proto);
+	if (IS_ERR(sk))
+		goto err;
 	if (!sk) {
-		sk = gen_uncon_sk(lfd, p);
+		sk = gen_uncon_sk(lfd, p, proto);
 		if (!sk)
 			goto err;
 	}
 
-	if (!can_dump_inet_sk(sk))
+	if (!can_dump_inet_sk(sk, proto))
 		goto err;
 
 	BUG_ON(sk->sd.already_dumped);
@@ -243,8 +249,8 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	ie.id		= id;
 	ie.ino		= sk->sd.ino;
 	ie.family	= family;
+	ie.proto	= proto;
 	ie.type		= sk->type;
-	ie.proto	= sk->proto;
 	ie.state	= sk->state;
 	ie.src_port	= sk->src_port;
 	ie.dst_port	= sk->dst_port;
@@ -290,19 +296,19 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	show_one_inet_img("Dumped", &ie);
 	sk->sd.already_dumped = 1;
 
-	switch (sk->proto) {
+	switch (proto) {
 	case IPPROTO_TCP:
-		ret = dump_one_tcp(lfd, sk);
+		err = dump_one_tcp(lfd, sk);
 		break;
 	default:
-		ret = 0;
+		err = 0;
 		break;
 	}
 err:
 	release_skopts(&skopts);
 	xfree(ie.src_addr);
 	xfree(ie.dst_addr);
-	return ret;
+	return err;
 }
 
 static int dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p)
@@ -335,7 +341,7 @@ int dump_one_inet6(struct fd_parms *p, int lfd, const int fdinfo)
 	return do_dump_gen_file(p, lfd, &inet6_dump_ops, fdinfo);
 }
 
-int inet_collect_one(struct nlmsghdr *h, int family, int type, int proto)
+int inet_collect_one(struct nlmsghdr *h, int family, int type)
 {
 	struct inet_sk_desc *d;
 	struct inet_diag_msg *m = NLMSG_DATA(h);
@@ -350,7 +356,6 @@ int inet_collect_one(struct nlmsghdr *h, int family, int type, int proto)
 		return -1;
 
 	d->type = type;
-	d->proto = proto;
 	d->src_port = ntohs(m->id.idiag_sport);
 	d->dst_port = ntohs(m->id.idiag_dport);
 	d->state = m->idiag_state;
@@ -443,8 +448,12 @@ static int post_open_inet_sk(struct file_desc *d, int sk)
 	 * TCP sockets are handled at the last moment
 	 * after unlocking connections.
 	 */
-	if (tcp_connection(ii->ie))
+	if (tcp_connection(ii->ie)) {
+		if (rst_tcp_socks_add(sk, ii->ie->opts->reuseaddr))
+			return -1;
+
 		return 0;
+	}
 
 	/* SO_REUSEADDR is set for all sockets */
 	if (ii->ie->opts->reuseaddr)
@@ -617,7 +626,7 @@ int inet_connect(int sk, struct inet_sk_info *ii)
 	return 0;
 }
 
-void show_inetsk(int fd, struct cr_options *o)
+void show_inetsk(int fd)
 {
 	pb_show_plain_pretty(fd, PB_INETSK, "1:%#x 2:%#x 3:%d 4:%d 5:%d 6:%d 7:%d 8:%d 9:%2x 11:A 12:A");
 }

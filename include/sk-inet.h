@@ -20,7 +20,6 @@
 struct inet_sk_desc {
 	struct socket_desc	sd;
 	unsigned int		type;
-	unsigned int		proto;
 	unsigned int		src_port;
 	unsigned int		dst_port;
 	unsigned int		state;
@@ -52,10 +51,11 @@ struct rst_tcp_sock {
 
 static inline void tcp_repair_off(int fd)
 {
-	int aux = 0;
+	int aux = 0, ret;
 
-	if (sys_setsockopt(fd, SOL_TCP, TCP_REPAIR, &aux, sizeof(aux)) < 0)
-		pr_perror("Failed to turn off repair mode on socket");
+	ret = sys_setsockopt(fd, SOL_TCP, TCP_REPAIR, &aux, sizeof(aux));
+	if (ret < 0)
+		pr_perror("Failed to turn off repair mode on socket (%d)", ret);
 }
 
 void tcp_locked_conn_add(struct inet_sk_info *);
@@ -68,11 +68,12 @@ int restore_one_tcp(int sk, struct inet_sk_info *si);
 #define SK_EST_PARAM	"tcp-established"
 
 struct cr_options;
-void show_tcp_stream(int fd, struct cr_options *);
+void show_tcp_stream(int fd);
 
 int check_tcp(void);
 
 extern int rst_tcp_socks_size;
 extern int rst_tcp_socks_remap(void *addr);
+extern int rst_tcp_socks_add(int fd, bool reuseaddr);
 
 #endif /* __CR_SK_INET_H__ */

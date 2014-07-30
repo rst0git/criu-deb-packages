@@ -1,22 +1,23 @@
 #include <string.h>
 #include <unistd.h>
+#include <elf.h>
 
+#include "asm/processor-flags.h"
 #include "asm/types.h"
 #include "asm/fpu.h"
+
 #include "compiler.h"
 #include "ptrace.h"
-#include "asm/processor-flags.h"
-#include "protobuf.h"
-#include "protobuf/core.pb-c.h"
-#include "protobuf/creds.pb-c.h"
 #include "parasite-syscall.h"
+#include "restorer.h"
 #include "syscall.h"
 #include "log.h"
 #include "util.h"
 #include "cpu.h"
-#include "elf.h"
-#include "parasite-syscall.h"
-#include "restorer.h"
+
+#include "protobuf.h"
+#include "protobuf/core.pb-c.h"
+#include "protobuf/creds.pb-c.h"
 
 /*
  * Injected syscall instruction
@@ -45,26 +46,36 @@ void parasite_setup_regs(unsigned long new_ip, user_regs_struct_t *regs)
 	regs->flags &= ~(X86_EFLAGS_TF | X86_EFLAGS_DF | X86_EFLAGS_IF);
 }
 
-int task_in_compat_mode(pid_t pid)
+static int task_in_compat_mode(pid_t pid)
 {
 	unsigned long cs, ds;
 
 	errno = 0;
 	cs = ptrace(PTRACE_PEEKUSER, pid, offsetof(user_regs_struct_t, cs), 0);
 	if (errno != 0) {
-		perror("Can't get CS register");
+		pr_perror("Can't get CS register for %d", pid);
 		return -1;
 	}
 
 	errno = 0;
 	ds = ptrace(PTRACE_PEEKUSER, pid, offsetof(user_regs_struct_t, ds), 0);
 	if (errno != 0) {
-		perror("Can't get DS register");
+		pr_perror("Can't get DS register for %d", pid);
 		return -1;
 	}
 
 	/* It's x86-32 or x32 */
 	return cs != 0x33 || ds == 0x2b;
+}
+
+bool arch_can_dump_task(pid_t pid)
+{
+	if (task_in_compat_mode(pid)) {
+		pr_err("Can't dump task %d running in 32-bit mode\n", pid);
+		return false;
+	}
+
+	return true;
 }
 
 int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
@@ -87,7 +98,7 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 	regs.r9  = arg6;
 
 	parasite_setup_regs(ctl->syscall_ip, &regs);
-	err = __parasite_execute(ctl, ctl->pid, &regs);
+	err = __parasite_execute(ctl, ctl->pid.real, &regs);
 	if (err)
 		return err;
 
@@ -103,7 +114,7 @@ int get_task_regs(pid_t pid, CoreEntry *core, const struct parasite_ctl *ctl)
 	struct iovec iov;
 	int ret = -1;
 
-	pr_info("Dumping GP/FPU registers ... ");
+	pr_info("Dumping GP/FPU registers for %d\n", pid);
 
 	if (ctl)
 		regs = ctl->regs_orig;
@@ -284,25 +295,21 @@ err:
 	return 1;
 }
 
-void core_entry_free(CoreEntry *core)
+void arch_free_thread_info(CoreEntry *core)
 {
-	if (core) {
-		if (core->thread_info) {
-			if (core->thread_info->fpregs) {
-				if (core->thread_info->fpregs->xsave)
-					xfree(core->thread_info->fpregs->xsave->ymmh_space);
-				xfree(core->thread_info->fpregs->xsave);
-				xfree(core->thread_info->fpregs->st_space);
-				xfree(core->thread_info->fpregs->xmm_space);
-				xfree(core->thread_info->fpregs->padding);
-			}
-			xfree(core->thread_info->gpregs);
-			xfree(core->thread_info->fpregs);
+	if (core->thread_info) {
+		if (core->thread_info->fpregs) {
+			if (core->thread_info->fpregs->xsave)
+				xfree(core->thread_info->fpregs->xsave->ymmh_space);
+			xfree(core->thread_info->fpregs->xsave);
+			xfree(core->thread_info->fpregs->st_space);
+			xfree(core->thread_info->fpregs->xmm_space);
+			xfree(core->thread_info->fpregs->padding);
 		}
+		xfree(core->thread_info->gpregs);
+		xfree(core->thread_info->fpregs);
 		xfree(core->thread_info);
-		xfree(core->thread_core);
-		xfree(core->tc);
-		xfree(core->ids);
+		core->thread_info = NULL;
 	}
 }
 

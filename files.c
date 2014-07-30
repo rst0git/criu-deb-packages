@@ -32,6 +32,7 @@
 #include "eventpoll.h"
 #include "fsnotify.h"
 #include "signalfd.h"
+#include "namespaces.h"
 
 #include "parasite.h"
 #include "parasite-syscall.h"
@@ -135,31 +136,55 @@ int do_dump_gen_file(struct fd_parms *p, int lfd,
 	return pb_write_one(fdinfo, &e, PB_FDINFO);
 }
 
+int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
+{
+	size_t len;
+
+	link->name[0] = '.';
+
+	len = read_fd_link(lfd, &link->name[1], sizeof(link->name) - 1);
+	if (len < 0) {
+		pr_err("Can't read link for pid %d fd %d\n", p->pid, p->fd);
+		return -1;
+	}
+
+	link->len = len + 1;
+	return 0;
+}
+
 static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 				struct fd_opts *opts, struct fd_parms *p)
 {
+	int ret;
+
 	if (fstat(lfd, &p->stat) < 0) {
-		pr_perror("Can't stat fd %d\n", lfd);
+		pr_perror("Can't stat fd %d", lfd);
 		return -1;
 	}
 
 	p->ctl		= ctl;
 	p->fd		= fd;
 	p->pos		= lseek(lfd, 0, SEEK_CUR);
-	p->flags	= fcntl(lfd, F_GETFL);
-	p->pid		= ctl->pid;
+	ret = fcntl(lfd, F_GETFL);
+	if (ret == -1) {
+		pr_perror("Unable to get fd %d flags", lfd);
+		return -1;
+	}
+	p->flags	= ret;
+	p->pid		= ctl->pid.real;
 	p->fd_flags	= opts->flags;
 
 	fown_entry__init(&p->fown);
 
 	pr_info("%d fdinfo %d: pos: 0x%16lx flags: %16o/%#x\n",
-		ctl->pid, fd, p->pos, p->flags, (int)p->fd_flags);
+		ctl->pid.real, fd, p->pos, p->flags, (int)p->fd_flags);
 
-	p->fown.signum = fcntl(lfd, F_GETSIG, 0);
-	if (p->fown.signum < 0) {
-		pr_perror("Can't get owner signum on %d\n", lfd);
+	ret = fcntl(lfd, F_GETSIG, 0);
+	if (ret < 0) {
+		pr_perror("Can't get owner signum on %d", lfd);
 		return -1;
 	}
+	p->fown.signum = ret;
 
 	if (opts->fown.pid == 0)
 		return 0;
@@ -174,7 +199,7 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 
 static int dump_unsupp_fd(const struct fd_parms *p)
 {
-	pr_err("Can't dump file %d of that type [%#x]\n",
+	pr_err("Can't dump file %d of that type [%o]\n",
 			p->fd, p->stat.st_mode);
 	return -1;
 }
@@ -202,7 +227,7 @@ static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
 static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_opts *opts,
 		       const int fdinfo)
 {
-	struct fd_parms p;
+	struct fd_parms p = FD_PARMS_INIT;
 	struct statfs statfs;
 
 	if (fill_fd_params(ctl, fd, lfd, opts, &p) < 0) {
@@ -217,7 +242,7 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 		return dump_chrdev(&p, lfd, fdinfo);
 
 	if (fstatfs(lfd, &statfs)) {
-		pr_perror("Can't obtain statfs on fd %d\n", fd);
+		pr_perror("Can't obtain statfs on fd %d", fd);
 		return -1;
 	}
 
@@ -236,8 +261,21 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 			return dump_unsupp_fd(&p);
 	}
 
-	if (S_ISREG(p.stat.st_mode) || S_ISDIR(p.stat.st_mode))
-		return dump_reg_file(&p, lfd, fdinfo);
+	if (S_ISREG(p.stat.st_mode) || S_ISDIR(p.stat.st_mode)) {
+		struct fd_link link;
+
+		if (fill_fdlink(lfd, &p, &link))
+			return -1;
+
+		p.link = &link;
+		if (link.name[1] == '/')
+			return dump_reg_file(&p, lfd, fdinfo);
+
+		if (check_ns_proc(&link))
+			return dump_ns_file(&p, lfd, fdinfo);
+
+		return dump_unsupp_fd(&p);
+	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {
 		if (statfs.f_type == PIPEFS_MAGIC)
@@ -257,7 +295,7 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 	int i, ret = -1;
 
 	pr_info("\n");
-	pr_info("Dumping opened files (pid: %d)\n", ctl->pid);
+	pr_info("Dumping opened files (pid: %d)\n", ctl->pid.real);
 	pr_info("----------------------------------------\n");
 
 	lfds = xmalloc(dfds->nr_fds * sizeof(int));
@@ -360,7 +398,7 @@ static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 	struct fdinfo_list_entry *le, *new_le;
 	struct file_desc *fdesc;
 
-	pr_info("Collect fdinfo pid=%d fd=%d id=0x%16x\n",
+	pr_info("Collect fdinfo pid=%d fd=%d id=%#x\n",
 		pid, e->fd, e->id);
 
 	new_le = shmalloc(sizeof(*new_le));
@@ -373,7 +411,7 @@ static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 
 	fdesc = find_file_desc(e);
 	if (fdesc == NULL) {
-		pr_err("No file for fd %d id %d\n", e->fd, e->id);
+		pr_err("No file for fd %d id %#x\n", e->fd, e->id);
 		return -1;
 	}
 
@@ -405,7 +443,7 @@ int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
 	fdinfo_entry__init(e);
 
 	e->id		= ctl_tty_id;
-	e->fd		= get_service_fd(CTL_TTY_OFF);
+	e->fd		= reserve_service_fd(CTL_TTY_OFF);
 	e->type		= FD_TYPES__TTY;
 
 	if (collect_fd(pid, e, rst_info)) {
@@ -427,7 +465,7 @@ int prepare_fd_pid(struct pstree_item *item)
 	INIT_LIST_HEAD(&rst_info->tty_slaves);
 
 	if (!fdinfo_per_id) {
-		fdinfo_fd = open_image_ro(CR_FD_FDINFO, pid);
+		fdinfo_fd = open_image(CR_FD_FDINFO, O_RSTR, pid);
 		if (fdinfo_fd < 0) {
 			if (errno == ENOENT)
 				return 0;
@@ -440,7 +478,7 @@ int prepare_fd_pid(struct pstree_item *item)
 		if (item->rst->fdt && item->rst->fdt->pid != item->pid.virt)
 			return 0;
 
-		fdinfo_fd = open_image_ro(CR_FD_FDINFO, item->ids->files_id);
+		fdinfo_fd = open_image(CR_FD_FDINFO, O_RSTR, item->ids->files_id);
 		if (fdinfo_fd < 0)
 			return -1;
 	}
@@ -580,7 +618,11 @@ static int send_fd_to_self(int fd, struct fdinfo_list_entry *fle, int *sock)
 		return -1;
 	}
 
-	fcntl(dfd, F_SETFD, fle->fe->flags);
+	if (fcntl(dfd, F_SETFD, fle->fe->flags) == -1) {
+		pr_perror("Unable to set file descriptor flags");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -645,7 +687,10 @@ static int open_fd(int pid, struct fdinfo_list_entry *fle)
 	if (reopen_fd_as(fle->fe->fd, new_fd))
 		return -1;
 
-	fcntl(fle->fe->fd, F_SETFD, fle->fe->flags);
+	if (fcntl(fle->fe->fd, F_SETFD, fle->fe->flags) == -1) {
+		pr_perror("Unable to set file descriptor flags");
+		return -1;
+	}
 
 	return serve_out_fd(pid, fle->fe->fd, d);
 }
@@ -671,7 +716,11 @@ static int receive_fd(int pid, struct fdinfo_list_entry *fle)
 	if (reopen_fd_as(fle->fe->fd, tmp) < 0)
 		return -1;
 
-	fcntl(tmp, F_SETFD, fle->fe->flags);
+	if (fcntl(fle->fe->fd, F_SETFD, fle->fe->flags) == -1) {
+		pr_perror("Unable to set file descriptor flags");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -757,7 +806,7 @@ int prepare_fds(struct pstree_item *me)
 		futex_wait_while_lt(&fdt->fdt_lock, fdt->nr);
 
 		if (fdt->pid != me->pid.virt) {
-			pr_info("File descriptor talbe is shared with %d\n", fdt->pid);
+			pr_info("File descriptor table is shared with %d\n", fdt->pid);
 			futex_wait_until(&fdt->fdt_lock, fdt->nr + 1);
 			goto out;
 		}
@@ -798,7 +847,7 @@ int prepare_fs(int pid)
 	int ifd, cwd, ret = -1;
 	FsEntry *fe;
 
-	ifd = open_image_ro(CR_FD_FS, pid);
+	ifd = open_image(CR_FD_FS, O_RSTR, pid);
 	if (ifd < 0)
 		return -1;
 
@@ -809,6 +858,7 @@ int prepare_fs(int pid)
 
 	cwd = open_reg_by_id(fe->cwd_id);
 	if (cwd < 0) {
+		pr_err("Can't open root %#x\n", fe->cwd_id);
 		close_safe(&ifd);
 		goto err;
 	}

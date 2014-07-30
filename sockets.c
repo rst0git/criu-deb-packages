@@ -13,6 +13,7 @@
 #include "unix_diag.h"
 #include "inet_diag.h"
 #include "packet_diag.h"
+#include "netlink_diag.h"
 #include "files.h"
 #include "util-net.h"
 #include "sk-packet.h"
@@ -38,6 +39,71 @@
 #define SO_GET_FILTER	SO_ATTACH_FILTER
 #endif
 
+enum socket_cl_bits
+{
+	NETLINK_CL_BIT,
+	INET_TCP_CL_BIT,
+	INET_UDP_CL_BIT,
+	INET_UDPLITE_CL_BIT,
+	INET6_TCP_CL_BIT,
+	INET6_UDP_CL_BIT,
+	INET6_UDPLITE_CL_BIT,
+	UNIX_CL_BIT,
+	PACKET_CL_BIT,
+	_MAX_CL_BIT,
+};
+
+#define MAX_CL_BIT (_MAX_CL_BIT - 1)
+
+static DECLARE_BITMAP(socket_cl_bits, MAX_CL_BIT);
+
+static inline
+enum socket_cl_bits get_collect_bit_nr(unsigned int family, unsigned int proto)
+{
+	if (family == AF_NETLINK)
+		return NETLINK_CL_BIT;
+	if (family == AF_UNIX)
+		return UNIX_CL_BIT;
+	if (family == AF_PACKET)
+		return PACKET_CL_BIT;
+	if (family == AF_INET) {
+		if (proto == IPPROTO_TCP)
+			return INET_TCP_CL_BIT;
+		if (proto == IPPROTO_UDP)
+			return INET_UDP_CL_BIT;
+		if (proto == IPPROTO_UDPLITE)
+			return INET_UDPLITE_CL_BIT;
+	}
+	if (family == AF_INET6) {
+		if (proto == IPPROTO_TCP)
+			return INET6_TCP_CL_BIT;
+		if (proto == IPPROTO_UDP)
+			return INET6_UDP_CL_BIT;
+		if (proto == IPPROTO_UDPLITE)
+			return INET6_UDPLITE_CL_BIT;
+	}
+
+	pr_err("Unknown pair family %d proto %d\n", family, proto);
+	BUG();
+	return -1;
+}
+
+static void set_collect_bit(unsigned int family, unsigned int proto)
+{
+	enum socket_cl_bits nr;
+
+	nr = get_collect_bit_nr(family, proto);
+	set_bit(nr, socket_cl_bits);
+}
+
+bool socket_test_collect_bit(unsigned int family, unsigned int proto)
+{
+	enum socket_cl_bits nr;
+
+	nr = get_collect_bit_nr(family, proto);
+	return test_bit(nr, socket_cl_bits) != 0;
+}
+
 static int dump_bound_dev(int sk, SkOptsEntry *soe)
 {
 	int ret;
@@ -55,6 +121,8 @@ static int dump_bound_dev(int sk, SkOptsEntry *soe)
 
 	pr_debug("\tDumping %s bound dev for sk\n", dev);
 	soe->so_bound_dev = xmalloc(len);
+	if (soe->so_bound_dev == NULL)
+		return -1;
 	strcpy(soe->so_bound_dev, dev);
 	return 0;
 }
@@ -124,13 +192,16 @@ static int dump_socket_filter(int sk, SkOptsEntry *soe)
 
 	ret = getsockopt(sk, SOL_SOCKET, SO_GET_FILTER, flt, &len);
 	if (ret) {
-		pr_perror("Can't get socket filter\n");
+		pr_perror("Can't get socket filter");
+		xfree(flt);
 		return ret;
 	}
 
 	soe->so_filter = xmalloc(len * sizeof(*soe->so_filter));
-	if (!soe->so_filter)
+	if (!soe->so_filter) {
+		xfree(flt);
 		return -1;
+	}
 
 	encode_filter(flt, soe->so_filter, len);
 	soe->n_so_filter = len;
@@ -161,9 +232,15 @@ static int restore_socket_filter(int sk, SkOptsEntry *soe)
 
 static struct socket_desc *sockets[SK_HASH_SIZE];
 
-struct socket_desc *lookup_socket(int ino, int family)
+struct socket_desc *lookup_socket(int ino, int family, int proto)
 {
 	struct socket_desc *sd;
+
+	if (!socket_test_collect_bit(family, proto)) {
+		pr_err("Sockets (family %d, proto %d) are not collected\n",
+								family, proto);
+		return ERR_PTR(-EINVAL);
+	}
 
 	pr_debug("\tSearching for socket %x (family %d)\n", ino, family);
 	for (sd = sockets[ino % SK_HASH_SIZE]; sd; sd = sd->next)
@@ -377,6 +454,8 @@ int dump_socket(struct fd_parms *p, int lfd, const int fdinfo)
 		return dump_one_inet6(p, lfd, fdinfo);
 	case AF_PACKET:
 		return dump_one_packet_sk(p, lfd, fdinfo);
+	case AF_NETLINK:
+		return dump_one_netlink(p, lfd, fdinfo);
 	default:
 		pr_err("BUG! Unknown socket collected (family %d)\n", family);
 		break;
@@ -403,7 +482,30 @@ static int inet_receive_one(struct nlmsghdr *h, void *arg)
 		return -1;
 	}
 
-	return inet_collect_one(h, i->sdiag_family, type, i->sdiag_protocol);
+	return inet_collect_one(h, i->sdiag_family, type);
+}
+
+struct sock_diag_req {
+	struct nlmsghdr hdr;
+	union {
+		struct unix_diag_req	u;
+		struct inet_diag_req_v2	i;
+		struct packet_diag_req	p;
+		struct netlink_diag_req n;
+	} r;
+};
+
+static int do_collect_req(int nl, struct sock_diag_req *req, int size,
+		int (*receive_callback)(struct nlmsghdr *h, void *), void *arg)
+{
+	int tmp;
+
+	tmp = do_rtnl_req(nl, req, size, receive_callback, arg);
+
+	if (tmp == 0)
+		set_collect_bit(req->r.n.sdiag_family, req->r.n.sdiag_protocol);
+
+	return tmp;
 }
 
 int collect_sockets(int pid)
@@ -411,14 +513,7 @@ int collect_sockets(int pid)
 	int err = 0, tmp;
 	int rst = -1;
 	int nl;
-	struct {
-		struct nlmsghdr hdr;
-		union {
-			struct unix_diag_req	u;
-			struct inet_diag_req_v2	i;
-			struct packet_diag_req	p;
-		} r;
-	} req;
+	struct sock_diag_req req;
 
 	if (current_ns_mask & CLONE_NEWNET) {
 		pr_info("Switching to %d's net for collecting sockets\n", pid);
@@ -446,7 +541,7 @@ int collect_sockets(int pid)
 	req.r.u.udiag_show	= UDIAG_SHOW_NAME | UDIAG_SHOW_VFS |
 				  UDIAG_SHOW_PEER | UDIAG_SHOW_ICONS |
 				  UDIAG_SHOW_RQLEN;
-	tmp = do_rtnl_req(nl, &req, sizeof(req), unix_receive_one, NULL);
+	tmp = do_collect_req(nl, &req, sizeof(req), unix_receive_one, NULL);
 	if (tmp)
 		err = tmp;
 
@@ -456,7 +551,7 @@ int collect_sockets(int pid)
 	req.r.i.idiag_ext	= 0;
 	/* Only listening and established sockets supported yet */
 	req.r.i.idiag_states	= (1 << TCP_LISTEN) | (1 << TCP_ESTABLISHED);
-	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
+	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -465,7 +560,7 @@ int collect_sockets(int pid)
 	req.r.i.sdiag_protocol	= IPPROTO_UDP;
 	req.r.i.idiag_ext	= 0;
 	req.r.i.idiag_states	= -1; /* All */
-	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
+	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -474,7 +569,7 @@ int collect_sockets(int pid)
 	req.r.i.sdiag_protocol	= IPPROTO_UDPLITE;
 	req.r.i.idiag_ext	= 0;
 	req.r.i.idiag_states	= -1; /* All */
-	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
+	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -484,7 +579,7 @@ int collect_sockets(int pid)
 	req.r.i.idiag_ext	= 0;
 	/* Only listening sockets supported yet */
 	req.r.i.idiag_states	= (1 << TCP_LISTEN) | (1 << TCP_ESTABLISHED);
-	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
+	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -493,7 +588,7 @@ int collect_sockets(int pid)
 	req.r.i.sdiag_protocol	= IPPROTO_UDP;
 	req.r.i.idiag_ext	= 0;
 	req.r.i.idiag_states	= -1; /* All */
-	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
+	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -502,7 +597,7 @@ int collect_sockets(int pid)
 	req.r.i.sdiag_protocol	= IPPROTO_UDPLITE;
 	req.r.i.idiag_ext	= 0;
 	req.r.i.idiag_states	= -1; /* All */
-	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
+	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -510,18 +605,36 @@ int collect_sockets(int pid)
 	req.r.p.sdiag_protocol	= 0;
 	req.r.p.pdiag_show	= PACKET_SHOW_INFO | PACKET_SHOW_MCLIST |
 					PACKET_SHOW_FANOUT | PACKET_SHOW_RING_CFG;
-	tmp = do_rtnl_req(nl, &req, sizeof(req), packet_receive_one, NULL);
-	if (tmp)
-		err = tmp;
+	tmp = do_collect_req(nl, &req, sizeof(req), packet_receive_one, NULL);
+	if (tmp) {
+		pr_warn("The current kernel doesn't support packet_diag\n");
+		if (pid == 0 || tmp != -ENOENT) /* Fedora 19 */
+			err = tmp;
+	}
 
+	if (pid == 0 && opts.check_ms_kernel) {
+		pr_warn("Skipping netling diag check (not yet merged)\n");
+		goto skip;
+	}
+
+	req.r.n.sdiag_family	= AF_NETLINK;
+	req.r.n.sdiag_protocol	= NDIAG_PROTO_ALL;
+	req.r.n.ndiag_show	= NDIAG_SHOW_GROUPS;
+	tmp = do_collect_req(nl, &req, sizeof(req), netlink_receive_one, NULL);
+	if (tmp) {
+		pr_warn("The current kernel doesn't support netlink_diag\n");
+		if (pid == 0 || tmp != -ENOENT) /* Going to be in 3.10 */
+			err = tmp;
+	}
+skip:
 	close(nl);
 out:
 	if (rst >= 0) {
 		if (restore_ns(rst, &net_ns_desc) < 0)
 			err = -1;
-	} else {
+	} else if (pid != 0) {
 		/*
-		 * If netns isn't dumped, crtools will fail only
+		 * If netns isn't dumped, criu will fail only
 		 * if an unsupported socket will be really dumped.
 		 */
 		pr_info("Uncollected sockets! Will probably fail later.\n");

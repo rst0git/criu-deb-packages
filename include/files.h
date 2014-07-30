@@ -17,6 +17,22 @@ struct cr_fdset;
 struct rst_info;
 struct parasite_ctl;
 
+struct fd_link {
+	union {
+		/* Link info for generic file (path) */
+		struct {
+			char	name[PATH_MAX + 1];
+			size_t	len;
+		};
+
+		/* Link info for proc-ns file */
+		struct {
+			struct ns_desc *ns_d;
+			unsigned int ns_kid;
+		};
+	};
+};
+
 struct fd_parms {
 	int		fd;
 	unsigned long	pos;
@@ -25,15 +41,19 @@ struct fd_parms {
 	struct stat	stat;
 	pid_t		pid;
 	FownEntry	fown;
+	struct fd_link	*link;
 
 	struct parasite_ctl *ctl;
 };
 
 #define FD_PARMS_INIT			\
-{					\
+(struct fd_parms) {			\
 	.fd	= FD_DESC_INVALID,	\
 	.fown	= FOWN_ENTRY__INIT,	\
+	.link	= NULL,			\
 }
+
+extern int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link);
 
 struct file_desc;
 
@@ -53,10 +73,28 @@ static inline int fdinfo_rst_prio(struct fdinfo_list_entry *fd_a, struct fdinfo_
 }
 
 struct file_desc_ops {
+	/* fd_types from protobuf/fdinfo.proto */
 	unsigned int		type;
+	/*
+	 * Opens a file by whatever syscall is required for that.
+	 * The returned descriptor may be closed (dup2-ed to another)
+	 * so it shouldn't be saved for any post-actions.
+	 */
 	int			(*open)(struct file_desc *d);
+	/*
+	 * Called on a file when all files of that type are opened
+	 * and with the fd being the "restored" one.
+	 */
 	int			(*post_open)(struct file_desc *d, int fd);
+	/*
+	 * Report whether the fd in question wants a transport socket
+	 * in it instead of a real file.
+	 */
 	int			(*want_transport)(FdinfoEntry *fe, struct file_desc *d);
+	/*
+	 * Helps determining sequence of different file types restore.
+	 * See the prepare_fds for details.
+	 */
 	struct list_head *	(*select_ps_list)(struct file_desc *, struct rst_info *);
 };
 

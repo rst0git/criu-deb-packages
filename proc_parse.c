@@ -18,6 +18,7 @@
 #include "file-lock.h"
 #include "pstree.h"
 #include "fsnotify.h"
+#include "kerndat.h"
 
 #include "proc_parse.h"
 #include "protobuf.h"
@@ -95,9 +96,10 @@ static int parse_vmflags(char *buf, struct vma_area *vma_area)
 
 	do {
 		/* mmap() block */
-		if (_vmflag_match(tok, "gd"))
+		if (_vmflag_match(tok, "gd")) {
 			vma_area->vma.flags |= MAP_GROWSDOWN;
-		else if (_vmflag_match(tok, "lo"))
+			vma_area->vma.start -= PAGE_SIZE; /* Guard page */
+		} else if (_vmflag_match(tok, "lo"))
 			vma_area->vma.flags |= MAP_LOCKED;
 		else if (_vmflag_match(tok, "nr"))
 			vma_area->vma.flags |= MAP_NORESERVE;
@@ -133,50 +135,27 @@ static int parse_vmflags(char *buf, struct vma_area *vma_area)
 	return 0;
 }
 
-static int is_anon_shmem_map(dev_t dev)
+static inline int is_anon_shmem_map(dev_t dev)
 {
-	static dev_t shmem_dev = 0;
-
-	if (!shmem_dev) {
-		void *map;
-		char maps[128];
-		struct stat buf;
-
-		map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
-				MAP_SHARED | MAP_ANONYMOUS, 0, 0);
-		if (map == MAP_FAILED) {
-			pr_perror("Can't mmap piggie");
-			return -1;
-		}
-
-		sprintf(maps, "/proc/%d/map_files/%lx-%lx",
-				getpid(), (unsigned long)map,
-				(unsigned long)map + PAGE_SIZE);
-		if (stat(maps, &buf) < 0) {
-			pr_perror("Can't stat piggie");
-			return -1;
-		}
-
-		munmap(map, PAGE_SIZE);
-
-		shmem_dev = buf.st_dev;
-		pr_info("Found anon-shmem piggie at %"PRIx64"\n", shmem_dev);
-	}
-
-	return shmem_dev == dev;
+	return kerndat_shmem_dev == dev;
 }
 
-int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
+int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_files)
 {
 	struct vma_area *vma_area = NULL;
 	unsigned long start, end, pgoff;
 	unsigned long ino;
 	char r, w, x, s;
 	int dev_maj, dev_min;
-	int ret = -1, nr = 0;
+	int ret = -1;
 
 	DIR *map_files_dir = NULL;
 	FILE *smaps = NULL;
+
+	vma_area_list->nr = 0;
+	vma_area_list->longest = 0;
+	vma_area_list->priv_size = 0;
+	INIT_LIST_HEAD(&vma_area_list->h);
 
 	smaps = fopen_proc(pid, "smaps");
 	if (!smaps)
@@ -188,11 +167,14 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 			goto err;
 	}
 
-	while (fgets(buf, BUF_SIZE, smaps)) {
+	while (1) {
 		int num;
 		char file_path[6];
+		bool eof;
 
-		if (!is_vma_range_fmt(buf)) {
+		eof = (fgets(buf, BUF_SIZE, smaps) == NULL);
+
+		if (!eof && !is_vma_range_fmt(buf)) {
 			if (!strncmp(buf, "Nonlinear", 9)) {
 				BUG_ON(!vma_area);
 				pr_err("Nonlinear mapping found %016"PRIx64"-%016"PRIx64"\n",
@@ -211,6 +193,21 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 			} else
 				continue;
 		}
+
+		if (vma_area) {
+			list_add_tail(&vma_area->list, &vma_area_list->h);
+			vma_area_list->nr++;
+			if (privately_dump_vma(vma_area)) {
+				unsigned long pages;
+
+				pages = vma_area_len(vma_area) / PAGE_SIZE;
+				vma_area_list->priv_size += pages;
+				vma_area_list->longest = max(vma_area_list->longest, pages);
+			}
+		}
+
+		if (eof)
+			break;
 
 		vma_area = alloc_vma_area();
 		if (!vma_area)
@@ -277,7 +274,7 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 		}
 
 		if (vma_area->vma.status != 0) {
-			goto done;
+			continue;
 		} else if (strstr(buf, "[vsyscall]")) {
 			vma_area->vma.status |= VMA_AREA_VSYSCALL;
 		} else if (strstr(buf, "[vdso]")) {
@@ -339,13 +336,10 @@ int parse_smaps(pid_t pid, struct list_head *vma_area_list, bool use_map_files)
 			}
 			vma_area->vma.flags  |= MAP_ANONYMOUS;
 		}
-done:
-		list_add_tail(&vma_area->list, vma_area_list);
-		nr++;
 	}
 
 	vma_area = NULL;
-	ret = nr;
+	ret = 0;
 
 err:
 	if (smaps)
@@ -758,7 +752,7 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new)
 	new->fstype = find_fstype_by_name(fstype);
 	free(fstype);
 
-	new->options = xmalloc(strlen(opt));
+	new->options = xmalloc(strlen(opt) + 1);
 	if (!new->options)
 		return -1;
 
@@ -787,11 +781,12 @@ struct mount_info *parse_mountinfo(pid_t pid)
 		struct mount_info *new;
 		int ret;
 
-		new = xmalloc(sizeof(*new));
+		new = mnt_entry_alloc();
 		if (!new)
 			goto err;
 
-		mnt_entry_init(new);
+		new->next = list;
+		list = new;
 
 		ret = parse_mountinfo_ent(str, new);
 		if (ret < 0) {
@@ -803,9 +798,6 @@ struct mount_info *parse_mountinfo(pid_t pid)
 				new->fstype->name, new->source,
 				new->s_dev, new->root, new->mountpoint,
 				new->flags, new->options);
-
-		new->next = list;
-		list = new;
 	}
 out:
 	fclose(f);
@@ -814,7 +806,7 @@ out:
 err:
 	while (list) {
 		struct mount_info *next = list->next;
-		xfree(list);
+		mnt_entry_free(list);
 		list = next;
 	}
 	goto out;
@@ -873,6 +865,7 @@ int parse_fdinfo(int fd, int type,
 	FILE *f;
 	char str[256];
 	bool entry_met = false;
+	int ret = -1;
 
 	sprintf(str, "/proc/self/fdinfo/%d", fd);
 	f = fopen(str, "r");
@@ -882,7 +875,6 @@ int parse_fdinfo(int fd, int type,
 	}
 
 	while (fgets(str, sizeof(str), f)) {
-		int ret;
 		union fdinfo_entries entry;
 
 		if (fdinfo_field(str, "pos") || fdinfo_field(str, "counter"))
@@ -899,7 +891,7 @@ int parse_fdinfo(int fd, int type,
 				goto parse_err;
 			ret = cb(&entry, arg);
 			if (ret)
-				return ret;
+				goto out;
 
 			entry_met = true;
 			continue;
@@ -915,7 +907,7 @@ int parse_fdinfo(int fd, int type,
 				goto parse_err;
 			ret = cb(&entry, arg);
 			if (ret)
-				return ret;
+				goto out;
 
 			entry_met = true;
 			continue;
@@ -931,7 +923,7 @@ int parse_fdinfo(int fd, int type,
 				goto parse_err;
 			ret = cb(&entry, arg);
 			if (ret)
-				return ret;
+				goto out;
 
 			entry_met = true;
 			continue;
@@ -971,8 +963,10 @@ int parse_fdinfo(int fd, int type,
 			if (ret != 7)
 				goto parse_err;
 
-			if (alloc_fhandle(&f_handle))
-				return -1;
+			if (alloc_fhandle(&f_handle)) {
+				ret = -1;
+				goto out;
+			}
 			parse_fhandle_encoded(str + hoff, &f_handle);
 
 			entry.ffy.type = MARK_TYPE__INODE;
@@ -981,7 +975,7 @@ int parse_fdinfo(int fd, int type,
 			free_fhandle(&f_handle);
 
 			if (ret)
-				return ret;
+				goto out;
 
 			entry_met = true;
 			continue;
@@ -1005,7 +999,7 @@ int parse_fdinfo(int fd, int type,
 			entry.ffy.type = MARK_TYPE__MOUNT;
 			ret = cb(&entry, arg);
 			if (ret)
-				return ret;
+				goto out;
 
 			entry_met = true;
 			continue;
@@ -1031,8 +1025,11 @@ int parse_fdinfo(int fd, int type,
 			if (ret != 7)
 				goto parse_err;
 
-			if (alloc_fhandle(&f_handle))
-				return -1;
+			if (alloc_fhandle(&f_handle)) {
+				ret = -1;
+				goto out;
+			}
+
 			parse_fhandle_encoded(str + hoff, entry.ify.f_handle);
 
 			ret = cb(&entry, arg);
@@ -1040,28 +1037,30 @@ int parse_fdinfo(int fd, int type,
 			free_fhandle(&f_handle);
 
 			if (ret)
-				return ret;
+				goto out;
 
 			entry_met = true;
 			continue;
 		}
 	}
 
-	fclose(f);
-
+	ret = 0;
 	if (entry_met)
-		return 0;
+		goto out;
 	/*
 	 * An eventpoll/inotify file may have no target fds set thus
 	 * resulting in no tfd: lines in proc. This is normal.
 	 */
 	if (type == FD_TYPES__EVENTPOLL || type == FD_TYPES__INOTIFY)
-		return 0;
+		goto out;
 
 	pr_err("No records of type %d found in fdinfo file\n", type);
 parse_err:
-	pr_perror("%s: error parsing [%s] for %d\n", __func__, str, type);
-	return -1;
+	ret = -1;
+	pr_perror("%s: error parsing [%s] for %d", __func__, str, type);
+out:
+	fclose(f);
+	return ret;
 }
 
 static int parse_file_lock_buf(char *buf, struct file_lock *fl,
@@ -1140,6 +1139,7 @@ int parse_file_locks(void)
 			 */
 			pr_perror("We have a blocked file lock!");
 			ret = -1;
+			xfree(fl);
 			goto err;
 		}
 

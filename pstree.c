@@ -8,6 +8,8 @@
 #include "lock.h"
 #include "namespaces.h"
 #include "files.h"
+#include "tty.h"
+#include "asm/dump.h"
 
 #include "protobuf.h"
 #include "protobuf/pstree.pb-c.h"
@@ -87,8 +89,8 @@ int dump_pstree(struct pstree_item *root_item)
 	 */
 	if (root_item->pid.virt != root_item->sid) {
 		if (!opts.shell_job) {
-			pr_err("The root process %d is not a session leader,"
-			       "miss option?\n", item->pid.virt);
+			pr_err("The root process %d is not a session leader. "
+			       "Consider using --" OPT_SHELL_JOB " option\n", item->pid.virt);
 			return -1;
 		}
 	}
@@ -142,6 +144,9 @@ static int prepare_pstree_for_shell_job(void)
 	if (!opts.shell_job)
 		return 0;
 
+	if (root_item->sid == root_item->pid.virt)
+		return 0;
+
 	/*
 	 * Migration of a root task group leader is a bit tricky.
 	 * When a task yields SIGSTOP, the kernel notifies the parent
@@ -185,7 +190,7 @@ static int read_pstree_image(void)
 
 	pr_info("Reading image tree\n");
 
-	ps_fd = open_image_ro(CR_FD_PSTREE);
+	ps_fd = open_image(CR_FD_PSTREE, O_RSTR);
 	if (ps_fd < 0)
 		return ps_fd;
 
@@ -255,7 +260,6 @@ static int read_pstree_image(void)
 		if (!pi->threads)
 			break;
 
-		ret = 0;
 		for (i = 0; i < e->n_threads; i++)
 			pi->threads[i].virt = e->threads[i];
 
@@ -264,11 +268,11 @@ static int read_pstree_image(void)
 
 		pstree_entry__free_unpacked(e, NULL);
 
-		fd = open_image_ro(CR_FD_IDS, pi->pid.virt);
+		fd = open_image(CR_FD_IDS, O_RSTR, pi->pid.virt);
 		if (fd < 0) {
 			if (errno == ENOENT)
 				continue;
-			return -1;
+			goto err;
 		}
 		ret = pb_read_one(fd, &pi->ids, PB_IDS);
 		close(fd);
@@ -485,10 +489,29 @@ static int prepare_pstree_kobj_ids(void)
 		else
 			ids = root_ids;
 
+		/*
+		 * Add some sanity check on image data.
+		 */
+		if (unlikely(!ids)) {
+			pr_err("No kIDs provided, image corruption\n");
+			return -1;
+		}
+
 		cflags = get_clone_mask(item->ids, ids);
 
 		if (cflags & CLONE_FILES) {
 			int ret;
+
+			/*
+			 * There might be a case when kIDs for
+			 * root task are the same as in root_ids,
+			 * thus it's image corruption and we should
+			 * exit out.
+			 */
+			if (unlikely(!item->parent)) {
+				pr_err("Image corruption on kIDs data\n");
+				return -1;
+			}
 
 			ret = shared_fdt_prepare(item);
 			if (ret)
@@ -502,7 +525,7 @@ set_mask:
 		 * Workaround for current namespaces model --
 		 * all tasks should be in one namespace. And
 		 * this namespace is either inherited from the
-		 * crtools or is created for the init task (only)
+		 * criu or is created for the init task (only)
 		 */
 		if (item == root_item) {
 			pr_info("Will restore in %lx namespaces\n", cflags);
@@ -513,6 +536,7 @@ set_mask:
 		}
 	}
 
+	pr_debug("NS mask to use %lx\n", current_ns_mask);
 	return 0;
 }
 

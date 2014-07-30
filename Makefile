@@ -1,5 +1,5 @@
 VERSION_MAJOR		:= 0
-VERSION_MINOR		:= 4
+VERSION_MINOR		:= 5
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -14,28 +14,21 @@ export VERSION_MAJOR VERSION_MINOR VERSION_SUBLEVEL VERSION_EXTRA VERSION_NAME
 # In future zdtm makefiles need to be fixed and the line below
 # may be uncommented.
 #
-#MAKEFLAGS := -r -R --no-print-directory
+#MAKEFLAGS := -r -R
+
+include Makefile.inc
+include Makefile.config
 
 #
 # Common definitions
 #
-ifeq ($(strip $(V)),)
-	E = @echo
-	Q = @
-else
-	E = @\#
-	Q =
-endif
 
 FIND		:= find
 CSCOPE		:= cscope
-TAGS		:= ctags
 RM		:= rm -f
 LD		:= ld
-CC		:= gcc
-ECHO		:= echo
+CC		?= gcc
 NM		:= nm
-AWK		:= awk
 SH		:= bash
 MAKE		:= make
 OBJCOPY		:= objcopy
@@ -76,8 +69,10 @@ ARCH_DIR	:= arch/$(ARCH)
 
 $(if $(wildcard $(ARCH_DIR)),,$(error "The architecture $(ARCH) isn't supported"))
 
-CFLAGS		+= -iquote include -iquote pie -iquote . -iquote $(ARCH_DIR)
-CFLAGS		+= -iquote $(ARCH_DIR)/include -fno-strict-aliasing
+cflags-y		+= -iquote include -iquote pie -iquote .
+cflags-y		+= -iquote $(ARCH_DIR) -iquote $(ARCH_DIR)/include
+cflags-y		+= -fno-strict-aliasing
+export cflags-y
 
 LIBS		:= -lrt -lpthread -lprotobuf-c
 
@@ -101,8 +96,9 @@ CFLAGS		+= $(WARNINGS) $(DEFINES)
 SYSCALL-LIB	:= arch/$(ARCH)/syscalls.built-in.o
 ARCH-LIB	:= arch/$(ARCH)/crtools.built-in.o
 
-export E Q CC ECHO MAKE CFLAGS LIBS ARCH DEFINES MAKEFLAGS
+export CC MAKE CFLAGS LIBS ARCH DEFINES MAKEFLAGS
 export SRC_DIR SYSCALL-LIB SH RM ARCH_DIR OBJCOPY LDARCH LD
+export cflags-y
 
 include scripts/Makefile.version
 include scripts/Makefile.rules
@@ -111,10 +107,10 @@ include scripts/Makefile.rules
 
 #
 # shorthand
-build := -r -R --no-print-directory -f scripts/Makefile.build makefile=Makefile obj
-build-crtools := -r -R --no-print-directory -f scripts/Makefile.build makefile=Makefile.crtools obj
+build := -r -R -f scripts/Makefile.build makefile=Makefile obj
+build-crtools := -r -R -f scripts/Makefile.build makefile=Makefile.crtools obj
 
-PROGRAM		:= crtools
+PROGRAM		:= criu
 
 .PHONY: all zdtm test rebuild clean distclean tags cscope	\
 	docs help pie protobuf arch/$(ARCH) clean-built
@@ -123,7 +119,7 @@ ifeq ($(GCOV),1)
 %.o $(PROGRAM): override CFLAGS += --coverage
 endif
 
-all: pie $(VERSION_HEADER)
+all: config pie $(VERSION_HEADER)
 	$(Q) $(MAKE) $(PROGRAM)
 
 protobuf/%::
@@ -163,6 +159,7 @@ clean-built:
 	$(Q) $(MAKE) $(build)=pie clean
 	$(Q) $(MAKE) $(build-crtools)=. clean
 	$(Q) $(MAKE) -C Documentation clean
+	$(Q) $(RM) ./include/config.h
 	$(Q) $(RM) ./$(PROGRAM)
 
 rebuild: clean-built
@@ -179,9 +176,7 @@ clean: clean-built
 	$(Q) $(RM) -r ./gcov
 	$(Q) $(RM) -r ./test/lib/
 	$(Q) $(RM) -r ./test/lib64/
-	$(Q) $(MAKE) -C test/zdtm cleandep
-	$(Q) $(MAKE) -C test/zdtm clean
-	$(Q) $(MAKE) -C test/zdtm cleanout
+	$(Q) $(MAKE) -C test/zdtm cleandep clean cleanout
 
 distclean: clean
 	$(E) "  DISTCLEAN"
@@ -189,29 +184,48 @@ distclean: clean
 	$(Q) $(RM) ./cscope*
 
 tags:
-	$(E) "  GEN" $@
+	$(E) "  GEN     " $@
 	$(Q) $(RM) tags
 	$(Q) $(FIND) . -name '*.[hcS]' ! -path './.*' -print | xargs ctags -a
 
 cscope:
-	$(E) "  GEN" $@
+	$(E) "  GEN     " $@
 	$(Q) $(FIND) . -name '*.[hcS]' ! -path './.*' -print > cscope.files
 	$(Q) $(CSCOPE) -bkqu
 
 docs:
 	$(Q) $(MAKE) -s -C Documentation all
 
+dist: tar
+tar: criu-$(CRTOOLSVERSION).tar.bz2
+criu-$(CRTOOLSVERSION).tar.bz2:
+	git archive --format tar --prefix 'criu-$(CRTOOLSVERSION)/' \
+		v$(CRTOOLSVERSION) | bzip2 > $@
+.PHONY: dist tar
+
+install: $(PROGRAM) install-man
+	$(E) "  INSTALL " $(PROGRAM)
+	$(Q) mkdir -p $(DESTDIR)$(SBINDIR)
+	$(Q) install -m 755 $(PROGRAM) $(DESTDIR)$(SBINDIR)
+
+install-man:
+	$(Q) $(MAKE) -C Documentation install
+
+.PHONY: install install-man
+
 help:
-	$(E) '    Targets:'
-	$(E) '      all             - Build all [*] targets'
-	$(E) '    * crtools         - Build crtools'
-	$(E) '      zdtm            - Build zdtm test-suite'
-	$(E) '      docs            - Build documentation'
-	$(E) '      clean           - Clean everything'
-	$(E) '      tags            - Generate tags file (ctags)'
-	$(E) '      cscope          - Generate cscope database'
-	$(E) '      rebuild         - Force-rebuild of [*] targets'
-	$(E) '      test            - Run zdtm test-suite'
+	@echo '    Targets:'
+	@echo '      all             - Build all [*] targets'
+	@echo '    * criu            - Build criu'
+	@echo '      zdtm            - Build zdtm test-suite'
+	@echo '      docs            - Build documentation'
+	@echo '      install         - Install binary and man page'
+	@echo '      dist            - Create a source tarball'
+	@echo '      clean           - Clean everything'
+	@echo '      tags            - Generate tags file (ctags)'
+	@echo '      cscope          - Generate cscope database'
+	@echo '      rebuild         - Force-rebuild of [*] targets'
+	@echo '      test            - Run zdtm test-suite'
 
 gcov:
 	$(E) " GCOV"
@@ -223,5 +237,6 @@ gcov:
 	sed -i 's#/test/root/crtools##' crtools.ns.info && \
 	lcov -a crtools.l.info -a crtools.ns.info -o crtools.info && \
 	genhtml -o html crtools.info
+.PHONY: gcov
 
 .DEFAULT_GOAL	:= all

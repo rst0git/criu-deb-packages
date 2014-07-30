@@ -37,11 +37,11 @@ int open_mount(unsigned int s_dev)
 	return -ENOENT;
 }
 
-int collect_mount_info(void)
+int collect_mount_info(pid_t pid)
 {
 	pr_info("Collecting mountinfo\n");
 
-	mntinfo = parse_mountinfo(getpid());
+	mntinfo = parse_mountinfo(pid);
 	if (!mntinfo) {
 		pr_err("Parsing mountinfo %d failed\n", getpid());
 		return -1;
@@ -296,7 +296,7 @@ static int tmpfs_restore(struct mount_info *pm)
 	int ret;
 	int fd_img;
 
-	fd_img = open_image_ro(CR_FD_TMPFS, pm->mnt_id);
+	fd_img = open_image(CR_FD_TMPFS, O_RSTR, pm->mnt_id);
 	if (fd_img < 0)
 		return -1;
 
@@ -342,13 +342,14 @@ out:
 }
 
 static struct fstype fstypes[] = {
-	{ "unsupported" },
-	{ "proc" },
-	{ "sysfs" },
-	{ "devtmpfs" },
-	{ "binfmt_misc", binfmt_misc_dump },
-	{ "tmpfs", tmpfs_dump, tmpfs_restore },
-	{ "devpts" },
+	[FSTYPE__UNSUPPORTED]	= { "unsupported" },
+	[FSTYPE__PROC]		= { "proc" },
+	[FSTYPE__SYSFS]		= { "sysfs" },
+	[FSTYPE__DEVTMPFS]	= { "devtmpfs" },
+	[FSTYPE__BINFMT_MISC]	= { "binfmt_misc", binfmt_misc_dump },
+	[FSTYPE__TMPFS]		= { "tmpfs", tmpfs_dump, tmpfs_restore },
+	[FSTYPE__DEVPTS]	= { "devpts" },
+	[FSTYPE__SIMFS]		= { "simfs" },
 };
 
 struct fstype *find_fstype_by_name(char *fst)
@@ -574,6 +575,11 @@ static int clean_mnt_ns(void)
 	 * Mountinfos were collected at prepare stage
 	 */
 
+	if (mount("none", "/", "none", MS_REC|MS_PRIVATE, NULL)) {
+		pr_perror("Can't remount root with MS_PRIVATE");
+		return -1;
+	}
+
 	pm = mnt_build_tree(mntinfo);
 	if (!pm)
 		return -1;
@@ -593,16 +599,22 @@ static int cr_pivot_root()
 {
 	char put_root[] = "crtools-put-root.XXXXXX";
 
-	pr_info("Move the root to %s", opts.root);
+	pr_info("Move the root to %s\n", opts.root);
 
 	if (chdir(opts.root)) {
 		pr_perror("chdir(%s) failed", opts.root);
 		return -1;
 	}
 	if (mkdtemp(put_root) == NULL) {
-		pr_perror("Can't create a temparary directory");
+		pr_perror("Can't create a temporary directory");
 		return -1;
 	}
+
+	if (mount("none", "/", "none", MS_REC|MS_PRIVATE, NULL)) {
+		pr_perror("Can't remount root with MS_PRIVATE");
+		return -1;
+	}
+
 	if (pivot_root(".", put_root)) {
 		pr_perror("pivot_root(., %s) failed", put_root);
 		if (rmdir(put_root))
@@ -621,6 +633,37 @@ static int cr_pivot_root()
 	return 0;
 }
 
+struct mount_info *mnt_entry_alloc()
+{
+	struct mount_info *new;
+
+	new = xmalloc(sizeof(struct mount_info));
+	if (new == NULL)
+		return NULL;
+
+	new->root	= NULL;
+	new->mountpoint	= NULL;
+	new->source	= NULL;
+	new->options	= NULL;
+
+	new->parent = NULL;
+	INIT_LIST_HEAD(&new->children);
+
+	return new;
+}
+
+void mnt_entry_free(struct mount_info *mi)
+{
+	if (mi == NULL)
+		return;
+
+	xfree(mi->root);
+	xfree(mi->mountpoint);
+	xfree(mi->source);
+	xfree(mi->options);
+	xfree(mi);
+}
+
 static int populate_mnt_ns(int ns_pid)
 {
 	MntEntry *me = NULL;
@@ -629,7 +672,7 @@ static int populate_mnt_ns(int ns_pid)
 
 	pr_info("Populating mount namespace\n");
 
-	img = open_image_ro(CR_FD_MOUNTPOINTS, ns_pid);
+	img = open_image(CR_FD_MOUNTPOINTS, O_RSTR, ns_pid);
 	if (img < 0)
 		return -1;
 
@@ -642,12 +685,12 @@ static int populate_mnt_ns(int ns_pid)
 		if (ret <= 0)
 			break;
 
-		ret = -1;
-		pm = xmalloc(sizeof(*pm));
+		pm = mnt_entry_alloc();
 		if (!pm)
-			break;
+			goto err;
 
-		mnt_entry_init(pm);
+		pm->next = pms;
+		pms = pm;
 
 		pm->mnt_id		= me->mnt_id;
 		pm->parent_mnt_id	= me->parent_mnt_id;
@@ -678,8 +721,6 @@ static int populate_mnt_ns(int ns_pid)
 			goto err;
 
 		pr_debug("\tRead %d mp @ %s\n", pm->mnt_id, pm->mountpoint);
-		pm->next = pms;
-		pms = pm;
 	}
 
 	if (me)
@@ -694,6 +735,11 @@ static int populate_mnt_ns(int ns_pid)
 
 	return mnt_tree_for_each(pms, do_mount_one);
 err:
+	while (pms) {
+		struct mount_info *pm = pms;
+		pms = pm->next;
+		mnt_entry_free(pm);
+	}
 	close_safe(&img);
 	return -1;
 }
@@ -723,7 +769,7 @@ int prepare_mnt_ns(int ns_pid)
 	return ret;
 }
 
-void show_mountpoints(int fd, struct cr_options *o)
+void show_mountpoints(int fd)
 {
 	pb_show_plain(fd, PB_MOUNTPOINTS);
 }
@@ -741,8 +787,10 @@ int mntns_collect_root(pid_t pid)
 
 	pfd = open_pid_proc(pid);
 	ret = readlinkat(pfd, "root", path, sizeof(path) - 1);
-	if (ret < 0)
+	if (ret < 0){
+		close_pid_proc();
 		return ret;
+	}
 
 	path[ret] = '\0';
 
@@ -764,7 +812,4 @@ int mntns_collect_root(pid_t pid)
 	return 0;
 }
 
-struct ns_desc mnt_ns_desc = {
-	.cflag = CLONE_NEWNS,
-	.str = "mnt",
-};
+struct ns_desc mnt_ns_desc = NS_DESC_ENTRY(CLONE_NEWNS, "mnt");

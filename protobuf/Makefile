@@ -9,12 +9,14 @@
 
 CFLAGS		+= -I$(obj)/
 
+proto-obj-y	+= stats.o
 proto-obj-y	+= core.o
 proto-obj-y	+= core-x86.o
 proto-obj-y	+= core-arm.o
 proto-obj-y	+= inventory.o
 proto-obj-y	+= fdinfo.o
 proto-obj-y	+= fown.o
+proto-obj-y	+= ns.o
 proto-obj-y	+= regfile.o
 proto-obj-y	+= ghost-file.o
 proto-obj-y	+= fifo.o
@@ -37,6 +39,7 @@ proto-obj-y	+= mm.o
 proto-obj-y	+= sk-opts.o
 proto-obj-y	+= sk-unix.o
 proto-obj-y	+= sk-inet.o
+proto-obj-y	+= sk-netlink.o
 proto-obj-y	+= packet-sock.o
 proto-obj-y	+= ipc-var.o
 proto-obj-y	+= ipc-desc.o
@@ -50,6 +53,8 @@ proto-obj-y	+= netdev.o
 proto-obj-y	+= tty.o
 proto-obj-y	+= file-lock.o
 proto-obj-y	+= rlimit.o
+proto-obj-y	+= pagemap.o
+proto-obj-y	+= siginfo.o
 
 proto		:= $(proto-obj-y:.o=)
 proto-c		:= $(proto-obj-y:.o=.pb-c.c)

@@ -16,13 +16,13 @@
 
 enum {
 	CR_FD_INVENTORY,
+	CR_FD_STATS,
 	/*
 	 * Task entries
 	 */
 
 	_CR_FD_TASK_FROM,
 	CR_FD_FILE_LOCKS,
-	CR_FD_PAGES,
 	CR_FD_CORE,
 	CR_FD_IDS,
 	CR_FD_MM,
@@ -32,7 +32,10 @@ enum {
 	CR_FD_CREDS,
 	CR_FD_FS,
 	CR_FD_RLIMIT,
+	CR_FD_SIGNAL,
 	_CR_FD_TASK_TO,
+
+	CR_FD_PAGEMAP,
 
 	/*
 	 * NS entries
@@ -51,7 +54,7 @@ enum {
 	_CR_FD_NS_TO,
 
 	CR_FD_PSTREE,
-	CR_FD_SHMEM_PAGES,
+	CR_FD_SHMEM_PAGEMAP,
 	CR_FD_GHOST_FILE,
 	CR_FD_TCP_STREAM,
 	CR_FD_FDINFO,
@@ -59,9 +62,11 @@ enum {
 	_CR_FD_GLOB_FROM,
 	CR_FD_SK_QUEUES,
 	CR_FD_REG_FILES,
+	CR_FD_NS_FILES,
 	CR_FD_INETSK,
 	CR_FD_UNIXSK,
 	CR_FD_PACKETSK,
+	CR_FD_NETLINKSK,
 	CR_FD_PIPES,
 	CR_FD_PIPES_DATA,
 	CR_FD_FIFO,
@@ -80,6 +85,11 @@ enum {
 	_CR_FD_GLOB_TO,
 
 	CR_FD_TMPFS,
+	CR_FD_PAGES,
+	CR_FD_PSIGNAL,
+
+	CR_FD_PAGES_OLD,
+	CR_FD_SHM_PAGES_OLD,
 
 	CR_FD_MAX
 };
@@ -92,6 +102,7 @@ struct script {
 struct cr_options {
 	int			final_state;
 	char			*show_dump_file;
+	bool			check_ms_kernel;
 	bool			show_pages_content;
 	bool			restore_detach;
 	bool			ext_unix_sk;
@@ -107,6 +118,10 @@ struct cr_options {
 	char			*pidfile;
 	struct list_head	veth_pairs;
 	struct list_head	scripts;
+	bool			use_page_server;
+	struct sockaddr_in	ps_addr;
+	bool			track_mem;
+	char			*img_parent;
 };
 
 extern struct cr_options opts;
@@ -121,13 +136,17 @@ enum sfd_type {
 	PROC_FD_OFF,
 	CTL_TTY_OFF,
 	SELF_STDIN_OFF,
+	PARENT_FD_OFF,
 
 	SERVICE_FD_MAX
 };
 
+#define CR_PARENT_LINK	"parent"
+
 extern int clone_service_fd(int id);
 extern int init_service_fd(void);
 extern int get_service_fd(enum sfd_type type);
+extern int reserve_service_fd(enum sfd_type type);
 extern int install_service_fd(enum sfd_type type, int fd);
 extern int close_service_fd(enum sfd_type type);
 extern bool is_service_fd(int fd, enum sfd_type type);
@@ -137,36 +156,39 @@ extern bool is_any_service_fd(int fd);
 struct cr_fd_desc_tmpl {
 	const char	*fmt;			/* format for the name */
 	u32		magic;			/* magic in the header */
-	void		(*show)(int fd, struct cr_options *o);
+	void		(*show)(int fd);
 };
 
-void show_files(int fd_files, struct cr_options *o);
-void show_pages(int fd_pages, struct cr_options *o);
-void show_reg_files(int fd_reg_files, struct cr_options *o);
-void show_core(int fd_core, struct cr_options *o);
-void show_ids(int fd_ids, struct cr_options *o);
-void show_mm(int fd_mm, struct cr_options *o);
-void show_vmas(int fd_vma, struct cr_options *o);
-void show_pipes(int fd_pipes, struct cr_options *o);
-void show_pipes_data(int fd_pipes, struct cr_options *o);
-void show_fifo(int fd, struct cr_options *o);
-void show_fifo_data(int fd_pipes, struct cr_options *o);
-void show_pstree(int fd_pstree, struct cr_options *o);
-void show_sigacts(int fd_sigacts, struct cr_options *o);
-void show_itimers(int fd, struct cr_options *o);
-void show_creds(int fd, struct cr_options *o);
-void show_fs(int fd, struct cr_options *o);
-void show_remap_files(int fd, struct cr_options *o);
-void show_ghost_file(int fd, struct cr_options *o);
+void show_files(int fd);
+void show_pagemap(int fd);
+void show_reg_files(int fd);
+void show_ns_files(int fd);
+void show_core(int fd);
+void show_ids(int fd);
+void show_mm(int fd);
+void show_vmas(int fd);
+void show_pipes(int fd);
+void show_pipes_data(int fd);
+void show_fifo(int fd);
+void show_fifo_data(int fd);
+void show_pstree(int fd);
+void show_sigacts(int fd);
+void show_siginfo(int fd);
+void show_itimers(int fd);
+void show_creds(int fd);
+void show_fs(int fd);
+void show_remap_files(int fd);
+void show_ghost_file(int fd);
 void show_fown_cont(void *p);
-void show_eventfds(int fd, struct cr_options *o);
-void show_tty(int fd, struct cr_options *o);
-void show_tty_info(int fd, struct cr_options *o);
-void show_file_locks(int fd, struct cr_options *o);
-void show_rlimit(int fd, struct cr_options *o);
+void show_eventfds(int fd);
+void show_tty(int fd);
+void show_tty_info(int fd);
+void show_file_locks(int fd);
+void show_rlimit(int fd);
 
 int check_img_inventory(void);
 int write_img_inventory(void);
+void kill_inventory(void);
 
 extern void print_data(unsigned long addr, unsigned char *data, size_t size);
 extern void print_image_data(int fd, unsigned int length, int show);
@@ -175,8 +197,11 @@ extern struct cr_fd_desc_tmpl fdset_template[CR_FD_MAX];
 extern int open_image_dir(void);
 extern void close_image_dir(void);
 
-int open_image(int type, unsigned long flags, ...);
-#define open_image_ro(type, ...) open_image(type, O_RDONLY, ##__VA_ARGS__)
+int open_image_at(int dfd, int type, unsigned long flags, ...);
+#define open_image(typ, flags, ...) open_image_at(get_service_fd(IMG_FD_OFF), typ, flags, ##__VA_ARGS__)
+int open_pages_image(unsigned long flags, int pm_fd);
+int open_pages_image_at(int dfd, unsigned long flags, int pm_fd);
+void up_page_ids_base(void);
 
 #define LAST_PID_PATH		"/proc/sys/kernel/ns_last_pid"
 #define LAST_PID_PERM		0666
@@ -200,15 +225,17 @@ static inline int fdset_fd(const struct cr_fdset *fdset, int type)
 extern struct cr_fdset *glob_fdset;
 extern struct cr_options opts;
 
-int cr_dump_tasks(pid_t pid, const struct cr_options *opts);
-int cr_restore_tasks(pid_t pid, struct cr_options *opts);
-int cr_show(struct cr_options *opts);
+int cr_dump_tasks(pid_t pid);
+int cr_pre_dump_tasks(pid_t pid);
+int cr_restore_tasks(struct cr_options *opts);
+int cr_show(struct cr_options *opts, int pid);
 int convert_to_elf(char *elf_path, int fd_core);
 int cr_check(void);
 int cr_exec(int pid, char **opts);
 
 #define O_DUMP	(O_RDWR | O_CREAT | O_EXCL)
 #define O_SHOW	(O_RDONLY)
+#define O_RSTR	(O_RDONLY)
 
 struct cr_fdset *cr_task_fdset_open(int pid, int mode);
 struct cr_fdset *cr_ns_fdset_open(int pid, int mode);
@@ -216,8 +243,18 @@ struct cr_fdset *cr_glob_fdset_open(int mode);
 
 void close_cr_fdset(struct cr_fdset **cr_fdset);
 
-int collect_mappings(pid_t pid, struct list_head *vma_area_list);
-void free_mappings(struct list_head *vma_area_list);
+struct vm_area_list {
+	struct list_head	h;
+	unsigned		nr;
+	unsigned long		priv_size; /* nr of pages in private VMAs */
+	unsigned long		longest; /* nr of pages in longest VMA */
+};
+
+#define VM_AREA_LIST(name)	struct vm_area_list name = { .h = LIST_HEAD_INIT(name.h), .nr = 0, }
+
+int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list);
+void free_mappings(struct vm_area_list *vma_area_list);
+bool privately_dump_vma(struct vma_area *vma);
 
 struct vma_area {
 	struct list_head	list;
@@ -253,9 +290,10 @@ struct rst_info {
 	unsigned long		premmapped_len;
 	unsigned long		clone_flags;
 
+	int			nr_zombies;
+
 	int service_fd_id;
 	struct fdt		*fdt;
-
 };
 
 static inline int in_vma_area(struct vma_area *vma, unsigned long addr)

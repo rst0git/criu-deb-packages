@@ -14,7 +14,10 @@
 
 #include "compiler.h"
 #include "asm/types.h"
+#include "xmalloc.h"
+#include "bug.h"
 #include "log.h"
+#include "err.h"
 
 #include "protobuf/vma.pb-c.h"
 
@@ -30,36 +33,6 @@
 #define KILO(size)	PREF_SHIFT_OP(K, <<, size)
 #define MEGA(size)	PREF_SHIFT_OP(K, <<, size)
 #define GIGA(size)	PREF_SHIFT_OP(K, <<, size)
-
-#ifndef BUG_ON_HANDLER
-
-#ifdef CR_NOGLIBC
-
-#define BUG_ON_HANDLER(condition)					\
-	do {								\
-		if ((condition)) {					\
-			pr_err("BUG at %s:%d\n", __FILE__, __LINE__);	\
-			*(volatile unsigned long *)NULL = 0xdead0000 + __LINE__;	\
-		}							\
-	} while (0)
-
-#else /* CR_NOGLIBC */
-
-# define BUG_ON_HANDLER(condition)					\
-	do {								\
-		if ((condition)) {					\
-			pr_err("BUG at %s:%d\n", __FILE__, __LINE__);	\
-			raise(SIGABRT);					\
-			*(volatile unsigned long *)NULL = 0xdead0000 + __LINE__; \
-		}							\
-	} while (0)
-
-#endif /* CR_NOGLIBC */
-
-#endif /* BUG_ON_HANDLER */
-
-#define BUG_ON(condition)	BUG_ON_HANDLER((condition))
-#define BUG()			BUG_ON(true)
 
 /*
  * Write buffer @ptr of @size bytes into @fd file
@@ -129,9 +102,6 @@ static inline int read_img_buf(int fd, void *ptr, int size)
 
 #define read_img(fd, ptr)	read_img_buf((fd), (ptr), sizeof(*(ptr)))
 
-#define memzero_p(p)		memset(p, 0, sizeof(*p))
-#define memzero(p, size)	memset(p, 0, size)
-
 struct vma_area;
 struct list_head;
 
@@ -162,8 +132,6 @@ extern void pr_vma(unsigned int loglevel, const struct vma_area *vma_area);
 		}						\
 		p__;						\
 	})
-
-extern void mark_stack_vma(unsigned long sp, struct list_head *vma_area_list);
 
 extern int move_img_fd(int *img_fd, int want_fd);
 extern int close_safe(int *fd);
@@ -229,35 +197,6 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
 					__fd, pid, ##__VA_ARGS__);	\
 									\
 		__f;							\
-	 })
-
-#define __xalloc(op, size, ...)						\
-	({								\
-		void *___p = op( __VA_ARGS__ );				\
-		if (!___p)						\
-			pr_err("%s: Can't allocate %li bytes\n",	\
-			       __func__, (long)(size));			\
-		___p;							\
-	})
-
-#include <stdlib.h>
-
-#define xstrdup(str)		__xalloc(strdup, strlen(str) + 1, str)
-#define xmalloc(size)		__xalloc(malloc, size, size)
-#define xzalloc(size)		__xalloc(calloc, size, 1, size)
-#define xrealloc(p, size)	__xalloc(realloc, size, p, size)
-
-#define xfree(p)		do { if (p) free(p); } while (0)
-
-#define xrealloc_safe(pptr, size)					\
-	({								\
-		int __ret = -1;						\
-		void *new = xrealloc(*pptr, size);			\
-		if (new) {						\
-			*pptr = new;					\
-			__ret = 0;					\
-		}							\
-		__ret;							\
 	 })
 
 #define pr_img_head(type, ...)	pr_msg("\n"#type __VA_ARGS__ "\n----------------\n")
@@ -331,5 +270,9 @@ static inline bool dir_dots(struct dirent *de)
 {
 	return !strcmp(de->d_name, ".") || !strcmp(de->d_name, "..");
 }
+
+extern int read_fd_link(int lfd, char *buf, size_t size);
+
+#define USEC_PER_SEC	1000000L
 
 #endif /* __CR_UTIL_H__ */

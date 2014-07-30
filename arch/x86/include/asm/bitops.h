@@ -1,8 +1,9 @@
 #ifndef __CR_BITOPS_H__
 #define __CR_BITOPS_H__
 
+#include "asm/bitsperlong.h"
+
 #define DIV_ROUND_UP(n,d)	(((n) + (d) - 1) / (d))
-#define BITS_PER_LONG		(8 * sizeof(long))
 #define BITS_TO_LONGS(nr)	DIV_ROUND_UP(nr, BITS_PER_LONG)
 
 #define DECLARE_BITMAP(name, bits)		\
@@ -20,12 +21,12 @@
 
 static inline void set_bit(int nr, volatile unsigned long *addr)
 {
-	asm volatile("bts %1,%0" : ADDR : "Ir" (nr) : "memory");
+	asm volatile("btsl %1,%0" : ADDR : "Ir" (nr) : "memory");
 }
 
 static inline void change_bit(int nr, volatile unsigned long *addr)
 {
-	asm volatile("btc %1,%0" : ADDR : "Ir" (nr));
+	asm volatile("btcl %1,%0" : ADDR : "Ir" (nr));
 }
 
 static inline int test_bit(int nr, volatile const unsigned long *addr)
@@ -42,7 +43,7 @@ static inline int test_bit(int nr, volatile const unsigned long *addr)
 
 static inline void clear_bit(int nr, volatile unsigned long *addr)
 {
-	asm volatile("btr %1,%0" : ADDR : "Ir" (nr));
+	asm volatile("btrl %1,%0" : ADDR : "Ir" (nr));
 }
 
 /**

@@ -43,15 +43,15 @@ void parasite_setup_regs(unsigned long new_ip, user_regs_struct_t *regs)
 	regs->ARM_ORIG_r0 = -1;
 
 	/* Make sure flags are in known state */
-	regs->ARM_cpsr &= PSR_f | PSR_s | PSR_x | PSR_T_BIT | MODE32_BIT;
+	regs->ARM_cpsr &= PSR_f | PSR_s | PSR_x | MODE32_BIT;
 }
 
-int task_in_compat_mode(pid_t pid)
+bool arch_can_dump_task(pid_t pid)
 {
 	/*
 	 * TODO: Add proper check here
 	 */
-	return 0;
+	return true;
 }
 
 int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
@@ -74,7 +74,7 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 	regs.ARM_r5 = arg6;
 
 	parasite_setup_regs(ctl->syscall_ip, &regs);
-	err = __parasite_execute(ctl, ctl->pid, &regs);
+	err = __parasite_execute(ctl, ctl->pid.real, &regs);
 	if (err)
 		return err;
 
@@ -84,13 +84,14 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 
 #define assign_reg(dst, src, e)		dst->e = (__typeof__(dst->e))src.ARM_##e
 
+#define PTRACE_GETVFPREGS 27
 int get_task_regs(pid_t pid, CoreEntry *core, const struct parasite_ctl *ctl)
 {
 	user_regs_struct_t regs = {{-1}};
 	struct user_vfp vfp;
 	int ret = -1;
 
-	pr_info("Dumping GP/FPU registers ... ");
+	pr_info("Dumping GP/FPU registers for %d\n", pid);
 
 	if (ctl)
 		regs = ctl->regs_orig;
@@ -101,7 +102,7 @@ int get_task_regs(pid_t pid, CoreEntry *core, const struct parasite_ctl *ctl)
 		}
 	}
 
-	if (ptrace(PTRACE_GETFPREGS, pid, NULL, &vfp)) {
+	if (ptrace(PTRACE_GETVFPREGS, pid, NULL, &vfp)) {
 		pr_err("Can't obtain FPU registers for %d\n", pid);
 		goto err;
 	}
@@ -192,22 +193,17 @@ err:
 	return 0;
 }
 
-void core_entry_free(CoreEntry *core)
+void arch_free_thread_info(CoreEntry *core)
 {
-	if (core) {
-		if (CORE_THREAD_ARCH_INFO(core)) {
-			if (CORE_THREAD_ARCH_INFO(core)->fpstate) {
-				xfree(CORE_THREAD_ARCH_INFO(core)->fpstate->vfp_regs);
-				xfree(CORE_THREAD_ARCH_INFO(core)->fpstate);
-			}
-			xfree(CORE_THREAD_ARCH_INFO(core)->gpregs);
+	if (CORE_THREAD_ARCH_INFO(core)) {
+		if (CORE_THREAD_ARCH_INFO(core)->fpstate) {
+			xfree(CORE_THREAD_ARCH_INFO(core)->fpstate->vfp_regs);
+			xfree(CORE_THREAD_ARCH_INFO(core)->fpstate);
 		}
+		xfree(CORE_THREAD_ARCH_INFO(core)->gpregs);
 		xfree(CORE_THREAD_ARCH_INFO(core));
-		xfree(core->thread_core);
-		xfree(core->tc);
-		xfree(core->ids);
+		CORE_THREAD_ARCH_INFO(core) = NULL;
 	}
-
 }
 
 int sigreturn_prep_fpu_frame(struct thread_restore_args *args, CoreEntry *core)

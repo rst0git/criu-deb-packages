@@ -80,6 +80,7 @@ struct tty_info {
 	int				major;
 
 	bool				create;
+	bool				inherit;
 };
 
 struct tty_dump_info {
@@ -94,8 +95,6 @@ struct tty_dump_info {
 
 static LIST_HEAD(all_tty_info_entries);
 static LIST_HEAD(all_ttys);
-
-#define INHERIT_SID			(-1)
 
 /*
  * Usually an application has not that many ttys opened.
@@ -200,7 +199,7 @@ static int parse_index(u32 id, int lfd, int major)
 	switch (major) {
 	case TTYAUX_MAJOR:
 		if (ioctl(lfd, TIOCGPTN, &index)) {
-			pr_perror("Can't obtain ptmx index\n");
+			pr_perror("Can't obtain ptmx index");
 			return -1;
 		}
 		break;
@@ -328,7 +327,7 @@ static int lock_pty(int fd)
 static int tty_set_sid(int fd)
 {
 	if (ioctl(fd, TIOCSCTTY, 1)) {
-		pr_perror("Can't set sid on terminal fd %d\n", fd);
+		pr_perror("Can't set sid on terminal fd %d", fd);
 		return -1;
 	}
 
@@ -338,7 +337,7 @@ static int tty_set_sid(int fd)
 static int tty_set_prgp(int fd, int group)
 {
 	if (ioctl(fd, TIOCSPGRP, &group)) {
-		pr_perror("Failed to set group %d on %d\n", group, fd);
+		pr_perror("Failed to set group %d on %d", group, fd);
 		return -1;
 	}
 	return 0;
@@ -411,9 +410,9 @@ static bool tty_has_active_pair(struct tty_info *info)
 
 static void tty_show_pty_info(char *prefix, struct tty_info *info)
 {
-	pr_info("%s type %s id %#x index %d (master %d sid %d pgrp %d)\n",
+	pr_info("%s type %s id %#x index %d (master %d sid %d pgrp %d inherit %d)\n",
 		prefix, tty_type(info->major), info->tfe->id, info->tie->pty->index,
-		pty_is_master(info), info->tie->sid, info->tie->pgrp);
+		pty_is_master(info), info->tie->sid, info->tie->pgrp, info->inherit);
 }
 
 static int restore_tty_params(int fd, struct tty_info *info)
@@ -426,7 +425,7 @@ static int restore_tty_params(int fd, struct tty_info *info)
 	 * because it contain @c_cc array which
 	 * is bigger than TERMIOS_NCC. Same applies
 	 * to winsize usage, we can't guarantee the
-	 * structure taked from the system headers will
+	 * structure taken from the system headers will
 	 * never be extended.
 	 */
 
@@ -535,7 +534,7 @@ static int pty_open_unpaired_slave(struct file_desc *d, struct tty_info *slave)
 	 * be inherited, either it requires a fake master.
 	 */
 
-	if (likely(slave->tie->sid == INHERIT_SID)) {
+	if (likely(slave->inherit)) {
 		fd = dup(get_service_fd(SELF_STDIN_OFF));
 		if (fd < 0) {
 			pr_perror("Can't dup SELF_STDIN_OFF");
@@ -575,11 +574,22 @@ static int pty_open_unpaired_slave(struct file_desc *d, struct tty_info *slave)
 	 *
 	 * Note, at this point the group/session should
 	 * be already restored properly thus we can simply
-	 * use syscalls intead of lookup via process tree.
+	 * use syscalls instead of lookup via process tree.
 	 */
-	if (likely(slave->tie->sid == INHERIT_SID)) {
-		if (tty_set_prgp(fd, getpgid(getppid())))
-			goto err;
+	if (likely(slave->inherit)) {
+		/*
+		 * The restoration procedure only works if we're
+		 * migrating not a session leader, otherwise it's
+		 * not allowed to restore a group and one better to
+		 * checkpoint complete process tree together with
+		 * the process which keeps the master peer.
+		 */
+		if (root_item->sid != root_item->pid.virt) {
+			pr_debug("Restore inherited group %d\n",
+				 getpgid(getppid()));
+			if (tty_set_prgp(fd, getpgid(getppid())))
+				goto err;
+		}
 	}
 
 	if (pty_open_slaves(slave))
@@ -731,9 +741,11 @@ static int tty_find_restoring_task(struct tty_info *info)
 	}
 
 	if (info->tie->sid) {
-		if (pty_is_master(info)) {
+		if (!pty_is_master(info)) {
 			if (tty_has_active_pair(info))
 				return 0;
+			else
+				goto shell_job;
 		}
 
 		/*
@@ -750,8 +762,7 @@ static int tty_find_restoring_task(struct tty_info *info)
 					       info->tfe->id);
 		}
 
-		if (pty_is_master(info))
-			goto notask;
+		goto notask;
 	} else {
 		if (pty_is_master(info))
 			return 0;
@@ -759,9 +770,10 @@ static int tty_find_restoring_task(struct tty_info *info)
 			return 0;
 	}
 
+shell_job:
 	if (opts.shell_job) {
 		pr_info("Inherit terminal for id %x\n", info->tfe->id);
-		info->tie->sid = info->tie->pgrp = INHERIT_SID;
+		info->inherit = true;
 		return 0;
 	}
 
@@ -942,12 +954,13 @@ static int collect_one_tty(void *obj, ProtobufCMessage *msg)
 	INIT_LIST_HEAD(&info->sibling);
 	info->major = major(info->tie->rdev);
 	info->create = (info->major == TTYAUX_MAJOR);
+	info->inherit = false;
 
 	if (verify_info(info))
 		return -1;
 
 	/*
-	 * The tty peers which have no @termios are hunged up,
+	 * The tty peers which have no @termios are hung up,
 	 * so don't mark them as active, we create them with
 	 * faked master and they are rather a rudiment which
 	 * can't be used. Most likely they appear if a user has
@@ -1013,8 +1026,8 @@ int dump_verify_tty_sids(void)
 
 			if (!item || item->pid.virt != dinfo->sid) {
 				if (!opts.shell_job) {
-					pr_err("Found sid %d pgid %d (%s) on peer fd %d. "
-					       "Missing option?\n",
+					pr_err("Found dangling tty with sid %d pgid %d (%s) on peer fd %d. "
+					       "Consider using --" OPT_SHELL_JOB " option.\n",
 					       dinfo->sid, dinfo->pgrp,
 					       tty_type(dinfo->major),
 					       dinfo->fd);
@@ -1081,7 +1094,7 @@ static int dump_pty_info(int lfd, u32 id, const struct fd_parms *p, int major, i
 	pty.index		= index;
 
 	/*
-	 * Nothing we can do on hangin up terminal,
+	 * Nothing we can do on hanging up terminal,
 	 * just write out minimum information we can
 	 * gather.
 	 */
@@ -1093,7 +1106,7 @@ static int dump_pty_info(int lfd, u32 id, const struct fd_parms *p, int major, i
 	 * the task might have slave peer assigned but no
 	 * master peer. Such "detached" master peers are
 	 * not yet supported by our tool and better to
-	 * inform a user about such situatio,
+	 * inform a user about such situation.
 	 */
 	tty_test_and_set(id, tty_active_pairs);
 
@@ -1199,7 +1212,7 @@ int tty_prep_fds(struct cr_options *opts)
 		return 0;
 
 	if (!isatty(STDIN_FILENO)) {
-		pr_err("Standart stream is not a terminal, aborting\n");
+		pr_err("Standard stream is not a terminal, aborting\n");
 		return -1;
 	}
 
