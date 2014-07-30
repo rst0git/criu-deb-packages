@@ -1,5 +1,5 @@
 Format: http://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: CRtools
+Upstream-Name: CRIU
 Upstream-Contact: CriuML <criu@openvz.org>
 Source: http://git.criu.org/?p=crtools.git
 
