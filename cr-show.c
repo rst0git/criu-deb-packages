@@ -41,6 +41,7 @@
 #include "protobuf/vma.pb-c.h"
 #include "protobuf/creds.pb-c.h"
 #include "protobuf/core.pb-c.h"
+#include "protobuf/tty.pb-c.h"
 
 #define DEF_PAGES_PER_LINE	6
 
@@ -56,7 +57,7 @@ static LIST_HEAD(pstree_list);
 
 void show_files(int fd_files, struct cr_options *o)
 {
-	pb_show_plain(fd_files, fdinfo_entry);
+	pb_show_plain_pretty(fd_files, PB_FDINFO, "2:%#o 4:%d");
 }
 
 void show_fown_cont(void *p)
@@ -68,81 +69,69 @@ void show_fown_cont(void *p)
 
 void show_reg_files(int fd_reg_files, struct cr_options *o)
 {
-	pb_show_plain(fd_reg_files, reg_file_entry);
+	pb_show_plain(fd_reg_files, PB_REG_FILES);
 }
 
 void show_remap_files(int fd, struct cr_options *o)
 {
-	pb_show_plain(fd, remap_file_path_entry);
+	pb_show_plain(fd, PB_REMAP_FPATH);
 }
 
 void show_ghost_file(int fd, struct cr_options *o)
 {
-	GhostFileEntry *gfe;
-
-	pr_img_head(CR_FD_GHOST_FILE);
-	if (pb_read_eof(fd, &gfe, ghost_file_entry) > 0) {
-		pr_msg("uid %u god %u mode %#x\n", gfe->uid, gfe->gid, gfe->mode);
-		ghost_file_entry__free_unpacked(gfe, NULL);
-	}
-	pr_img_tail(CR_FD_GHOST_FILE);
+	pb_show_vertical(fd, PB_GHOST_FILE);
 }
 
-void __show_pipes_data(int fd, struct cr_options *o)
+static void pipe_data_handler(int fd, void *obj, int show_pages_content)
 {
-	PipeDataEntry *e;
+	PipeDataEntry *e = obj;
 
-	while (1) {
-		if (pb_read_eof(fd, &e, pipe_data_entry) <= 0)
-			break;
-		pr_msg("pipeid: 0x%8x bytes: 0x%8x\n", e->pipe_id, e->bytes);
+	if (show_pages_content) {
+		pr_msg("\n");
+		print_image_data(fd, e->bytes);
+	} else
 		lseek(fd, e->bytes, SEEK_CUR);
-		pipe_data_entry__free_unpacked(e, NULL);
-	}
 }
 
-void show_pipes_data(int fd_pipes, struct cr_options *o)
+void show_pipes_data(int fd, struct cr_options *o)
 {
-	pr_img_head(CR_FD_PIPES_DATA);
-	__show_pipes_data(fd_pipes, o);
-	pr_img_tail(CR_FD_PIPES_DATA);
+	pb_show_plain_payload(fd, PB_PIPES_DATA,
+			pipe_data_handler, o->show_pages_content);
 }
 
 void show_pipes(int fd_pipes, struct cr_options *o)
 {
-	pb_show_plain(fd_pipes, pipe_entry);
+	pb_show_plain(fd_pipes, PB_PIPES);
 }
 
 void show_fifo_data(int fd, struct cr_options *o)
 {
-	pr_img_head(CR_FD_FIFO_DATA);
-	__show_pipes_data(fd, o);
-	pr_img_tail(CR_FD_FIFO_DATA);
+	show_pipes_data(fd, o);
 }
 
 void show_fifo(int fd, struct cr_options *o)
 {
-	pb_show_plain(fd, fifo_entry);
+	pb_show_plain(fd, PB_FIFO);
+}
+
+void show_tty(int fd, struct cr_options *o)
+{
+	pb_show_plain(fd, PB_TTY);
+}
+
+void show_tty_info(int fd, struct cr_options *o)
+{
+	pb_show_plain(fd, PB_TTY_INFO);
 }
 
 void show_fs(int fd_fs, struct cr_options *o)
 {
-	FsEntry *fe;
-
-	pr_img_head(CR_FD_FS);
-
-	if (pb_read_eof(fd_fs, &fe, fs_entry) > 0) {
-		pr_msg("CWD : %#x\n", fe->cwd_id);
-		pr_msg("ROOT: %#x\n", fe->root_id);
-		fs_entry__free_unpacked(fe, NULL);
-	}
-
-	pr_img_tail(CR_FD_FS);
+	pb_show_vertical(fd_fs, PB_FS);
 }
 
 void show_vmas(int fd_vma, struct cr_options *o)
 {
-	pb_show_plain(fd_vma, vma_entry);
+	pb_show_plain(fd_vma, PB_VMAS);
 }
 
 static int nice_width_for(unsigned long addr)
@@ -163,7 +152,7 @@ void print_data(unsigned long addr, unsigned char *data, size_t size)
 
 	addr_len = nice_width_for(addr + size);
 
-	for (i = 0; i < size; i+= 16) {
+	for (i = 0; i < size; i += 16) {
 		pr_msg("%#0*lx: ", addr_len, addr + i);
 		for (j = 0; j < 8; j++)
 			pr_msg("0x%02x ", data[i +  j]);
@@ -180,6 +169,23 @@ void print_data(unsigned long addr, unsigned char *data, size_t size)
 
 		pr_msg("|\n");
 	}
+}
+
+void print_image_data(int fd, unsigned int length)
+{
+	void *data;
+	int ret;
+
+	data = xmalloc(length);
+	if (!data)
+		return;
+	ret = read_img_buf(fd, (unsigned char *)data, length);
+	if (ret < 0) {
+		xfree(data);
+		return;
+	}
+	print_data(0, (unsigned char *)data, length);
+	xfree(data);
 }
 
 void show_pages(int fd_pages, struct cr_options *o)
@@ -220,7 +226,7 @@ out:
 
 void show_sigacts(int fd_sigacts, struct cr_options *o)
 {
-	pb_show_plain(fd_sigacts, sa_entry);
+	pb_show_plain(fd_sigacts, PB_SIGACT);
 }
 
 static void show_itimer(char *n, ItimerEntry *ie)
@@ -237,19 +243,19 @@ void show_itimers(int fd, struct cr_options *o)
 
 	pr_img_head(CR_FD_ITIMERS);
 
-	ret = pb_read(fd, &ie, itimer_entry);
+	ret = pb_read_one(fd, &ie, PB_ITIMERS);
 	if (ret < 0)
 		goto out;
 	show_itimer("real", ie);
 	itimer_entry__free_unpacked(ie, NULL);
 
-	ret = pb_read(fd, &ie, itimer_entry);
+	ret = pb_read_one(fd, &ie, PB_ITIMERS);
 	if (ret < 0)
 		goto out;
 	show_itimer("virt", ie);
 	itimer_entry__free_unpacked(ie, NULL);
 
-	ret = pb_read(fd, &ie, itimer_entry);
+	ret = pb_read_one(fd, &ie, PB_ITIMERS);
 	if (ret < 0)
 		goto out;
 	show_itimer("prof", ie);
@@ -258,99 +264,43 @@ out:
 	pr_img_tail(CR_FD_ITIMERS);
 }
 
-static void show_cap(char *name, int nr, uint32_t *v)
-{
-	int i;
-
-	pr_msg("%s: ", name);
-	for (i = nr - 1; i >= 0; i--)
-		pr_msg("0x%08x", v[i]);
-	pr_msg("\n");
-}
-
 void show_creds(int fd, struct cr_options *o)
 {
-	CredsEntry *ce;
-
-	pr_img_head(CR_FD_CREDS);
-	if (pb_read(fd, &ce, creds_entry) < 0)
-		goto out;
-
-	pr_msg("uid %u  euid %u  suid %u  fsuid %u\n",
-	       ce->uid, ce->euid, ce->suid, ce->fsuid);
-	pr_msg("gid %u  egid %u  sgid %u  fsgid %u\n",
-	       ce->gid, ce->egid, ce->sgid, ce->fsgid);
-
-	show_cap("Inh", ce->n_cap_inh, ce->cap_inh);
-	show_cap("Eff", ce->n_cap_eff, ce->cap_eff);
-	show_cap("Prm", ce->n_cap_prm, ce->cap_prm);
-	show_cap("Bnd", ce->n_cap_bnd, ce->cap_bnd);
-
-	pr_msg("secbits: %#x\n", ce->secbits);
-
-	creds_entry__free_unpacked(ce, NULL);
-out:
-	pr_img_tail(CR_FD_CREDS);
+	pb_show_vertical(fd, PB_CREDS);
 }
 
-static int show_collect_pstree(int fd_pstree, struct list_head *collect)
+static void pstree_handler(int fd, void *obj, int collect)
 {
-	PstreeEntry *e;
+	PstreeEntry *e = obj;
+	struct pstree_item *item = NULL;
 
-	pr_img_head(CR_FD_PSTREE);
+	if (!collect)
+		return;
 
-	while (1) {
-		int ret;
-		struct pstree_item *item = NULL;
+	item = xzalloc(sizeof(struct pstree_item));
+	if (!item)
+		return;
 
-		e = NULL;
-		ret = pb_read_eof(fd_pstree, &e, pstree_entry);
-		if (ret <= 0)
-			goto out;
-		pr_msg("pid: %8d ppid %8d pgid: %8d sid %8d  n_threads: %8d\n",
-		       (int)e->pid, (int)e->ppid, (int)e->pgid,
-		       (int)e->sid, (int)e->n_threads);
-
-		if (collect) {
-			item = xzalloc(sizeof(struct pstree_item));
-			if (!item)
-				return -1;
-
-			item->pid.virt = e->pid;
-			item->nr_threads = e->n_threads;
-			item->threads = xzalloc(sizeof(u32) * e->n_threads);
-			if (!item->threads) {
-				xfree(item);
-				return -1;
-			}
-
-			list_add_tail(&item->list, collect);
-		}
-
-		if (e->n_threads) {
-			pr_msg("  \\\n");
-			pr_msg("   --- threads: ");
-			while (e->n_threads--) {
-				pr_msg(" %6d", (int)e->threads[e->n_threads]);
-				if (item)
-					item->threads[e->n_threads].virt = e->threads[e->n_threads];
-			}
-			pr_msg("\n");
-		}
-
-		pstree_entry__free_unpacked(e, NULL);
+	item->pid.virt = e->pid;
+	item->nr_threads = e->n_threads;
+	item->threads = xzalloc(sizeof(u32) * e->n_threads);
+	if (!item->threads) {
+		xfree(item);
+		return;
 	}
 
-out:
-	if (e)
-		pstree_entry__free_unpacked(e, NULL);
-	pr_img_tail(CR_FD_PSTREE);
-	return 0;
+	list_add_tail(&item->list, &pstree_list);
 }
 
-void show_pstree(int fd_pstree, struct cr_options *o)
+void show_collect_pstree(int fd, int collect)
 {
-	show_collect_pstree(fd_pstree, NULL);
+	pb_show_plain_payload_pretty(fd, PB_PSTREE, pstree_handler,
+				     collect, "1:%d 2:%d 3:%d 4:%d 5:%d");
+}
+
+void show_pstree(int fd, struct cr_options *o)
+{
+	show_collect_pstree(fd, 0);
 }
 
 static inline char *task_state_str(int state)
@@ -363,37 +313,6 @@ static inline char *task_state_str(int state)
 	default:
 		return "UNKNOWN";
 	}
-}
-
-static void show_core_rest(TaskCoreEntry *tc)
-{
-	if (!tc)
-		return;
-
-	pr_msg("\t---[ Task parameters ]---\n");
-	pr_msg("\tPersonality:  %#x\n", tc->personality);
-	pr_msg("\tCommand:      %s\n", tc->comm);
-	pr_msg("\tState:        %d (%s)\n",
-	       (int)tc->task_state,
-	       task_state_str((int)tc->task_state));
-
-	pr_msg("\t   Exit code: %u\n",
-	       (unsigned int)tc->exit_code);
-
-	pr_msg("\tBlkSig: 0x%lx\n", tc->blk_sigset);
-	pr_msg("\n");
-}
-
-static void show_core_ids(TaskKobjIdsEntry *ids)
-{
-	if (!ids)
-		return;
-
-	pr_msg("\t---[ Task IDS ]---\n");
-	pr_msg("\tVM:      %#x\n", ids->vm_id);
-	pr_msg("\tFS:      %#x\n", ids->fs_id);
-	pr_msg("\tFILES:   %#x\n", ids->files_id);
-	pr_msg("\tSIGHAND: %#x\n", ids->sighand_id);
 }
 
 static void show_core_regs(UserX86RegsEntry *regs)
@@ -442,52 +361,32 @@ void show_thread_info(ThreadInfoX86 *thread_info)
 
 void show_core(int fd_core, struct cr_options *o)
 {
-	CoreEntry *core;
-
-	pr_img_head(CR_FD_CORE);
-	if (pb_read_eof(fd_core, &core, core_entry) > 0) {
-
-		pr_msg("\t---[ General ]---\n");
-		pr_msg("\tmtype:           0x%x\n", core->mtype);
-		pr_msg("\n");
-
-		/* Continue if we support it */
-		if (core->mtype == CORE_ENTRY__MARCH__X86_64) {
-			show_thread_info(core->thread_info);
-			show_core_rest(core->tc);
-			show_core_ids(core->ids);
-		}
-
-		core_entry__free_unpacked(core, NULL);
-	}
-	pr_img_tail(CR_FD_CORE);
+	pb_show_vertical(fd_core, PB_CORE);
 }
 
 void show_mm(int fd_mm, struct cr_options *o)
 {
-	MmEntry *mme;
+	pb_show_vertical(fd_mm, PB_MM);
+}
 
-	pr_img_head(CR_FD_MM);
+static struct {
+	u32 magic;
+	u32 mask;
+	char *hint;
+} magic_hints[] = {
+	{ .magic = 0x45311224, .mask = 0xffffffff, .hint = "ip route dump", },
+	{ .magic = 0x47361222, .mask = 0xffffffff, .hint = "ip ifaddr dump", },
+	{ .magic = 0x00008b1f, .mask = 0x0000ffff, .hint = "gzip file", },
+	{ },
+};
 
-	if (pb_read(fd_mm, &mme, mm_entry) < 0)
-		goto out;
+static void try_hint_magic(u32 magic)
+{
+	int i;
 
-	pr_msg("\tBrk:          0x%lx\n", mme->mm_brk);
-	pr_msg("\tStart code:   0x%lx\n", mme->mm_start_code);
-	pr_msg("\tEnd code:     0x%lx\n", mme->mm_end_code);
-	pr_msg("\tStart stack:  0x%lx\n", mme->mm_start_stack);
-	pr_msg("\tStart data:   0x%lx\n", mme->mm_start_data);
-	pr_msg("\tEnd data:     0x%lx\n", mme->mm_end_data);
-	pr_msg("\tStart brk:    0x%lx\n", mme->mm_start_brk);
-	pr_msg("\tArg start:    0x%lx\n", mme->mm_arg_start);
-	pr_msg("\tArg end:      0x%lx\n", mme->mm_arg_end);
-	pr_msg("\tEnv start:    0x%lx\n", mme->mm_env_start);
-	pr_msg("\tEnv end:      0x%lx\n", mme->mm_env_end);
-	pr_msg("\tExe file ID   %#x\n", mme->exe_file_id);
-
-	mm_entry__free_unpacked(mme, NULL);
-out:
-	pr_img_tail(CR_FD_MM);
+	for (i = 0; magic_hints[i].hint != 0; i++)
+		if ((magic & magic_hints[i].mask) == magic_hints[i].magic)
+			pr_msg("This can be %s\n", magic_hints[i].hint);
 }
 
 static int cr_parse_file(struct cr_options *opts)
@@ -511,6 +410,7 @@ static int cr_parse_file(struct cr_options *opts)
 	if (i == CR_FD_MAX) {
 		pr_err("Unknown magic %#x in %s\n",
 				magic, opts->show_dump_file);
+		try_hint_magic(magic);
 		goto err;
 	}
 
@@ -530,17 +430,12 @@ err:
 static int cr_show_all(struct cr_options *opts)
 {
 	struct pstree_item *item = NULL, *tmp;
-	LIST_HEAD(pstree_list);
 	int i, ret = -1, fd, pid;
 
 	fd = open_image_ro(CR_FD_PSTREE);
 	if (fd < 0)
 		goto out;
-
-	ret = show_collect_pstree(fd, &pstree_list);
-	if (ret)
-		goto out;
-
+	show_collect_pstree(fd, 1);
 	close(fd);
 
 	fd = open_image_ro(CR_FD_SK_QUEUES);

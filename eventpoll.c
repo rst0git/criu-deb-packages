@@ -24,6 +24,9 @@
 #include "protobuf.h"
 #include "protobuf/eventpoll.pb-c.h"
 
+#undef	LOG_PREFIX
+#define LOG_PREFIX "epoll: "
+
 struct eventpoll_file_info {
 	EventpollFileEntry		*efe;
 	struct file_desc		d;
@@ -55,12 +58,12 @@ static void pr_info_eventpoll(char *action, EventpollFileEntry *e)
 
 void show_eventpoll_tfd(int fd, struct cr_options *o)
 {
-	pb_show_plain(fd, eventpoll_tfd_entry);
+	pb_show_plain(fd, PB_EVENTPOLL_TFD);
 }
 
 void show_eventpoll(int fd, struct cr_options *o)
 {
-	pb_show_plain(fd, eventpoll_file_entry);
+	pb_show_plain(fd, PB_EVENTPOLL);
 }
 
 static int dump_eventpoll_entry(union fdinfo_entries *e, void *arg)
@@ -69,8 +72,8 @@ static int dump_eventpoll_entry(union fdinfo_entries *e, void *arg)
 
 	efd->id = *(u32 *)arg;
 	pr_info_eventpoll_tfd("Dumping: ", efd);
-	return pb_write(fdset_fd(glob_fdset, CR_FD_EVENTPOLL_TFD),
-			efd, eventpoll_tfd_entry);
+	return pb_write_one(fdset_fd(glob_fdset, CR_FD_EVENTPOLL_TFD),
+			efd, PB_EVENTPOLL_TFD);
 }
 
 static int dump_one_eventpoll(int lfd, u32 id, const struct fd_parms *p)
@@ -82,8 +85,8 @@ static int dump_one_eventpoll(int lfd, u32 id, const struct fd_parms *p)
 	e.fown = (FownEntry *)&p->fown;
 
 	pr_info_eventpoll("Dumping ", &e);
-	if (pb_write(fdset_fd(glob_fdset, CR_FD_EVENTPOLL),
-		     &e, eventpoll_file_entry))
+	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_EVENTPOLL),
+		     &e, PB_EVENTPOLL))
 		return -1;
 
 	return parse_fdinfo(lfd, FD_TYPES__EVENTPOLL, dump_eventpoll_entry, &id);
@@ -91,7 +94,6 @@ static int dump_one_eventpoll(int lfd, u32 id, const struct fd_parms *p)
 
 static const struct fdtype_ops eventpoll_ops = {
 	.type		= FD_TYPES__EVENTPOLL,
-	.make_gen_id	= make_gen_id,
 	.dump		= dump_one_eventpoll,
 };
 
@@ -102,11 +104,12 @@ int dump_eventpoll(struct fd_parms *p, int lfd, const struct cr_fdset *set)
 
 static int eventpoll_open(struct file_desc *d)
 {
-	struct eventpoll_tfd_file_info *td_info;
 	struct eventpoll_file_info *info;
-	int tmp, ret;
+	int tmp;
 
 	info = container_of(d, struct eventpoll_file_info, d);
+
+	pr_info_eventpoll("Restore ", info->efe);
 
 	tmp = epoll_create(1);
 	if (tmp < 0) {
@@ -121,90 +124,85 @@ static int eventpoll_open(struct file_desc *d)
 		goto err_close;
 	}
 
+	return tmp;
+err_close:
+	close(tmp);
+	return -1;
+}
+
+static int eventpoll_post_open(struct file_desc *d, int fd)
+{
+	int ret;
+	struct eventpoll_tfd_file_info *td_info;
+	struct eventpoll_file_info *info;
+
+	info = container_of(d, struct eventpoll_file_info, d);
+
 	list_for_each_entry(td_info, &eventpoll_tfds, list) {
 		struct epoll_event event;
 
 		if (td_info->tdefe->id != info->efe->id)
 			continue;
 
+		pr_info_eventpoll_tfd("Restore ", td_info->tdefe);
+
 		event.events	= td_info->tdefe->events;
 		event.data.u64	= td_info->tdefe->data;
-		ret = epoll_ctl(tmp, EPOLL_CTL_ADD, td_info->tdefe->tfd, &event);
+		ret = epoll_ctl(fd, EPOLL_CTL_ADD, td_info->tdefe->tfd, &event);
 		if (ret) {
 			pr_perror("Can't add event on %#08x", info->efe->id);
-			goto err_close;
+			return -1;
 		}
 	}
 
-	return tmp;
+	return 0;
+}
 
-err_close:
-	close(tmp);
-	return -1;
+static struct list_head *eventpoll_select_list(struct file_desc *d, struct rst_info *ri)
+{
+	return &ri->eventpoll;
 }
 
 static struct file_desc_ops desc_ops = {
 	.type = FD_TYPES__EVENTPOLL,
 	.open = eventpoll_open,
+	.post_open = eventpoll_post_open,
+	.select_ps_list = eventpoll_select_list,
 };
+
+static int collect_one_epoll_tfd(void *o, ProtobufCMessage *msg)
+{
+	struct eventpoll_tfd_file_info *info = o;
+
+	info->tdefe = pb_msg(msg, EventpollTfdEntry);
+	list_add(&info->list, &eventpoll_tfds);
+	pr_info_eventpoll_tfd("Collected ", info->tdefe);
+
+	return 0;
+}
+
+static int collect_one_epoll(void *o, ProtobufCMessage *msg)
+{
+	struct eventpoll_file_info *info = o;
+
+	info->efe = pb_msg(msg, EventpollFileEntry);
+	file_desc_add(&info->d, info->efe->id, &desc_ops);
+	pr_info_eventpoll("Collected ", info->efe);
+
+	return 0;
+}
 
 int collect_eventpoll(void)
 {
-	int image_fd;
-	int ret = -1;
+	int ret;
 
-	image_fd = open_image_ro(CR_FD_EVENTPOLL_TFD);
-	if (image_fd < 0)
-		return -1;
+	ret = collect_image(CR_FD_EVENTPOLL_TFD, PB_EVENTPOLL_TFD,
+			sizeof(struct eventpoll_tfd_file_info),
+			collect_one_epoll_tfd);
+	if (!ret)
+		ret = collect_image(CR_FD_EVENTPOLL, PB_EVENTPOLL,
+				sizeof(struct eventpoll_file_info),
+				collect_one_epoll);
 
-	while (1) {
-		struct eventpoll_tfd_file_info *info;
-
-		info = xmalloc(sizeof(*info));
-		if (info) {
-			info->tdefe = xmalloc(sizeof(*info->tdefe));
-			if (!info->tdefe)
-				goto err;
-		} else
-			goto err;
-
-		ret = pb_read_eof(image_fd, &info->tdefe, eventpoll_tfd_entry);
-		if (ret < 0)
-			goto err;
-		else if (!ret)
-			break;
-
-		INIT_LIST_HEAD(&info->list);
-
-		list_add(&info->list, &eventpoll_tfds);
-		pr_info_eventpoll_tfd("Collected ", info->tdefe);
-	}
-
-	close_safe(&image_fd);
-
-	image_fd = open_image_ro(CR_FD_EVENTPOLL);
-	if (image_fd < 0)
-		return -1;
-
-	while (1) {
-		struct eventpoll_file_info *info;
-
-		ret = -1;
-		info = xmalloc(sizeof(*info));
-		if (!info)
-			goto err;
-
-		ret = pb_read_eof(image_fd, &info->efe, eventpoll_file_entry);
-		if (ret < 0)
-			goto err;
-		else if (!ret)
-			break;
-
-		pr_info_eventpoll("Collected ", info->efe);
-		file_desc_add(&info->d, info->efe->id, &desc_ops);
-	}
-
-err:
-	close_safe(&image_fd);
 	return ret;
 }

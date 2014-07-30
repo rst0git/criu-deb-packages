@@ -38,9 +38,9 @@
 #define BUG_ON_HANDLER(condition)					\
 	do {								\
 		if ((condition)) {					\
-			write_string("BUG at " __FILE__ ": ");		\
-			write_num(__LINE__);				\
-			write_string("\n");				\
+			write_str_err("BUG at " __FILE__ ": ");		\
+			write_num_err(__LINE__);			\
+			write_str_err("\n");				\
 			*(volatile unsigned long *)NULL = 0xdead0000 + __LINE__;	\
 		}							\
 	} while (0)
@@ -61,6 +61,7 @@
 #endif /* BUG_ON_HANDLER */
 
 #define BUG_ON(condition)	BUG_ON_HANDLER((condition))
+#define BUG()			BUG_ON(true)
 
 /*
  * Write buffer @ptr of @size bytes into @fd file
@@ -164,6 +165,8 @@ extern void pr_vma(unsigned int loglevel, const struct vma_area *vma_area);
 		p__;						\
 	})
 
+extern void mark_stack_vma(unsigned long sp, struct list_head *vma_area_list);
+
 extern int move_img_fd(int *img_fd, int want_fd);
 extern int close_safe(int *fd);
 
@@ -175,6 +178,7 @@ int set_proc_mountpoint(char *path);
 void close_proc(void);
 int open_pid_proc(pid_t pid);
 int close_pid_proc(void);
+int set_proc_fd(int fd);
 
 int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
 
@@ -263,7 +267,7 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
 
 #define KDEV_MINORBITS	20
 #define KDEV_MINORMASK	((1UL << KDEV_MINORBITS) - 1)
-#define MKKDEV(ma,mi)	(((ma) << KDEV_MINORBITS) | (mi))
+#define MKKDEV(ma, mi)	(((ma) << KDEV_MINORBITS) | (mi))
 
 static inline u32 kdev_major(u32 kdev)
 {
@@ -316,5 +320,9 @@ static inline int read_img_str(int fd, char **pstr, int size)
 	*pstr = str;
 	return 0;
 }
+
+extern void *shmalloc(size_t bytes);
+extern void shfree_last(void *ptr);
+extern int run_scripts(char *action);
 
 #endif /* UTIL_H_ */

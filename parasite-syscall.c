@@ -11,6 +11,7 @@
 #include "parasite-blob.h"
 #include "parasite.h"
 #include "crtools.h"
+#include "namespaces.h"
 
 #include "protobuf.h"
 #include "protobuf/sa.pb-c.h"
@@ -227,6 +228,8 @@ static int parasite_execute_by_pid(unsigned long cmd, struct parasite_ctl *ctl,
 	int ret;
 	user_regs_struct_t regs_orig, regs;
 
+	BUG_ON(args_size > PARASITE_ARG_SIZE);
+
 	if (ctl->pid == pid)
 		regs = ctl->regs_orig;
 	else {
@@ -245,7 +248,7 @@ static int parasite_execute_by_pid(unsigned long cmd, struct parasite_ctl *ctl,
 
 	ret = __parasite_execute(ctl, pid, &regs);
 	if (ret == 0)
-		ret = (int)regs.ax;
+		ret = -(int)regs.ax;
 
 	if (args)
 		memcpy(args, ctl->addr_args, args_size);
@@ -276,13 +279,13 @@ static void *mmap_seized(struct parasite_ctl *ctl,
 	void *map = NULL;
 	int ret;
 
-	regs.ax = (unsigned long)__NR_mmap;	/* mmap		*/
-	regs.di = (unsigned long)addr;		/* @addr	*/
-	regs.si = (unsigned long)length;	/* @length	*/
-	regs.dx = (unsigned long)prot;		/* @prot	*/
-	regs.r10= (unsigned long)flags;		/* @flags	*/
-	regs.r8 = (unsigned long)fd;		/* @fd		*/
-	regs.r9 = (unsigned long)offset;	/* @offset	*/
+	regs.ax  = (unsigned long)__NR_mmap;	/* mmap		*/
+	regs.di  = (unsigned long)addr;		/* @addr	*/
+	regs.si  = (unsigned long)length;	/* @length	*/
+	regs.dx  = (unsigned long)prot;		/* @prot	*/
+	regs.r10 = (unsigned long)flags;	/* @flags	*/
+	regs.r8  = (unsigned long)fd;		/* @fd		*/
+	regs.r9  = (unsigned long)offset;	/* @offset	*/
 
 	parasite_setup_regs(ctl->syscall_ip, &regs);
 
@@ -353,16 +356,6 @@ static int parasite_prep_file(int fd, struct parasite_ctl *ctl)
 	return 0;
 }
 
-static int parasite_init(struct parasite_ctl *ctl, pid_t pid)
-{
-	struct parasite_init_args args = { };
-
-	args.sun_len = gen_parasite_saddr(&args.saddr, pid);
-
-	return parasite_execute(PARASITE_CMD_INIT, ctl,
-				&args, sizeof(args));
-}
-
 static int parasite_set_logfd(struct parasite_ctl *ctl, pid_t pid)
 {
 	int ret;
@@ -378,36 +371,63 @@ static int parasite_set_logfd(struct parasite_ctl *ctl, pid_t pid)
 	return 0;
 }
 
-static int parasite_connect_tsocket(struct parasite_ctl *ctl)
+static int parasite_init(struct parasite_ctl *ctl, pid_t pid)
 {
 	struct parasite_init_args args = { };
-	struct sockaddr_un saddr;
-	int sun_len;
-	int sock;
+	static int sock = -1;
 
-	sun_len = gen_parasite_saddr(&saddr, ctl->pid);
+	pr_info("Putting tsock into pid %d\n", pid);
+	args.h_addr_len = gen_parasite_saddr(&args.h_addr, 0);
+	args.p_addr_len = gen_parasite_saddr(&args.p_addr, pid);
 
-	sock = socket(PF_UNIX, SOCK_DGRAM, 0);
-	if (sock < 0) {
-		pr_perror("Can't create socket");
-		return -1;
+	if (sock == -1) {
+		int rst = -1;
+
+		if (opts.namespaces_flags & CLONE_NEWNET) {
+			pr_info("Switching to %d's net for tsock creation\n", pid);
+
+			if (switch_ns(pid, CLONE_NEWNET, "net", &rst))
+				return -1;
+		}
+
+		sock = socket(PF_UNIX, SOCK_DGRAM, 0);
+		if (sock < 0) {
+			pr_perror("Can't create socket");
+			return -1;
+		}
+
+		if (bind(sock, (struct sockaddr *)&args.h_addr, args.h_addr_len) < 0) {
+			pr_perror("Can't bind socket");
+			goto err;
+		}
+
+		if (rst > 0 && restore_ns(rst, CLONE_NEWNET) < 0)
+			goto err;
+	} else {
+		struct sockaddr addr = { .sa_family = AF_UNSPEC, };
+
+		/*
+		 * When the peer of a dgram socket dies the original socket
+		 * remains in connected state, thus denying any connections
+		 * from "other" sources. Unconnect the socket by hands thus
+		 * allowing for parasite to connect back.
+		 */
+
+		if (connect(sock, &addr, sizeof(addr)) < 0) {
+			pr_perror("Can't unconnect");
+			goto err;
+		}
 	}
 
-	if (connect(sock, &saddr, sun_len) < 0) {
+	if (parasite_execute(PARASITE_CMD_INIT, ctl, &args, sizeof(args)) < 0) {
+		pr_err("Can't init parasite\n");
+		goto err;
+	}
+
+	if (connect(sock, (struct sockaddr *)&args.p_addr, args.p_addr_len) < 0) {
 		pr_perror("Can't connect a transport socket");
 		goto err;
 	}
-
-	args.sun_len = gen_parasite_saddr(&args.saddr, -getpid());
-
-	if (bind(sock, (struct sockaddr *)&args.saddr, args.sun_len) < 0) {
-		pr_perror("Can't bind socket");
-		goto err;
-	}
-
-	if (parasite_execute(PARASITE_CMD_TCONNECT, ctl,
-				&args, sizeof(args)) < 0)
-		goto err;
 
 	ctl->tsock = sock;
 	return 0;
@@ -417,7 +437,7 @@ err:
 }
 
 int parasite_dump_thread_seized(struct parasite_ctl *ctl, pid_t pid,
-					unsigned int **tid_addr, u32 *tid)
+					unsigned int **tid_addr, pid_t *tid)
 {
 	struct parasite_dump_tid_info args = { };
 	int ret;
@@ -452,7 +472,7 @@ int parasite_dump_sigacts_seized(struct parasite_ctl *ctl, struct cr_fdset *cr_f
 		ASSIGN_TYPED(se.restorer, args.sas[i].rt_sa_restorer);
 		ASSIGN_TYPED(se.mask, args.sas[i].rt_sa_mask.sig[0]);
 
-		if (pb_write(fd, &se, sa_entry) < 0)
+		if (pb_write_one(fd, &se, PB_SIGACT) < 0)
 			return -1;
 	}
 
@@ -468,7 +488,7 @@ static int dump_one_timer(struct itimerval *v, int fd)
 	ie.vsec = v->it_value.tv_sec;
 	ie.vusec = v->it_value.tv_sec;
 
-	return pb_write(fd, &ie, itimer_entry);
+	return pb_write_one(fd, &ie, PB_ITIMERS);
 }
 
 int parasite_dump_itimers_seized(struct parasite_ctl *ctl, struct cr_fdset *cr_fdset)
@@ -583,41 +603,52 @@ out:
 	return ret;
 }
 
-int parasite_drain_fds_seized(struct parasite_ctl *ctl, int *fds, int *lfds, int nr_fds, char *flags)
+int parasite_drain_fds_seized(struct parasite_ctl *ctl,
+		struct parasite_drain_fd *dfds, int *lfds, struct fd_opts *opts)
 {
-	struct parasite_drain_fd *args;
 	int ret = -1;
 
-	args = xmalloc(sizeof(*args));
-	if (!args)
-		return -ENOMEM;
-
-	args->nr_fds = nr_fds;
-	memcpy(&args->fds, fds, sizeof(int) * nr_fds);
-
-	ret = parasite_execute(PARASITE_CMD_DRAIN_FDS, ctl, args, sizeof(*args));
+	ret = parasite_execute(PARASITE_CMD_DRAIN_FDS, ctl,
+			dfds, drain_fds_size(dfds));
 	if (ret) {
 		pr_err("Parasite failed to drain descriptors\n");
 		goto err;
 	}
 
-	ret = recv_fds(ctl->tsock, lfds, nr_fds, flags);
+	ret = recv_fds(ctl->tsock, lfds, dfds->nr_fds, opts);
 	if (ret) {
 		pr_err("Can't retrieve FDs from socket\n");
 		goto err;
 	}
 
 err:
-	xfree(args);
 	return ret;
+}
+
+int parasite_get_proc_fd_seized(struct parasite_ctl *ctl)
+{
+	int ret = -1, fd;
+
+	ret = parasite_execute(PARASITE_CMD_GET_PROC_FD, ctl, NULL, 0);
+	if (ret) {
+		pr_err("Parasite failed to get proc fd\n");
+		return ret;
+	}
+
+	fd = recv_fd(ctl->tsock);
+	if (fd < 0) {
+		pr_err("Can't retrieve FD from socket\n");
+		return fd;
+	}
+
+	return fd;
 }
 
 int parasite_cure_seized(struct parasite_ctl *ctl)
 {
 	int ret = 0;
 
-	if (ctl->tsock >= 0)
-		close(ctl->tsock);
+	ctl->tsock = -1;
 
 	if (ctl->parasite_ip) {
 		ctl->signals_blocked = 0;
@@ -745,12 +776,6 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct list_head *vma_are
 	}
 
 	ctl->signals_blocked = 1;
-
-	ret = parasite_connect_tsocket(ctl);
-	if (ret) {
-		pr_err("%d: Can't set connect\n", pid);
-		goto err_restore;
-	}
 
 	ret = parasite_set_logfd(ctl, pid);
 	if (ret) {

@@ -23,28 +23,17 @@
 #include "lock.h"
 #include "sockets.h"
 #include "pstree.h"
+#include "tty.h"
 
 #include "protobuf.h"
 #include "protobuf/fs.pb-c.h"
 
-static struct fdinfo_list_entry *fdinfo_list;
-static int nr_fdinfo_list;
-
 #define FDESC_HASH_SIZE	64
 static struct list_head file_desc_hash[FDESC_HASH_SIZE];
-
-#define FDINFO_POOL_SIZE	(4 * 4096)
 
 int prepare_shared_fdinfo(void)
 {
 	int i;
-
-	fdinfo_list = mmap(NULL, FDINFO_POOL_SIZE,
-			PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, 0, 0);
-	if (fdinfo_list == MAP_FAILED) {
-		pr_perror("Can't map fdinfo_list");
-		return -1;
-	}
 
 	for (i = 0; i < FDESC_HASH_SIZE; i++)
 		INIT_LIST_HEAD(&file_desc_hash[i]);
@@ -81,7 +70,11 @@ static inline struct file_desc *find_file_desc(FdinfoEntry *fe)
 
 struct fdinfo_list_entry *file_master(struct file_desc *d)
 {
-	BUG_ON(list_empty(&d->fd_info_head));
+	if (list_empty(&d->fd_info_head)) {
+		pr_err("Empty list on file desc id %#x\n", d->id);
+		BUG();
+	}
+
 	return list_first_entry(&d->fd_info_head,
 			struct fdinfo_list_entry, desc_list);
 }
@@ -155,23 +148,29 @@ int rst_file_params(int fd, FownEntry *fown, int flags)
 	return 0;
 }
 
+static struct list_head *select_ps_list(struct file_desc *desc, struct rst_info *ri)
+{
+	if (desc->ops->select_ps_list)
+		return desc->ops->select_ps_list(desc, ri);
+	else
+		return &ri->fds;
+}
+
 static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 {
-	struct fdinfo_list_entry *l, *le = &fdinfo_list[nr_fdinfo_list];
+	struct fdinfo_list_entry *le, *new_le;
 	struct file_desc *fdesc;
 
 	pr_info("Collect fdinfo pid=%d fd=%d id=0x%16x\n",
 		pid, e->fd, e->id);
 
-	nr_fdinfo_list++;
-	if ((nr_fdinfo_list) * sizeof(struct fdinfo_list_entry) >= FDINFO_POOL_SIZE) {
-		pr_err("OOM storing fdinfo_list_entries\n");
+	new_le = shmalloc(sizeof(*new_le));
+	if (!new_le)
 		return -1;
-	}
 
-	le->pid = pid;
-	futex_init(&le->real_pid);
-	le->fe = e;
+	futex_init(&new_le->real_pid);
+	new_le->pid = pid;
+	new_le->fe = e;
 
 	fdesc = find_file_desc(e);
 	if (fdesc == NULL) {
@@ -179,17 +178,42 @@ static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 		return -1;
 	}
 
-	list_for_each_entry(l, &fdesc->fd_info_head, desc_list)
-		if (l->pid > le->pid)
+	list_for_each_entry(le, &fdesc->fd_info_head, desc_list) {
+		if (le->pid > new_le->pid)
 			break;
+	}
 
-	list_add_tail(&le->desc_list, &l->desc_list);
-	le->desc = fdesc;
+	list_add_tail(&new_le->desc_list, &le->desc_list);
+	new_le->desc = fdesc;
+	list_add_tail(&new_le->ps_list, select_ps_list(fdesc, rst_info));
 
-	if (unlikely(le->fe->type == FD_TYPES__EVENTPOLL))
-		list_add_tail(&le->ps_list, &rst_info->eventpoll);
-	else
-		list_add_tail(&le->ps_list, &rst_info->fds);
+	return 0;
+}
+
+int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
+{
+	FdinfoEntry *e;
+
+	if (!ctl_tty_id)
+		return 0;
+
+	pr_info("Requesting for ctl tty %#x into service fd\n", ctl_tty_id);
+
+	e = xmalloc(sizeof(*e));
+	if (!e)
+		return -1;
+
+	fdinfo_entry__init(e);
+
+	e->id		= ctl_tty_id;
+	e->fd		= get_service_fd(CTL_TTY_OFF);
+	e->type		= FD_TYPES__TTY;
+
+	if (collect_fd(pid, e, rst_info)) {
+		xfree(e);
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -199,6 +223,7 @@ int prepare_fd_pid(int pid, struct rst_info *rst_info)
 
 	INIT_LIST_HEAD(&rst_info->fds);
 	INIT_LIST_HEAD(&rst_info->eventpoll);
+	INIT_LIST_HEAD(&rst_info->tty_slaves);
 
 	fdinfo_fd = open_image_ro(CR_FD_FDINFO, pid);
 	if (fdinfo_fd < 0) {
@@ -211,7 +236,7 @@ int prepare_fd_pid(int pid, struct rst_info *rst_info)
 	while (1) {
 		FdinfoEntry *e;
 
-		ret = pb_read_eof(fdinfo_fd, &e, fdinfo_entry);
+		ret = pb_read_one_eof(fdinfo_fd, &e, PB_FDINFO);
 		if (ret <= 0)
 			break;
 
@@ -314,7 +339,7 @@ static int open_transport_fd(int pid, struct fdinfo_list_entry *fle)
 	return 0;
 }
 
-int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle, int tsk)
+int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle, int sock)
 {
 	struct sockaddr_un saddr;
 	int len;
@@ -324,27 +349,50 @@ int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle, int tsk)
 	transport_name_gen(&saddr, &len,
 			futex_get(&fle->real_pid), fle->fe->fd);
 	pr_info("\t\tSend fd %d to %s\n", fd, saddr.sun_path + 1);
-	return send_fd(tsk, &saddr, len, fd);
+	return send_fd(sock, &saddr, len, fd);
 }
 
-static int open_fd(int pid, FdinfoEntry *fe, struct file_desc *d)
+static int send_fd_to_self(int fd, struct fdinfo_list_entry *fle, int *sock)
 {
-	int tmp;
-	int sock;
-	struct fdinfo_list_entry *fle;
+	int dfd = fle->fe->fd;
 
-	fle = file_master(d);
-	if ((fle->pid != pid) || (fe->fd != fle->fe->fd))
+	if (fd == dfd)
 		return 0;
 
-	tmp = d->ops->open(d);
-	if (tmp < 0)
+	pr_info("\t\t\tGoing to dup %d into %d\n", fd, dfd);
+	if (move_img_fd(sock, dfd))
 		return -1;
 
-	if (reopen_fd_as(fe->fd, tmp))
+	if (dup2(fd, dfd) != dfd) {
+		pr_perror("Can't dup local fd %d -> %d", fd, dfd);
 		return -1;
+	}
 
-	fcntl(fe->fd, F_SETFD, fe->flags);
+	fcntl(dfd, F_SETFD, fle->fe->flags);
+	return 0;
+}
+
+static int post_open_fd(int pid, struct fdinfo_list_entry *fle)
+{
+	struct file_desc *d = fle->desc;
+
+	if (!d->ops->post_open)
+		return 0;
+
+	if (is_service_fd(fle->fe->fd, CTL_TTY_OFF))
+		return d->ops->post_open(d, fle->fe->fd);
+
+	if (fle != file_master(d))
+		return 0;
+
+	return d->ops->post_open(d, fle->fe->fd);
+}
+
+
+static int serve_out_fd(int pid, int fd, struct file_desc *d)
+{
+	int sock, ret;
+	struct fdinfo_list_entry *fle;
 
 	sock = socket(PF_UNIX, SOCK_DGRAM, 0);
 	if (sock < 0) {
@@ -352,30 +400,16 @@ static int open_fd(int pid, FdinfoEntry *fe, struct file_desc *d)
 		return -1;
 	}
 
-	pr_info("\t\tCreate fd for %d\n", fe->fd);
+	pr_info("\t\tCreate fd for %d\n", fd);
 
 	list_for_each_entry(fle, &d->fd_info_head, desc_list) {
-		if (pid == fle->pid) {
-			pr_info("\t\t\tGoing to dup %d into %d\n", fe->fd, fle->fe->fd);
-			if (fe->fd == fle->fe->fd)
-				continue;
+		if (pid == fle->pid)
+			ret = send_fd_to_self(fd, fle, &sock);
+		else
+			ret = send_fd_to_peer(fd, fle, sock);
 
-			if (move_img_fd(&sock, fle->fe->fd))
-				return -1;
-
-			if (dup2(fe->fd, fle->fe->fd) != fle->fe->fd) {
-				pr_perror("Can't dup local fd %d -> %d",
-						fe->fd, fle->fe->fd);
-				return -1;
-			}
-
-			fcntl(fle->fe->fd, F_SETFD, fle->fe->flags);
-
-			continue;
-		}
-
-		if (send_fd_to_peer(fe->fd, fle, sock)) {
-			pr_perror("Can't send file descriptor");
+		if (ret) {
+			pr_err("Can't sent fd %d to %d\n", fd, fle->pid);
 			return -1;
 		}
 	}
@@ -384,56 +418,79 @@ static int open_fd(int pid, FdinfoEntry *fe, struct file_desc *d)
 	return 0;
 }
 
-static int receive_fd(int pid, FdinfoEntry *fe, struct file_desc *d)
+static int open_fd(int pid, struct fdinfo_list_entry *fle)
 {
-	int tmp;
-	struct fdinfo_list_entry *fle;
+	struct file_desc *d = fle->desc;
+	int new_fd;
 
-	fle = file_master(d);
-
-	if (fle->pid == pid)
+	if (fle != file_master(d))
 		return 0;
 
-	pr_info("\tReceive fd for %d\n", fe->fd);
+	new_fd = d->ops->open(d);
+	if (new_fd < 0)
+		return -1;
 
-	tmp = recv_fd(fe->fd);
+	if (reopen_fd_as(fle->fe->fd, new_fd))
+		return -1;
+
+	fcntl(fle->fe->fd, F_SETFD, fle->fe->flags);
+
+	return serve_out_fd(pid, fle->fe->fd, d);
+}
+
+static int receive_fd(int pid, struct fdinfo_list_entry *fle)
+{
+	int tmp;
+	struct fdinfo_list_entry *flem;
+
+	flem = file_master(fle->desc);
+	if (flem->pid == pid)
+		return 0;
+
+	pr_info("\tReceive fd for %d\n", fle->fe->fd);
+
+	tmp = recv_fd(fle->fe->fd);
 	if (tmp < 0) {
 		pr_err("Can't get fd %d\n", tmp);
 		return -1;
 	}
-	close(fe->fd);
+	close(fle->fe->fd);
 
-	if (reopen_fd_as(fe->fd, tmp) < 0)
+	if (reopen_fd_as(fle->fe->fd, tmp) < 0)
 		return -1;
 
-	fcntl(tmp, F_SETFD, fe->flags);
+	fcntl(tmp, F_SETFD, fle->fe->flags);
 	return 0;
 }
 
-static char *fdinfo_states[FD_STATE_MAX] = {
-	[FD_STATE_PREP]		= "prepare",
-	[FD_STATE_CREATE]	= "create",
-	[FD_STATE_RECV]		= "receive",
+struct fd_open_state {
+	char *name;
+	int (*cb)(int, struct fdinfo_list_entry *);
+};
+
+static struct fd_open_state states[] = {
+	{ "prepare",		open_transport_fd, },
+	{ "create",		open_fd, },
+	{ "receive",		receive_fd, },
+	{ "post_create",	post_open_fd, },
 };
 
 static int open_fdinfo(int pid, struct fdinfo_list_entry *fle, int state)
 {
-	int ret = 0;
-
-	BUG_ON(state >= FD_STATE_MAX);
 	pr_info("\tRestoring fd %d (state -> %s)\n",
-			fle->fe->fd, fdinfo_states[state]);
+			fle->fe->fd, states[state].name);
+	return states[state].cb(pid, fle);
+}
 
-	switch (state) {
-	case FD_STATE_PREP:
-		ret = open_transport_fd(pid, fle);
-		break;
-	case FD_STATE_CREATE:
-		ret = open_fd(pid, fle->fe, fle->desc);
-		break;
-	case FD_STATE_RECV:
-		ret = receive_fd(pid, fle->fe, fle->desc);
-		break;
+static int open_fdinfos(int pid, struct list_head *list, int state)
+{
+	int ret = 0;
+	struct fdinfo_list_entry *fle;
+
+	list_for_each_entry(fle, list, ps_list) {
+		ret = open_fdinfo(pid, fle, state);
+		if (ret)
+			break;
 	}
 
 	return ret;
@@ -460,7 +517,6 @@ int prepare_fds(struct pstree_item *me)
 {
 	u32 ret;
 	int state;
-	struct fdinfo_list_entry *fle;
 
 	ret = close_old_fds(me);
 	if (ret)
@@ -468,27 +524,29 @@ int prepare_fds(struct pstree_item *me)
 
 	pr_info("Opening fdinfo-s\n");
 
-	for (state = 0; state < FD_STATE_MAX; state++) {
-		list_for_each_entry(fle, &me->rst->fds, ps_list) {
-			ret = open_fdinfo(me->pid.virt, fle, state);
-			if (ret)
-				goto done;
-		}
+	for (state = 0; state < ARRAY_SIZE(states); state++) {
+		ret = open_fdinfos(me->pid.virt, &me->rst->fds, state);
+		if (ret)
+			break;
+
+		/*
+		 * Now handle TTYs. Slaves are delayed to be sure masters
+		 * are already opened.
+		 */
+		ret = open_fdinfos(me->pid.virt, &me->rst->tty_slaves, state);
+		if (ret)
+			break;
 
 		/*
 		 * The eventpoll descriptors require all the other ones
 		 * to be already restored, thus we store them in a separate
 		 * list and restore at the very end.
 		 */
-		list_for_each_entry(fle, &me->rst->eventpoll, ps_list) {
-			ret = open_fdinfo(me->pid.virt, fle, state);
-			if (ret)
-				goto done;
-		}
+		ret = open_fdinfos(me->pid.virt, &me->rst->eventpoll, state);
+		if (ret)
+			break;
 	}
 
-	ret = run_unix_connections();
-done:
 	return ret;
 }
 
@@ -501,7 +559,7 @@ int prepare_fs(int pid)
 	if (ifd < 0)
 		return -1;
 
-	if (pb_read(ifd, &fe, fs_entry) < 0)
+	if (pb_read_one(ifd, &fe, PB_FS) < 0)
 		return -1;
 
 	cwd = open_reg_by_id(fe->cwd_id);

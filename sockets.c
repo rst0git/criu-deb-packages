@@ -1,15 +1,19 @@
+#include <unistd.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <netinet/tcp.h>
 
 #include "libnetlink.h"
 #include "sockets.h"
 #include "unix_diag.h"
 #include "inet_diag.h"
+#include "packet_diag.h"
 #include "files.h"
 #include "util-net.h"
-
-static char buf[4096];
+#include "sk-packet.h"
+#include "namespaces.h"
+#include "crtools.h"
 
 #ifndef NETLINK_SOCK_DIAG
 #define NETLINK_SOCK_DIAG NETLINK_INET_DIAG
@@ -27,13 +31,17 @@ static char buf[4096];
 
 static struct socket_desc *sockets[SK_HASH_SIZE];
 
-struct socket_desc *lookup_socket(int ino)
+struct socket_desc *lookup_socket(int ino, int family)
 {
 	struct socket_desc *sd;
 
+	pr_debug("\tSearching for socket %x (family %d)\n", ino, family);
 	for (sd = sockets[ino % SK_HASH_SIZE]; sd; sd = sd->next)
-		if (sd->ino == ino)
+		if (sd->ino == ino) {
+			BUG_ON(sd->family != family);
 			return sd;
+		}
+
 	return NULL;
 }
 
@@ -43,6 +51,7 @@ int sk_collect_one(int ino, int family, struct socket_desc *d)
 
 	d->ino		= ino;
 	d->family	= family;
+	d->already_dumped = 0;
 
 	chain = &sockets[ino % SK_HASH_SIZE];
 	d->next = *chain;
@@ -51,72 +60,74 @@ int sk_collect_one(int ino, int family, struct socket_desc *d)
 	return 0;
 }
 
-static int do_restore_opt(int sk, int name, void *val, int len)
+int do_restore_opt(int sk, int level, int name, void *val, int len)
 {
-	if (setsockopt(sk, SOL_SOCKET, name, val, len) < 0) {
-		pr_perror("Can't set SOL_SOCKET:%d (len %d)", name, len);
+	if (setsockopt(sk, level, name, val, len) < 0) {
+		pr_perror("Can't set %d:%d (len %d)", level, name, len);
 		return -1;
 	}
 
 	return 0;
 }
-
-#define restore_opt(s, n, f)	do_restore_opt(s, n, f, sizeof(*f))
 
 int restore_socket_opts(int sk, SkOptsEntry *soe)
 {
 	int ret = 0;
 	struct timeval tv;
 
-	ret |= restore_opt(sk, SO_SNDBUFFORCE, &soe->so_sndbuf);
-	ret |= restore_opt(sk, SO_RCVBUFFORCE, &soe->so_rcvbuf);
+	ret |= restore_opt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &soe->so_sndbuf);
+	ret |= restore_opt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &soe->so_rcvbuf);
 
 	tv.tv_sec = soe->so_snd_tmo_sec;
 	tv.tv_usec = soe->so_snd_tmo_usec;
-	ret |= restore_opt(sk, SO_SNDTIMEO, &tv);
+	ret |= restore_opt(sk, SOL_SOCKET, SO_SNDTIMEO, &tv);
 
 	tv.tv_sec = soe->so_rcv_tmo_sec;
 	tv.tv_usec = soe->so_rcv_tmo_usec;
-	ret |= restore_opt(sk, SO_RCVTIMEO, &tv);
+	ret |= restore_opt(sk, SOL_SOCKET, SO_RCVTIMEO, &tv);
+
+	/* The restore of SO_REUSEADDR depends on type of socket */
 
 	return ret;
 }
 
-int do_dump_opt(int sk, int name, void *val, int len)
+int do_dump_opt(int sk, int level, int name, void *val, int len)
 {
 	socklen_t aux = len;
 
-	if (getsockopt(sk, SOL_SOCKET, name, val, &aux) < 0) {
-		pr_perror("Can't get SOL_SOCKET:%d opt", name);
+	if (getsockopt(sk, level, name, val, &aux) < 0) {
+		pr_perror("Can't get %d:%d opt", level, name);
 		return -1;
 	}
 
 	if (aux != len) {
-		pr_err("Len mismatch on SOL_SOCKET:%d : %d, want %d\n",
-				name, aux, len);
+		pr_err("Len mismatch on %d:%d : %d, want %d\n",
+				level, name, aux, len);
 		return -1;
 	}
 
 	return 0;
 }
 
-#define dump_opt(s, n, f)	do_dump_opt(s, n, f, sizeof(*f))
-
 int dump_socket_opts(int sk, SkOptsEntry *soe)
 {
-	int ret = 0;
+	int ret = 0, val;
 	struct timeval tv;
 
-	ret |= dump_opt(sk, SO_SNDBUF, &soe->so_sndbuf);
-	ret |= dump_opt(sk, SO_RCVBUF, &soe->so_rcvbuf);
+	ret |= dump_opt(sk, SOL_SOCKET, SO_SNDBUF, &soe->so_sndbuf);
+	ret |= dump_opt(sk, SOL_SOCKET, SO_RCVBUF, &soe->so_rcvbuf);
 
-	ret |= dump_opt(sk, SO_SNDTIMEO, &tv);
+	ret |= dump_opt(sk, SOL_SOCKET, SO_SNDTIMEO, &tv);
 	soe->so_snd_tmo_sec = tv.tv_sec;
 	soe->so_snd_tmo_usec = tv.tv_usec;
 
-	ret |= dump_opt(sk, SO_RCVTIMEO, &tv);
+	ret |= dump_opt(sk, SOL_SOCKET, SO_RCVTIMEO, &tv);
 	soe->so_rcv_tmo_sec = tv.tv_sec;
 	soe->so_rcv_tmo_usec = tv.tv_usec;
+
+	ret |= dump_opt(sk, SOL_SOCKET, SO_REUSEADDR, &val);
+	soe->reuseaddr = val ? true : false;
+	soe->has_reuseaddr = true;
 
 	return ret;
 }
@@ -125,15 +136,18 @@ int dump_socket(struct fd_parms *p, int lfd, const struct cr_fdset *cr_fdset)
 {
 	int family;
 
-	if (dump_opt(lfd, SO_DOMAIN, &family))
+	if (dump_opt(lfd, SOL_SOCKET, SO_DOMAIN, &family))
 		return -1;
 
 	switch (family) {
 	case AF_UNIX:
 		return dump_one_unix(p, lfd, cr_fdset);
 	case AF_INET:
-	case AF_INET6:
 		return dump_one_inet(p, lfd, cr_fdset);
+	case AF_INET6:
+		return dump_one_inet6(p, lfd, cr_fdset);
+	case AF_PACKET:
+		return dump_one_packet_sk(p, lfd, cr_fdset);
 	default:
 		pr_err("BUG! Unknown socket collected\n");
 		break;
@@ -142,113 +156,53 @@ int dump_socket(struct fd_parms *p, int lfd, const struct cr_fdset *cr_fdset)
 	return -1;
 }
 
-static int inet_tcp_receive_one(struct nlmsghdr *h)
+static int inet_receive_one(struct nlmsghdr *h, void *arg)
 {
-	return inet_collect_one(h, AF_INET, SOCK_STREAM, IPPROTO_TCP);
-}
+	struct inet_diag_req_v2 *i = arg;
+	int type;
 
-static int inet_udp_receive_one(struct nlmsghdr *h)
-{
-	return inet_collect_one(h, AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-}
-
-static int inet_udplite_receive_one(struct nlmsghdr *h)
-{
-	return inet_collect_one(h, AF_INET, SOCK_DGRAM, IPPROTO_UDPLITE);
-}
-
-static int inet6_tcp_receive_one(struct nlmsghdr *h)
-{
-	return inet_collect_one(h, AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-}
-
-static int inet6_udp_receive_one(struct nlmsghdr *h)
-{
-	return inet_collect_one(h, AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-}
-
-static int inet6_udplite_receive_one(struct nlmsghdr *h)
-{
-	return inet_collect_one(h, AF_INET6, SOCK_DGRAM, IPPROTO_UDPLITE);
-}
-
-static int collect_sockets_nl(int nl, void *req, int size,
-			      int (*receive_callback)(struct nlmsghdr *h))
-{
-	struct msghdr msg;
-	struct sockaddr_nl nladdr;
-	struct iovec iov;
-
-	memset(&msg, 0, sizeof(msg));
-	msg.msg_name	= &nladdr;
-	msg.msg_namelen	= sizeof(nladdr);
-	msg.msg_iov	= &iov;
-	msg.msg_iovlen	= 1;
-
-	memset(&nladdr, 0, sizeof(nladdr));
-	nladdr.nl_family= AF_NETLINK;
-
-	iov.iov_base	= req;
-	iov.iov_len	= size;
-
-	if (sendmsg(nl, &msg, 0) < 0) {
-		pr_perror("Can't send request message");
-		goto err;
+	switch (i->sdiag_protocol) {
+	case IPPROTO_TCP:
+		type = SOCK_STREAM;
+		break;
+	case IPPROTO_UDP:
+	case IPPROTO_UDPLITE:
+		type = SOCK_DGRAM;
+		break;
+	default:
+		BUG_ON(1);
+		return -1;
 	}
 
-	iov.iov_base	= buf;
-	iov.iov_len	= sizeof(buf);
-
-	while (1) {
-		int err;
-
-		memset(&msg, 0, sizeof(msg));
-		msg.msg_name	= &nladdr;
-		msg.msg_namelen	= sizeof(nladdr);
-		msg.msg_iov	= &iov;
-		msg.msg_iovlen	= 1;
-
-		err = recvmsg(nl, &msg, 0);
-		if (err < 0) {
-			if (errno == EINTR)
-				continue;
-			else {
-				pr_perror("Error receiving nl report");
-				goto err;
-			}
-		}
-		if (err == 0)
-			break;
-
-		err = nlmsg_receive(buf, err, receive_callback);
-		if (err < 0)
-			goto err;
-		if (err == 0)
-			break;
-	}
-
-	return 0;
-
-err:
-	return -1;
+	return inet_collect_one(h, i->sdiag_family, type, i->sdiag_protocol);
 }
 
-int collect_sockets(void)
+int collect_sockets(int pid)
 {
 	int err = 0, tmp;
+	int rst = -1;
 	int nl;
 	struct {
 		struct nlmsghdr hdr;
 		union {
 			struct unix_diag_req	u;
 			struct inet_diag_req_v2	i;
+			struct packet_diag_req	p;
 		} r;
 	} req;
+
+	if (opts.namespaces_flags & CLONE_NEWNET) {
+		pr_info("Switching to %d's net for collecting sockets\n", pid);
+
+		if (switch_ns(pid, CLONE_NEWNET, "net", &rst))
+			return -1;
+	}
 
 	nl = socket(PF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
 	if (nl < 0) {
 		pr_perror("Can't create sock diag socket");
-		return -1;
+		err = -1;
+		goto out;
 	}
 
 	memset(&req, 0, sizeof(req));
@@ -263,7 +217,7 @@ int collect_sockets(void)
 	req.r.u.udiag_show	= UDIAG_SHOW_NAME | UDIAG_SHOW_VFS |
 				  UDIAG_SHOW_PEER | UDIAG_SHOW_ICONS |
 				  UDIAG_SHOW_RQLEN;
-	tmp = collect_sockets_nl(nl, &req, sizeof(req), unix_receive_one);
+	tmp = do_rtnl_req(nl, &req, sizeof(req), unix_receive_one, NULL);
 	if (tmp)
 		err = tmp;
 
@@ -273,7 +227,7 @@ int collect_sockets(void)
 	req.r.i.idiag_ext	= 0;
 	/* Only listening and established sockets supported yet */
 	req.r.i.idiag_states	= (1 << TCP_LISTEN) | (1 << TCP_ESTABLISHED);
-	tmp = collect_sockets_nl(nl, &req, sizeof(req), inet_tcp_receive_one);
+	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -282,7 +236,7 @@ int collect_sockets(void)
 	req.r.i.sdiag_protocol	= IPPROTO_UDP;
 	req.r.i.idiag_ext	= 0;
 	req.r.i.idiag_states	= -1; /* All */
-	tmp = collect_sockets_nl(nl, &req, sizeof(req), inet_udp_receive_one);
+	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -291,7 +245,7 @@ int collect_sockets(void)
 	req.r.i.sdiag_protocol	= IPPROTO_UDPLITE;
 	req.r.i.idiag_ext	= 0;
 	req.r.i.idiag_states	= -1; /* All */
-	tmp = collect_sockets_nl(nl, &req, sizeof(req), inet_udplite_receive_one);
+	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -301,7 +255,7 @@ int collect_sockets(void)
 	req.r.i.idiag_ext	= 0;
 	/* Only listening sockets supported yet */
 	req.r.i.idiag_states	= 1 << TCP_LISTEN;
-	tmp = collect_sockets_nl(nl, &req, sizeof(req), inet6_tcp_receive_one);
+	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -310,7 +264,7 @@ int collect_sockets(void)
 	req.r.i.sdiag_protocol	= IPPROTO_UDP;
 	req.r.i.idiag_ext	= 0;
 	req.r.i.idiag_states	= -1; /* All */
-	tmp = collect_sockets_nl(nl, &req, sizeof(req), inet6_udp_receive_one);
+	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
 
@@ -319,11 +273,22 @@ int collect_sockets(void)
 	req.r.i.sdiag_protocol	= IPPROTO_UDPLITE;
 	req.r.i.idiag_ext	= 0;
 	req.r.i.idiag_states	= -1; /* All */
-	tmp = collect_sockets_nl(nl, &req, sizeof(req), inet6_udplite_receive_one);
+	tmp = do_rtnl_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
+	if (tmp)
+		err = tmp;
+
+	req.r.p.sdiag_family	= AF_PACKET;
+	req.r.p.sdiag_protocol	= 0;
+	req.r.p.pdiag_show	= PACKET_SHOW_INFO | PACKET_SHOW_MCLIST |
+					PACKET_SHOW_FANOUT | PACKET_SHOW_RING_CFG;
+	tmp = do_rtnl_req(nl, &req, sizeof(req), packet_receive_one, NULL);
 	if (tmp)
 		err = tmp;
 
 	close(nl);
+out:
+	if (rst > 0 && restore_ns(rst, CLONE_NEWNET) < 0)
+		err = -1;
 	return err;
 }
 

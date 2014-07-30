@@ -9,6 +9,7 @@ TST_NOFILE	=	\
 		socket_loop00	\
 		netlink00	\
 		file_aio	\
+		socket-tcp	\
 
 TST_FILE	=	\
 		unix_sock	\
@@ -36,12 +37,12 @@ $(TST_FILE:%=%.pid):	%.pid:	%
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test
 
 %.out:	%.pid %
-	-kill -TERM `< $<`
+	-kill -TERM `cat $<`
 
 start:	$(PID)
 
 %.is_running:	%.pid
-	kill -0 `< $<`
+	kill -0 `cat $<`
 
 check_start:	$(PID:%.pid=%.is_running)
 
@@ -57,7 +58,8 @@ wait_stop:
 
 $(TST):	$(LIB)
 
-file_aio: override LDLIBS += -lrt
+file_aio: override LDLIBS += -lrt -pthread
+socket-tcp: override CFLAGS += -D STREAM
 
 $(LIB):	force
 	$(MAKE) -C $(LIBDIR)

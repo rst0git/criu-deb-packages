@@ -8,6 +8,7 @@
 
 #include "../protobuf/eventfd.pb-c.h"
 #include "../protobuf/eventpoll.pb-c.h"
+#include "../protobuf/signalfd.pb-c.h"
 #include "../protobuf/inotify.pb-c.h"
 
 #define PROC_TASK_COMM_LEN	32
@@ -89,6 +90,13 @@ struct proc_status_creds {
 	uint32_t cap_bnd[PROC_CAP_SIZE];
 };
 
+struct mount_info;
+struct fstype {
+	char *name;
+	int (*dump)(struct mount_info *pm);
+	int (*restore)(struct mount_info *pm);
+};
+
 struct mount_info {
 	int		mnt_id;
 	int		parent_mnt_id;
@@ -98,7 +106,7 @@ struct mount_info {
 	unsigned	flags;
 	int		master_id;
 	int		shared_id;
-	char		*fstype;
+	struct fstype	*fstype;
 	char		*source;
 	char		*options;
 	struct mount_info *next;
@@ -124,6 +132,7 @@ extern int parse_pid_status(pid_t pid, struct proc_status_creds *);
 union fdinfo_entries {
 	EventfdFileEntry efd;
 	EventpollTfdEntry epl;
+	SignalfdEntry sfd;
 	InotifyWdEntry ify;
 };
 

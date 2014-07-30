@@ -78,7 +78,7 @@ int collect_pipe_data(int img_type, struct pipe_data_rst **hash)
 		if (!r)
 			break;
 
-		ret = pb_read_eof(fd, &r->pde, pipe_data_entry);
+		ret = pb_read_one_eof(fd, &r->pde, PB_PIPES_DATA);
 		if (ret <= 0)
 			break;
 
@@ -112,7 +112,6 @@ void mark_pipe_master(void)
 	while (1) {
 		struct fdinfo_list_entry *fle;
 		struct pipe_info *pi, *pic, *p;
-		int fd, pid;
 
 		if (list_empty(&pipes))
 			break;
@@ -125,18 +124,15 @@ void mark_pipe_master(void)
 
 		fle = file_master(&pi->d);
 		p = pi;
-		fd = fle->fe->fd;
-		pid = fle->pid;
 
 		list_for_each_entry(pic, &pi->pipe_list, pipe_list) {
-			list_move(&pic->list, &head);
+			struct fdinfo_list_entry *f;
 
-			fle = file_master(&p->d);
-			if (fle->pid < pid ||
-			    (pid == fle->pid && fle->fe->fd < fd)) {
+			list_move(&pic->list, &head);
+			f = file_master(&pic->d);
+			if (fdinfo_rst_prio(f, fle)) {
 				p = pic;
-				fd = fle->fe->fd;
-				pid = fle->pid;
+				fle = f;
 			}
 
 			show_saved_pipe_fds(pic);
@@ -308,48 +304,42 @@ static struct file_desc_ops pipe_desc_ops = {
 	.want_transport	= want_transport,
 };
 
+static int collect_one_pipe(void *o, ProtobufCMessage *base)
+{
+	struct pipe_info *pi = o, *tmp;
+
+	pi->pe = pb_msg(base, PipeEntry);
+
+	pi->create = 0;
+	pr_info("Collected pipe entry ID %#x PIPE ID %#x\n",
+			pi->pe->id, pi->pe->pipe_id);
+
+	file_desc_add(&pi->d, pi->pe->id, &pipe_desc_ops);
+
+	list_for_each_entry(tmp, &pipes, list)
+		if (pi->pe->pipe_id == tmp->pe->pipe_id)
+			break;
+
+	if (&tmp->list == &pipes)
+		INIT_LIST_HEAD(&pi->pipe_list);
+	else
+		list_add(&pi->pipe_list, &tmp->pipe_list);
+
+	list_add_tail(&pi->list, &pipes);
+
+	return 0;
+}
+
 int collect_pipes(void)
 {
-	struct pipe_info *pi = NULL, *tmp;
-	int fd, ret = -1;
+	int ret;
 
-	fd = open_image_ro(CR_FD_PIPES);
-	if (fd < 0)
-		return -1;
+	ret = collect_image(CR_FD_PIPES, PB_PIPES,
+			sizeof(struct pipe_info), collect_one_pipe);
+	if (!ret)
+		ret = collect_pipe_data(CR_FD_PIPES_DATA, pd_hash_pipes);
 
-	while (1) {
-		ret = -1;
-		pi = xmalloc(sizeof(*pi));
-		if (pi == NULL)
-			break;
-
-		pi->create = 0;
-		ret = pb_read_eof(fd, &pi->pe, pipe_entry);
-		if (ret <= 0)
-			break;
-
-		pr_info("Collected pipe entry ID %#x PIPE ID %#x\n",
-					pi->pe->id, pi->pe->pipe_id);
-
-		file_desc_add(&pi->d, pi->pe->id, &pipe_desc_ops);
-
-		list_for_each_entry(tmp, &pipes, list)
-			if (pi->pe->pipe_id == tmp->pe->pipe_id)
-				break;
-
-		if (&tmp->list == &pipes)
-			INIT_LIST_HEAD(&pi->pipe_list);
-		else
-			list_add(&pi->pipe_list, &tmp->pipe_list);
-
-		list_add_tail(&pi->list, &pipes);
-	}
-
-	xfree(pi);
-
-	close(fd);
-
-	return collect_pipe_data(CR_FD_PIPES_DATA, pd_hash_pipes);
+	return ret;
 }
 
 int dump_one_pipe_data(struct pipe_data_dump *pd, int lfd, const struct fd_parms *p)
@@ -367,7 +357,7 @@ int dump_one_pipe_data(struct pipe_data_dump *pd, int lfd, const struct fd_parms
 		if (pd->ids[i] == pipe_id(p))
 			return 0;
 	}
-	
+
 	pr_info("Dumping data from pipe %#x fd %d\n", pipe_id(p), lfd);
 
 	if (pd->nr >= NR_PIPES_WITH_DATA) {
@@ -397,7 +387,7 @@ int dump_one_pipe_data(struct pipe_data_dump *pd, int lfd, const struct fd_parms
 		pde.pipe_id	= pipe_id(p);
 		pde.bytes	= bytes;
 
-		if (pb_write(img, &pde, pipe_data_entry))
+		if (pb_write_one(img, &pde, PB_PIPES_DATA))
 			goto err_close;
 
 		wrote = splice(steal_pipe[0], NULL, img, NULL, bytes, 0);
@@ -439,7 +429,7 @@ static int dump_one_pipe(int lfd, u32 id, const struct fd_parms *p)
 	pe.flags	= p->flags;
 	pe.fown		= (FownEntry *)&p->fown;
 
-	if (pb_write(fdset_fd(glob_fdset, CR_FD_PIPES), &pe, pipe_entry))
+	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_PIPES), &pe, PB_PIPES))
 		return -1;
 
 	return dump_one_pipe_data(&pd_pipes, lfd, p);
@@ -447,7 +437,6 @@ static int dump_one_pipe(int lfd, u32 id, const struct fd_parms *p)
 
 static const struct fdtype_ops pipe_ops = {
 	.type		= FD_TYPES__PIPE,
-	.make_gen_id	= make_gen_id,
 	.dump		= dump_one_pipe,
 };
 

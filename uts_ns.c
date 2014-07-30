@@ -18,7 +18,7 @@ int dump_uts_ns(int ns_pid, struct cr_fdset *fdset)
 	struct utsname ubuf;
 	UtsnsEntry ue = UTSNS_ENTRY__INIT;
 
-	ret = switch_ns(ns_pid, CLONE_NEWUTS, "uts");
+	ret = switch_ns(ns_pid, CLONE_NEWUTS, "uts", NULL);
 	if (ret < 0)
 		return ret;
 
@@ -27,11 +27,11 @@ int dump_uts_ns(int ns_pid, struct cr_fdset *fdset)
 		pr_perror("Error calling uname");
 		return ret;
 	}
-	
+
 	ue.nodename = ubuf.nodename;
 	ue.domainname = ubuf.domainname;
 
-	return pb_write(fdset_fd(fdset, CR_FD_UTSNS), &ue, utsns_entry);
+	return pb_write_one(fdset_fd(fdset, CR_FD_UTSNS), &ue, PB_UTSNS);
 }
 
 int prepare_utsns(int pid)
@@ -48,7 +48,7 @@ int prepare_utsns(int pid)
 	if (fd < 0)
 		return -1;
 
-	ret = pb_read(fd, &ue, utsns_entry);
+	ret = pb_read_one(fd, &ue, PB_UTSNS);
 	if (ret < 0)
 		goto out;
 
@@ -66,15 +66,5 @@ out:
 
 void show_utsns(int fd, struct cr_options *o)
 {
-	int ret;
-	UtsnsEntry *ue;
-
-	ret = pb_read(fd, &ue, utsns_entry);
-	if (ret < 0)
-		return;
-
-	pr_msg("nodename: %s\n", ue->nodename);
-	pr_msg("domainname: %s\n", ue->domainname);
-
-	utsns_entry__free_unpacked(ue, NULL);
+	pb_show_vertical(fd, PB_UTSNS);
 }

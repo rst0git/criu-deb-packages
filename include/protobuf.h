@@ -5,6 +5,47 @@
 #include "compiler.h"
 #include "util.h"
 
+enum {
+	PB_INVENTORY,
+	PB_FDINFO,
+	PB_CORE,
+	PB_MM,
+	PB_VMAS,
+	PB_SIGACT,
+	PB_ITIMERS,
+	PB_CREDS,
+	PB_FS,
+	PB_UTSNS,
+	PB_IPCNS_VAR,
+	PB_IPCNS_SHM,
+	PB_IPCNS_MSG,
+	PB_IPCNS_MSG_ENT,
+	PB_IPCNS_SEM,
+	PB_MOUNTPOINTS,
+	PB_NETDEV,
+	PB_PSTREE,
+	PB_GHOST_FILE,
+	PB_TCP_STREAM,
+	PB_SK_QUEUES,
+	PB_REG_FILES,
+	PB_INETSK,
+	PB_UNIXSK,
+	PB_PACKETSK,
+	PB_PIPES,
+	PB_FIFO,
+	PB_PIPES_DATA,
+	PB_REMAP_FPATH,
+	PB_EVENTFD,
+	PB_EVENTPOLL,
+	PB_EVENTPOLL_TFD,
+	PB_SIGNALFD,
+	PB_INOTIFY,
+	PB_INOTIFY_WD,
+	PB_TTY,
+	PB_TTY_INFO,
+
+	PB_MAX
+};
 /*
  * ATTENTION
  *
@@ -19,36 +60,14 @@
  * to match this typedefs.
  */
 
-typedef size_t (*pb_getpksize_t)(void *obj);
-typedef size_t (*pb_pack_t)(void *obj, void *where);
-typedef void  *(*pb_unpack_t)(void *allocator, size_t size, void *from);
-typedef void   (*pb_free_t)(void *obj, void *allocator);
+void cr_pb_init(void);
 
-extern int pb_read_object_with_header(int fd, void **pobj,
-				      pb_unpack_t unpack,
-				      bool eof);
+extern int do_pb_read_one(int fd, void **objp, int type, bool eof);
 
-#define PB_UNPACK_TYPECHECK(__op, __fn)	({ if (0) *__op = __fn##__unpack(NULL, 0, NULL); (pb_unpack_t)&__fn##__unpack; })
-#define PB_PACK_TYPECHECK(__o, __fn)	({ if (0) __fn##__pack(__o, NULL); (pb_pack_t)&__fn##__pack; })
-#define PB_GPS_TYPECHECK(__o, __fn)	({ if (0) __fn##__get_packed_size(__o); (pb_getpksize_t)&__fn##__get_packed_size; })
-#define PB_FREE_TYPECHECK(__o, __fn)	({ if (0) __fn##__free_unpacked(__o, NULL); (pb_free_t)&__fn##__free_unpacked; })
+#define pb_read_one(fd, objp, type) do_pb_read_one(fd, (void **)objp, type, false)
+#define pb_read_one_eof(fd, objp, type) do_pb_read_one(fd, (void **)objp, type, true)
 
-#define pb_read(__fd, __obj_pptr, __proto_message_name)					\
-	pb_read_object_with_header(__fd, (void **)__obj_pptr,				\
-		PB_UNPACK_TYPECHECK(__obj_pptr, __proto_message_name), false)
-
-#define pb_read_eof(__fd, __obj_pptr, __proto_message_name)				\
-	pb_read_object_with_header(__fd, (void **)__obj_pptr,				\
-		PB_UNPACK_TYPECHECK(__obj_pptr, __proto_message_name), true)
-
-extern int pb_write_object_with_header(int fd, void *obj,
-				       pb_getpksize_t getpksize,
-				       pb_pack_t pack);
-
-#define pb_write(__fd, __obj, __proto_message_name)					\
-	pb_write_object_with_header(__fd, __obj,					\
-		PB_GPS_TYPECHECK(__obj, __proto_message_name),				\
-		PB_PACK_TYPECHECK(__obj, __proto_message_name))
+extern int pb_write_one(int fd, void *obj, int type);
 
 #define pb_pksize(__obj, __proto_message_name)						\
 	(__proto_message_name ##__get_packed_size(__obj) + sizeof(u32))
@@ -56,15 +75,33 @@ extern int pb_write_object_with_header(int fd, void *obj,
 #define pb_repeated_size(__obj, __member)						\
 	(sizeof(*(__obj)->__member) * (__obj)->n_ ##__member)
 
+#define pb_msg(__base, __type)			\
+	container_of(__base, __type, base)
+
 #include <google/protobuf-c/protobuf-c.h>
 
-extern void do_pb_show_plain(int fd, const ProtobufCMessageDescriptor *d,
-		pb_unpack_t unpack, pb_free_t free);
+extern void do_pb_show_plain(int fd, int type, int single_entry,
+		void (*payload_hadler)(int fd, void *obj, int flags),
+		int flags, const char *pretty_fmt);
 
 /* Don't have objects at hands to also do typechecking here */
-#define pb_show_plain(__fd, __proto_message_name)			\
-	do_pb_show_plain(__fd, &__proto_message_name##__descriptor,	\
-			(pb_unpack_t)__proto_message_name##__unpack,			\
-			(pb_free_t)__proto_message_name##__free_unpacked)
+#define pb_show_plain_payload_pretty(__fd, __type, payload_hadler, flags, pretty)	\
+	do_pb_show_plain(__fd, __type, 0, payload_hadler, flags, pretty)
 
+#define pb_show_plain_payload(__fd, __proto_message_name, payload_hadler, flags)	\
+	pb_show_plain_payload_pretty(__fd, __proto_message_name, payload_hadler, flags, NULL)
+
+#define pb_show_plain_pretty(__fd, __proto_message_name, __pretty)		\
+	pb_show_plain_payload_pretty(__fd, __proto_message_name, NULL, 0, __pretty)
+
+#define pb_show_plain(__fd, __type)							\
+	pb_show_plain_payload(__fd, __type, NULL, 0)
+
+#define pb_show_vertical(__fd, __type)							\
+	do_pb_show_plain(__fd, __type, 1, NULL, 0, NULL)
+
+int collect_image(int fd_t, int obj_t, unsigned size,
+		int (*collect)(void *obj, ProtobufCMessage *msg));
+int collect_image_sh(int fd_t, int obj_t, unsigned size,
+		int (*collect)(void *obj, ProtobufCMessage *msg));
 #endif /* PROTOBUF_H__ */

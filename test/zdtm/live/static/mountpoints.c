@@ -16,6 +16,7 @@ static char buf[1024];
 static int test_fn(int argc, char **argv)
 {
 	FILE *f;
+	int fd, tmpfs_fd;
 	unsigned fs_cnt, fs_cnt_last = 0;
 
 again:
@@ -59,9 +60,6 @@ again:
 	return -1;
 
 done:
-	close(0);
-	close(1);
-	close(2);
 	rmdir(MPTS_ROOT);
 	if (mkdir(MPTS_ROOT, 0600) < 0) {
 		fail("Can't make zdtm_sys");
@@ -73,16 +71,39 @@ done:
 		return 1;
 	}
 
+	if (mount("none", MPTS_ROOT"/dev", "tmpfs", 0, "") < 0) {
+		fail("Can't mount tmpfs");
+		return 1;
+	}
+	tmpfs_fd = open(MPTS_ROOT"/dev/test", O_WRONLY | O_CREAT);
+	if (write(tmpfs_fd, "hello", 5) <= 0) {
+		err("write() failed");
+		return 1;
+	}
+
 	if (mount("none", MPTS_ROOT"/kernel", "proc", 0, "") < 0) {
 		fail("Can't mount proc");
 		return 1;
 	}
+	if (mount("none", MPTS_ROOT"/kernel/sys/fs/binfmt_misc",
+					"binfmt_misc", 0, "") < 0) {
+		fail("Can't mount proc");
+		return 1;
+	}
+
+	mknod("/dev/null", 0777 | S_IFCHR, makedev(1, 3));
+
+	setup_outfile();
+
+	fd = open(MPTS_ROOT"/kernel/meminfo", O_RDONLY);
+	if (fd == -1)
+		return 1;
 
 	test_daemon();
 	test_waitsig();
 
 	/* this checks both -- sys and proc presence */
-	if (access(MPTS_ROOT"/kernel/slabinfo", F_OK)) {
+	if (access(MPTS_ROOT"/kernel/meminfo", F_OK)) {
 		fail("No proc after restore");
 		return 1;
 	}

@@ -64,6 +64,10 @@ struct thread_restore_args {
 	mutex_t				*rst_lock;
 	UserX86RegsEntry		gpregs;
 	u64				clear_tid_addr;
+
+	bool				has_futex;
+	u64				futex_rla;
+	u32				futex_rla_len;
 } __aligned(sizeof(long));
 
 struct task_restore_core_args {
@@ -73,6 +77,7 @@ struct task_restore_core_args {
 	int				fd_exe_link;		/* opened self->exe file */
 	int				fd_pages;		/* opened pages dump file */
 	int				logfd;
+	unsigned int			loglevel;
 	bool				restore_threads;	/* if to restore threads */
 	mutex_t				rst_lock;
 
@@ -101,6 +106,13 @@ struct task_restore_core_args {
 	char				comm[TASK_COMM_LEN];
 	TaskKobjIdsEntry		ids;
 	UserX86RegsEntry		gpregs;
+
+	bool				has_futex;
+	u64				futex_rla;
+	u32				futex_rla_len;
+
+	int				*rst_tcp_socks;
+	int				rst_tcp_socks_size;
 } __aligned(sizeof(long));
 
 struct pt_regs {

@@ -1,23 +1,6 @@
--include ../Makefile.inc
+include ../Makefile.inc
 
-CFLAGS		+= -I./include
-CFLAGS		+= -O0 -ggdb3
-
-DEFINES		+= -D_FILE_OFFSET_BITS=64
-DEFINES		+= -D_GNU_SOURCE
-
-ifneq ($(WERROR),0)
-	WARNINGS += -Werror
-endif
-
-ifeq ($(DEBUG),1)
-	DEFINES += -DCR_DEBUG
-endif
-
-WARNINGS	+= -Wall
-CFLAGS		+= $(WARNINGS) $(DEFINES)
-
-LIBRARY		:= protobuf-lib.o
+PROTO_LIBRARY	:= protobuf-lib.o
 
 PROTO_FILES	+= inventory.proto
 PROTO_FILES	+= fdinfo.proto
@@ -30,6 +13,7 @@ PROTO_FILES	+= eventfd.proto
 PROTO_FILES	+= eventpoll.proto
 PROTO_FILES	+= fh.proto
 PROTO_FILES	+= inotify.proto
+PROTO_FILES	+= signalfd.proto
 PROTO_FILES	+= fs.proto
 PROTO_FILES	+= pstree.proto
 PROTO_FILES	+= pipe.proto
@@ -43,6 +27,7 @@ PROTO_FILES	+= mm.proto
 PROTO_FILES	+= sk-opts.proto
 PROTO_FILES	+= sk-unix.proto
 PROTO_FILES	+= sk-inet.proto
+PROTO_FILES	+= packet-sock.proto
 PROTO_FILES	+= ipc-var.proto
 PROTO_FILES	+= ipc-desc.proto
 PROTO_FILES	+= ipc-shm.proto
@@ -52,32 +37,33 @@ PROTO_FILES	+= utsns.proto
 PROTO_FILES	+= creds.proto
 PROTO_FILES	+= vma.proto
 PROTO_FILES	+= core.proto
+PROTO_FILES	+= netdev.proto
+PROTO_FILES	+= tty.proto
 
-HDRS	:= $(patsubst %.proto,%.pb-c.h,$(PROTO_FILES))
-SRCS	:= $(patsubst %.proto,%.pb-c.c,$(PROTO_FILES))
-OBJS	:= $(patsubst %.c,%.o,$(SRCS))
+PROTO_HDRS	:= $(patsubst %.proto,%.pb-c.h,$(PROTO_FILES))
+PROTO_SRCS	:= $(patsubst %.proto,%.pb-c.c,$(PROTO_FILES))
+PROTO_OBJS	:= $(patsubst %.c,%.o,$(PROTO_SRCS))
 
 .DEFAULT_GOAL	:= protobuf
 
-%.pb-c.c: %.proto
+%.pb-c.c %.pb-c.h: %.proto
 	$(E) "  PROTOBUF "$@
 	$(Q) protoc-c --c_out=./ $<
 
-%.o: %.c
+%.o: %.c %.h
 	$(E) "  CC       "$@
 	$(Q) $(CC) -c $(CFLAGS) $< -o $@
 
 .SECONDARY:
 
-$(LIBRARY): $(OBJS)
+$(PROTO_LIBRARY): $(PROTO_OBJS)
 	$(E) "  LINK     "$@
-	$(Q) ld -r -o $@ $(OBJS)
+	$(Q) ld -r -o $@ $(PROTO_OBJS)
 
 .PHONY: protobuf
 
-protobuf: $(LIBRARY)
+protobuf: $(PROTO_LIBRARY) $(PROTO_SRCS) $(PROTO_HDRS)
 
 clean:
 	$(E) "  CLEAN PROTOBUF"
-	$(Q) rm -f $(SRCS) $(HDRS) $(OBJS) $(LIBRARY)
-
+	$(Q) rm -f $(PROTO_SRCS) $(PROTO_HDRS) $(PROTO_OBJS) $(PROTO_LIBRARY)

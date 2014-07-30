@@ -1,6 +1,8 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -17,6 +19,44 @@
 #include "util.h"
 #include "sockets.h"
 #include "sk-inet.h"
+
+#define PB_ALEN_INET	1
+#define PB_ALEN_INET6	4
+
+static LIST_HEAD(inet_ports);
+
+struct inet_port {
+	int port;
+	int type;
+	futex_t users;
+	struct list_head list;
+};
+
+static struct inet_port *port_add(int type, int port)
+{
+	struct inet_port *e;
+
+	list_for_each_entry(e, &inet_ports, list)
+		if (e->type == type && e->port == port) {
+			futex_inc(&e->users);
+			return e;
+		}
+
+	e = shmalloc(sizeof(*e));
+	if (e == NULL) {
+		pr_err("Not enough memory\n");
+		return NULL;
+	}
+
+	e->port = port;
+	e->type = type;
+	futex_init(&e->users);
+	futex_inc(&e->users);
+
+	list_add(&e->list, &inet_ports);
+
+	return e;
+}
 
 static void show_one_inet(const char *act, const struct inet_sk_desc *sk)
 {
@@ -129,9 +169,9 @@ static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p)
 
 	sk->sd.ino = p->stat.st_ino;
 
-	ret  = do_dump_opt(lfd, SO_DOMAIN, &sk->sd.family, sizeof(sk->sd.family));
-	ret |= do_dump_opt(lfd, SO_TYPE, &sk->type, sizeof(sk->type));
-	ret |= do_dump_opt(lfd, SO_PROTOCOL, &sk->proto, sizeof(sk->proto));
+	ret  = do_dump_opt(lfd, SOL_SOCKET, SO_DOMAIN, &sk->sd.family, sizeof(sk->sd.family));
+	ret |= do_dump_opt(lfd, SOL_SOCKET, SO_TYPE, &sk->type, sizeof(sk->type));
+	ret |= do_dump_opt(lfd, SOL_SOCKET, SO_PROTOCOL, &sk->proto, sizeof(sk->proto));
 	if (ret)
 		goto err;
 
@@ -164,14 +204,14 @@ err:
 	return NULL;
 }
 
-static int dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p)
+static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int family)
 {
 	struct inet_sk_desc *sk;
 	InetSkEntry ie = INET_SK_ENTRY__INIT;
 	SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
 	int ret = -1;
 
-	sk = (struct inet_sk_desc *)lookup_socket(p->stat.st_ino);
+	sk = (struct inet_sk_desc *)lookup_socket(p->stat.st_ino, family);
 	if (!sk) {
 		sk = gen_uncon_sk(lfd, p);
 		if (!sk)
@@ -185,7 +225,7 @@ static int dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p)
 
 	ie.id		= id;
 	ie.ino		= sk->sd.ino;
-	ie.family	= sk->sd.family;
+	ie.family	= family;
 	ie.type		= sk->type;
 	ie.proto	= sk->proto;
 	ie.state	= sk->state;
@@ -197,8 +237,21 @@ static int dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p)
 	ie.fown		= (FownEntry *)&p->fown;
 	ie.opts		= &skopts;
 
-	ie.n_src_addr = 4;
-	ie.n_dst_addr = 4;
+	ie.n_src_addr = PB_ALEN_INET;
+	ie.n_dst_addr = PB_ALEN_INET;
+	if (ie.family == AF_INET6) {
+		int val;
+
+		ie.n_src_addr = PB_ALEN_INET6;
+		ie.n_dst_addr = PB_ALEN_INET6;
+
+		ret = dump_opt(lfd, SOL_IPV6, IPV6_V6ONLY, &val);
+		if (ret < 0)
+			goto err;
+
+		ie.v6only = val ? true : false;
+		ie.has_v6only = true;
+	}
 
 	ie.src_addr = xmalloc(pb_repeated_size(&ie, src_addr));
 	ie.dst_addr = xmalloc(pb_repeated_size(&ie, dst_addr));
@@ -206,13 +259,13 @@ static int dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p)
 	if (!ie.src_addr || !ie.dst_addr)
 		goto err;
 
-	memcpy(ie.src_addr, sk->src_addr, sizeof(u32) * 4);
-	memcpy(ie.dst_addr, sk->dst_addr, sizeof(u32) * 4);
+	memcpy(ie.src_addr, sk->src_addr, pb_repeated_size(&ie, src_addr));
+	memcpy(ie.dst_addr, sk->dst_addr, pb_repeated_size(&ie, dst_addr));
 
 	if (dump_socket_opts(lfd, &skopts))
 		goto err;
 
-	if (pb_write(fdset_fd(glob_fdset, CR_FD_INETSK), &ie, inet_sk_entry))
+	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_INETSK), &ie, PB_INETSK))
 		goto err;
 
 	pr_info("Dumping inet socket at %d\n", p->fd);
@@ -230,15 +283,34 @@ err:
 	return ret;
 }
 
+static int dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p)
+{
+	return do_dump_one_inet_fd(lfd, id, p, PF_INET);
+}
+
 static const struct fdtype_ops inet_dump_ops = {
 	.type		= FD_TYPES__INETSK,
-	.make_gen_id	= make_gen_id,
 	.dump		= dump_one_inet_fd,
 };
 
 int dump_one_inet(struct fd_parms *p, int lfd, const struct cr_fdset *set)
 {
 	return do_dump_gen_file(p, lfd, &inet_dump_ops, set);
+}
+
+static int dump_one_inet6_fd(int lfd, u32 id, const struct fd_parms *p)
+{
+	return do_dump_one_inet_fd(lfd, id, p, PF_INET6);
+}
+
+static const struct fdtype_ops inet6_dump_ops = {
+	.type		= FD_TYPES__INETSK,
+	.dump		= dump_one_inet6_fd,
+};
+
+int dump_one_inet6(struct fd_parms *p, int lfd, const struct cr_fdset *set)
+{
+	return do_dump_gen_file(p, lfd, &inet6_dump_ops, set);
 }
 
 int inet_collect_one(struct nlmsghdr *h, int family, int type, int proto)
@@ -272,84 +344,129 @@ int inet_collect_one(struct nlmsghdr *h, int family, int type, int proto)
 	return ret;
 }
 
-static u32 zero_addr[4];
-
-static bool is_bound(struct inet_sk_info *ii)
-{
-	BUG_ON(sizeof(zero_addr) <
-		     max(pb_repeated_size(ii->ie, dst_addr),
-			 pb_repeated_size(ii->ie, src_addr)));
-
-	return memcmp(zero_addr, ii->ie->src_addr, pb_repeated_size(ii->ie, src_addr)) ||
-	       memcmp(zero_addr, ii->ie->dst_addr, pb_repeated_size(ii->ie, dst_addr));
-}
-
-
 static int open_inet_sk(struct file_desc *d);
+static int post_open_inet_sk(struct file_desc *d, int sk);
 
 static struct file_desc_ops inet_desc_ops = {
 	.type = FD_TYPES__INETSK,
 	.open = open_inet_sk,
+	.post_open = post_open_inet_sk,
 };
+
+static int collect_one_inetsk(void *o, ProtobufCMessage *base)
+{
+	struct inet_sk_info *ii = o;
+
+	ii->ie = pb_msg(base, InetSkEntry);
+	file_desc_add(&ii->d, ii->ie->id, &inet_desc_ops);
+	if (tcp_connection(ii->ie))
+		tcp_locked_conn_add(ii);
+
+	/*
+	 * A socket can reuse addr only if all previous sockets allow that,
+	 * so a value of SO_REUSEADDR can be restored after restoring all
+	 * sockets.
+	 */
+	ii->port = port_add(ii->ie->type, ii->ie->src_port);
+	if (ii->port == NULL)
+		return -1;
+
+	return 0;
+}
 
 int collect_inet_sockets(void)
 {
-	struct inet_sk_info *ii = NULL;
-	int fd, ret = -1;
+	return collect_image(CR_FD_INETSK, PB_INETSK,
+			sizeof(struct inet_sk_info), collect_one_inetsk);
+}
 
-	fd = open_image_ro(CR_FD_INETSK);
-	if (fd < 0)
+static int inet_validate_address(InetSkEntry *ie)
+{
+	if ((ie->family == AF_INET) &&
+			/* v0.1 had 4 in ipv4 addr len */
+			(ie->n_src_addr >= PB_ALEN_INET) &&
+			(ie->n_dst_addr >= PB_ALEN_INET))
+		return 0;
+
+	if ((ie->family == AF_INET6) &&
+			(ie->n_src_addr == PB_ALEN_INET6) &&
+			(ie->n_dst_addr == PB_ALEN_INET6))
+		return 0;
+
+	pr_err("Addr len mismatch f %d ss %lu ds %lu\n", ie->family,
+			pb_repeated_size(ie, src_addr),
+			pb_repeated_size(ie, dst_addr));
+
+	return -1;
+}
+
+static int post_open_inet_sk(struct file_desc *d, int sk)
+{
+	struct inet_sk_info *ii;
+	int val;
+
+	ii = container_of(d, struct inet_sk_info, d);
+
+	/* SO_REUSEADDR is set for all sockets */
+	if (!tcp_connection(ii->ie) && ii->ie->opts->reuseaddr)
+		return 0;
+
+	futex_wait_until(&ii->port->users, 0);
+
+	/* Disabling repair mode drops SO_REUSEADDR */
+	if (tcp_connection(ii->ie))
+		tcp_repair_off(sk);
+
+	val = ii->ie->opts->reuseaddr;
+	if (restore_opt(sk, SOL_SOCKET, SO_REUSEADDR, &val))
 		return -1;
 
-	while (1) {
-		ii = xmalloc(sizeof(*ii));
-		ret = -1;
-		if (!ii)
-			break;
-
-		ret = pb_read_eof(fd, &ii->ie, inet_sk_entry);
-		if (ret <= 0)
-			break;
-
-		file_desc_add(&ii->d, ii->ie->id, &inet_desc_ops);
-
-		if (tcp_connection(ii->ie))
-			tcp_locked_conn_add(ii);
-	}
-
-	if (ii)
-		xfree(ii);
-
-	close(fd);
-	return ret;
+	return 0;
 }
 
 static int open_inet_sk(struct file_desc *d)
 {
 	struct inet_sk_info *ii;
-	int sk;
+	InetSkEntry *ie;
+	int sk, yes = 1;
 
 	ii = container_of(d, struct inet_sk_info, d);
+	ie = ii->ie;
 
-	show_one_inet_img("Restore", ii->ie);
+	show_one_inet_img("Restore", ie);
 
-	if (ii->ie->family != AF_INET && ii->ie->family != AF_INET6) {
-		pr_err("Unsupported socket family: %d\n", ii->ie->family);
+	if (ie->family != AF_INET && ie->family != AF_INET6) {
+		pr_err("Unsupported socket family: %d\n", ie->family);
 		return -1;
 	}
 
-	if ((ii->ie->type != SOCK_STREAM) && (ii->ie->type != SOCK_DGRAM)) {
-		pr_err("Unsupported socket type: %d\n", ii->ie->type);
+	if ((ie->type != SOCK_STREAM) && (ie->type != SOCK_DGRAM)) {
+		pr_err("Unsupported socket type: %d\n", ie->type);
 		return -1;
 	}
 
-	sk = socket(ii->ie->family, ii->ie->type, ii->ie->proto);
+	if (inet_validate_address(ie))
+		return -1;
+
+	sk = socket(ie->family, ie->type, ie->proto);
 	if (sk < 0) {
 		pr_perror("Can't create unix socket");
 		return -1;
 	}
 
-	if (tcp_connection(ii->ie)) {
+	if (ie->v6only) {
+		if (restore_opt(sk, SOL_IPV6, IPV6_V6ONLY, &yes) == -1)
+			return -1;
+	}
+
+	/*
+	 * Set SO_REUSEADDR, because some sockets can be bound to one addr.
+	 * The origin value of SO_REUSEADDR will be restored in post_open.
+	 */
+	if (restore_opt(sk, SOL_SOCKET, SO_REUSEADDR, &yes))
+		return -1;
+
+	if (tcp_connection(ie)) {
 		if (!opts.tcp_established_ok) {
 			pr_err("Connected TCP socket in image\n");
 			goto err;
@@ -366,31 +483,33 @@ static int open_inet_sk(struct file_desc *d)
 	 * bind() and listen(), and that's all.
 	 */
 
-	if (is_bound(ii)) {
+	if (ie->src_port) {
 		if (inet_bind(sk, ii))
 			goto err;
 	}
 
-	if (ii->ie->state == TCP_LISTEN) {
-		if (ii->ie->proto != IPPROTO_TCP) {
-			pr_err("Wrong socket in listen state %d\n", ii->ie->proto);
+	if (ie->state == TCP_LISTEN) {
+		if (ie->proto != IPPROTO_TCP) {
+			pr_err("Wrong socket in listen state %d\n", ie->proto);
 			goto err;
 		}
 
-		if (listen(sk, ii->ie->backlog) == -1) {
+		if (listen(sk, ie->backlog) == -1) {
 			pr_perror("Can't listen on a socket");
 			goto err;
 		}
 	}
 
-	if (ii->ie->state == TCP_ESTABLISHED &&
+	if (ie->state == TCP_ESTABLISHED &&
 			inet_connect(sk, ii))
 		goto err;
 done:
-	if (rst_file_params(sk, ii->ie->fown, ii->ie->flags))
+	futex_dec(&ii->port->users);
+
+	if (rst_file_params(sk, ie->fown, ie->flags))
 		goto err;
 
-	if (restore_socket_opts(sk, ii->ie->opts))
+	if (restore_socket_opts(sk, ie->opts))
 		return -1;
 
 	return sk;
@@ -400,32 +519,44 @@ err:
 	return -1;
 }
 
+union sockaddr_inet {
+	struct sockaddr_in v4;
+	struct sockaddr_in6 v6;
+};
+
+static int restore_sockaddr(union sockaddr_inet *sa,
+		int family, uint32_t pb_port, uint32_t *pb_addr)
+{
+	BUILD_BUG_ON(sizeof(sa->v4.sin_addr.s_addr) > PB_ALEN_INET * sizeof(uint32_t));
+	BUILD_BUG_ON(sizeof(sa->v6.sin6_addr.s6_addr) > PB_ALEN_INET6 * sizeof(uint32_t));
+
+	memzero(sa, sizeof(*sa));
+
+	if (family == AF_INET) {
+		sa->v4.sin_family = AF_INET;
+		sa->v4.sin_port = htons(pb_port);
+		memcpy(&sa->v4.sin_addr.s_addr, pb_addr, sizeof(sa->v4.sin_addr.s_addr));
+		return sizeof(sa->v4);
+	}
+
+	if (family == AF_INET6) {
+		sa->v6.sin6_family = AF_INET6;
+		sa->v6.sin6_port = htons(pb_port);
+		memcpy(sa->v6.sin6_addr.s6_addr, pb_addr, sizeof(sa->v6.sin6_addr.s6_addr));
+		return sizeof(sa->v6);
+	}
+
+	BUG();
+	return -1;
+}
+
 int inet_bind(int sk, struct inet_sk_info *ii)
 {
-	union {
-		struct sockaddr_in	v4;
-		struct sockaddr_in6	v6;
-	} addr;
+	union sockaddr_inet addr;
 	int addr_size;
 
-
-	memzero(&addr, sizeof(addr));
-	if (ii->ie->family == AF_INET) {
-		BUG_ON(pb_repeated_size(ii->ie, src_addr) < sizeof(addr.v4.sin_addr.s_addr));
-
-		addr.v4.sin_family = ii->ie->family;
-		addr.v4.sin_port = htons(ii->ie->src_port);
-		memcpy(&addr.v4.sin_addr.s_addr, ii->ie->src_addr, sizeof(addr.v4.sin_addr.s_addr));
-		addr_size = sizeof(addr.v4);
-	} else if (ii->ie->family == AF_INET6) {
-		BUG_ON(pb_repeated_size(ii->ie, src_addr) < sizeof(addr.v6.sin6_addr.s6_addr));
-
-		addr.v6.sin6_family = ii->ie->family;
-		addr.v6.sin6_port = htons(ii->ie->src_port);
-		memcpy(&addr.v6.sin6_addr.s6_addr, ii->ie->src_addr, sizeof(addr.v6.sin6_addr.s6_addr));
-		addr_size = sizeof(addr.v6);
-	} else
-		BUG_ON(1);
+	addr_size = restore_sockaddr(&addr, ii->ie->family,
+			ii->ie->src_port, ii->ie->src_addr);
 
 	if (bind(sk, (struct sockaddr *)&addr, addr_size) == -1) {
 		pr_perror("Can't bind inet socket");
@@ -437,30 +568,11 @@ int inet_bind(int sk, struct inet_sk_info *ii)
 
 int inet_connect(int sk, struct inet_sk_info *ii)
 {
-	union {
-		struct sockaddr_in	v4;
-		struct sockaddr_in6	v6;
-	} addr;
+	union sockaddr_inet addr;
 	int addr_size;
 
-
-	memzero(&addr, sizeof(addr));
-	if (ii->ie->family == AF_INET) {
-		BUG_ON(pb_repeated_size(ii->ie, dst_addr) < sizeof(addr.v4.sin_addr.s_addr));
-
-		addr.v4.sin_family = ii->ie->family;
-		addr.v4.sin_port = htons(ii->ie->dst_port);
-		memcpy(&addr.v4.sin_addr.s_addr, ii->ie->dst_addr, sizeof(addr.v4.sin_addr.s_addr));
-		addr_size = sizeof(addr.v4);
-	} else if (ii->ie->family == AF_INET6) {
-		BUG_ON(pb_repeated_size(ii->ie, dst_addr) < sizeof(addr.v6.sin6_addr.s6_addr));
-
-		addr.v6.sin6_family = ii->ie->family;
-		addr.v6.sin6_port = htons(ii->ie->dst_port);
-		memcpy(&addr.v6.sin6_addr.s6_addr, ii->ie->dst_addr, sizeof(addr.v6.sin6_addr.s6_addr));
-		addr_size = sizeof(addr.v6);
-	} else
-		BUG_ON(1);
+	addr_size = restore_sockaddr(&addr, ii->ie->family,
+			ii->ie->dst_port, ii->ie->dst_addr);
 
 	if (connect(sk, (struct sockaddr *)&addr, addr_size) == -1) {
 		pr_perror("Can't connect inet socket back");
@@ -472,43 +584,5 @@ int inet_connect(int sk, struct inet_sk_info *ii)
 
 void show_inetsk(int fd, struct cr_options *o)
 {
-	InetSkEntry *ie;
-	int ret = 0;
-
-	pr_img_head(CR_FD_INETSK);
-
-	while (1) {
-		char src_addr[INET_ADDR_LEN] = "<unknown>";
-		char dst_addr[INET_ADDR_LEN] = "<unknown>";
-
-		ret = pb_read_eof(fd, &ie, inet_sk_entry);
-		if (ret <= 0)
-			goto out;
-
-		if (inet_ntop(ie->family, (void *)ie->src_addr, src_addr,
-			      INET_ADDR_LEN) == NULL) {
-			pr_perror("Failed to translate src address");
-		}
-
-		if (ie->state == TCP_ESTABLISHED) {
-			if (inet_ntop(ie->family, (void *)ie->dst_addr, dst_addr,
-				      INET_ADDR_LEN) == NULL) {
-				pr_perror("Failed to translate dst address");
-			}
-		}
-
-		pr_msg("id %#x ino %#x family %s type %s proto %s state %s %s:%d <-> %s:%d flags 0x%2x\n",
-			ie->id, ie->ino, skfamily2s(ie->family), sktype2s(ie->type), skproto2s(ie->proto),
-			skstate2s(ie->state), src_addr, ie->src_port, dst_addr, ie->dst_port, ie->flags);
-		pr_msg("\t"), show_fown_cont(ie->fown), pr_msg("\n");
-		show_socket_opts(ie->opts);
-
-		inet_sk_entry__free_unpacked(ie, NULL);
-	}
-
-out:
-	if (ret)
-		pr_info("\n");
-	pr_img_tail(CR_FD_INETSK);
+	pb_show_plain_pretty(fd, PB_INETSK, "1:%#x 2:%#x 3:%d 4:%d 5:%d 6:%d 7:%d 8:%d 9:%2x 11:A 12:A");
 }
-
