@@ -10,8 +10,8 @@ Build-Depends:
  xmlto
 Standards-Version: 3.9.5
 Homepage: http://www.criu.org/
-Vcs-Browser: http://daniel-baumann.ch/gitweb/?p=debian/packages/criu.git
-Vcs-Git: git://daniel-baumann.ch/git/debian/packages/criu.git
+Vcs-Browser: http://anonscm.debian.org/gitweb/?p=collab-maint/criu.git
+Vcs-Git: git://anonscm.debian.org/collab-maint/criu.git
 
 Package: criu
 Architecture: amd64 armhf
