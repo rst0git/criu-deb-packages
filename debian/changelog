@@ -1,3 +1,27 @@
+criu (1.3~rc2-4) experimental; urgency=low
+
+  * New Maintainer (Closes: #756087)
+  * Wrap and sort fields in debian/control file
+  * Change Vcs-Fields to the collab-maint repository on alioth
+  * Update Build-Depends on libprotobuf-c-dev rather than libprotobuf-c0-dev
+  * Drop override for dh_builddeb.
+    Default compression for dpkg-deb when building a package is now xz.
+  * Drop explicit xz compression option through debian/source/options
+  * Add debian/watch file to scan upstream sources for new releases
+  * Add myself to copyright holders for debian/* packaging
+  * Update Upstream-Name in debian/copyright to CRIU
+  * Update location of upstream git repository in debian/copyright Source field
+  * Update patch header for 0002-unused-function.patch
+  * Add spelling-error-in-manpage.patch patch.
+    Fix spelling errors in manpage.
+  * Drop override for dh_auto_clean.
+    Explicit override to clean Documentation build is not needed anymore.
+  * Drop override for dh_auto_build.
+    Explicit override to build Documentation is not needed.
+  * Drop 0001-documentation.patch patch
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 31 Jul 2014 13:42:53 +0200
+
 criu (1.3~rc2-3) unstable; urgency=low
 
   * I don't care anymore, not worth it.. orphaning.
