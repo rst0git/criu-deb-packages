@@ -5,11 +5,6 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=-all
 %:
 	dh ${@} --parallel
 
-override_dh_auto_build:
-	dh_auto_build
-
-	$(MAKE) -C Documentation
-
 override_dh_auto_install:
 	mkdir -p debian/criu/etc/logrotate.d
 
