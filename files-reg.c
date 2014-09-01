@@ -68,13 +68,68 @@ static LIST_HEAD(link_remaps);
  */
 #define MAX_GHOST_FILE_SIZE	(1 * 1024 * 1024)
 
+static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, char *root, int ifd)
+{
+	int gfd, ghost_flags, ret = -1;
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), "%s/%s", root, gf->remap.path);
+	if (S_ISFIFO(gfe->mode)) {
+		if (mknod(path, gfe->mode, 0)) {
+			pr_perror("Can't create node for ghost file");
+			goto err;
+		}
+		ghost_flags = O_RDWR; /* To not block */
+	} else if (S_ISCHR(gfe->mode) || S_ISBLK(gfe->mode)) {
+		if (!gfe->has_rdev) {
+			pr_err("No rdev for ghost device\n");
+			goto err;
+		}
+
+		if (mknod(path, gfe->mode, gfe->rdev)) {
+			pr_perror("Can't create node for ghost dev");
+			goto err;
+		}
+		ghost_flags = O_WRONLY;
+	} else if (S_ISDIR(gfe->mode)) {
+		if (mkdir(path, gfe->mode)) {
+			pr_perror("Can't make ghost dir");
+			goto err;
+		}
+		ghost_flags = O_DIRECTORY;
+	} else
+		ghost_flags = O_WRONLY | O_CREAT | O_EXCL;
+
+	gfd = open(path, ghost_flags, gfe->mode);
+	if (gfd < 0) {
+		pr_perror("Can't open ghost file %s", path);
+		goto err;
+	}
+
+	if (fchown(gfd, gfe->uid, gfe->gid) < 0) {
+		pr_perror("Can't reset user/group on ghost %s", path);
+		goto err_c;
+	}
+
+	if (S_ISREG(gfe->mode)) {
+		if (copy_file(ifd, gfd, 0) < 0)
+			goto err_c;
+	}
+
+	ret = 0;
+err_c:
+	close(gfd);
+err:
+	return ret;
+}
+
 static int open_remap_ghost(struct reg_file_info *rfi,
 		RemapFilePathEntry *rfe)
 {
 	struct ghost_file *gf;
 	GhostFileEntry *gfe = NULL;
-	int gfd, ifd, ghost_flags;
-	char *root, path[PATH_MAX];
+	int ifd;
+	char *root;
 
 	rfe->remap_id &= ~REMAP_GHOST;
 	list_for_each_entry(gf, &ghost_files, list)
@@ -99,6 +154,7 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	if (!gf)
 		return -1;
 	gf->remap.path = xmalloc(PATH_MAX);
+	gf->remap.mnt_id = rfi->rfe->mnt_id;
 	if (!gf->remap.path)
 		goto err;
 
@@ -119,45 +175,20 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 
 	snprintf(gf->remap.path, PATH_MAX, "%s.cr.%x.ghost", rfi->path, rfe->remap_id);
 
-	if (S_ISFIFO(gfe->mode)) {
-		if (mknod(gf->remap.path, gfe->mode, 0)) {
-			pr_perror("Can't create node for ghost file");
-			goto close_ifd;
-		}
-		ghost_flags = O_RDWR; /* To not block */
-	} else
-		ghost_flags = O_WRONLY | O_CREAT | O_EXCL;
-
-	snprintf(path, sizeof(path), "%s/%s", root, gf->remap.path);
-	gfd = open(path, ghost_flags, gfe->mode);
-	if (gfd < 0) {
-		pr_perror("Can't open ghost file %s", path);
+	if (create_ghost(gf, gfe, root, ifd))
 		goto close_ifd;
-	}
-
-	if (fchown(gfd, gfe->uid, gfe->gid) < 0) {
-		pr_perror("Can't reset user/group on ghost %#x", rfe->remap_id);
-		goto close_all;
-	}
-
-	if (S_ISREG(gfe->mode)) {
-		if (copy_file(ifd, gfd, 0) < 0)
-			goto close_all;
-	}
 
 	ghost_file_entry__free_unpacked(gfe, NULL);
 	close(ifd);
-	close(gfd);
 
 	gf->id = rfe->remap_id;
 	gf->remap.users = 0;
+	gf->remap.is_dir = S_ISDIR(gfe->mode);
 	list_add_tail(&gf->list, &ghost_files);
 gf_found:
 	rfi->remap = &gf->remap;
 	return 0;
 
-close_all:
-	close_safe(&gfd);
 close_ifd:
 	close_safe(&ifd);
 err:
@@ -190,6 +221,8 @@ static int open_remap_linked(struct reg_file_info *rfi,
 
 	rm->path = rrfi->path;
 	rm->users = 0;
+	rm->is_dir = false;
+	rm->mnt_id = rfi->rfe->mnt_id;
 	rfi->remap = rm;
 	return 0;
 }
@@ -246,6 +279,11 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st, dev_t phys_de
 	gfe.dev = phys_dev;
 	gfe.ino = st->st_ino;
 
+	if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode)) {
+		gfe.has_rdev = true;
+		gfe.rdev = st->st_rdev;
+	}
+
 	if (pb_write_one(img, &gfe, PB_GHOST_FILE))
 		return -1;
 
@@ -277,8 +315,12 @@ void remap_put(struct file_remap *remap)
 {
 	mutex_lock(ghost_file_mutex);
 	if (--remap->users == 0) {
+		int mntns_root;
+
 		pr_info("Unlink the ghost %s\n", remap->path);
-		unlink(remap->path);
+
+		mntns_root = mntns_get_root_by_mnt_id(remap->mnt_id);
+		unlinkat(mntns_root, remap->path, 0);
 	}
 	mutex_unlock(ghost_file_mutex);
 }
@@ -315,7 +357,7 @@ static int dump_ghost_remap(char *path, const struct stat *st,
 		return -1;
 	}
 
-	phys_dev = phys_stat_resolve_dev(nsid->mnt.mntinfo_tree, st->st_dev, path);
+	phys_dev = phys_stat_resolve_dev(nsid, st->st_dev, path);
 	list_for_each_entry(gf, &ghost_files, list)
 		if ((gf->dev == phys_dev) && (gf->ino == st->st_ino))
 			goto dump_entry;
@@ -391,7 +433,7 @@ static int create_link_remap(char *path, int len, int lfd,
 
 	link_name[0] = '.';
 	memcpy(link_name + 1, path, len);
-	tmp = link_name + len + 1;
+	tmp = link_name + len;
 	while (*tmp != '/') {
 		BUG_ON(tmp == link_name);
 		tmp--;
@@ -421,20 +463,23 @@ static int create_link_remap(char *path, int len, int lfd,
 	 * we keep all data in memory.
 	 */
 	rlb = xmalloc(sizeof(*rlb));
-	if (rlb)
-		rlb->path = strdup(link_name);
+	if (!rlb)
+		goto err1;
+
+	rlb->path = strdup(link_name);
+	if (!rlb->path)
+		goto err2;
 
 	rlb->mnt_ns = nsid;
-
-	if (!rlb || !rlb->path) {
-		pr_perror("Can't register rollback for %s", path);
-		xfree(rlb ? rlb->path : NULL);
-		xfree(rlb);
-		return -1;
-	}
 	list_add(&rlb->list, &link_remaps);
 
 	return pb_write_one(fdset_fd(glob_fdset, CR_FD_REG_FILES), &rfe, PB_REG_FILE);
+
+err2:
+	xfree(rlb);
+err1:
+	pr_perror("Can't register rollback for %s", path);
+	return -1;
 }
 
 static int dump_linked_remap(char *path, int len, const struct stat *ost,
@@ -610,6 +655,11 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	rfe.fown	= (FownEntry *)&p->fown;
 	rfe.name	= &link->name[1];
 
+	if (S_ISREG(p->stat.st_mode)) {
+		rfe.has_size = true;
+		rfe.size = p->stat.st_size;
+	}
+
 	rfd = fdset_fd(glob_fdset, CR_FD_REG_FILES);
 
 	return pb_write_one(rfd, &rfe, PB_REG_FILE);
@@ -620,22 +670,90 @@ const struct fdtype_ops regfile_dump_ops = {
 	.dump		= dump_one_reg_file,
 };
 
+static void convert_path_from_another_mp(char *src, char *dst, int dlen,
+					struct mount_info *smi,
+					struct mount_info *dmi)
+{
+	int off;
+
+	/*
+	 * mi->mountpoint	./foo/bar
+	 * mi->ns_mountpoint	/foo/bar
+	 * rfi->path		foo/bar/baz
+	 */
+	off = strlen(smi->ns_mountpoint + 1);
+	BUG_ON(strlen(smi->root) < strlen(dmi->root));
+
+	/*
+	 * Create paths relative to this mount.
+	 * Absolute path to the mount point + difference between source
+	 * and destination roots + path relative to the mountpoint.
+	 */
+	snprintf(dst, dlen, "%s/%s/%s",
+				dmi->ns_mountpoint + 1,
+				smi->root + strlen(dmi->root),
+				src + off);
+}
+
 /*
  * This routine properly resolves d's path handling ghost/link-remaps.
  * The open_cb is a routine that does actual open, it differs for
  * files, directories, fifos, etc.
  */
 
-static inline int rfi_remap(struct reg_file_info *rfi)
+static int rfi_remap(struct reg_file_info *rfi)
 {
-	return link(rfi->remap->path, rfi->path);
+	struct mount_info *mi, *rmi, *tmi;
+	char _path[PATH_MAX], *path = _path;
+	char _rpath[PATH_MAX], *rpath = _rpath;
+	int mntns_root;
+
+	if (rfi->rfe->mnt_id == -1) {
+		/* Know nothing about mountpoints */
+		mntns_root = mntns_get_root_by_mnt_id(-1);
+		path = rfi->path;
+		rpath = rfi->remap->path;
+		goto out_root;
+	}
+
+	mi = lookup_mnt_id(rfi->rfe->mnt_id);
+	if (rfi->rfe->mnt_id == rfi->remap->mnt_id) {
+		/* Both links on the same mount point */
+		tmi = mi;
+		path = rfi->path;
+		rpath = rfi->remap->path;
+		goto out;
+	}
+
+	rmi = lookup_mnt_id(rfi->remap->mnt_id);
+
+	/*
+	 * Find the common bind-mount. We know that one mount point was
+	 * really mounted and all other were bind-mounted from it, so the
+	 * lowest mount must contains all bind-mounts.
+	 */
+	for (tmi = mi; tmi->bind; tmi = tmi->bind)
+		;
+
+	BUG_ON(tmi->s_dev != rmi->s_dev);
+	BUG_ON(tmi->s_dev != mi->s_dev);
+
+	/* Calcalate paths on the device (root mount) */
+	convert_path_from_another_mp(rfi->path, path, sizeof(_path), mi, tmi);
+	convert_path_from_another_mp(rfi->remap->path, rpath, sizeof(_rpath), rmi, tmi);
+
+out:
+	pr_debug("%d: Link %s -> %s\n", tmi->mnt_id, rpath, path);
+	mntns_root = mntns_get_root_fd(tmi->nsid);
+
+out_root:
+	return linkat(mntns_root, rpath, mntns_root, path, 0);
 }
 
 int open_path(struct file_desc *d,
 		int(*open_cb)(int mntns_root, struct reg_file_info *, void *), void *arg)
 {
 	struct reg_file_info *rfi;
-	struct ns_id *ns;
 	int tmp, mntns_root;
 	char *orig_path = NULL;
 
@@ -643,7 +761,14 @@ int open_path(struct file_desc *d,
 
 	if (rfi->remap) {
 		mutex_lock(ghost_file_mutex);
-		if (rfi_remap(rfi) < 0) {
+		if (rfi->remap->is_dir) {
+			/*
+			 * FIXME Can't make directory under new name.
+			 * Will have to open it under the ghost one :(
+			 */
+			orig_path = rfi->path;
+			rfi->path = rfi->remap->path;
+		} else if (rfi_remap(rfi) < 0) {
 			static char tmp_path[PATH_MAX];
 
 			if (errno != EEXIST) {
@@ -674,24 +799,46 @@ int open_path(struct file_desc *d,
 		}
 	}
 
-	ns = lookup_nsid_by_mnt_id(rfi->rfe->mnt_id);
-	if (ns == NULL)
-		return -1;
-
-	mntns_root = mntns_get_root_fd(ns);
-
+	mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
 	tmp = open_cb(mntns_root, rfi, arg);
 	if (tmp < 0) {
 		pr_perror("Can't open file %s", rfi->path);
 		return -1;
 	}
 
+	if (rfi->rfe->has_size && !rfi->size_checked) {
+		struct stat st;
+
+		if (fstat(tmp, &st) < 0) {
+			pr_perror("Can't fstat opened file");
+			return -1;
+		}
+
+		if (st.st_size != rfi->rfe->size) {
+			pr_err("File %s has bad size %"PRIu64" (expect %"PRIu64")\n",
+					rfi->path, st.st_size,
+					rfi->rfe->size);
+			return -1;
+		}
+
+		/*
+		 * This is only visible in the current process, so
+		 * change w/o locks. Other tasks sharing the same
+		 * file will get one via unix sockets.
+		 */
+		rfi->size_checked = true;
+	}
+
 	if (rfi->remap) {
-		unlink(rfi->path);
+		if (!rfi->remap->is_dir) {
+			unlinkat(mntns_root, rfi->path, 0);
+		}
+
 		BUG_ON(!rfi->remap->users);
 		if (--rfi->remap->users == 0) {
 			pr_info("Unlink the ghost %s\n", rfi->remap->path);
-			unlink(rfi->remap->path);
+			mntns_root = mntns_get_root_by_mnt_id(rfi->remap->mnt_id);
+			unlinkat(mntns_root, rfi->remap->path, rfi->remap->is_dir ? AT_REMOVEDIR : 0);
 		}
 
 		if (orig_path)
@@ -742,6 +889,11 @@ static int do_open_reg(int ns_root_fd, struct reg_file_info *rfi, void *arg)
 	return fd;
 }
 
+int open_reg_fd(struct file_desc *fd)
+{
+	return open_path(fd, do_open_reg_noseek, NULL);
+}
+
 int open_reg_by_id(u32 id)
 {
 	struct file_desc *fd;
@@ -758,7 +910,7 @@ int open_reg_by_id(u32 id)
 		return -1;
 	}
 
-	return open_path(fd, do_open_reg_noseek, NULL);
+	return open_reg_fd(fd);
 }
 
 int get_filemap_fd(struct vma_area *vma)
@@ -840,10 +992,16 @@ struct file_desc *collect_special_file(u32 id)
 static int collect_one_regfile(void *o, ProtobufCMessage *base)
 {
 	struct reg_file_info *rfi = o;
+	static char dot[] = ".";
 
 	rfi->rfe = pb_msg(base, RegFileEntry);
-	rfi->path = rfi->rfe->name;
+	/* change "/foo" into "foo" and "/" into "." */
+	if (rfi->rfe->name[1] == '\0')
+		rfi->path = dot;
+	else
+		rfi->path = rfi->rfe->name + 1;
 	rfi->remap = NULL;
+	rfi->size_checked = false;
 
 	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
 	return file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);

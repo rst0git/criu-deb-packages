@@ -23,6 +23,7 @@ TST_NOFILE	=				\
 		sse20				\
 		mprotect00			\
 		timers				\
+		timerfd				\
 		unbound_sock			\
 		sched_prio00			\
 		sched_policy00			\
@@ -45,6 +46,7 @@ TST_NOFILE	=				\
 		pthread00			\
 		pthread01			\
 		vdso00				\
+		vdso01				\
 		utsname				\
 		pstree				\
 		sockets01			\
@@ -70,6 +72,7 @@ TST_NOFILE	=				\
 		maps05				\
 		xids00				\
 		groups				\
+		pdeath_sig			\
 		file_fown			\
 		proc-self			\
 		eventfs00			\
@@ -109,6 +112,8 @@ TST_NOFILE	=				\
 		stopped				\
 		rtc				\
 		clean_mntns			\
+		dumpable01			\
+		dumpable02			\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -149,6 +154,8 @@ TST_FILE	=				\
 
 TST_DIR		=				\
 		cwd00				\
+		cwd01				\
+		cwd02				\
 		overmount_dev			\
 		overmount_file			\
 		overmount_fifo			\
@@ -156,6 +163,12 @@ TST_DIR		=				\
 		tempfs				\
 		bind-mount			\
 		cgroup00			\
+		rmdir_open			\
+		cgroup01			\
+		cgroup02			\
+		mntns_open			\
+		mntns_link_remap		\
+		mntns_link_ghost		\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -269,6 +282,8 @@ socket-tcpbuf6: override CFLAGS += -D ZDTM_IPV6
 socket-tcpbuf-local: override CFLAGS += -D ZDTM_TCP_LOCAL
 socket_listen6: override CFLAGS += -D ZDTM_IPV6
 sigpending:		override LDLIBS += -lrt
+vdso01:			override LDLIBS += -lrt
+mntns_link_remap:	override CFLAGS += -DZDTM_LINK_REMAP
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)
@@ -293,7 +308,7 @@ criu-rtc.pb-c.c: criu-rtc.proto
 	protoc-c --proto_path=. --c_out=. criu-rtc.proto
 
 criu-rtc.so: criu-rtc.c criu-rtc.pb-c.c
-	gcc -g -Wall -shared -nostartfiles criu-rtc.c criu-rtc.pb-c.c -o criu-rtc.so -iquote ../../../../include -fPIC $(USERCFLAGS)
+	$(CC) -g -Wall -shared -nostartfiles criu-rtc.c criu-rtc.pb-c.c -o criu-rtc.so -iquote ../../../../include -fPIC $(USERCFLAGS)
 
 .PHONY:	force clean cleandep cleanout realclean start check_start stop wait_stop
 

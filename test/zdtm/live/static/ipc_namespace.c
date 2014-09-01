@@ -207,7 +207,7 @@ static int rand_ipc_sysctl(char *name, unsigned int val)
 		return fd;
 	}
 	sprintf(buf, "%d\n", val);
-	ret = write(fd, buf, 32);
+	ret = write(fd, buf, strlen(buf));
 	if (ret < 0) {
 		err("Can't write %u into %s\n", val, name);
 		return -errno;
@@ -251,7 +251,7 @@ static int rand_ipc_ns(void)
 	if (!ret)
 		ret = rand_ipc_sysctl("/proc/sys/kernel/msgmni", (unsigned)lrand48());
 	if (!ret)
-		ret = rand_ipc_sysctl("/proc/sys/kernel/auto_msgmni", (unsigned)lrand48() & 1);
+		ret = rand_ipc_sysctl("/proc/sys/kernel/auto_msgmni", 0);
 	if (!ret)
 		ret = rand_ipc_sysctl("/proc/sys/kernel/shmmax", (unsigned)lrand48());
 	if (!ret)

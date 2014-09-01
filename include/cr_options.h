@@ -19,6 +19,12 @@ struct script {
 #define CPU_CAP_FPU		(1u)
 #define CPU_CAP_ALL		(-1u)
 
+struct cg_root_opt {
+	struct list_head node;
+	char *controller;
+	char *newroot;
+};
+
 struct cr_options {
 	int			final_state;
 	char			*show_dump_file;
@@ -34,6 +40,7 @@ struct cr_options {
 	bool			link_remap_ok;
 	unsigned int		rst_namespaces_flags;
 	bool			log_file_per_pid;
+	bool			swrk_restore;
 	char			*output;
 	char			*root;
 	char			*pidfile;
@@ -50,6 +57,10 @@ struct cr_options {
 	unsigned int		cpu_cap;
 	bool			force_irmap;
 	char			**exec_cmd;
+	bool			manage_cgroups;
+	char			*new_global_cg_root;
+	struct list_head	new_cgroup_roots;
+	bool			aufs;		/* auto-deteced, not via cli */
 };
 
 extern struct cr_options opts;

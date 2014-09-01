@@ -1,12 +1,24 @@
 #!/bin/bash
 
+ARCH=`uname -m | sed			\
+		-e s/i.86/i386/		\
+		-e s/sun4u/sparc64/	\
+		-e s/s390x/s390/	\
+		-e s/parisc64/parisc/	\
+		-e s/ppc.*/powerpc/	\
+		-e s/mips.*/mips/	\
+		-e s/sh[234].*/sh/`
+
 ZP="zdtm/live"
 
 TEST_LIST="
 static/pipe00
 static/pipe01
+static/pipe02
 static/busyloop00
 static/cwd00
+static/cwd01
+static/cwd02
 static/env00
 static/maps00
 static/maps01
@@ -47,6 +59,7 @@ static/sock_opts01
 static/sockets_spair
 static/sockets_dgram
 static/socket_queues
+static/deleted_unix_sock
 static/sk-unix-unconn
 static/pid00
 static/pstree
@@ -60,12 +73,15 @@ static/sock_filter
 static/socket6_udp
 static/socket_udplite
 static/selfexe00
+static/link10
 static/unlink_fstat00
+static/unlink_fstat01
 static/unlink_fstat02
 static/unlink_fstat03
 static/unlink_mmap00
 static/unlink_mmap01
 static/unlink_mmap02
+static/rmdir_open
 static/eventfs00
 static/signalfd00
 static/inotify00
@@ -76,6 +92,9 @@ static/fifo-rowo-pair
 static/fifo-ghost
 static/fifo
 static/fifo_wronly
+static/fifo_ro
+static/unlink_fifo
+static/unlink_fifo_wronly
 static/zombie00
 static/rlimits00
 transition/fork
@@ -92,6 +111,7 @@ static/fpu01
 static/mmx00
 static/sse00
 static/sse20
+static/pdeath_sig
 static/fdt_shared
 static/file_locks00
 static/file_locks01
@@ -107,7 +127,21 @@ static/chroot
 static/chroot-file
 static/rtc
 transition/maps007
+static/dumpable01
+static/dumpable02
+static/deleted_dev
 "
+
+#
+# Arch specific tests
+if [ $ARCH = "x86_64" ]; then
+	TEST_LIST_ARCH="
+static/vdso01
+"
+fi
+
+TEST_LIST=$TEST_LIST$TEST_LIST_ARCH
+
 # Duplicate list with ns/ prefix
 TEST_LIST=$TEST_LIST$(echo $TEST_LIST | tr ' ' '\n' | sed 's#^#ns/#')
 
@@ -138,12 +172,27 @@ ns/static/tun
 static/netns-nf
 static/netns
 static/cgroup00
+static/cgroup01
+static/cgroup02
 ns/static/clean_mntns
 "
 
 TEST_CR_KERNEL="
 ns/static/tun
+static/timerfd
 "
+
+cat /proc/self/fdinfo/1 | grep -q mnt_id
+if [ $? -eq 0 ]; then
+	TEST_LIST="$TEST_LIST
+ns/static/mntns_open
+ns/static/mntns_link_remap
+ns/static/mntns_link_ghost
+"
+else
+	export ZDTM_NOSUBNS=1
+fi
+
 
 TEST_SUID_LIST="
 pid00
@@ -169,7 +218,14 @@ bind-mount
 mountpoints
 inotify_irmap
 cgroup00
+cgroup01
+cgroup02
 clean_mntns
+deleted_dev
+mntns_open
+mntns_link_remap
+mntns_link_ghost
+sockets00
 "
 
 source $(readlink -f `dirname $0`/env.sh) || exit 1
@@ -179,8 +235,6 @@ TMP_TREE=""
 SCRIPTDIR=`dirname $CRIU`/test
 POSTDUMP="--action-script $SCRIPTDIR/post-dump.sh"
 VERBOSE=0
-
-ARGS=""
 
 PID=""
 PIDNS=""
@@ -194,8 +248,6 @@ COMPILE_ONLY=0
 START_ONLY=0
 BATCH_TEST=0
 SPECIFIED_NAME_USED=0
-
-cat /proc/self/fdinfo/1 | grep -q mnt_id || export ZDTM_NOSUBNS=1
 
 zdtm_sep()
 { (
@@ -222,9 +274,6 @@ check_criu()
 
 check_mainstream()
 {
-	local -a ver_arr
-	local ver_str=`uname -r`
-
 	zdtm_sep "CRIU CHECK"
 
 	$CRIU check && return 0
@@ -238,12 +287,12 @@ git://git.kernel.org/pub/scm/linux/kernel/git/gorcunov/linux-cr.git
 ===================================================================
 EOF
 
-	ver_arr=(`echo ${ver_str//./ }`)
+	set -- `uname -r | sed 's/\./ /g'`
 
-	[ "${ver_arr[0]}" -gt 3 ] && return 0
-	[[ "${ver_arr[0]}" -eq 3 && "${ver_arr[1]}" -ge 11 ]] && return 0
+	[ $1 -gt 3 ] && return 0
+	[ $1 -eq 3 -a $2 -ge 11 ] && return 0
 
-	echo "A version of kernel should be greater or equal to 3.11" >&2
+	echo "Kernel version should be greater than or equal to 3.11" >&2
 
 	return 1
 }
@@ -289,7 +338,15 @@ construct_root()
 	#	libc.so.6 => /lib/arm-linux-gnueabihf/libc.so.6 (0xb6dc5000)
 	#	/lib/ld-linux-armhf.so.3 (0xb6f0b000)
 
-	for i in `ldd $test_path $ps_path | grep -P '^\s' | grep -v vdso | sed "s/.*=> //" | awk '{ print $1 }'`; do
+	local libs=$(ldd $test_path $ps_path | awk '
+		!/^[ \t]/ { next }
+		/\<linux-vdso\.so\>/ { next }
+		/\<linux-gate\.so\>/ { next }
+		/\<not a dynamic executable$/ { next }
+		$2 ~ /^=>$/ { print $3; next }
+		{ print $1 }
+	')
+	for i in ${libs}; do
 		local ldir lib=`basename $i`
 
 		[ -f $libdir2/$lib ] && continue # fast path
@@ -331,8 +388,8 @@ start_test()
 {
 	local tdir=$1
 	local tname=$2
+	local test=$(readlink -f $tdir)/$tname
 	export ZDTM_ROOT
-	TPID=`readlink -f $tdir`/$tname.init.pid
 
 	killall -9 $tname > /dev/null 2>&1
 	make -C $tdir $tname.cleanout
@@ -347,29 +404,34 @@ start_test()
 	fi
 
 	if [ -z "$PIDNS" ]; then
-		make -C $tdir $tname.pid || return 1
-		PID=`cat $test.pid` || return 1
+		TPID="$test.pid"
+		unset ZDTM_NEWNS
 	else
+		TPID=$test.init.pid
 		if [ -z "$ZDTM_ROOT" ]; then
 			mkdir -p dump
 			ZDTM_ROOT=`mktemp -d /tmp/criu-root.XXXXXX`
 			ZDTM_ROOT=`readlink -f $ZDTM_ROOT`
-			mount --bind . $ZDTM_ROOT || return 1
+			mount --make-private --bind . $ZDTM_ROOT || return 1
 		fi
-		make -C $tdir $tname || return 1
-		construct_root $ZDTM_ROOT $tdir/$tname || return 1
-	(	export ZDTM_NEWNS=1
+		construct_root $ZDTM_ROOT $test || return 1
+		export ZDTM_NEWNS=1
 		export ZDTM_PIDFILE=$TPID
 		cd $ZDTM_ROOT
 		rm -f $ZDTM_PIDFILE
-		if ! make -C $tdir $tname.pid; then
-			echo ERROR: fail to start $tdir/$tname
-			return 1
-		fi
-	)
+	fi
 
-		PID=`cat "$TPID"`
-		ps -p $PID || return 1
+	if ! make -C $tdir $tname.pid; then
+		echo ERROR: fail to start $test
+		return 1
+	fi
+
+	[ -z "$PIDNS" ] || cd -
+
+	PID=`cat "$TPID"` || return 1
+	if ! kill -0 $PID ; then
+		echo "Test failed to start"
+		return 1
 	fi
 }
 
@@ -413,21 +475,10 @@ diff_fds()
 run_test()
 {
 	local test=$1
-	local linkremap=
-	local snapopt=
 	local snappdir=
 	local ps_pid=
 
 	[ -n "$EXCLUDE_PATTERN" ] && echo $test | grep "$EXCLUDE_PATTERN" && return 0
-
-	#
-	# add option for unlinked files test
-	if [[ $1 =~ "unlink_" ]]; then
-		linkremap="--link-remap"
-	fi
-	if [[ $1 =~ "write_read10" ]]; then
-		linkremap="--link-remap"
-	fi
 
 	if [ -n "$MAINSTREAM_KERNEL" ] && [ $COMPILE_ONLY -eq 0 ] && echo $TEST_CR_KERNEL | grep -q ${test#ns/}; then
 		echo "Skip $test"
@@ -438,7 +489,7 @@ run_test()
 	test=${ZP}/${test#ns/}
 
 	shift
-	local args=$*
+	local gen_args=$*
 	local tname=`basename $test`
 	local tdir=`dirname $test`
 	DUMP_PATH=""
@@ -458,9 +509,9 @@ run_test()
 	fi
 
 	local ddump
-	if ! kill -s 0 "$PID"; then
-		echo "Got a wrong pid '$PID'"
-		return 1
+
+	if [ -f "${test}.opts" ]; then
+		gen_args="$gen_args $(cat "${test}.opts")"
 	fi
 
 	if [ -n "$PIDNS" ]; then
@@ -473,27 +524,27 @@ to ip is written in \$CR_IP_TOOL.
 EOF
 			exit 1
 		fi
-		args="--root $ZDTM_ROOT --pidfile $TPID $args"
+		gen_args="--root $ZDTM_ROOT --pidfile $TPID $gen_args"
 	fi
 
 	if [ $tname = "rtc" ]; then
-		args="$args -L `pwd`/$tdir/lib"
+		gen_args="$gen_args -L `pwd`/$tdir/lib"
 	fi
 
 	if [ -n "$AUTO_DEDUP" ]; then
-		args="$args --auto-dedup"
+		gen_args="$gen_args --auto-dedup"
 		ps_args="--auto-dedup"
 	fi
 
 	if echo $tname | fgrep -q 'irmap'; then
-		args="$args --force-irmap"
+		gen_args="$gen_args --force-irmap"
 	fi
 
 	for i in `seq $ITERATIONS`; do
+		local cpt_args=
 		local dump_only=
-		local postdump=
 		local dump_cmd="dump"
-		ddump=`readlink -fm dump/$tname/$PID/$i`
+		ddump=`readlink -fm dump/$(basename $tdir)/$tname/$PID/$i`
 		DUMP_PATH=$ddump
 		echo Dump $PID
 		mkdir -p $ddump
@@ -507,25 +558,24 @@ EOF
 				echo "Unable to determing PID of page-server"
 				return 1
 			}
-			opts="--page-server --address 127.0.0.1 --port $PS_PORT"
+			cpt_args="$cpt_args --page-server --address 127.0.0.1 --port $PS_PORT"
 		fi
 
 		if [ -n "$SNAPSHOT" ]; then
-			snapopt="--track-mem"
+			cpt_args="$cpt_args --track-mem"
 			if [ "$i" -ne "$ITERATIONS" ]; then
-				snapopt="$snapopt -R"
+				cpt_args="$cpt_args -R"
 				dump_only=1
 				[ -n "$PRE_DUMP" ] && dump_cmd="pre-dump"
 			fi
-			[ -n "$snappdir" ] && snapopt="$snapopt --prev-images-dir=$snappdir"
+			[ -n "$snappdir" ] && cpt_args="$cpt_args --prev-images-dir=$snappdir"
 		fi
 
-		[ -n "$dump_only" ] && postdump=$POSTDUMP
+		[ -n "$dump_only" ] && cpt_args="$cpt_args $POSTDUMP"
 
 		save_fds $PID  $ddump/dump.fd
 		save_maps $PID  $ddump/dump.maps
-		setsid $CRIU_CPT $dump_cmd $opts --file-locks --tcp-established $linkremap \
-			-x --evasive-devices -D $ddump -o dump.log -v4 -t $PID $args $ARGS $snapopt $postdump
+		setsid $CRIU_CPT $dump_cmd -D $ddump -o dump.log -v4 -t $PID $gen_args $cpt_args
 		retcode=$?
 
 		#
@@ -563,10 +613,7 @@ EOF
 				diff_maps $ddump/dump.maps $ddump/dump.maps.after || return 1
 			}
 
-			if [[ $linkremap ]]; then
-				echo "remove ./$tdir/link_remap.*"
-				rm -f ./$tdir/link_remap.*
-			fi
+			rm -f ./$tdir/link_remap.*
 		else
 			# Wait while tasks are dying, otherwise PIDs would be busy.
 			for i in $ddump/core-*.img; do
@@ -582,8 +629,13 @@ EOF
 				done
 			done
 
+			if [ -x "${test}.hook" ]; then
+				echo "Executing pre-restore hook"
+				"${test}.hook" --pre-restore || return 2
+			fi
+
 			echo Restore
-			setsid $CRIU restore --file-locks --tcp-established -x -D $ddump -o restore.log -v4 -d $args || return 2
+			setsid $CRIU restore -D $ddump -o restore.log -v4 -d $gen_args || return 2
 
 			[ -n "$PIDNS" ] && PID=`cat $TPID`
 			for i in `seq 5`; do
@@ -615,6 +667,11 @@ EOF
 		[ $sltime -lt 9 ] && sltime=$((sltime+1))
 	done
 
+	if [ -x "${test}.hook" ]; then
+		echo "Executing cleanup hook"
+		"${test}.hook" --clean
+	fi
+
 	if [ -n "$AUTO_DEDUP" ]; then
 		for img in $ddump/pages-*.img; do
 			img_name="${img##*/}"
@@ -636,7 +693,7 @@ EOF
 
 case_error()
 {
-	test=${ZP}/${1#ns/}
+	local test=${ZP}/${1#ns/}
 	local test_log=`pwd`/$test.out
 
 	echo "Test: $test, Result: FAIL"
@@ -724,6 +781,7 @@ Options:
 	-P : Make pre-dump instead of dump on all iterations except the last one
 	-s : Make iterative snapshots. Only the last one will be checked.
 	--auto-dedup : Make auto-dedup on restore. Check sizes of pages imges, it must be zero.
+	--ct : re-execute $0 in a container
 EOF
 }
 
@@ -829,6 +887,19 @@ while :; do
 	  -h)
 		usage
 		exit 0
+		;;
+	  --ct)
+		[ -z "$ZDTM_SH_IN_CT" ] && {
+			export ZDTM_SH_IN_CT=1
+			shift
+			# pidns is used to avoid conflicts
+			# mntns is used to mount /proc
+			# net is used to avoid conflicts of parasite sockets
+			make zdtm_ct &&
+			./zdtm_ct ./zdtm.sh "$@"
+			exit
+		}
+		shift
 		;;
 	  -*)
 		echo "Unrecognized option $1, aborting!" 1>&2

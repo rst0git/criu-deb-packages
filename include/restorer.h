@@ -16,6 +16,7 @@
 #include "config.h"
 
 #include "posix-timer.h"
+#include "timerfd.h"
 #include "shmem.h"
 #include "sigframe.h"
 #include "vdso.h"
@@ -90,6 +91,7 @@ struct thread_restore_args {
 
 	siginfo_t			*siginfo;
 	unsigned int			siginfo_nr;
+	int				pdeath_sig;
 } __aligned(64);
 
 struct task_restore_args {
@@ -125,6 +127,9 @@ struct task_restore_args {
 	int				timer_n;
 	struct restore_posix_timer	*posix_timers;
 
+	int				timerfd_n;
+	struct restore_timerfd		*timerfd;
+
 	CredsEntry			creds;
 	u32				cap_inh[CR_CAP_SIZE];
 	u32				cap_prm[CR_CAP_SIZE];
@@ -159,8 +164,6 @@ static inline unsigned long restorer_stack(struct thread_restore_args *a)
 {
 	return RESTORE_ALIGN_STACK((long)a->mem_zone.stack, RESTORE_STACK_SIZE);
 }
-
-#define TASK_ENTRIES_SIZE 4096
 
 enum {
 	CR_STATE_FAIL		= -1,

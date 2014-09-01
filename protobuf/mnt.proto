@@ -11,6 +11,8 @@ enum fstype {
 	SECURITYFS		= 9;
 	FUSECTL			= 10;
 	DEBUGFS			= 11;
+	CGROUP			= 12;
+	AUFS			= 13;
 };
 
 message mnt_entry {

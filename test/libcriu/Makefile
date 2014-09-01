@@ -1,12 +1,25 @@
-all: build/test
-.PHONY: all
+TESTS += test_sub 
+TESTS += test_self
+TESTS += test_notify
+TESTS += test_iters
 
-build/test: build/test.o
-	gcc $^ -L ../../lib -lcriu -o $@
+all: $(TESTS)
 
-build/test.o: test.c
-	gcc -c $^ -I ../../lib -o $@
+run: all
+	./run.sh
+
+define genb
+$(1): $(1).o lib.o
+	gcc $$^ -L ../../lib -lcriu -o $$@
+endef
+
+$(foreach t, $(TESTS), $(eval $(call genb, $(t))))
+
+%.o: %.c
+	gcc -c $^ -I../../lib/ -o $@ -Werror
 
 clean:
-	rm -rf build
+	rm -rf $(TESTS) $(TESTS:%=%.o) lib.o
+
 .PHONY: clean
+.PHONY: all

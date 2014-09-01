@@ -16,7 +16,13 @@
 #include "protobuf/pagemap.pb-c.h"
 
 unsigned long nr_shmems;
-unsigned int rst_shmems;
+unsigned long rst_shmems;
+
+int prepare_shmem_restore(void)
+{
+	rst_shmems = rst_mem_cpos(RM_SHREMAP);
+	return 0;
+}
 
 void show_saved_shmems(void)
 {
@@ -70,7 +76,7 @@ int collect_shmem(int pid, VmaEntry *vi)
 	if (!si)
 		return -1;
 
-	pr_info("Add new shmem 0x%"PRIx64" (0x0160x%"PRIx64"-0x0160x%"PRIx64")\n",
+	pr_info("Add new shmem 0x%"PRIx64" (0x%016"PRIx64"-0x%016"PRIx64")\n",
 				vi->shmid, vi->start, vi->end);
 
 	si->start = vi->start;

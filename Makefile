@@ -1,5 +1,5 @@
 VERSION_MAJOR		:= 1
-VERSION_MINOR		:= 3-rc2
+VERSION_MINOR		:= 3
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -71,6 +71,9 @@ ifeq ($(shell echo $(ARCH) | sed -e 's/arm.*/arm/'),arm)
 	ifeq ($(ARMV),7)
 		USERCFLAGS += -march=armv7-a
 	endif
+endif
+ifeq ($(ARCH),aarch64)
+	VDSO         := y
 endif
 
 SRCARCH		?= $(ARCH)
@@ -172,8 +175,14 @@ lib: $(VERSION_HEADER) config built-in.o
 	$(Q) $(MAKE) $(build)=lib all
 
 ifeq ($(VDSO),y)
+$(ARCH_DIR)/vdso-pie.o: pie
+	$(Q) $(MAKE) $(build)=pie $(ARCH_DIR)/vdso-pie.o
 PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-pie.o
+ifeq ($(SRCARCH),aarch64)
+PROGRAM-BUILTINS	+= $(ARCH_DIR)/intraprocedure.o
 endif
+endif
+
 PROGRAM-BUILTINS	+= pie/util-fd.o
 PROGRAM-BUILTINS	+= pie/util.o
 PROGRAM-BUILTINS	+= protobuf/built-in.o
@@ -219,6 +228,7 @@ clean: clean-built
 	$(Q) $(RM) protobuf-desc-gen.h
 	$(Q) $(MAKE) -C test/zdtm cleandep clean cleanout
 	$(Q) $(MAKE) -C test/libcriu clean
+	$(Q) $(MAKE) -C test/rpc clean
 
 distclean: clean
 	$(E) "  DISTCLEAN"
@@ -245,7 +255,7 @@ criu-$(CRTOOLSVERSION).tar.bz2:
 		v$(CRTOOLSVERSION) | bzip2 > $@
 .PHONY: dist tar
 
-install: $(PROGRAM) install-man
+install: $(PROGRAM) $(CRIU-LIB) install-man
 	$(E) "  INSTALL " $(PROGRAM)
 	$(Q) mkdir -p $(DESTDIR)$(SBINDIR)
 	$(Q) install -m 755 $(PROGRAM) $(DESTDIR)$(SBINDIR)
@@ -263,6 +273,12 @@ install: $(PROGRAM) install-man
 	$(Q) install -m 644 scripts/sd/criu.service $(DESTDIR)$(SYSTEMDUNITDIR)
 	$(Q) mkdir -p $(DESTDIR)$(LOGROTATEDIR)
 	$(Q) install -m 644 scripts/logrotate.d/criu-service $(DESTDIR)$(LOGROTATEDIR)
+	$(Q) sed -e 's,@version@,$(GITID),' \
+		-e 's,@libdir@,$(LIBDIR),' \
+		-e 's,@includedir@,$(dir $(INCLUDEDIR)),' \
+		lib/criu.pc.in > criu.pc
+	$(Q) mkdir -p $(DESTDIR)$(LIBDIR)/pkgconfig
+	$(Q) install -m 644 criu.pc $(DESTDIR)$(LIBDIR)/pkgconfig
 
 install-man:
 	$(Q) $(MAKE) -C Documentation install

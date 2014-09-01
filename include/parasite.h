@@ -87,7 +87,8 @@ struct parasite_vma_entry
 struct parasite_vdso_vma_entry {
 	unsigned long	start;
 	unsigned long	len;
-	unsigned long	proxy_addr;
+	unsigned long	proxy_vdso_addr;
+	unsigned long	proxy_vvar_addr;
 	int		is_marked;
 };
 
@@ -140,6 +141,7 @@ struct parasite_dump_thread {
 	pid_t			tid;
 	tls_t			tls;
 	stack_t			sas;
+	int			pdeath_sig;
 };
 
 /*
@@ -160,9 +162,25 @@ struct parasite_dump_misc {
 	int dumpable;
 };
 
-#define PARASITE_MAX_GROUPS	(PAGE_SIZE / sizeof(unsigned int) - 2 * sizeof(unsigned))
+/*
+ * Calculate how long we can make the groups array in parasite_dump_creds
+ * and still fit the struct in one page
+ */
+#define PARASITE_MAX_GROUPS							\
+	(PAGE_SIZE								\
+	 - sizeof(unsigned int)			/* cap_last_cap */		\
+	 - 4 * CR_CAP_SIZE * sizeof(u32)	/* cap_{inh,prm,eff,bnd} */ 	\
+	 - 2 * sizeof(unsigned int)		/* secbits, ngroups*/		\
+	) / sizeof(unsigned int)		/* groups */
 
 struct parasite_dump_creds {
+	unsigned int		cap_last_cap;
+
+	u32			cap_inh[CR_CAP_SIZE];
+	u32			cap_prm[CR_CAP_SIZE];
+	u32			cap_eff[CR_CAP_SIZE];
+	u32			cap_bnd[CR_CAP_SIZE];
+
 	unsigned int		secbits;
 	unsigned int		ngroups;
 	unsigned int		groups[PARASITE_MAX_GROUPS];

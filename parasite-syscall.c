@@ -267,7 +267,7 @@ static int __parasite_send_cmd(int sockfd, struct ctl_msg *m)
 
 	ret = send(sockfd, m, sizeof(*m), 0);
 	if (ret == -1) {
-		pr_perror("Failed to send command %d to daemon\n", m->cmd);
+		pr_perror("Failed to send command %d to daemon", m->cmd);
 		return -1;
 	} else if (ret != sizeof(*m)) {
 		pr_err("Message to daemon is trimmed (%d/%d)\n",
@@ -735,9 +735,22 @@ int parasite_dump_creds(struct parasite_ctl *ctl, CredsEntry *ce)
 {
 	struct parasite_dump_creds *pc;
 
+	BUILD_BUG_ON(sizeof(*pc) > PAGE_SIZE);
+
 	pc = parasite_args(ctl, struct parasite_dump_creds);
+	pc->cap_last_cap = kern_last_cap;
+
 	if (parasite_execute_daemon(PARASITE_CMD_DUMP_CREDS, ctl) < 0)
 		return -1;
+
+	ce->n_cap_inh = CR_CAP_SIZE;
+	ce->cap_inh = pc->cap_inh;
+	ce->n_cap_prm = CR_CAP_SIZE;
+	ce->cap_prm = pc->cap_prm;
+	ce->n_cap_eff = CR_CAP_SIZE;
+	ce->cap_eff = pc->cap_eff;
+	ce->n_cap_bnd = CR_CAP_SIZE;
+	ce->cap_bnd = pc->cap_bnd;
 
 	ce->secbits = pc->secbits;
 	ce->n_groups = pc->ngroups;
@@ -799,6 +812,7 @@ int parasite_get_proc_fd_seized(struct parasite_ctl *ctl)
 	return fd;
 }
 
+/* This is officially the 50000'th line in the CRIU source code */
 
 static bool task_in_parasite(struct parasite_ctl *ctl, user_regs_struct_t *regs)
 {
@@ -1145,9 +1159,6 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	unsigned long p, map_exchange_size;
 
 	BUG_ON(item->threads[0].real != pid);
-
-	if (pstree_alloc_cores(item))
-		return NULL;
 
 	ctl = parasite_prep_ctl(pid, vma_area_list);
 	if (!ctl)

@@ -5,11 +5,13 @@
 #include "asm/types.h"
 #include "image.h"
 #include "list.h"
+#include "cgroup.h"
 
 #include "protobuf/eventfd.pb-c.h"
 #include "protobuf/eventpoll.pb-c.h"
 #include "protobuf/signalfd.pb-c.h"
 #include "protobuf/fsnotify.pb-c.h"
+#include "protobuf/timerfd.pb-c.h"
 
 #define PROC_TASK_COMM_LEN	32
 #define PROC_TASK_COMM_LEN_FMT	"(%31s"
@@ -106,11 +108,17 @@ struct mount_info {
 	unsigned int	s_dev;
 	char		*root;
 	/*
-	 * mountpoint contains path with dot at the beginning.
-	 * It allows to use openat, statat, etc without creating
-	 * a temporary copy.
+	 * During dump mountpoint contains path with dot at the 
+	 * beginning. It allows to use openat, statat, etc without 
+	 * creating a temporary copy of the path.
+	 *
+	 * On restore mountpoint is prepended with so called ns
+	 * root path -- it's a place in fs where the namespace
+	 * mount tree is constructed. Check mnt_roots for details.
+	 * The ns_mountpoint contains path w/o this prefix.
 	 */
 	char		*mountpoint;
+	char		*ns_mountpoint;
 	unsigned	flags;
 	int		master_id;
 	int		shared_id;
@@ -164,6 +172,7 @@ union fdinfo_entries {
 	SignalfdEntry sfd;
 	InotifyWdEntry ify;
 	FanotifyMarkEntry ffy;
+	TimerfdEntry tfy;
 };
 
 struct fdinfo_common {
@@ -202,5 +211,10 @@ struct cg_ctl {
 
 extern int parse_task_cgroup(int pid, struct list_head *l, unsigned int *n);
 extern void put_ctls(struct list_head *);
+
+int parse_cgroups(struct list_head *cgroups, unsigned int *n_cgroups);
+
+/* callback for AUFS support */
+extern int aufs_parse(struct mount_info *mi);
 
 #endif /* __CR_PROC_PARSE_H__ */

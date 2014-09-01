@@ -208,19 +208,6 @@ static int init_zero_page_pfn()
 	return ret;
 }
 
-int kerndat_init(void)
-{
-	int ret;
-
-	ret = kerndat_get_shmemdev();
-	if (!ret)
-		ret = kerndat_get_dirty_track();
-	if (!ret)
-		ret = init_zero_page_pfn();
-
-	return ret;
-}
-
 int kern_last_cap;
 
 int get_last_cap(void)
@@ -231,6 +218,21 @@ int get_last_cap(void)
 	};
 
 	return sysctl_op(req, CTL_READ);
+}
+
+int kerndat_init(void)
+{
+	int ret;
+
+	ret = kerndat_get_shmemdev();
+	if (!ret)
+		ret = kerndat_get_dirty_track();
+	if (!ret)
+		ret = init_zero_page_pfn();
+	if (!ret)
+		ret = get_last_cap();
+
+	return ret;
 }
 
 int kerndat_init_rst(void)
