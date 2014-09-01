@@ -6,6 +6,7 @@ extern struct mount_info *mntinfo;
 struct ns_id;
 extern int __mntns_get_root_fd(pid_t pid);
 extern int mntns_get_root_fd(struct ns_id *ns);
+extern int mntns_get_root_by_mnt_id(int mnt_id);
 extern struct ns_id *lookup_nsid_by_mnt_id(int mnt_id);
 
 struct proc_mountinfo;
@@ -25,10 +26,9 @@ extern struct mount_info *lookup_mnt_sdev(unsigned int s_dev);
 
 extern struct ns_desc mnt_ns_desc;
 
-extern dev_t phys_stat_resolve_dev(struct mount_info *tree,
-					dev_t st_dev, const char *path);
-extern bool phys_stat_dev_match(struct mount_info *tree, dev_t st_dev,
-					dev_t phys_dev, const char *path);
+extern dev_t phys_stat_resolve_dev(struct ns_id *, dev_t st_dev, const char *path);
+extern bool phys_stat_dev_match(dev_t st_dev, dev_t phys_dev,
+		struct ns_id *, const char *path);
 
 struct pstree_item;
 extern int restore_task_mnt_ns(struct pstree_item *);

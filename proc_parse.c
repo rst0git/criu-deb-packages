@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <ctype.h>
 #include <linux/fs.h>
 
 #include "asm/types.h"
@@ -24,8 +25,11 @@
 #include "vma.h"
 
 #include "proc_parse.h"
+#include "cr_options.h"
+#include "sysfs_parse.h"
 #include "protobuf.h"
 #include "protobuf/fdinfo.pb-c.h"
+#include "protobuf/mnt.pb-c.h"
 
 #include <stdlib.h>
 
@@ -138,8 +142,16 @@ static int parse_vmflags(char *buf, struct vma_area *vma_area)
 			vma_area->e->madv |= (1ul << MADV_NOHUGEPAGE);
 
 		/* vmsplice doesn't work for VM_IO and VM_PFNMAP mappings. */
-		if (_vmflag_match(tok, "io") || _vmflag_match(tok, "pf"))
-			vma_area->e->status |= VMA_UNSUPP;
+		if (_vmflag_match(tok, "io") || _vmflag_match(tok, "pf")) {
+#ifdef CONFIG_VDSO
+			/*
+			 * VVAR area mapped by the kernel as
+			 * VM_IO | VM_PFNMAP| VM_DONTEXPAND | VM_DONTDUMP
+			 */
+			if (!vma_area_is(vma_area, VMA_AREA_VVAR))
+#endif
+				vma_area->e->status |= VMA_UNSUPP;
+		}
 
 		/*
 		 * Anything else is just ignored.
@@ -232,7 +244,8 @@ static int vma_get_mapfile(struct vma_area *vma, DIR *mfd,
 			vma->vm_socket_id = buf.st_ino;
 		} else if (errno != ENOENT)
 			return -1;
-	}
+	} else if (opts.aufs && fixup_aufs_vma_fd(vma) < 0)
+		return -1;
 
 	return 0;
 }
@@ -409,6 +422,15 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 			pr_warn_once("Found vDSO area without support\n");
 			goto err;
 #endif
+		} else if (strstr(buf, "[vvar]")) {
+#ifdef CONFIG_VDSO
+			vma_area->e->status |= VMA_AREA_REGULAR;
+			if ((vma_area->e->prot & VVAR_PROT) == VVAR_PROT)
+				vma_area->e->status |= VMA_AREA_VVAR;
+#else
+			pr_warn_once("Found VVAR area without support\n");
+			goto err;
+#endif
 		} else if (strstr(buf, "[heap]")) {
 			vma_area->e->status |= VMA_AREA_REGULAR | VMA_AREA_HEAP;
 		} else {
@@ -438,7 +460,19 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 			if (!st_buf)
 				goto err;
 
-			if (fstat(vma_area->vm_file_fd, st_buf) < 0) {
+			/*
+			 * For AUFS support, we cannot fstat() a file descriptor that
+			 * is a symbolic link to a branch (it would return different
+			 * dev/ino than the real file).  Instead, we stat() using the
+			 * full pathname that we saved before.
+			 */
+			if (vma_area->aufs_fpath) {
+				if (stat(vma_area->aufs_fpath, st_buf) < 0) {
+					pr_perror("Failed stat on %d's map %lu (%s)",
+						pid, start, vma_area->aufs_fpath);
+					goto err;
+				}
+			} else if (fstat(vma_area->vm_file_fd, st_buf) < 0) {
 				pr_perror("Failed fstat on %d's map %lu", pid, start);
 				goto err;
 			}
@@ -927,8 +961,7 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid)
 	FILE *f;
 	char str[1024];
 
-	snprintf(str, sizeof(str), "/proc/%d/mountinfo", pid);
-	f = fopen(str, "r");
+	f = fopen_proc(pid, "mountinfo");
 	if (!f) {
 		pr_perror("Can't open %d mountinfo", pid);
 		return NULL;
@@ -1026,6 +1059,51 @@ static void parse_fhandle_encoded(char *tok, FhEntry *fh)
 	}
 }
 
+static int parse_timerfd(FILE *f, char *buf, size_t size, TimerfdEntry *tfy)
+{
+	/*
+	 * Format is
+	 * clockid: 0
+	 * ticks: 0
+	 * settime flags: 01
+	 * it_value: (0, 49406829)
+	 * it_interval: (1, 0)
+	 */
+	if (sscanf(buf, "clockid: %d", &tfy->clockid) != 1)
+		goto parse_err;
+
+	if (!fgets(buf, size, f))
+		goto nodata;
+	if (sscanf(buf, "ticks: %llu", (unsigned long long *)&tfy->ticks) != 1)
+		goto parse_err;
+
+	if (!fgets(buf, size, f))
+		goto nodata;
+	if (sscanf(buf, "settime flags: 0%o", &tfy->settime_flags) != 1)
+		goto parse_err;
+
+	if (!fgets(buf, size, f))
+		goto nodata;
+	if (sscanf(buf, "it_value: (%llu, %llu)",
+		   (unsigned long long *)&tfy->vsec,
+		   (unsigned long long *)&tfy->vnsec) != 2)
+		goto parse_err;
+
+	if (!fgets(buf, size, f))
+		goto nodata;
+	if (sscanf(buf, "it_interval: (%llu, %llu)",
+		   (unsigned long long *)&tfy->isec,
+		   (unsigned long long *)&tfy->insec) != 2)
+		goto parse_err;
+	return 0;
+
+parse_err:
+	return -1;
+nodata:
+	pr_err("No data left in proc file while parsing timerfd\n");
+	goto parse_err;
+}
+
 #define fdinfo_field(str, field)	!strncmp(str, field":", sizeof(field))
 
 static int parse_fdinfo_pid_s(char *pid, int fd, int type,
@@ -1088,6 +1166,21 @@ static int parse_fdinfo_pid_s(char *pid, int fd, int type,
 			entry_met = true;
 			continue;
 		}
+		if (fdinfo_field(str, "clockid")) {
+			timerfd_entry__init(&entry.tfy);
+
+			if (type != FD_TYPES__TIMERFD)
+				goto parse_err;
+			ret = parse_timerfd(f, str, sizeof(str), &entry.tfy);
+			if (ret)
+				goto parse_err;
+			ret = cb(&entry, arg);
+			if (ret)
+				goto out;
+
+			entry_met = true;
+			continue;
+		}
 		if (fdinfo_field(str, "tfd")) {
 			eventpoll_tfd_entry__init(&entry.epl);
 
@@ -1136,7 +1229,7 @@ static int parse_fdinfo_pid_s(char *pid, int fd, int type,
 		if (fdinfo_field(str, "fanotify ino")) {
 			FanotifyInodeMarkEntry ie = FANOTIFY_INODE_MARK_ENTRY__INIT;
 			FhEntry f_handle = FH_ENTRY__INIT;
-			int hoff;
+			int hoff = 0;
 
 			if (type != FD_TYPES__FANOTIFY)
 				goto parse_err;
@@ -1152,7 +1245,7 @@ static int parse_fdinfo_pid_s(char *pid, int fd, int type,
 				     &entry.ffy.mflags, &entry.ffy.mask, &entry.ffy.ignored_mask,
 				     &f_handle.bytes, &f_handle.type,
 				     &hoff);
-			if (ret != 7)
+			if (ret != 7 || hoff == 0)
 				goto parse_err;
 
 			if (alloc_fhandle(&f_handle)) {
@@ -1506,15 +1599,28 @@ int parse_task_cgroup(int pid, struct list_head *retl, unsigned int *n)
 	f = fopen_proc(pid, "cgroup");
 	while (fgets(buf, BUF_SIZE, f)) {
 		struct cg_ctl *ncc, *cc;
-		char *name, *path, *e;
+		char *name, *path = NULL, *e;
 
 		ret = -1;
 		ncc = xmalloc(sizeof(*cc));
 		if (!ncc)
 			goto err;
 
+		/*
+		 * Typical output (':' is a separator here)
+		 *
+		 * 4:cpu,cpuacct:/
+		 * 3:cpuset:/
+		 * 2:name=systemd:/user.slice/user-1000.slice/session-1.scope
+		 */
 		name = strchr(buf, ':') + 1;
-		path = strchr(name, ':');
+		if (name)
+			path = strchr(name, ':');
+		if (!name || !path) {
+			pr_err("Failed parsing cgroup %s\n", buf);
+			xfree(ncc);
+			goto err;
+		}
 		e = strchr(name, '\n');
 		*path++ = '\0';
 		if (e)
@@ -1522,7 +1628,7 @@ int parse_task_cgroup(int pid, struct list_head *retl, unsigned int *n)
 
 		ncc->name = xstrdup(name);
 		ncc->path = xstrdup(path);
-		if (!ncc->name || !ncc->name) {
+		if (!ncc->name || !ncc->path) {
 			xfree(ncc->name);
 			xfree(ncc->path);
 			xfree(ncc);
@@ -1530,7 +1636,7 @@ int parse_task_cgroup(int pid, struct list_head *retl, unsigned int *n)
 		}
 
 		list_for_each_entry(cc, retl, l)
-			if (strcmp(cc->name, name) >= 0)
+			if (strcmp(cc->name, name) >= 0 && strcmp(cc->path, path) >= 0)
 				break;
 
 		list_add_tail(&ncc->l, &cc->l);
@@ -1555,4 +1661,93 @@ void put_ctls(struct list_head *l)
 		xfree(c->path);
 		xfree(c);
 	}
+}
+
+
+/* Parse and create all the real controllers. This does not include things with
+ * the "name=" prefix, e.g. systemd.
+ */
+int parse_cgroups(struct list_head *cgroups, unsigned int *n_cgroups)
+{
+	FILE *f;
+	char buf[1024], name[1024];
+	int heirarchy, ret = 0;
+	struct cg_controller *cur = NULL;
+
+	f = fopen("/proc/cgroups", "r");
+	if (!f) {
+		pr_perror("failed opening /proc/cgroups");
+		return -1;
+	}
+
+	/* throw away the header */
+	if (!fgets(buf, 1024, f)) {
+		ret = -1;
+		goto out;
+	}
+
+	while (fgets(buf, 1024, f)) {
+		char *n;
+		char found = 0;
+
+		sscanf(buf, "%s %d", name, &heirarchy);
+		list_for_each_entry(cur, cgroups, l) {
+			if (cur->heirarchy == heirarchy) {
+				void *m;
+
+				found = 1;
+				cur->n_controllers++;
+				m = xrealloc(cur->controllers, sizeof(char *) * cur->n_controllers);
+				if (!m) {
+					ret = -1;
+					goto out;
+				}
+
+				cur->controllers = m;
+				if (!cur->controllers) {
+					ret = -1;
+					goto out;
+				}
+
+				n = xstrdup(name);
+				if (!n) {
+					ret = -1;
+					goto out;
+				}
+
+				cur->controllers[cur->n_controllers-1] = n;
+				break;
+			}
+		}
+
+		if (!found) {
+			struct cg_controller *nc = new_controller(name, heirarchy);
+			if (!nc) {
+				ret = -1;
+				goto out;
+			}
+			list_add_tail(&nc->l, &cur->l);
+			(*n_cgroups)++;
+		}
+	}
+
+out:
+	fclose(f);
+	return ret;
+}
+
+/*
+ * AUFS callback function to "fix up" the root pathname.
+ * See sysfs_parse.c for details.
+ */
+int aufs_parse(struct mount_info *new)
+{
+	int ret = 0;
+
+	if (!strcmp(new->mountpoint, "./")) {
+		opts.aufs = true;
+		ret = parse_aufs_branches(new);
+	}
+
+	return ret;
 }

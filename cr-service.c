@@ -24,6 +24,7 @@
 #include "page-xfer.h"
 #include "net.h"
 #include "mount.h"
+#include "cgroup.h"
 
 unsigned int service_sk_ino = -1;
 
@@ -178,7 +179,8 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		return -1;
 	}
 
-	restrict_uid(ids.uid, ids.gid);
+	if (restrict_uid(ids.uid, ids.gid))
+		return -1;
 
 	if (fstat(sk, &st)) {
 		pr_perror("Can't get socket stat");
@@ -300,8 +302,17 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 			return -1;
 	}
 
+	for (i = 0; i < req->n_cg_root; i++) {
+		if (new_cg_root_add(req->cg_root[i]->ctrl,
+					req->cg_root[i]->path))
+			return -1;
+	}
+
 	if (req->has_cpu_cap)
 		opts.cpu_cap = req->cpu_cap;
+
+	if (req->has_manage_cgroups)
+		opts.manage_cgroups = req->manage_cgroups;
 
 	return 0;
 }
@@ -493,11 +504,9 @@ out:
 	return send_criu_msg(sk, &resp);
 }
 
-static int cr_service_work(int sk)
+int cr_service_work(int sk)
 {
 	CriuReq *msg = 0;
-
-	init_opts();
 
 	if (recv_criu_msg(sk, &msg) == -1) {
 		pr_perror("Can't recv request");
@@ -684,6 +693,7 @@ int cr_service(bool daemon_mode)
 				exit(1);
 
 			close(server_fd);
+			init_opts();
 			ret = cr_service_work(sk);
 			close(sk);
 			exit(ret != 0);

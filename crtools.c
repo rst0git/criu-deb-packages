@@ -35,6 +35,7 @@
 #include "cr-service.h"
 #include "plugin.h"
 #include "mount.h"
+#include "cgroup.h"
 
 struct cr_options opts;
 
@@ -47,8 +48,10 @@ void init_opts(void)
 	INIT_LIST_HEAD(&opts.veth_pairs);
 	INIT_LIST_HEAD(&opts.scripts);
 	INIT_LIST_HEAD(&opts.ext_mounts);
+	INIT_LIST_HEAD(&opts.new_cgroup_roots);
 
 	opts.cpu_cap = CPU_CAP_ALL;
+	opts.manage_cgroups = false;
 }
 
 static int parse_ns_string(const char *ptr)
@@ -144,36 +147,39 @@ int main(int argc, char *argv[])
 		{ "root", required_argument, 0, 'r' },
 		{ USK_EXT_PARAM, no_argument, 0, 'x' },
 		{ "help", no_argument, 0, 'h' },
-		{ SK_EST_PARAM, no_argument, 0, 42 },
-		{ "close", required_argument, 0, 43 },
-		{ "log-pid", no_argument, 0, 44},
+		{ SK_EST_PARAM, no_argument, 0, 1042 },
+		{ "close", required_argument, 0, 1043 },
+		{ "log-pid", no_argument, 0, 1044},
 		{ "version", no_argument, 0, 'V'},
-		{ "evasive-devices", no_argument, 0, 45},
-		{ "pidfile", required_argument, 0, 46},
-		{ "veth-pair", required_argument, 0, 47},
-		{ "action-script", required_argument, 0, 49},
-		{ LREMAP_PARAM, no_argument, 0, 41},
+		{ "evasive-devices", no_argument, 0, 1045},
+		{ "pidfile", required_argument, 0, 1046},
+		{ "veth-pair", required_argument, 0, 1047},
+		{ "action-script", required_argument, 0, 1049},
+		{ LREMAP_PARAM, no_argument, 0, 1041},
 		{ OPT_SHELL_JOB, no_argument, 0, 'j'},
 		{ OPT_FILE_LOCKS, no_argument, 0, 'l'},
-		{ "page-server", no_argument, 0, 50},
-		{ "address", required_argument, 0, 51},
-		{ "port", required_argument, 0, 52},
-		{ "prev-images-dir", required_argument, 0, 53},
-		{ "ms", no_argument, 0, 54},
-		{ "track-mem", no_argument, 0, 55},
-		{ "auto-dedup", no_argument, 0, 56},
+		{ "page-server", no_argument, 0, 1050},
+		{ "address", required_argument, 0, 1051},
+		{ "port", required_argument, 0, 1052},
+		{ "prev-images-dir", required_argument, 0, 1053},
+		{ "ms", no_argument, 0, 1054},
+		{ "track-mem", no_argument, 0, 1055},
+		{ "auto-dedup", no_argument, 0, 1056},
 		{ "libdir", required_argument, 0, 'L'},
-		{ "cpu-cap", required_argument, 0, 57},
-		{ "force-irmap", no_argument, 0, 58},
+		{ "cpu-cap", required_argument, 0, 1057},
+		{ "force-irmap", no_argument, 0, 1058},
 		{ "ext-mount-map", required_argument, 0, 'M'},
-		{ "exec-cmd", no_argument, 0, 59},
+		{ "exec-cmd", no_argument, 0, 1059},
+		{ "manage-cgroups", no_argument, 0, 1060},
+		{ "cgroup-root", required_argument, 0, 1061},
 		{ },
 	};
 
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 
 	cr_pb_init();
-	restrict_uid(getuid(), getgid());
+	if (restrict_uid(getuid(), getgid()))
+		return 1;
 
 	if (argc < 2)
 		goto usage;
@@ -182,6 +188,17 @@ int main(int argc, char *argv[])
 
 	if (init_service_fd())
 		return 1;
+
+	if (!strcmp(argv[1], "swrk")) {
+		/*
+		 * This is to start criu service worker from libcriu calls.
+		 * The usage is "criu swrk <fd>" and is not for CLI/scripts.
+		 * The arguments semantics can change at any tyme with the
+		 * corresponding lib call change.
+		 */
+		opts.swrk_restore = true;
+		return cr_service_work(atoi(argv[2]));
+	}
 
 	while (1) {
 		idx = -1;
@@ -249,15 +266,15 @@ int main(int argc, char *argv[])
 			} else
 				log_level++;
 			break;
-		case 41:
+		case 1041:
 			pr_info("Will allow link remaps on FS\n");
 			opts.link_remap_ok = true;
 			break;
-		case 42:
+		case 1042:
 			pr_info("Will dump TCP connections\n");
 			opts.tcp_established_ok = true;
 			break;
-		case 43: {
+		case 1043: {
 			int fd;
 
 			fd = atoi(optarg);
@@ -265,16 +282,16 @@ int main(int argc, char *argv[])
 			close(fd);
 			break;
 		}
-		case 44:
+		case 1044:
 			opts.log_file_per_pid = 1;
 			break;
-		case 45:
+		case 1045:
 			opts.evasive_devices = true;
 			break;
-		case 46:
+		case 1046:
 			opts.pidfile = optarg;
 			break;
-		case 47:
+		case 1047:
 			{
 				char *aux;
 
@@ -287,7 +304,7 @@ int main(int argc, char *argv[])
 					return 1;
 			}
 			break;
-		case 49:
+		case 1049:
 			{
 				struct script *script;
 
@@ -299,13 +316,13 @@ int main(int argc, char *argv[])
 				list_add(&script->node, &opts.scripts);
 			}
 			break;
-		case 50:
+		case 1050:
 			opts.use_page_server = true;
 			break;
-		case 51:
+		case 1051:
 			opts.addr = optarg;
 			break;
-		case 52:
+		case 1052:
 			opts.ps_port = htons(atoi(optarg));
 			if (!opts.ps_port)
 				goto bad_arg;
@@ -316,30 +333,51 @@ int main(int argc, char *argv[])
 		case 'l':
 			opts.handle_file_locks = true;
 			break;
-		case 53:
+		case 1053:
 			opts.img_parent = optarg;
 			break;
-		case 55:
+		case 1055:
 			opts.track_mem = true;
 			break;
-		case 56:
+		case 1056:
 			opts.auto_dedup = true;
 			break;
-		case 57:
+		case 1057:
 			if (parse_cpu_cap(&opts, optarg))
 				goto usage;
 			break;
-		case 58:
+		case 1058:
 			opts.force_irmap = true;
 			break;
-		case 54:
+		case 1054:
 			opts.check_ms_kernel = true;
 			break;
 		case 'L':
 			opts.libdir = optarg;
 			break;
-		case 59:
+		case 1059:
 			has_exec_cmd = true;
+			break;
+		case 1060:
+			opts.manage_cgroups = true;
+			break;
+		case 1061:
+			{
+				char *path, *ctl;
+
+				path = strchr(optarg, ':');
+				if (path) {
+					*path = '\0';
+					path++;
+					ctl = optarg;
+				} else {
+					path = optarg;
+					ctl = NULL;
+				}
+
+				if (new_cg_root_add(ctl, path))
+					return -1;
+			}
 			break;
 		case 'M':
 			{
@@ -529,6 +567,11 @@ usage:
 "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
 "  -M|--ext-mount-map KEY:VALUE\n"
 "                        add external mount mapping\n"
+"  --manage-cgroups      dump or restore cgroups the process is in\n"
+"  --cgroup-root [controller:]/newroot\n"
+"                        change the root cgroup the controller will be\n"
+"                        installed into. No controller means that root is the\n"
+"                        default for all controllers not specified.\n"
 "\n"
 "* Logging:\n"
 "  -o|--log-file FILE    log file name\n"

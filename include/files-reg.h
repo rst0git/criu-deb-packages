@@ -13,6 +13,8 @@ struct fd_parms;
 
 struct file_remap {
 	char *path;
+	bool is_dir;
+	int  mnt_id;
 	unsigned int users;
 };
 
@@ -20,10 +22,12 @@ struct reg_file_info {
 	struct file_desc	d;
 	RegFileEntry		*rfe;
 	struct file_remap	*remap;
+	bool			size_checked;
 	char			*path;
 };
 
 extern int open_reg_by_id(u32 id);
+extern int open_reg_fd(struct file_desc *);
 extern int open_path(struct file_desc *, int (*open_cb)(int ns_root_fd,
 			struct reg_file_info *, void *), void *arg);
 extern void clear_ghost_files(void);

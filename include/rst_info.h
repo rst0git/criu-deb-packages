@@ -49,6 +49,11 @@ struct rst_info {
 		struct pstree_item	*pgrp_leader;
 		futex_t			pgrp_set;
 	};
+
+	struct file_desc	*cwd;
+	struct file_desc	*root;
+	bool			has_umask;
+	u32			umask;
 };
 
 #endif /* __CR_RST_INFO_H__ */

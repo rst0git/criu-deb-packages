@@ -72,7 +72,7 @@ static int sysctl_write_##__type(int fd,				\
 	int i, ret = -1;						\
 	int off = 0;							\
 									\
-	for (i = 0; i < nr && off < sizeof(buf) - 2; i++) {		\
+	for (i = 0; i < nr && off < sizeof(buf) - 1; i++) {		\
 		snprintf(&buf[off], sizeof(buf) - off, __fmt, arg[i]);	\
 		off += strlen(&buf[off]);				\
 	}								\
@@ -87,8 +87,7 @@ static int sysctl_write_##__type(int fd,				\
 	while (off > 0 && isspace(buf[off - 1]))			\
 		off--;							\
 	buf[off + 0] = '\n';						\
-	buf[off + 1] = '\0';						\
-	ret = write(fd, buf, off + 2);					\
+	ret = write(fd, buf, off + 1);					\
 	if (ret < 0) {							\
 		pr_perror("Can't write %s", req->name);			\
 		ret = -1;						\
@@ -106,11 +105,12 @@ static int sysctl_print_##__type(int fd,				\
 				 __type *arg,				\
 				 int nr)				\
 {									\
-	int i;								\
-	pr_info("sysctl: <%s> = <", req->name);				\
+	char msg[PAGE_SIZE];						\
+	int i, off = 0;							\
 	for (i = 0; i < nr; i++)					\
-		pr_info(__fmt, arg[i]);					\
-	pr_info(">\n");							\
+		off += snprintf(msg + off, sizeof(msg) - off,		\
+				__fmt, arg[i]);				\
+	pr_info("sysctl: <%s> = <%s>\n", req->name, msg);		\
 									\
 	return 0;							\
 }

@@ -35,6 +35,10 @@
 
 #include "asm/restorer.h"
 
+#ifndef PR_SET_PDEATHSIG
+#define PR_SET_PDEATHSIG 1
+#endif
+
 #define sys_prctl_safe(opcode, val1, val2, val3)			\
 	({								\
 		long __ret = sys_prctl(opcode, val1, val2, val3, 0);	\
@@ -189,22 +193,57 @@ static int restore_creds(CredsEntry *ce)
 	return 0;
 }
 
+/*
+ * This should be done after creds restore, as
+ * some creds changes might drop the value back
+ * to zero.
+ */
+
+static inline int restore_pdeath_sig(struct thread_restore_args *ta)
+{
+	if (ta->pdeath_sig)
+		return sys_prctl(PR_SET_PDEATHSIG, ta->pdeath_sig, 0, 0, 0);
+	else
+		return 0;
+}
+
 static int restore_dumpable_flag(MmEntry *mme)
 {
+	int current_dumpable;
 	int ret;
 
-	if (mme->has_dumpable) {
-               /*
-                * Allowed values for PR_SET_DUMPABLE are only
-                * SUID_DUMP_DISABLE (0) and SUID_DUMP_USER (1).
-                */
-               ret = sys_prctl(PR_SET_DUMPABLE, mme->dumpable == 1 ? 1 : 0, 0, 0, 0);
+	if (!mme->has_dumpable) {
+		pr_warn("Dumpable flag not present in criu dump.\n");
+		return 0;
+	}
+
+	if (mme->dumpable == 0 || mme->dumpable == 1) {
+		ret = sys_prctl(PR_SET_DUMPABLE, mme->dumpable, 0, 0, 0);
+		if (ret) {
+			pr_err("Unable to set PR_SET_DUMPABLE: %d\n", ret);
+			return -1;
+		}
+		return 0;
+	}
+
+	/*
+	 * If dumpable flag is present but it is not 0 or 1, then we can not
+	 * use prctl to set it back.  Try to see if it is already correct
+	 * (which is likely if sysctl fs.suid_dumpable is the same when dump
+	 * and restore are run), in which case there is nothing to do.
+	 * Otherwise, set dumpable to 0 which should be a secure fallback.
+	 */
+	current_dumpable = sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+	if (mme->dumpable != current_dumpable) {
+		pr_warn("Dumpable flag [%d] does not match current [%d]. "
+			"Will fallback to setting it to 0 to disable it.\n",
+			mme->dumpable, current_dumpable);
+		ret = sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 		if (ret) {
 			pr_err("Unable to set PR_SET_DUMPABLE: %d\n", ret);
 			return -1;
 		}
 	}
-
 	return 0;
 }
 
@@ -328,6 +367,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 		goto core_restore_end;
 
 	restore_finish_stage(CR_STATE_RESTORE_SIGCHLD);
+	restore_pdeath_sig(args);
 	restore_finish_stage(CR_STATE_RESTORE_CREDS);
 	futex_dec_and_wake(&thread_inprogress);
 
@@ -491,6 +531,49 @@ static int vma_remap(unsigned long src, unsigned long dst, unsigned long len)
 		return -1;
 	}
 
+	return 0;
+}
+
+static int timerfd_arm(struct task_restore_args *args)
+{
+	int i;
+
+	for (i = 0; i < args->timerfd_n; i++) {
+		struct restore_timerfd *t = &args->timerfd[i];
+		int ret;
+
+		pr_debug("timerfd: arm for fd %d (%d)\n", t->fd, i);
+
+		if (t->settime_flags & TFD_TIMER_ABSTIME) {
+			struct timespec ts = { };
+
+			/*
+			 * We might need to adjust value because the checkpoint
+			 * and restore procedure takes some time itself. Note
+			 * we don't adjust nanoseconds, since the result may
+			 * overflow the limit NSEC_PER_SEC FIXME
+			 */
+			if (sys_clock_gettime(t->clockid, &ts)) {
+				pr_err("Can't get current time");
+				return -1;
+			}
+
+			t->val.it_value.tv_sec += (time_t)ts.tv_sec;
+
+			pr_debug("Ajust id %#x it_value(%llu, %llu) -> it_value(%llu, %llu)\n",
+				 t->id, (unsigned long long)ts.tv_sec,
+				 (unsigned long long)ts.tv_nsec,
+				 (unsigned long long)t->val.it_value.tv_sec,
+				 (unsigned long long)t->val.it_value.tv_nsec);
+		}
+
+		ret  = sys_timerfd_settime(t->fd, t->settime_flags, &t->val, NULL);
+		ret |= sys_ioctl(t->fd, TFD_IOC_SET_TICKS, (unsigned long)&t->ticks);
+		if (ret) {
+			pr_err("Can't restore ticks/time for timerfd - %d\n", i);
+			return ret;
+		}
+	}
 	return 0;
 }
 
@@ -661,9 +744,7 @@ long __export_restore_task(struct task_restore_args *args)
 	pr_info("Switched to the restorer %d\n", my_pid);
 
 #ifdef CONFIG_VDSO
-	if (vdso_remap("rt-vdso", args->vdso_sym_rt.vma_start,
-		       args->vdso_rt_parked_at,
-		       vdso_vma_size(&args->vdso_sym_rt)))
+	if (vdso_do_park(&args->vdso_sym_rt, args->vdso_rt_parked_at, vdso_rt_size))
 		goto core_restore_end;
 #endif
 
@@ -690,13 +771,6 @@ long __export_restore_task(struct task_restore_args *args)
 		if (vma_remap(vma_premmaped_start(vma_entry),
 				vma_entry->start, vma_entry_len(vma_entry)))
 			goto core_restore_end;
-#ifdef CONFIG_VDSO
-		if (vma_entry_is(vma_entry, VMA_AREA_VDSO)) {
-			if (vdso_proxify("left dumpee", &args->vdso_sym_rt,
-					 vma_entry, args->vdso_rt_parked_at))
-				goto core_restore_end;
-		}
-#endif
 	}
 
 	/* Shift private vma-s to the right */
@@ -718,13 +792,6 @@ long __export_restore_task(struct task_restore_args *args)
 		if (vma_remap(vma_premmaped_start(vma_entry),
 				vma_entry->start, vma_entry_len(vma_entry)))
 			goto core_restore_end;
-#ifdef CONFIG_VDSO
-		if (vma_entry_is(vma_entry, VMA_AREA_VDSO)) {
-			if (vdso_proxify("right dumpee", &args->vdso_sym_rt,
-					 vma_entry, args->vdso_rt_parked_at))
-				goto core_restore_end;
-		}
-#endif
 	}
 
 	/*
@@ -746,6 +813,22 @@ long __export_restore_task(struct task_restore_args *args)
 			goto core_restore_end;
 		}
 	}
+
+#ifdef CONFIG_VDSO
+	/*
+	 * Proxify vDSO.
+	 */
+	for (i = 0; i < args->nr_vmas; i++) {
+		if (vma_entry_is(&args->tgt_vmas[i], VMA_AREA_VDSO) ||
+		    vma_entry_is(&args->tgt_vmas[i], VMA_AREA_VVAR)) {
+			if (vdso_proxify("dumpee", &args->vdso_sym_rt,
+					 args->vdso_rt_parked_at,
+					 i, args->tgt_vmas, args->nr_vmas))
+				goto core_restore_end;
+			break;
+		}
+	}
+#endif
 
 	/*
 	 * Walk though all VMAs again to drop PROT_WRITE
@@ -887,6 +970,7 @@ long __export_restore_task(struct task_restore_args *args)
 
 			new_sp = restorer_stack(thread_args + i);
 			last_pid_len = vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
+			sys_lseek(fd, 0, SEEK_SET);
 			ret = sys_write(fd, s, last_pid_len);
 			if (ret < 0) {
 				pr_err("Can't set last_pid %ld/%s\n", ret, last_pid_buf);
@@ -918,6 +1002,12 @@ long __export_restore_task(struct task_restore_args *args)
 	ret = create_posix_timers(args);
 	if (ret < 0) {
 		pr_err("Can't restore posix timers %ld\n", ret);
+		goto core_restore_end;
+	}
+
+	ret = timerfd_arm(args);
+	if (ret < 0) {
+		pr_err("Can't restore timerfd %ld\n", ret);
 		goto core_restore_end;
 	}
 
@@ -958,6 +1048,7 @@ long __export_restore_task(struct task_restore_args *args)
 
 	ret = restore_creds(&args->creds);
 	ret = ret || restore_dumpable_flag(&args->mm);
+	ret = ret || restore_pdeath_sig(args->t);
 
 	futex_set_and_wake(&thread_inprogress, args->nr_threads);
 
@@ -989,7 +1080,6 @@ long __export_restore_task(struct task_restore_args *args)
 
 	restore_posix_timers(args);
 
-	sys_munmap(args->task_entries, TASK_ENTRIES_SIZE);
 	sys_munmap(args->rst_mem, args->rst_mem_size);
 
 	/*

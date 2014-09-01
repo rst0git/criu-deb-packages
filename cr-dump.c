@@ -71,6 +71,7 @@
 #include "cr-service.h"
 #include "plugin.h"
 #include "irmap.h"
+#include "sysfs_parse.h"
 
 #include "asm/dump.h"
 
@@ -94,6 +95,11 @@ bool privately_dump_vma(struct vma_area *vma)
 	if (vma->e->status & VMA_AREA_SYSVIPC)
 		return false;
 
+#ifdef CONFIG_VDSO
+	/* No dumps for vDSO VVAR data */
+	if (vma->e->status & VMA_AREA_VVAR)
+		return false;
+#endif
 	if (vma_area_is(vma, VMA_ANON_SHARED))
 		return false;
 
@@ -365,6 +371,22 @@ static int dump_filemap(pid_t pid, struct vma_area *vma_area,
 	BUG_ON(!vma_area->st);
 	p.stat = *vma_area->st;
 
+	/*
+	 * AUFS support to compensate for the kernel bug
+	 * exposing branch pathnames in map_files.
+	 *
+	 * If the link found in vma_get_mapfile() pointed
+	 * inside a branch, we should use the pathname
+	 * from root that was saved in vma_area->aufs_rpath.
+	 */
+	if (vma_area->aufs_rpath) {
+		struct fd_link aufs_link;
+
+		strcpy(aufs_link.name, vma_area->aufs_rpath);
+		aufs_link.len = strlen(aufs_link.name);
+		p.link = &aufs_link;
+	}
+
 	if (get_fd_mntid(vma_area->vm_file_fd, &p.mnt_id))
 		return -1;
 
@@ -497,10 +519,6 @@ static int dump_task_creds(struct parasite_ctl *ctl,
 {
 	CredsEntry ce = CREDS_ENTRY__INIT;
 
-	pr_info("\n");
-	pr_info("Dumping creds for %d)\n", ctl->pid.real);
-	pr_info("----------------------------------------\n");
-
 	ce.uid   = cr->uids[0];
 	ce.gid   = cr->gids[0];
 	ce.euid  = cr->uids[1];
@@ -510,16 +528,9 @@ static int dump_task_creds(struct parasite_ctl *ctl,
 	ce.fsuid = cr->uids[3];
 	ce.fsgid = cr->gids[3];
 
-	BUILD_BUG_ON(CR_CAP_SIZE != PROC_CAP_SIZE);
-
-	ce.n_cap_inh = CR_CAP_SIZE;
-	ce.cap_inh = cr->cap_inh;
-	ce.n_cap_prm = CR_CAP_SIZE;
-	ce.cap_prm = cr->cap_prm;
-	ce.n_cap_eff = CR_CAP_SIZE;
-	ce.cap_eff = cr->cap_eff;
-	ce.n_cap_bnd = CR_CAP_SIZE;
-	ce.cap_bnd = cr->cap_bnd;
+	pr_info("\n");
+	pr_info("Dumping creds for %d)\n", ctl->pid.real);
+	pr_info("----------------------------------------\n");
 
 	if (parasite_dump_creds(ctl, &ce) < 0)
 		return -1;
@@ -534,15 +545,35 @@ static int get_task_futex_robust_list(pid_t pid, ThreadCoreEntry *info)
 	int ret;
 
 	ret = sys_get_robust_list(pid, &head, &len);
-	if (ret) {
-		pr_err("Failed obtaining futex robust list on %d\n", pid);
-		return -1;
+	if (ret == -ENOSYS) {
+		/*
+		 * If the kernel says get_robust_list is not implemented, then
+		 * check whether set_robust_list is also not implemented, in
+		 * that case we can assume it is empty, since set_robust_list
+		 * is the only way to populate it. This case is possible when
+		 * "futex_cmpxchg_enabled" is unset in the kernel.
+		 *
+		 * The following system call should always fail, even if it is
+		 * implemented, in which case it will return -EINVAL because
+		 * len should be greater than zero.
+		 */
+		if (sys_set_robust_list(NULL, 0) != -ENOSYS)
+			goto err;
+
+		head = NULL;
+		len = 0;
+	} else if (ret) {
+		goto err;
 	}
 
 	info->futex_rla		= encode_pointer(head);
 	info->futex_rla_len	= (u32)len;
 
 	return 0;
+
+err:
+	pr_err("Failed obtaining futex robust list on %d\n", pid);
+	return -1;
 }
 
 static int get_task_personality(pid_t pid, u32 *personality)
@@ -664,6 +695,10 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 		CORE_THREAD_ARCH_INFO(core)->clear_tid_addr = encode_pointer(ti->tid_addr);
 		BUG_ON(!tc->sas);
 		copy_sas(tc->sas, &ti->sas);
+		if (ti->pdeath_sig) {
+			tc->has_pdeath_sig = true;
+			tc->pdeath_sig = ti->pdeath_sig;
+		}
 	}
 
 	return ret;
@@ -996,6 +1031,9 @@ static int collect_task(struct pstree_item *item)
 		goto err_close;
 	}
 
+	if (pstree_alloc_cores(item))
+		goto err_close;
+
 	close_pid_proc();
 
 	pr_info("Collected %d in %d state\n", item->pid.real, item->state);
@@ -1136,80 +1174,105 @@ err:
 	return ret;
 }
 
-static int dump_signal_queue(pid_t tid, int fd, bool group)
+#define SI_BATCH	32
+
+static int dump_signal_queue(pid_t tid, SignalQueueEntry **sqe, bool group)
 {
 	struct ptrace_peeksiginfo_args arg;
-	siginfo_t siginfo[32]; /* One page or all non-rt signals */
-	int ret, i = 0, j, nr;
+	int ret;
+	SignalQueueEntry *queue = NULL;
 
 	pr_debug("Dump %s signals of %d\n", group ? "shared" : "private", tid);
 
-	arg.nr = sizeof(siginfo) / sizeof(siginfo_t);
+	arg.nr = SI_BATCH;
 	arg.flags = 0;
 	if (group)
 		arg.flags |= PTRACE_PEEKSIGINFO_SHARED;
+	arg.off = 0;
 
-	for (; ; ) {
-		arg.off = i;
+	queue = xmalloc(sizeof(*queue));
+	if (!queue)
+		return -1;
 
-		ret = ptrace(PTRACE_PEEKSIGINFO, tid, &arg, siginfo);
+	signal_queue_entry__init(queue);
+
+	while (1) {
+		int nr, si_pos;
+		siginfo_t *si;
+
+		si = xmalloc(SI_BATCH * sizeof(*si));
+		if (!si) {
+			ret = -1;
+			break;
+		}
+
+		nr = ret = ptrace(PTRACE_PEEKSIGINFO, tid, &arg, si);
+		if (ret == 0)
+			break; /* Finished */
+
 		if (ret < 0) {
 			if (errno == EIO) {
 				pr_warn("ptrace doesn't support PTRACE_PEEKSIGINFO\n");
 				ret = 0;
 			} else
 				pr_perror("ptrace");
+
 			break;
 		}
 
-		if (ret == 0)
+		queue->n_signals += nr;
+		queue->signals = xrealloc(queue->signals, sizeof(*queue->signals) * queue->n_signals);
+		if (!queue->signals) {
+			ret = -1;
 			break;
-		nr = ret;
+		}
 
-		for (j = 0; j < nr; j++) {
-			SiginfoEntry sie = SIGINFO_ENTRY__INIT;
+		for (si_pos = queue->n_signals - nr;
+				si_pos < queue->n_signals; si_pos++) {
+			SiginfoEntry *se;
 
-			sie.siginfo.len = sizeof(siginfo_t);
-			sie.siginfo.data = (void *) (siginfo + j);
-
-			ret = pb_write_one(fd, &sie, PB_SIGINFO);
-			if (ret < 0)
+			se = xmalloc(sizeof(*se));
+			if (!se) {
+				ret = -1;
 				break;
-			i++;
+			}
+
+			siginfo_entry__init(se);
+			se->siginfo.len = sizeof(siginfo_t);
+			se->siginfo.data = (void *)si++; /* XXX we don't free cores, but when
+							  * we will, this would cause problems
+							  */
+			queue->signals[si_pos] = se;
 		}
+
+		if (ret < 0)
+			break;
+
+		arg.off += nr;
 	}
 
+	*sqe = queue;
 	return ret;
 }
 
-static int dump_thread_signals(struct pid *tid)
-{
-	int fd, ret;
-
-	fd = open_image(CR_FD_PSIGNAL, O_DUMP, tid->virt);
-	if (fd < 0)
-		return -1;
-	ret = dump_signal_queue(tid->real, fd, false);
-	close(fd);
-
-	return ret;
-}
-
-static int dump_task_signals(pid_t pid, struct pstree_item *item,
-		struct cr_fdset *cr_fdset)
+static int dump_task_signals(pid_t pid, struct pstree_item *item)
 {
 	int i, ret;
 
-	ret = dump_signal_queue(pid, fdset_fd(cr_fdset, CR_FD_SIGNAL), true);
-	if (ret) {
-		pr_err("Can't dump pending signals (pid: %d)\n", pid);
-		return -1;
+	/* Dump private signals for each thread */
+	for (i = 0; i < item->nr_threads; i++) {
+		ret = dump_signal_queue(item->threads[i].real, &item->core[i]->thread_core->signals_p, false);
+		if (ret) {
+			pr_err("Can't dump private signals for thread %d\n", item->threads[i].real);
+			return -1;
+		}
 	}
 
-	for (i = 0; i < item->nr_threads; i++) {
-		ret = dump_thread_signals(&item->threads[i]);
-		if (ret)
-			return -1;
+	/* Dump shared signals */
+	ret = dump_signal_queue(pid, &item->core[0]->tc->signals_s, true);
+	if (ret) {
+		pr_err("Can't dump shared signals (pid: %d)\n", pid);
+		return -1;
 	}
 
 	return 0;
@@ -1469,6 +1532,12 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
+	ret = dump_task_signals(pid, item);
+	if (ret) {
+		pr_err("Dump %d signals failed %d\n", pid, ret);
+		goto err;
+	}
+
 	ret = -1;
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas, dfds, proc_args.timer_n);
 	if (!parasite_ctl) {
@@ -1600,12 +1669,6 @@ static int dump_one_task(struct pstree_item *item)
 	ret = dump_task_fs(pid, &misc, cr_fdset);
 	if (ret) {
 		pr_err("Dump fs (pid: %d) failed with %d\n", pid, ret);
-		goto err;
-	}
-
-	ret = dump_task_signals(pid, item, cr_fdset);
-	if (ret) {
-		pr_err("Dump %d signals failed %d\n", pid, ret);
 		goto err;
 	}
 
@@ -1747,6 +1810,9 @@ int cr_dump_tasks(pid_t pid)
 	if (vdso_init())
 		goto err;
 
+	if (parse_cg_info())
+		goto err;
+
 	if (write_img_inventory())
 		goto err;
 
@@ -1771,7 +1837,7 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_file_locks())
 		goto err;
 
-	if (dump_mnt_namespaces() < 0)
+	if (collect_mnt_namespaces() < 0)
 		goto err;
 
 	if (collect_sockets(pid))
@@ -1785,6 +1851,10 @@ int cr_dump_tasks(pid_t pid)
 		if (dump_one_task(item))
 			goto err;
 	}
+
+	/* MNT namespaces are dumped after files to save remapped links */
+	if (dump_mnt_namespaces() < 0)
+		goto err;
 
 	if (dump_verify_tty_sids())
 		goto err;
@@ -1874,6 +1944,7 @@ err:
 	free_pstree(root_item);
 	free_file_locks();
 	free_link_remaps();
+	free_aufs_branches();
 
 	close_service_fd(CR_PROC_FD_OFF);
 

@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <linux/limits.h>
+#include <linux/capability.h>
 #include <sys/mount.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
@@ -33,6 +34,10 @@ static struct parasite_dump_pages_args *mprotect_args = NULL;
 
 #ifndef SPLICE_F_GIFT
 #define SPLICE_F_GIFT	0x08
+#endif
+
+#ifndef PR_GET_PDEATHSIG
+#define PR_GET_PDEATHSIG  2
 #endif
 
 static int mprotect_vmas(struct parasite_dump_pages_args *args)
@@ -145,9 +150,15 @@ static int dump_thread_common(struct parasite_dump_thread *ti)
 
 	arch_get_tls(&ti->tls);
 	ret = sys_prctl(PR_GET_TID_ADDRESS, (unsigned long) &ti->tid_addr, 0, 0, 0);
-	if (ret == 0)
-		ret = sys_sigaltstack(NULL, &ti->sas);
+	if (ret)
+		goto out;
 
+	ret = sys_sigaltstack(NULL, &ti->sas);
+	if (ret)
+		goto out;
+
+	ret = sys_prctl(PR_GET_PDEATHSIG, (unsigned long)&ti->pdeath_sig, 0, 0, 0);
+out:
 	return ret;
 }
 
@@ -167,7 +178,40 @@ static int dump_misc(struct parasite_dump_misc *args)
 
 static int dump_creds(struct parasite_dump_creds *args)
 {
-	int ret;
+	int ret, i, j;
+	struct cap_data data[_LINUX_CAPABILITY_U32S_3];
+	struct cap_header hdr = {_LINUX_CAPABILITY_VERSION_3, 0};
+
+	ret = sys_capget(&hdr, data);
+	if (ret < 0) {
+		pr_err("Unable to get capabilities: %d\n", ret);
+		return -1;
+	}
+
+	/*
+	 * Loop through the capability constants until we reach cap_last_cap.
+	 * The cap_bnd set is stored as a bitmask comprised of CR_CAP_SIZE number of
+	 * 32-bit uints, hence the inner loop from 0 to 32.
+	 */
+	for (i = 0; i < CR_CAP_SIZE; i++) {
+		args->cap_eff[i] = data[i].eff;
+		args->cap_prm[i] = data[i].prm;
+		args->cap_inh[i] = data[i].inh;
+		args->cap_bnd[i] = 0;
+
+		for (j = 0; j < 32; j++) {
+			if (j + i * 32 > args->cap_last_cap)
+				break;
+			ret = sys_prctl(PR_CAPBSET_READ, j + i * 32, 0, 0, 0);
+			if (ret < 0) {
+				pr_err("Unable to read capability %d: %d\n",
+					j + i * 32, ret);
+				return -1;
+			}
+			if (ret)
+				args->cap_bnd[i] |= (1 << j);
+		}
+	}
 
 	args->secbits = sys_prctl(PR_GET_SECUREBITS, 0, 0, 0, 0);
 
@@ -331,11 +375,21 @@ static int parasite_check_vdso_mark(struct parasite_vdso_vma_entry *args)
 	struct vdso_mark *m = (void *)args->start;
 
 	if (is_vdso_mark(m)) {
+		/*
+		 * Make sure we don't meet some corrupted entry
+		 * where signature matches but verions is not!
+		 */
+		if (m->version != VDSO_MARK_CUR_VERSION) {
+			pr_err("vdso: Mark version mismatch!\n");
+			return -EINVAL;
+		}
 		args->is_marked = 1;
-		args->proxy_addr = m->proxy_addr;
+		args->proxy_vdso_addr = m->proxy_vdso_addr;
+		args->proxy_vvar_addr = m->proxy_vvar_addr;
 	} else {
 		args->is_marked = 0;
-		args->proxy_addr = VDSO_BAD_ADDR;
+		args->proxy_vdso_addr = VDSO_BAD_ADDR;
+		args->proxy_vvar_addr = VVAR_BAD_ADDR;
 	}
 
 	return 0;
