@@ -377,10 +377,9 @@ static int validate_mounts(struct mount_info *info, bool for_dump)
 			/* root mount can be any */
 			continue;
 
-		if (m->parent->shared_id) {
+		if (m->parent->shared_id && !list_empty(&m->parent->mnt_share)) {
 			struct mount_info *ct;
-			if (list_empty(&m->parent->mnt_share))
-				continue;
+
 			t = list_first_entry(&m->parent->mnt_share, struct mount_info, mnt_share);
 
 			list_for_each_entry(ct, &t->children, siblings) {
@@ -902,19 +901,6 @@ uns:
 	return &fstypes[0];
 }
 
-static char *strip(char *opt)
-{
-	int len;
-
-	len = strlen(opt);
-	if (len > 1 && opt[len - 1] == ',')
-		opt[len - 1] = '\0';
-	if (opt[0] == ',')
-		opt++;
-
-	return opt;
-}
-
 static int dump_one_mountpoint(struct mount_info *pm, int fd)
 {
 	MntEntry me = MNT_ENTRY__INIT;
@@ -941,7 +927,7 @@ static int dump_one_mountpoint(struct mount_info *pm, int fd)
 	me.flags		= pm->flags;
 	me.mountpoint		= pm->mountpoint + 1;
 	me.source		= pm->source;
-	me.options		= strip(pm->options);
+	me.options		= pm->options;
 	me.shared_id		= pm->shared_id;
 	me.has_shared_id	= true;
 	me.master_id		= pm->master_id;
