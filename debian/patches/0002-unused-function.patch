@@ -7,7 +7,7 @@ Last-Update: 2014-07-30
 
 --- a/arch/x86/crtools.c
 +++ b/arch/x86/crtools.c
-@@ -32,12 +32,6 @@ const char code_syscall[] = {
+@@ -33,12 +33,6 @@ const char code_syscall[] = {
  
  const int code_syscall_size = round_up(sizeof(code_syscall), sizeof(long));
  
@@ -22,7 +22,7 @@ Last-Update: 2014-07-30
  	regs->ip = new_ip;
 --- a/cr-show.c
 +++ b/cr-show.c
-@@ -205,18 +205,6 @@ void show_collect_pstree(int fd, int col
+@@ -205,18 +205,6 @@ static void show_collect_pstree(struct c
  			collect ? pstree_handler : NULL, "*:%d");
  }
  
