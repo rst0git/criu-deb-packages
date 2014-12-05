@@ -162,17 +162,21 @@ void free_pstree(struct pstree_item *root_item)
 struct pstree_item *__alloc_pstree_item(bool rst)
 {
 	struct pstree_item *item;
+	int sz;
 
 	if (!rst) {
-		item = xzalloc(sizeof(*item));
+		sz = sizeof(*item) + sizeof(struct dmp_info);
+		item = xzalloc(sz);
 		if (!item)
 			return NULL;
 	} else {
-		item = shmalloc(sizeof(*item) + sizeof(item->rst[0]));
+		sz = sizeof(*item) + sizeof(struct rst_info);
+		item = shmalloc(sz);
 		if (!item)
 			return NULL;
-		memset(item, 0, sizeof(*item) + sizeof(item->rst[0]));
-		vm_area_list_init(&item->rst[0].vmas);
+
+		memset(item, 0, sz);
+		vm_area_list_init(&rsti(item)->vmas);
 	}
 
 	INIT_LIST_HEAD(&item->children);
@@ -183,6 +187,20 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 	item->born_sid = -1;
 
 	return item;
+}
+
+struct pstree_item *alloc_pstree_helper(void)
+{
+	struct pstree_item *ret;
+
+	ret = alloc_pstree_item_with_rst();
+	if (ret) {
+		ret->state = TASK_HELPER;
+		rsti(ret)->clone_flags = CLONE_FILES | CLONE_FS;
+		task_entries->nr_helpers++;
+	}
+
+	return ret;
 }
 
 /* Deep first search on children */
@@ -205,7 +223,7 @@ int dump_pstree(struct pstree_item *root_item)
 	struct pstree_item *item = root_item;
 	PstreeEntry e = PSTREE_ENTRY__INIT;
 	int ret = -1, i;
-	int pstree_fd;
+	struct cr_img *img;
 
 	pr_info("\n");
 	pr_info("Dumping pstree (pid: %d)\n", root_item->pid.real);
@@ -228,8 +246,8 @@ int dump_pstree(struct pstree_item *root_item)
 		}
 	}
 
-	pstree_fd = open_image(CR_FD_PSTREE, O_DUMP);
-	if (pstree_fd < 0)
+	img = open_image(CR_FD_PSTREE, O_DUMP);
+	if (!img)
 		return -1;
 
 	for_each_pstree_item(item) {
@@ -248,7 +266,7 @@ int dump_pstree(struct pstree_item *root_item)
 		for (i = 0; i < item->nr_threads; i++)
 			e.threads[i] = item->threads[i].virt;
 
-		ret = pb_write_one(pstree_fd, &e, PB_PSTREE);
+		ret = pb_write_one(img, &e, PB_PSTREE);
 		xfree(e.threads);
 
 		if (ret)
@@ -258,7 +276,7 @@ int dump_pstree(struct pstree_item *root_item)
 
 err:
 	pr_info("----------------------------------------\n");
-	close(pstree_fd);
+	close_image(img);
 	return ret;
 }
 
@@ -318,19 +336,20 @@ static int prepare_pstree_for_shell_job(void)
 
 static int read_pstree_image(void)
 {
-	int ret = 0, i, ps_fd, fd;
+	int ret = 0, i;
+	struct cr_img *img;
 	struct pstree_item *pi, *parent = NULL;
 
 	pr_info("Reading image tree\n");
 
-	ps_fd = open_image(CR_FD_PSTREE, O_RSTR);
-	if (ps_fd < 0)
-		return ps_fd;
+	img = open_image(CR_FD_PSTREE, O_RSTR);
+	if (!img)
+		return -1;
 
 	while (1) {
 		PstreeEntry *e;
 
-		ret = pb_read_one_eof(ps_fd, &e, PB_PSTREE);
+		ret = pb_read_one_eof(img, &e, PB_PSTREE);
 		if (ret <= 0)
 			break;
 
@@ -396,6 +415,7 @@ static int read_pstree_image(void)
 		for (i = 0; i < e->n_threads; i++) {
 			pi->threads[i].real = -1;
 			pi->threads[i].virt = e->threads[i];
+			max_pid = max((int)e->threads[i], max_pid);
 		}
 
 		task_entries->nr_threads += e->n_threads;
@@ -403,14 +423,19 @@ static int read_pstree_image(void)
 
 		pstree_entry__free_unpacked(e, NULL);
 
-		fd = open_image(CR_FD_IDS, O_RSTR, pi->pid.virt);
-		if (fd < 0) {
-			if (errno == ENOENT)
-				continue;
-			goto err;
-		}
-		ret = pb_read_one(fd, &pi->ids, PB_IDS);
-		close(fd);
+		{
+			struct cr_img *img;
+
+			img = open_image(CR_FD_IDS, O_RSTR, pi->pid.virt);
+			if (!img) {
+				if (errno == ENOENT)
+					continue;
+				goto err;
+			}
+			ret = pb_read_one(img, &pi->ids, PB_IDS);
+			close_image(img);
+			}
+
 		if (ret != 1)
 			goto err;
 
@@ -420,7 +445,7 @@ static int read_pstree_image(void)
 		}
 	}
 err:
-	close(ps_fd);
+	close_image(img);
 	return ret;
 }
 
@@ -447,16 +472,14 @@ static int prepare_pstree_ids(void)
 		if (item->sid == root_item->sid || item->sid == item->pid.virt)
 			continue;
 
-		helper = alloc_pstree_item_with_rst();
+		helper = alloc_pstree_helper();
 		if (helper == NULL)
 			return -1;
 		helper->sid = item->sid;
 		helper->pgid = item->sid;
 		helper->pid.virt = item->sid;
-		helper->state = TASK_HELPER;
 		helper->parent = root_item;
 		list_add_tail(&helper->sibling, &helpers);
-		task_entries->nr_helpers++;
 
 		pr_info("Add a helper %d for restoring SID %d\n",
 				helper->pid.virt, helper->sid);
@@ -555,7 +578,7 @@ static int prepare_pstree_ids(void)
 		}
 
 		if (gleader) {
-			item->rst->pgrp_leader = gleader;
+			rsti(item)->pgrp_leader = gleader;
 			continue;
 		}
 
@@ -567,17 +590,15 @@ static int prepare_pstree_ids(void)
 		if (current_pgid == item->pgid)
 			continue;
 
-		helper = alloc_pstree_item_with_rst();
+		helper = alloc_pstree_helper();
 		if (helper == NULL)
 			return -1;
 		helper->sid = item->sid;
 		helper->pgid = item->pgid;
 		helper->pid.virt = item->pgid;
-		helper->state = TASK_HELPER;
 		helper->parent = item;
 		list_add(&helper->sibling, &item->children);
-		task_entries->nr_helpers++;
-		item->rst->pgrp_leader = helper;
+		rsti(item)->pgrp_leader = helper;
 
 		pr_info("Add a helper %d for restoring PGID %d\n",
 				helper->pid.virt, helper->pgid);
@@ -603,6 +624,8 @@ static unsigned long get_clone_mask(TaskKobjIdsEntry *i,
 		mask |= CLONE_NEWUTS;
 	if (i->mnt_ns_id != p->mnt_ns_id)
 		mask |= CLONE_NEWNS;
+	if (i->user_ns_id != p->user_ns_id)
+		mask |= CLONE_NEWUSER;
 
 	return mask;
 }
@@ -661,7 +684,7 @@ static int prepare_pstree_kobj_ids(void)
 		}
 
 set_mask:
-		item->rst->clone_flags = cflags;
+		rsti(item)->clone_flags = cflags;
 		if (parent)
 			/*
 			 * Mount namespaces are setns()-ed at
@@ -669,7 +692,7 @@ set_mask:
 			 * no need in creating it with its own
 			 * temporary namespace
 			 */
-			item->rst->clone_flags &= ~CLONE_NEWNS;
+			rsti(item)->clone_flags &= ~CLONE_NEWNS;
 
 		cflags &= CLONE_ALLNS;
 

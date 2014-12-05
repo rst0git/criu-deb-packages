@@ -2,7 +2,7 @@
 #define __CR_PAGE_XFER__H__
 #include "page-read.h"
 
-extern int cr_page_server(bool daemon_mode);
+extern int cr_page_server(bool daemon_mode, int cfd);
 
 /*
  * page_xfer -- transfer pages into image file.
@@ -20,11 +20,18 @@ struct page_xfer {
 	void (*close)(struct page_xfer *self);
 
 	/* private data for every page-xfer engine */
-	int fd;
 	union {
-		int fd_pg;
-		u64 dst_id;
+		struct /* local */ {
+			struct cr_img *pmi; /* pagemaps */
+			struct cr_img *pi;  /* pages */
+		};
+
+		struct /* page-server */ {
+			int sk;
+			u64 dst_id;
+		};
 	};
+
 	struct page_read *parent;
 };
 
@@ -34,5 +41,7 @@ extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *,
 				unsigned long off);
 extern int connect_to_page_server(void);
 extern int disconnect_from_page_server(void);
+
+extern int check_parent_page_xfer(int fd_type, long id);
 
 #endif /* __CR_PAGE_XFER__H__ */

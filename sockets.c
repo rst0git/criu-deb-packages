@@ -21,10 +21,6 @@
 #include "net.h"
 #include "fs-magic.h"
 
-#ifndef NETLINK_SOCK_DIAG
-#define NETLINK_SOCK_DIAG NETLINK_INET_DIAG
-#endif
-
 #ifndef SOCK_DIAG_BY_FAMILY
 #define SOCK_DIAG_BY_FAMILY 20
 #endif
@@ -98,6 +94,41 @@ bool socket_test_collect_bit(unsigned int family, unsigned int proto)
 
 	nr = get_collect_bit_nr(family, proto);
 	return test_bit(nr, socket_cl_bits) != 0;
+}
+
+void preload_socket_modules()
+{
+	/*
+	 * If the task to dump (e.g. an LXC container) has any netlink
+	 * KOBJECT_UEVENT socket open and the _diag modules aren't
+	 * loaded is dumped, criu will freeze the task and then the
+	 * kernel will send it messages on the socket, and then we will
+	 * fail to dump because the socket has pending data. The Real
+	 * Solution is to dump this pending data, but we just modprobe
+	 * things beforehand for now so that the first dump doesn't
+	 * fail.
+	 *
+	 * We ignore failure since these could be compiled directly
+	 * in, instead of being kernel modules.
+	 */
+	char *modules[] = {
+		"netlink_diag",
+		"af_packet_diag",
+		"udp_diag",
+		"tcp_diag",
+		"unix_diag",
+		NULL,
+	};
+	int i;
+	char *args[2] = {
+		"modprobe",
+		NULL
+	};
+
+	for (i = 0; modules[i]; i++) {
+		args[1] = modules[i];
+		cr_system(-1, -1, -1, args[0], args);
+	}
 }
 
 static int dump_bound_dev(int sk, SkOptsEntry *soe)
@@ -439,7 +470,7 @@ void release_skopts(SkOptsEntry *soe)
 	xfree(soe->so_bound_dev);
 }
 
-int dump_socket(struct fd_parms *p, int lfd, const int fdinfo)
+int dump_socket(struct fd_parms *p, int lfd, struct cr_img *img)
 {
 	int family;
 	const struct fdtype_ops *ops;
@@ -468,7 +499,7 @@ int dump_socket(struct fd_parms *p, int lfd, const int fdinfo)
 		return -1;
 	}
 
-	return do_dump_gen_file(p, lfd, ops, fdinfo);
+	return do_dump_gen_file(p, lfd, ops, img);
 }
 
 static int inet_receive_one(struct nlmsghdr *h, void *arg)
@@ -515,26 +546,11 @@ static int do_collect_req(int nl, struct sock_diag_req *req, int size,
 	return tmp;
 }
 
-int collect_sockets(int pid)
+int collect_sockets(struct ns_id *ns)
 {
 	int err = 0, tmp;
-	int rst = -1;
-	int nl;
+	int nl = ns->net.nlsk;
 	struct sock_diag_req req;
-
-	if (root_ns_mask & CLONE_NEWNET) {
-		pr_info("Switching to %d's net for collecting sockets\n", pid);
-
-		if (switch_ns(pid, &net_ns_desc, &rst))
-			return -1;
-	}
-
-	nl = socket(PF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
-	if (nl < 0) {
-		pr_perror("Can't create sock diag socket");
-		err = -1;
-		goto out;
-	}
 
 	memset(&req, 0, sizeof(req));
 	req.hdr.nlmsg_len	= sizeof(req);
@@ -615,7 +631,7 @@ int collect_sockets(int pid)
 	tmp = do_collect_req(nl, &req, sizeof(req), packet_receive_one, NULL);
 	if (tmp) {
 		pr_warn("The current kernel doesn't support packet_diag\n");
-		if (pid == 0 || tmp != -ENOENT) /* Fedora 19 */
+		if (ns->pid == 0 || tmp != -ENOENT) /* Fedora 19 */
 			err = tmp;
 	}
 
@@ -625,16 +641,15 @@ int collect_sockets(int pid)
 	tmp = do_collect_req(nl, &req, sizeof(req), netlink_receive_one, NULL);
 	if (tmp) {
 		pr_warn("The current kernel doesn't support netlink_diag\n");
-		if (pid == 0 || tmp != -ENOENT) /* Fedora 19 */
+		if (ns->pid == 0 || tmp != -ENOENT) /* Fedora 19 */
 			err = tmp;
 	}
 
+	/* don't need anymore */
 	close(nl);
-out:
-	if (rst >= 0) {
-		if (restore_ns(rst, &net_ns_desc) < 0)
-			err = -1;
-	} else if (pid != 0) {
+	ns->net.nlsk = -1;
+
+	if (ns->pid == getpid()) {
 		/*
 		 * If netns isn't dumped, criu will fail only
 		 * if an unsupported socket will be really dumped.

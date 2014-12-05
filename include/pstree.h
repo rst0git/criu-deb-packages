@@ -28,15 +28,28 @@ struct pstree_item {
 	struct pid		*threads;	/* array of threads */
 	CoreEntry		**core;
 	TaskKobjIdsEntry	*ids;
-
-	struct rst_info		rst[0];
 };
 
-static inline int shared_fdtable(struct pstree_item *item) {
-	return (item->parent && item->parent->state != TASK_HELPER &&
-		item->ids &&
-		item->parent->ids &&
-		item->ids->files_id &&
+/* See alloc_pstree_item() for details */
+static inline struct rst_info *rsti(struct pstree_item *i)
+{
+	return (struct rst_info *)(i + 1);
+}
+
+struct ns_id;
+struct dmp_info {
+	struct ns_id *netns;
+};
+
+static inline struct dmp_info *dmpi(struct pstree_item *i)
+{
+	return (struct dmp_info *)(i + 1);
+}
+
+/* ids is alocated and initialized for all alive tasks */
+static inline int shared_fdtable(struct pstree_item *item)
+{
+	return (item->parent &&
 		item->ids->files_id == item->parent->ids->files_id);
 }
 
@@ -49,6 +62,7 @@ extern void free_pstree(struct pstree_item *root_item);
 extern struct pstree_item *__alloc_pstree_item(bool rst);
 #define alloc_pstree_item() __alloc_pstree_item(false)
 #define alloc_pstree_item_with_rst() __alloc_pstree_item(true)
+extern struct pstree_item *alloc_pstree_helper(void);
 
 extern struct pstree_item *root_item;
 extern struct pstree_item *pstree_item_next(struct pstree_item *item);

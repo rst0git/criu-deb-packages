@@ -5,7 +5,7 @@
 #include <sys/ioctl.h>
 
 #include "cr_options.h"
-#include "fdset.h"
+#include "imgset.h"
 #include "protobuf.h"
 #include "cr-show.h"
 #include "string.h"
@@ -266,7 +266,8 @@ static struct tun_link *get_tun_link_fd(char *name, unsigned flags)
 
 static int dump_tunfile(int lfd, u32 id, const struct fd_parms *p)
 {
-	int ret, img = fdset_fd(glob_fdset, CR_FD_TUNFILE);
+	int ret;
+	struct cr_img *img;
 	TunfileEntry tfe = TUNFILE_ENTRY__INIT;
 	struct ifreq ifr;
 
@@ -305,11 +306,12 @@ static int dump_tunfile(int lfd, u32 id, const struct fd_parms *p)
 			return -1;
 	}
 
+	img = img_from_set(glob_imgset, CR_FD_TUNFILE);
 	return pb_write_one(img, &tfe, PB_TUNFILE);
 }
 
 const struct fdtype_ops tunfile_dump_ops = {
-	.type = FD_TYPES__TUN,
+	.type = FD_TYPES__TUNF,
 	.dump = dump_tunfile,
 };
 
@@ -374,7 +376,7 @@ err:
 }
 
 static struct file_desc_ops tunfile_desc_ops = {
-	.type = FD_TYPES__TUN,
+	.type = FD_TYPES__TUNF,
 	.open = tunfile_open,
 };
 
@@ -398,7 +400,7 @@ struct collect_image_info tunfile_cinfo = {
 	.flags = COLLECT_OPTIONAL,
 };
 
-int dump_tun_link(NetDeviceEntry *nde, struct cr_fdset *fds)
+int dump_tun_link(NetDeviceEntry *nde, struct cr_imgset *fds)
 {
 	TunLinkEntry tle = TUN_LINK_ENTRY__INIT;
 	char spath[64];

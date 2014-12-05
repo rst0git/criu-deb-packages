@@ -26,6 +26,7 @@ enum {
 	 */
 	CR_FD_UTSNS,
 	CR_FD_MNTS,
+	CR_FD_USERNS,
 
 	_CR_FD_IPCNS_FROM,
 	CR_FD_IPC_VAR,
@@ -65,12 +66,9 @@ enum {
 	CR_FD_REMAP_FPATH,
 	CR_FD_EVENTFD_FILE,
 	CR_FD_EVENTPOLL_FILE,
-	CR_FD_EVENTPOLL_TFD,
 	CR_FD_SIGNALFD,
 	CR_FD_INOTIFY_FILE,
-	CR_FD_INOTIFY_WD,
 	CR_FD_FANOTIFY_FILE,
-	CR_FD_FANOTIFY_MARK,
 	CR_FD_TUNFILE,
 	CR_FD_CGROUP,
 	CR_FD_TIMERFD,
@@ -90,9 +88,13 @@ enum {
 	CR_FD_FILE_LOCKS_PID,
 
 	CR_FD_IRMAP_CACHE,
+	CR_FD_CPUINFO,
 
 	CR_FD_SIGNAL,
 	CR_FD_PSIGNAL,
+	CR_FD_INOTIFY_WD,
+	CR_FD_FANOTIFY_MARK,
+	CR_FD_EVENTPOLL_TFD,
 
 	CR_FD_MAX
 };
@@ -101,8 +103,9 @@ enum {
 struct cr_fd_desc_tmpl {
 	const char	*fmt;			/* format for the name */
 	u32		magic;			/* magic in the header */
+	int		oflags;			/* flags for image_open */
 };
 
-extern struct cr_fd_desc_tmpl fdset_template[CR_FD_MAX];
+extern struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX];
 
 #endif /* __CR_IMAGE_DESC_H__ */

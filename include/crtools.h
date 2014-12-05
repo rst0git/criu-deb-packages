@@ -7,7 +7,7 @@
 #include "asm/types.h"
 #include "servicefd.h"
 
-#define CR_FD_PERM		(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH)
+#define CR_FD_PERM		(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 
 extern int check_img_inventory(void);
 extern int write_img_inventory(void);
@@ -29,5 +29,6 @@ struct proc_status_creds;
 extern bool may_dump(struct proc_status_creds *);
 struct _CredsEntry;
 extern bool may_restore(struct _CredsEntry *);
+extern bool cr_user_is_root(void);
 
 #endif /* __CR_CRTOOLS_H__ */

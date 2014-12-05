@@ -2,9 +2,12 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <stdlib.h>
+#include <sys/prctl.h>
+#include <grp.h>
+
 #include "cr-show.h"
 #include "util.h"
-#include "fdset.h"
+#include "imgset.h"
 #include "syscall.h"
 #include "uts_ns.h"
 #include "ipc_ns.h"
@@ -15,6 +18,7 @@
 
 #include "protobuf.h"
 #include "protobuf/ns.pb-c.h"
+#include "protobuf/userns.pb-c.h"
 
 static struct ns_desc *ns_desc_array[] = {
 	&net_ns_desc,
@@ -66,8 +70,7 @@ int switch_ns(int pid, struct ns_desc *nd, int *rst)
 	int nsfd;
 	int ret = -1;
 
-	snprintf(buf, sizeof(buf), "/proc/%d/ns/%s", pid, nd->str);
-	nsfd = open(buf, O_RDONLY);
+	nsfd = open_proc(pid, "ns/%s", nd->str);
 	if (nsfd < 0) {
 		pr_perror("Can't open ipcns file");
 		goto err_ns;
@@ -117,19 +120,25 @@ struct ns_id *ns_ids = NULL;
 static unsigned int ns_next_id = 1;
 unsigned long root_ns_mask = 0;
 
+static void nsid_add(struct ns_id *ns, struct ns_desc *nd, unsigned int id, pid_t pid)
+{
+	ns->nd = nd;
+	ns->id = id;
+	ns->pid = pid;
+	ns->next = ns_ids;
+	ns_ids = ns;
+
+	pr_info("Add %s ns %d pid %d\n", nd->str, ns->id, ns->pid);
+}
+
 struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd)
 {
 	struct ns_id *nsid;
 
 	nsid = shmalloc(sizeof(*nsid));
 	if (nsid) {
-		nsid->nd = nd;
-		nsid->id = id;
-		nsid->pid = pid;
-		futex_set(&nsid->created, 0);
-
-		nsid->next = ns_ids;
-		ns_ids = nsid;
+		nsid_add(nsid, nd, id, pid);
+		futex_set(&nsid->ns_created, 0);
 	}
 
 	return nsid;
@@ -139,31 +148,29 @@ int rst_add_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd)
 {
 	struct ns_id *nsid;
 
-	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
-		if (nsid->id == id) {
-			if (pid_rst_prio(pid, nsid->pid))
-				nsid->pid = pid;
-			return 0;
-		}
+	nsid = lookup_ns_by_id(id, nd);
+	if (nsid) {
+		if (pid_rst_prio(pid, nsid->pid))
+			nsid->pid = pid;
+		return 0;
 	}
 
 	nsid = rst_new_ns_id(id, pid, nd);
 	if (nsid == NULL)
 		return -1;
 
-	pr_info("Add namespace %d pid %d\n", nsid->id, nsid->pid);
 	return 0;
 }
 
-static unsigned int lookup_ns_id(unsigned int kid, struct ns_desc *nd)
+static struct ns_id *lookup_ns_by_kid(unsigned int kid, struct ns_desc *nd)
 {
 	struct ns_id *nsid;
 
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next)
 		if (nsid->kid == kid && nsid->nd == nd)
-			return nsid->id;
+			return nsid;
 
-	return 0;
+	return NULL;
 }
 
 struct ns_id *lookup_ns_by_id(unsigned int id, struct ns_desc *nd)
@@ -177,14 +184,54 @@ struct ns_id *lookup_ns_by_id(unsigned int id, struct ns_desc *nd)
 	return NULL;
 }
 
-static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd)
+/*
+ * For all namespaces we support, there are two supported
+ * tasks-to-namespaces layout.
+ *
+ * If root task lives in the same namespace as criu does
+ * all other tasks should live in it too and we do NOT dump
+ * this namespace. On restore tasks inherit the respective
+ * namespace from criu.
+ *
+ * If root task lives in its own namespace, then all other
+ * tasks may live in it. Sometimes (CLONE_SUBNS) there can
+ * be more than one namespace of that type. For this case
+ * we dump all namespace's info and recreate them on restore.
+ */
+
+int walk_namespaces(struct ns_desc *nd, int (*cb)(struct ns_id *, void *), void *oarg)
 {
-	unsigned int id;
+	int ret = 0;
+	struct ns_id *ns;
+
+	for (ns = ns_ids; ns != NULL; ns = ns->next) {
+		if (ns->nd != nd)
+			continue;
+
+		if (ns->pid == getpid()) {
+			if (root_ns_mask & nd->cflag)
+				continue;
+
+			ret = cb(ns, oarg);
+			break;
+		}
+
+		ret = cb(ns, oarg);
+		if (ret)
+			break;
+	}
+
+	return ret;
+}
+
+static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd,
+		struct ns_id **ns_ret)
+{
 	struct ns_id *nsid;
 
-	id = lookup_ns_id(kid, nd);
-	if (id)
-		return id;
+	nsid = lookup_ns_by_kid(kid, nd);
+	if (nsid)
+		goto found;
 
 	if (pid != getpid()) {
 		if (pid == root_item->pid.real) {
@@ -202,19 +249,16 @@ static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd
 	if (!nsid)
 		return 0;
 
-	nsid->id = ns_next_id++;
 	nsid->kid = kid;
-	nsid->nd = nd;
-	nsid->next = ns_ids;
-	nsid->pid = pid;
-	ns_ids = nsid;
+	nsid_add(nsid, nd, ns_next_id++, pid);
 
-	pr_info("Collected %u.%s namespace\n", nsid->id, nd->str);
-
+found:
+	if (ns_ret)
+		*ns_ret = nsid;
 	return nsid->id;
 }
 
-static unsigned int get_ns_id(int pid, struct ns_desc *nd)
+static unsigned int __get_ns_id(int pid, struct ns_desc *nd, struct ns_id **ns)
 {
 	int proc_dir, ret;
 	unsigned int kid;
@@ -225,37 +269,49 @@ static unsigned int get_ns_id(int pid, struct ns_desc *nd)
 		return 0;
 
 	sprintf(ns_path, "ns/%s", nd->str);
-	ret = readlinkat(proc_dir, ns_path, ns_id, sizeof(ns_id));
+	ret = readlinkat(proc_dir, ns_path, ns_id, sizeof(ns_id) - 1);
 	if (ret < 0) {
+		if (errno == ENOENT) {
+			/* The namespace is unsupported */
+			kid = 0;
+			goto out;
+		}
 		pr_perror("Can't readlink ns link");
 		return 0;
 	}
+	ns_id[ret] = '\0';
 
 	kid = parse_ns_link(ns_id, ret, nd);
 	BUG_ON(!kid);
 
-	return generate_ns_id(pid, kid, nd);
+out:
+	return generate_ns_id(pid, kid, nd, ns);
+}
+
+static unsigned int get_ns_id(int pid, struct ns_desc *nd)
+{
+	return __get_ns_id(pid, nd, NULL);
 }
 
 int dump_one_ns_file(int lfd, u32 id, const struct fd_parms *p)
 {
-	int fd = fdset_fd(glob_fdset, CR_FD_NS_FILES);
+	struct cr_img *img = img_from_set(glob_imgset, CR_FD_NS_FILES);
 	NsFileEntry nfe = NS_FILE_ENTRY__INIT;
 	struct fd_link *link = p->link;
-	unsigned int nsid;
+	struct ns_id *nsid;
 
-	nsid = lookup_ns_id(link->ns_kid, link->ns_d);
+	nsid = lookup_ns_by_kid(link->ns_kid, link->ns_d);
 	if (!nsid) {
 		pr_err("No NS ID with kid %u\n", link->ns_kid);
 		return -1;
 	}
 
 	nfe.id		= id;
-	nfe.ns_id	= nsid;
+	nfe.ns_id	= nsid->id;
 	nfe.ns_cflag	= link->ns_d->cflag;
 	nfe.flags	= p->flags;
 
-	return pb_write_one(fd, &nfe, PB_NS_FILE);
+	return pb_write_one(img, &nfe, PB_NS_FILE);
 }
 
 const struct fdtype_ops nsfile_dump_ops = {
@@ -351,6 +407,28 @@ struct collect_image_info nsfile_cinfo = {
 	.flags = COLLECT_OPTIONAL,
 };
 
+/*
+ * Same as dump_task_ns_ids(), but
+ * a) doesn't keep IDs (don't need them)
+ * b) generates them for mount and netns only
+ *    mnt ones are needed for open_mount() in
+ *    inotify pred-dump
+ *    net ones are needed for parasite socket
+ */
+
+int predump_task_ns_ids(struct pstree_item *item)
+{
+	int pid = item->pid.real;
+
+	if (!__get_ns_id(pid, &net_ns_desc, &dmpi(item)->netns))
+		return -1;
+
+	if (!get_ns_id(pid, &mnt_ns_desc))
+		return -1;
+
+	return 0;
+}
+
 int dump_task_ns_ids(struct pstree_item *item)
 {
 	int pid = item->pid.real;
@@ -364,7 +442,7 @@ int dump_task_ns_ids(struct pstree_item *item)
 	}
 
 	ids->has_net_ns_id = true;
-	ids->net_ns_id = get_ns_id(pid, &net_ns_desc);
+	ids->net_ns_id = __get_ns_id(pid, &net_ns_desc, &dmpi(item)->netns);
 	if (!ids->net_ns_id) {
 		pr_err("Can't make netns id\n");
 		return -1;
@@ -391,60 +469,258 @@ int dump_task_ns_ids(struct pstree_item *item)
 		return -1;
 	}
 
+	ids->has_user_ns_id = true;
+	ids->user_ns_id = get_ns_id(pid, &user_ns_desc);
+	if (!ids->user_ns_id) {
+		pr_err("Can't make userns id\n");
+		return -1;
+	}
+
 	return 0;
 }
 
-static int gen_ns_ids(int pid)
+static UsernsEntry userns_entry = USERNS_ENTRY__INIT;
+
+static int userns_id(int id, UidGidExtent **map, int n)
 {
-	/* needed for mntns_get_root_fd */
-	if (!get_ns_id(pid, &mnt_ns_desc))
+	int i;
+
+	if (!(root_ns_mask & CLONE_NEWUSER))
+		return id;
+
+	for (i = 0; i < n; i++) {
+		if (map[i]->lower_first <= id &&
+		    map[i]->lower_first + map[i]->count > id)
+			return map[i]->first + (id - map[i]->lower_first);
+	}
+
+	return -1;
+}
+
+int userns_uid(int uid)
+{
+	UsernsEntry *e = &userns_entry;
+	return userns_id(uid, e->uid_map, e->n_uid_map);
+}
+
+int userns_gid(int gid)
+{
+	UsernsEntry *e = &userns_entry;
+	return userns_id(gid, e->gid_map, e->n_gid_map);
+}
+
+static int parse_id_map(pid_t pid, char *name, UidGidExtent ***pb_exts)
+{
+	UidGidExtent *extents = NULL;
+	int len = 0, size = 0, ret, i;
+	FILE *f;
+
+	f = fopen_proc(pid, "%s", name);
+	if (f == NULL)
 		return -1;
+
+	ret = -1;
+	while (1) {
+		UidGidExtent *ext;
+
+		if (len == size) {
+			UidGidExtent *t;
+
+			size = size * 2 + 1;
+			t = xrealloc(extents, size * sizeof(UidGidExtent));
+			if (t == NULL)
+				break;
+			extents = t;
+		}
+
+		ext = &extents[len];
+
+		uid_gid_extent__init(ext);
+		ret = fscanf(f, "%d %d %d", &ext->first,
+				&ext->lower_first, &ext->count);
+		if (ret != 3) {
+			if (errno != 0) {
+				pr_perror("Unable to parse extents");
+				ret = -1;
+			} else
+				ret = 0;
+			break;
+		}
+		pr_info("id_map: %d %d %d\n", ext->first, ext->lower_first, ext->count);
+		len++;
+	}
+
+	fclose(f);
+
+	if (ret)
+		goto err;
+
+	if (len) {
+		*pb_exts = xmalloc(sizeof(UidGidExtent *) * len);
+		if (*pb_exts == NULL)
+			goto err;
+
+		for (i = 0; i < len; i++)
+			(*pb_exts)[i] = &extents[i];
+	} else {
+		xfree(extents);
+		*pb_exts = NULL;
+	}
+
+	return len;
+err:
+	xfree(extents);
+	return -1;
+}
+
+int collect_user_ns(struct ns_id *ns, void *oarg)
+{
+	/*
+	 * User namespace is dumped before files to get uid and gid
+	 * mappings, which are used for convirting local id-s to
+	 * userns id-s (userns_uid(), userns_gid())
+	 */
+	if (dump_user_ns(root_item->pid.real, root_item->ids->user_ns_id))
+		return -1;
+
 	return 0;
 }
 
-/*
- * We use ns_mask in various places to check whether
- * the tasks we dump live in namespaces or not. The
- * mask generation is tied with dumping inventory and
- * tasks' images, which is not needed for pre-dump.
- * This routine generates a mask for pre-dump.
- */
-int gen_predump_ns_mask(void)
+int collect_user_namespaces(bool for_dump)
 {
-	BUG_ON(root_ns_mask);
+	if (!for_dump)
+		return 0;
 
-	if (gen_ns_ids(getpid()))
-		return -1;
-	if (gen_ns_ids(root_item->pid.real))
-		return -1;
+	if (!(root_ns_mask & CLONE_NEWUSER))
+		return 0;
 
-	pr_info("NS mask generated: %lx\n", root_ns_mask);
+	return walk_namespaces(&net_ns_desc, collect_user_ns, NULL);
+}
+
+static int check_user_ns(int pid)
+{
+	int status;
+	pid_t chld;
+
+	chld = fork();
+	if (chld == -1) {
+		pr_perror("Unable to fork a process\n");
+		return -1;
+	}
+
+	if (chld == 0) {
+		/*
+		 * Check that we are able to enter into other namespaces
+		 * from the target userns namespace. This signs that these
+		 * namespaces were created from the target userns.
+		 */
+
+		if (switch_ns(pid, &user_ns_desc, NULL))
+			exit(-1);
+
+		if ((root_ns_mask & CLONE_NEWNET) &&
+		    switch_ns(pid, &net_ns_desc, NULL))
+			exit(-1);
+		if ((root_ns_mask & CLONE_NEWUTS) &&
+		    switch_ns(pid, &uts_ns_desc, NULL))
+			exit(-1);
+		if ((root_ns_mask & CLONE_NEWIPC) &&
+		    switch_ns(pid, &ipc_ns_desc, NULL))
+			exit(-1);
+		if ((root_ns_mask & CLONE_NEWNS) &&
+		    switch_ns(pid, &mnt_ns_desc, NULL))
+			exit(-1);
+		exit(0);
+	}
+
+	if (waitpid(chld, &status, 0) != chld) {
+		pr_perror("Unable to wait the %d process", pid);
+		return -1;
+	}
+
+	if (status) {
+		pr_err("One or more namespaces doesn't belong to the target user namespace\n");
+		return -1;
+	}
+
 	return 0;
+}
+
+int dump_user_ns(pid_t pid, int ns_id)
+{
+	int ret, exit_code = -1;
+	UsernsEntry *e = &userns_entry;
+	struct cr_img *img;
+
+	if (check_user_ns(pid))
+		return -1;
+
+	ret = parse_id_map(pid, "uid_map", &e->uid_map);
+	if (ret < 0)
+		goto err;
+	e->n_uid_map = ret;
+
+	ret = parse_id_map(pid, "gid_map", &e->gid_map);
+	if (ret < 0)
+		goto err;
+	e->n_gid_map = ret;
+
+	img = open_image(CR_FD_USERNS, O_DUMP, ns_id);
+	if (!img)
+		goto err;
+	ret = pb_write_one(img, e, PB_USERNS);
+	close_image(img);
+	if (ret < 0)
+		goto err;
+
+	return 0;
+err:
+	if (e->uid_map) {
+		xfree(e->uid_map[0]);
+		xfree(e->uid_map);
+	}
+	if (e->gid_map) {
+		xfree(e->gid_map[0]);
+		xfree(e->gid_map);
+	}
+	return exit_code;
+}
+
+void free_userns_maps()
+{
+	if (userns_entry.n_uid_map > 0) {
+		xfree(userns_entry.uid_map[0]);
+		xfree(userns_entry.uid_map);
+	}
+	if (userns_entry.n_gid_map > 0) {
+		xfree(userns_entry.gid_map[0]);
+		xfree(userns_entry.gid_map);
+	}
 }
 
 static int do_dump_namespaces(struct ns_id *ns)
 {
-	int ret = -1;
+	int ret;
+
+	ret = switch_ns(ns->pid, ns->nd, NULL);
+	if (ret)
+		return ret;
 
 	switch (ns->nd->cflag) {
-	case CLONE_NEWPID:
-	case CLONE_NEWNS:
-		ret = 0;
-		break;
 	case CLONE_NEWUTS:
 		pr_info("Dump UTS namespace %d via %d\n",
 				ns->id, ns->pid);
-		ret = dump_uts_ns(ns->pid, ns->id);
+		ret = dump_uts_ns(ns->id);
 		break;
 	case CLONE_NEWIPC:
 		pr_info("Dump IPC namespace %d via %d\n",
 				ns->id, ns->pid);
-		ret = dump_ipc_ns(ns->pid, ns->id);
+		ret = dump_ipc_ns(ns->id);
 		break;
 	case CLONE_NEWNET:
 		pr_info("Dump NET namespace info %d via %d\n",
 				ns->id, ns->pid);
-		ret = dump_net_ns(ns->pid, ns->id);
+		ret = dump_net_ns(ns->id);
 		break;
 	default:
 		pr_err("Unknown namespace flag %x", ns->nd->cflag);
@@ -459,7 +735,7 @@ int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 {
 	struct pid *ns_pid = &item->pid;
 	struct ns_id *ns;
-	int pid, status;
+	int pid, nr = 0;
 	int ret = 0;
 
 	/*
@@ -485,6 +761,16 @@ int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 		if (ns->pid == getpid())
 			continue;
 
+		switch (ns->nd->cflag) {
+			/* No data for pid namespaces to dump */
+			case CLONE_NEWPID:
+			/* Dumped explicitly with dump_mnt_namespaces() */
+			case CLONE_NEWNS:
+			/* Userns is dumped before dumping tasks */
+			case CLONE_NEWUSER:
+				continue;
+		}
+
 		pid = fork();
 		if (pid < 0) {
 			pr_perror("Can't fork ns dumper");
@@ -496,8 +782,14 @@ int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 			exit(ret);
 		}
 
-		ret = waitpid(pid, &status, 0);
-		if (ret != pid) {
+		nr++;
+	}
+
+	while (nr > 0) {
+		int status;
+
+		ret = waitpid(-1, &status, 0);
+		if (ret < 0) {
 			pr_perror("Can't wait ns dumper");
 			return -1;
 		}
@@ -506,9 +798,104 @@ int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 			pr_err("Namespaces dumping finished with error %d\n", status);
 			return -1;
 		}
+
+		nr--;
 	}
 
 	pr_info("Namespaces dump complete\n");
+	return 0;
+}
+
+static int write_id_map(pid_t pid, UidGidExtent **extents, int n, char *id_map)
+{
+	char buf[PAGE_SIZE];
+	int off = 0, i;
+	int fd;
+
+	/*
+	 *  We can perform only a single write (that may contain multiple
+	 *  newline-delimited records) to a uid_map and a gid_map files.
+	 */
+	for (i = 0; i < n; i++)
+		off += snprintf(buf + off, sizeof(buf) - off,
+				"%d %d %d\n", extents[i]->first,
+					extents[i]->lower_first,
+					extents[i]->count);
+
+	fd = open_proc_rw(pid, "%s", id_map);
+	if (fd < 0)
+		return -1;
+	if (write(fd, buf, off) != off) {
+		pr_perror("Unable to write into %s\n", id_map);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	return 0;
+}
+
+int prepare_userns(struct pstree_item *item)
+{
+	struct cr_img *img;
+	UsernsEntry *e;
+	int ret;
+
+	img = open_image(CR_FD_USERNS, O_RSTR, item->ids->user_ns_id);
+	if (!img)
+		return -1;
+	ret = pb_read_one(img, &e, PB_USERNS);
+	close_image(img);
+	if (ret < 0)
+		return -1;
+
+	if (write_id_map(item->pid.real, e->uid_map, e->n_uid_map, "uid_map"))
+		return -1;
+
+	if (write_id_map(item->pid.real, e->gid_map, e->n_gid_map, "gid_map"))
+		return -1;
+
+	return 0;
+}
+
+int collect_namespaces(bool for_dump)
+{
+	int ret;
+
+	ret = collect_mnt_namespaces(for_dump);
+	if (ret < 0)
+		return ret;
+
+	ret = collect_net_namespaces(for_dump);
+	if (ret < 0)
+		return ret;
+
+	ret = collect_user_namespaces(for_dump);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+static int prepare_userns_creds()
+{
+	/* UID and GID must be set after restoring /proc/PID/{uid,gid}_maps */
+	if (setuid(0) || setgid(0) || setgroups(0, NULL)) {
+		pr_perror("Unable to initialize id-s");
+		return -1;
+	}
+
+	/*
+	 * This flag is dropped after entering userns, but is
+	 * required to access files in /proc, so put one here
+	 * temoprarily. It will be set to proper value at the
+	 * very end.
+	 */
+	if (prctl(PR_SET_DUMPABLE, 1, 0)) {
+		pr_perror("Unable to set PR_SET_DUMPABLE");
+		exit(1);
+	}
+
 	return 0;
 }
 
@@ -519,6 +906,9 @@ int prepare_namespace(struct pstree_item *item, unsigned long clone_flags)
 
 	pr_info("Restoring namespaces %d flags 0x%lx\n",
 			item->pid.virt, clone_flags);
+
+	if ((clone_flags & CLONE_NEWUSER) && prepare_userns_creds())
+		return -1;
 
 	/*
 	 * On netns restore we launch an IP tool, thus we
@@ -548,60 +938,59 @@ int prepare_namespace(struct pstree_item *item, unsigned long clone_flags)
 
 int try_show_namespaces(int ns_pid)
 {
-	struct cr_fdset *fdset;
-	int i, fd, ret;
+	struct cr_imgset *imgset;
+	int i, ret;
+	struct cr_img *img;
 	TaskKobjIdsEntry *ids;
 
 	pr_msg("Namespaces for %d:\n", ns_pid);
 
-	fd = open_image(CR_FD_IDS, O_RSTR, ns_pid);
-	if (fd < 0)
+	img = open_image(CR_FD_IDS, O_RSTR, ns_pid);
+	if (!img)
 		return -1;
-	ret = pb_read_one(fd, &ids, PB_IDS);
-	close(fd);
+	ret = pb_read_one(img, &ids, PB_IDS);
+	close_image(img);
 	if (ret < 0)
 		return -1;
 
-	fdset = cr_fdset_open(ids->net_ns_id, NETNS, O_SHOW);
-	if (fdset) {
+	imgset = cr_imgset_open(ids->net_ns_id, NETNS, O_SHOW);
+	if (imgset) {
 		pr_msg("-------------------NETNS---------------------\n");
 		for (i = _CR_FD_NETNS_FROM + 1; i < _CR_FD_NETNS_TO; i++) {
-			int fd;
-
-			fd = fdset_fd(fdset, i);
-			if (fd == -1)
+			img = img_from_set(imgset, i);
+			if (!img)
 				continue;
 
-			cr_parse_fd(fd, fdset_template[i].magic);
+			cr_parse_fd(img, imgset_template[i].magic);
 		}
-		close_cr_fdset(&fdset);
+		close_cr_imgset(&imgset);
 	}
 
-	fdset = cr_fdset_open(ids->ipc_ns_id, IPCNS, O_SHOW);
-	if (fdset) {
+	imgset = cr_imgset_open(ids->ipc_ns_id, IPCNS, O_SHOW);
+	if (imgset) {
 		pr_msg("-------------------IPCNS---------------------\n");
 		for (i = _CR_FD_IPCNS_FROM + 1; i < _CR_FD_IPCNS_TO; i++) {
-			fd = fdset_fd(fdset, i);
-			if (fd == -1)
+			img = img_from_set(imgset, i);
+			if (!img)
 				continue;
 
-			cr_parse_fd(fd, fdset_template[i].magic);
+			cr_parse_fd(img, imgset_template[i].magic);
 		}
-		close_cr_fdset(&fdset);
+		close_cr_imgset(&imgset);
 	}
 
-	fd = open_image(CR_FD_UTSNS, O_SHOW, ids->uts_ns_id);
-	if (fd >= 0) {
+	img = open_image(CR_FD_UTSNS, O_SHOW, ids->uts_ns_id);
+	if (img) {
 		pr_msg("-------------------UTSNS---------------------\n");
-		cr_parse_fd(fd, fdset_template[CR_FD_UTSNS].magic);
-		close(fd);
+		cr_parse_fd(img, imgset_template[CR_FD_UTSNS].magic);
+		close_image(img);
 	}
 
-	fd = open_image(CR_FD_MNTS, O_SHOW, ids->mnt_ns_id);
-	if (fd > 0) {
+	img = open_image(CR_FD_MNTS, O_SHOW, ids->mnt_ns_id);
+	if (img) {
 		pr_msg("-------------------MNTNS---------------------\n");
-		cr_parse_fd(fd, fdset_template[CR_FD_MNTS].magic);
-		close(fd);
+		cr_parse_fd(img, imgset_template[CR_FD_MNTS].magic);
+		close_image(img);
 	}
 
 	pr_msg("---[ end of %d namespaces ]---\n", ns_pid);

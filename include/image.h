@@ -8,6 +8,8 @@
 #include "image-desc.h"
 #include "fcntl.h"
 #include "magic.h"
+#include "bfd.h"
+#include "bug.h"
 
 #define PAGE_IMAGE_SIZE	4096
 #define PAGE_RSS	1
@@ -69,18 +71,42 @@
 extern bool fdinfo_per_id;
 extern bool ns_per_id;
 
-#define O_DUMP	(O_RDWR | O_CREAT | O_TRUNC)
-#define O_SHOW	(O_RDONLY)
-#define O_RSTR	(O_RDONLY)
 #define O_OPT	(O_PATH)
+#define O_NOBUF	(O_DIRECT)
+
+#define O_DUMP	(O_RDWR | O_CREAT | O_TRUNC)
+#define O_SHOW	(O_RDONLY | O_NOBUF)
+#define O_RSTR	(O_RDONLY)
+
+struct cr_img {
+	struct bfd _x;
+};
+
+static inline int img_raw_fd(struct cr_img *img)
+{
+	BUG_ON(bfd_buffered(&img->_x));
+	return img->_x.fd;
+}
 
 extern int open_image_dir(char *dir);
 extern void close_image_dir(void);
 
-extern int open_image_at(int dfd, int type, unsigned long flags, ...);
+extern struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...);
 #define open_image(typ, flags, ...) open_image_at(get_service_fd(IMG_FD_OFF), typ, flags, ##__VA_ARGS__)
-extern int open_pages_image(unsigned long flags, int pm_fd);
-extern int open_pages_image_at(int dfd, unsigned long flags, int pm_fd);
+extern struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi);
+extern struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi);
 extern void up_page_ids_base(void);
+
+extern struct cr_img *img_from_fd(int fd); /* for cr-show mostly */
+
+extern int write_img_buf(struct cr_img *, const void *ptr, int size);
+#define write_img(img, ptr)	write_img_buf((img), (ptr), sizeof(*(ptr)))
+extern int read_img_buf_eof(struct cr_img *, void *ptr, int size);
+#define read_img_eof(img, ptr)	read_img_buf_eof((img), (ptr), sizeof(*(ptr)))
+extern int read_img_buf(struct cr_img *, void *ptr, int size);
+#define read_img(img, ptr)	read_img_buf((img), (ptr), sizeof(*(ptr)))
+extern int read_img_str(struct cr_img *, char **pstr, int size);
+
+extern void close_image(struct cr_img *);
 
 #endif /* __CR_IMAGE_H__ */

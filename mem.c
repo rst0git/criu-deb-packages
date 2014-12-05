@@ -29,7 +29,7 @@ static int task_reset_dirty_track(int pid)
 	if (!opts.track_mem)
 		return 0;
 
-	BUG_ON(!kerndat_has_dirty_track);
+	BUG_ON(!kdat.has_dirty_track);
 
 	return do_task_reset_dirty_track(pid);
 }
@@ -92,7 +92,7 @@ static inline bool should_dump_page(VmaEntry *vmae, u64 pme)
 		return false;
 	if (pme & PME_SWAP)
 		return true;
-	if ((pme & PME_PRESENT) && ((pme & PME_PFRAME_MASK) != zero_page_pfn))
+	if ((pme & PME_PRESENT) && ((pme & PME_PFRAME_MASK) != kdat.zero_page_pfn))
 		return true;
 
 	return false;
@@ -244,14 +244,14 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 	pmc_t pmc = PMC_INIT;
 	struct page_pipe *pp;
 	struct vma_area *vma_area;
-	struct page_xfer xfer;
+	struct page_xfer xfer = { .parent = NULL };
 	int ret = -1;
 
 	pr_info("\n");
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, ctl->pid.real);
 	pr_info("----------------------------------------\n");
 
-	BUG_ON(zero_page_pfn == 0);
+	BUG_ON(kdat.zero_page_pfn == 0);
 
 	timing_start(TIME_MEMDUMP);
 
@@ -276,6 +276,13 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, ctl->pid.virt);
 		if (ret < 0)
 			goto out_pp;
+	} else {
+		ret = check_parent_page_xfer(CR_FD_PAGEMAP, ctl->pid.virt);
+		if (ret < 0)
+			goto out_pp;
+
+		if (ret)
+			xfer.parent = NULL + 1;
 	}
 
 	/*
@@ -377,25 +384,27 @@ static inline int collect_filemap(struct vma_area *vma)
 	if (!fd)
 		return -1;
 
-	vma->fd = fd;
+	vma->vmfd = fd;
 	return 0;
 }
 
 int prepare_mm_pid(struct pstree_item *i)
 {
 	pid_t pid = i->pid.virt;
-	int fd, ret = -1, vn = 0;
-	struct rst_info *ri = i->rst;
+	int ret = -1, vn = 0;
+	struct cr_img *img;
+	struct rst_info *ri = rsti(i);
 
-	fd = open_image(CR_FD_MM, O_RSTR | O_OPT, pid);
-	if (fd < 0) {
-		if (fd == -ENOENT)
+	img = open_image(CR_FD_MM, O_RSTR | O_OPT, pid);
+	if (!img) {
+		if (errno == ENOENT)
 			return 0;
 		return -1;
 	}
 
-	ret = pb_read_one(fd, &ri->mm, PB_MM);
-	close(fd);
+	ret = pb_read_one(img, &ri->mm, PB_MM);
+	close_image(img);
+
 	if (ret < 0)
 		return -1;
 
@@ -403,18 +412,18 @@ int prepare_mm_pid(struct pstree_item *i)
 		return -1;
 
 	pr_debug("Found %zd VMAs in image\n", ri->mm->n_vmas);
-	fd = -1;
+	img = NULL;
 	if (ri->mm->n_vmas == 0) {
 		/*
 		 * Old image. Read VMAs from vma-.img
 		 */
-		fd = open_image(CR_FD_VMAS, O_RSTR, pid);
-		if (fd < 0)
+		img = open_image(CR_FD_VMAS, O_RSTR, pid);
+		if (!img)
 			return -1;
 	}
 
 
-	while (vn < ri->mm->n_vmas || fd >= 0) {
+	while (vn < ri->mm->n_vmas || img != NULL) {
 		struct vma_area *vma;
 
 		ret = -1;
@@ -424,13 +433,13 @@ int prepare_mm_pid(struct pstree_item *i)
 
 		ret = 0;
 		ri->vmas.nr++;
-		if (fd == -1)
+		if (!img)
 			vma->e = ri->mm->vmas[vn++];
 		else {
-			ret = pb_read_one_eof(fd, &vma->e, PB_VMA);
+			ret = pb_read_one_eof(img, &vma->e, PB_VMA);
 			if (ret <= 0) {
 				xfree(vma);
-				close(fd);
+				close_image(img);
 				break;
 			}
 		}

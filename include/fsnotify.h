@@ -4,8 +4,10 @@
 #include "asm/types.h"
 #include "files.h"
 
+#include "protobuf.h"
+#include "protobuf/fsnotify.pb-c.h"
+
 struct fsnotify_params {
-	u32	id;
 	u32	faflags;
 	u32	evflags;
 };

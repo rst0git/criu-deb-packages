@@ -34,74 +34,6 @@
 #define MEGA(size)	PREF_SHIFT_OP(K, <<, size)
 #define GIGA(size)	PREF_SHIFT_OP(K, <<, size)
 
-/*
- * Write buffer @ptr of @size bytes into @fd file
- * Returns
- *	0  on success
- *	-1 on error (error message is printed)
- */
-static inline int write_img_buf(int fd, const void *ptr, int size)
-{
-	int ret;
-	ret = write(fd, ptr, size);
-	if (ret == size)
-		return 0;
-
-	if (ret < 0)
-		pr_perror("Can't write img file");
-	else
-		pr_err("Img trimmed %d/%d\n", ret, size);
-	return -1;
-}
-
-#define write_img(fd, ptr)	write_img_buf((fd), (ptr), sizeof(*(ptr)))
-
-/*
- * Read buffer @ptr of @size bytes from @fd file
- * Returns
- *	1  on success
- *	0  on EOF (silently)
- *	-1 on error (error message is printed)
- */
-static inline int read_img_buf_eof(int fd, void *ptr, int size)
-{
-	int ret;
-	ret = read(fd, ptr, size);
-	if (ret == size)
-		return 1;
-	if (ret == 0)
-		return 0;
-
-	if (ret < 0)
-		pr_perror("Can't read img file");
-	else
-		pr_err("Img trimmed %d/%d\n", ret, size);
-	return -1;
-}
-
-#define read_img_eof(fd, ptr)	read_img_buf_eof((fd), (ptr), sizeof(*(ptr)))
-
-/*
- * Read buffer @ptr of @size bytes from @fd file
- * Returns
- *	1  on success
- *	-1 on error or EOF (error message is printed)
- */
-static inline int read_img_buf(int fd, void *ptr, int size)
-{
-	int ret;
-
-	ret = read_img_buf_eof(fd, ptr, size);
-	if (ret == 0) {
-		pr_err("Unexpected EOF\n");
-		ret = -1;
-	}
-
-	return ret;
-}
-
-#define read_img(fd, ptr)	read_img_buf((fd), (ptr), sizeof(*(ptr)))
-
 struct vma_area;
 struct list_head;
 
@@ -234,37 +166,11 @@ extern int is_anon_link_type(char *link, char *type);
 	 ((c) >= 'a' && (c) <= 'f')	||	\
 	 ((c) >= 'A' && (c) <= 'F'))
 
-/*
- * read_img_str -- same as read_img_buf, but allocates memory for
- * the buffer and puts the '\0' at the end
- */
-
-static inline int read_img_str(int fd, char **pstr, int size)
-{
-	int ret;
-	char *str;
-
-	str = xmalloc(size + 1);
-	if (!str)
-		return -1;
-
-	ret = read_img_buf(fd, str, size);
-	if (ret < 0) {
-		xfree(str);
-		return -1;
-	}
-
-	str[size] = '\0';
-	*pstr = str;
-	return 0;
-}
-
 extern void *shmalloc(size_t bytes);
 extern void shfree_last(void *ptr);
-extern int run_scripts(char *action);
 
 extern int cr_system(int in, int out, int err, char *cmd, char *const argv[]);
-extern int cr_daemon(int nochdir, int noclose);
+extern int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd);
 extern int is_root_user(void);
 
 static inline bool dir_dots(struct dirent *de)
@@ -286,13 +192,24 @@ extern int read_fd_link(int lfd, char *buf, size_t size);
 int vaddr_to_pfn(unsigned long vaddr, u64 *pfn);
 
 /*
- * Check whether @str starts with @sub
+ * Check whether @str starts with @sub and report the
+ * next character of @str in @end
  */
-static inline bool strstartswith(const char *str, const char *sub)
+static inline bool strstartswith2(const char *str, const char *sub, char *end)
 {
+	const char *osub = sub;
+
 	while (1) {
-		if (*sub == '\0') /* end of sub -- match */
+		if (*sub == '\0') /* end of sub -- match */ {
+			if (end) {
+				if (sub == osub + 1) /* pure root */
+					*end = '/';
+				else
+					*end = *str;
+			}
+
 			return true;
+		}
 		if (*str == '\0') /* end of str, sub is NOT ended -- miss */
 			return false;
 		if (*str != *sub)
@@ -303,10 +220,33 @@ static inline bool strstartswith(const char *str, const char *sub)
 	}
 }
 
+static inline bool strstartswith(const char *str, const char *sub)
+{
+	return strstartswith2(str, sub, NULL);
+}
+
+/*
+ * Checks whether the @path has @sub_path as a sub path, i.e.
+ * sub_path is the beginning of path and the last component
+ * match is full (next character terminates path component).
+ *
+ * Paths shouldn't contain excessive /-s, i.e. only one slash
+ * between path components and no slash at the end (except for
+ * the "/" path. This is pretty good assumption to what paths
+ * are used by criu.
+ */
+
+static inline bool issubpath(const char *path, const char *sub_path)
+{
+	char end;
+	return strstartswith2(path, sub_path, &end) &&
+		(end == '/' || end == '\0');
+}
+
 /*
  * mkdir -p
  */
-int mkdirp(const char *path);
+int mkdirpat(int fd, const char *path);
 
 /*
  * Tests whether a path is a prefix of another path. This is different than
@@ -316,4 +256,7 @@ int mkdirp(const char *path);
 bool is_path_prefix(const char *path, const char *prefix);
 FILE *fopenat(int dirfd, char *path, char *cflags);
 void split(char *str, char token, char ***out, int *n);
+
+int fd_has_data(int lfd);
+
 #endif /* __CR_UTIL_H__ */

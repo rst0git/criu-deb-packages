@@ -14,7 +14,7 @@
 #include "pstree.h"
 #include "proc_parse.h"
 #include "util.h"
-#include "fdset.h"
+#include "imgset.h"
 #include "util-pie.h"
 #include "protobuf.h"
 #include "protobuf/core.pb-c.h"
@@ -177,7 +177,7 @@ static struct cg_set *get_cg_set(struct list_head *ctls, unsigned int n_ctls)
 		list_add_tail(&cs->l, &cg_sets);
 		n_sets++;
 
-		if (log_get_loglevel() >= LOG_DEBUG) {
+		if (!pr_quelled(LOG_DEBUG)) {
 			struct cg_ctl *ctl;
 
 			list_for_each_entry(ctl, &cs->ctls, l)
@@ -305,31 +305,26 @@ static inline char *strip(char *str)
 static int read_cgroup_prop(struct cgroup_prop *property, const char *fullpath)
 {
 	char buf[1024];
-	FILE *f;
-	char *endptr;
+	int fd, ret;
 
-	f = fopen(fullpath, "r");
-	if (!f) {
+	fd = open(fullpath, O_RDONLY);
+	if (fd == -1) {
 		property->value = NULL;
 		pr_perror("Failed opening %s", fullpath);
 		return -1;
 	}
 
-	memset(buf, 0, sizeof(buf));
-	if (fread(buf, sizeof(buf), 1, f) != 1) {
-		if (!feof(f)) {
-			pr_err("Failed scanning %s\n", fullpath);
-			fclose(f);
-			return -1;
-		}
-	}
-
-	if (fclose(f) != 0) {
-		pr_err("Failed closing %s\n", fullpath);
+	ret = read(fd, buf, sizeof(buf) - 1);
+	if (ret == -1) {
+		pr_err("Failed scanning %s\n", fullpath);
+		close(fd);
 		return -1;
 	}
+	close(fd);
 
-	if (strtoll(buf, &endptr, 10) == LLONG_MAX)
+	buf[ret] = 0;
+
+	if (strtoll(buf, NULL, 10) == LLONG_MAX)
 		strcpy(buf, "-1");
 
 	property->value = xstrdup(strip(buf));
@@ -366,9 +361,10 @@ static void free_cgroup_prop(struct cgroup_prop *prop)
 
 static void free_all_cgroup_props(struct cgroup_dir *ncd)
 {
-	struct cgroup_prop *prop;
+	struct cgroup_prop *prop, *t;
 
-	list_for_each_entry(prop, &ncd->properties, list) {
+	list_for_each_entry_safe(prop, t, &ncd->properties, list) {
+		list_del(&prop->list);
 		free_cgroup_prop(prop);
 	}
 
@@ -828,7 +824,7 @@ int dump_cgroups(void)
 		return -1;
 
 	pr_info("Writing CG image\n");
-	return pb_write_one(fdset_fd(glob_fdset, CR_FD_CGROUP), &cg, PB_CGROUP);
+	return pb_write_one(img_from_set(glob_imgset, CR_FD_CGROUP), &cg, PB_CGROUP);
 }
 
 static int ctrl_dir_and_opt(CgControllerEntry *ctl, char *dir, int ds,
@@ -868,48 +864,6 @@ static const char *special_cpuset_props[] = {
 	NULL,
 };
 
-static int copy_special_cg_props(const char *controller, const char *path)
-{
-	int cg = get_service_fd(CGROUP_YARD);
-
-	pr_info("copying special cg props for %s\n", controller);
-
-	if (strstr(controller, "cpuset")) {
-		int i;
-
-		for (i = 0; special_cpuset_props[i]; i++) {
-			char fpath[PATH_MAX], buf[1024];
-			const char *prop = special_cpuset_props[i];
-			int ret;
-			FILE *f;
-
-			snprintf(fpath, PATH_MAX, "%s/%s", controller, prop);
-			f = fopenat(cg, fpath, "r");
-			if (!f)
-				return -1;
-
-			ret = fscanf(f, "%1024s", buf);
-			fclose(f);
-
-			if (ret <= 0) {
-				continue;
-			}
-
-			pr_info("copying %s for %s/%s\n", buf, controller, prop);
-
-			snprintf(fpath, PATH_MAX, "%s/%s/%s", controller, path, prop);
-			f = fopenat(cg, fpath, "w");
-			if (!f)
-				return -1;
-
-			fprintf(f, "%s", buf);
-			fclose(f);
-		}
-	}
-
-	return 0;
-}
-
 static int move_in_cgroup(CgSetEntry *se)
 {
 	int cg, i;
@@ -937,11 +891,6 @@ static int move_in_cgroup(CgSetEntry *se)
 
 		aux_off = ctrl_dir_and_opt(ctrl, aux, sizeof(aux), NULL, 0);
 
-		if (copy_special_cg_props(aux, ce->path) < 0) {
-			pr_perror("Couldn't copy special cgroup properties\n");
-			return -1;
-		}
-
 		snprintf(aux + aux_off, sizeof(aux) - aux_off, "/%s/tasks", ce->path);
 		pr_debug("  `-> %s\n", aux);
 		err = fd = openat(cg, aux, O_WRONLY);
@@ -968,22 +917,22 @@ int prepare_task_cgroup(struct pstree_item *me)
 	CgSetEntry *se;
 	u32 current_cgset;
 
-	if (!me->rst->cg_set)
+	if (!rsti(me)->cg_set)
 		return 0;
 
 	if (me->parent)
-		current_cgset = me->parent->rst->cg_set;
+		current_cgset = rsti(me->parent)->cg_set;
 	else
 		current_cgset = root_cg_set;
 
-	if (me->rst->cg_set == current_cgset) {
+	if (rsti(me)->cg_set == current_cgset) {
 		pr_info("Cgroups %d inherited from parent\n", current_cgset);
 		return 0;
 	}
 
-	se = find_rst_set_by_id(me->rst->cg_set);
+	se = find_rst_set_by_id(rsti(me)->cg_set);
 	if (!se) {
-		pr_err("No set %d found\n", me->rst->cg_set);
+		pr_err("No set %d found\n", rsti(me)->cg_set);
 		return -1;
 	}
 
@@ -999,6 +948,7 @@ void fini_cgroup(void)
 	umount2(cg_yard, MNT_DETACH);
 	rmdir(cg_yard);
 	xfree(cg_yard);
+	cg_yard = NULL;
 }
 
 static int restore_cgroup_prop(const CgroupPropEntry * cg_prop_entry_p,
@@ -1049,12 +999,7 @@ static int prepare_cgroup_dir_properties(char *path, int off, CgroupDirEntry **e
 		size_t off2 = off;
 
 		off2 += sprintf(path + off, "/%s", e->dir_name);
-		/*
-		 * Check to see if we made e->properties NULL during restore
-		 * because directory already existed and as such we don't want to
-		 * change its properties
-		 */
-		if (e->properties) {
+		if (e->n_properties > 0) {
 			for (j = 0; j < e->n_properties; ++j) {
 				if (restore_cgroup_prop(e->properties[j], path, off2) < 0)
 					return -1;
@@ -1089,38 +1034,75 @@ int prepare_cgroup_properties(void)
 	return 0;
 }
 
-static int prepare_cgroup_dirs(char *paux, size_t off, CgroupDirEntry **ents, size_t n_ents)
+static int restore_special_cpuset_props(char *paux, size_t off, CgroupDirEntry *e)
 {
-	size_t i;
+	int i, j;
+
+	for (i = 0; special_cpuset_props[i]; i++) {
+		const char *name = special_cpuset_props[i];
+
+		for (j = 0; j < e->n_properties; j++) {
+			CgroupPropEntry *prop = e->properties[j];
+
+			if (strcmp(name, prop->name) == 0)
+				if (restore_cgroup_prop(prop, paux, off) < 0)
+					return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int prepare_cgroup_dirs(char **controllers, int n_controllers, char *paux, size_t off,
+				CgroupDirEntry **ents, size_t n_ents)
+{
+	size_t i, j;
 	CgroupDirEntry *e;
+	int cg = get_service_fd(CGROUP_YARD);
 
 	for (i = 0; i < n_ents; i++) {
 		size_t off2 = off;
 		e = ents[i];
+		struct stat st;
 
 		off2 += sprintf(paux + off, "/%s", e->dir_name);
 
 		/*
 		 * Checking to see if file already exists. If not, create it. If
 		 * it does exist, prevent us from overwriting the properties
-		 * later by setting the CgroupDirEntry's properties pointer to NULL
+		 * later by removing the CgroupDirEntry's properties.
 		 */
-		if (access(paux, F_OK) < 0) {
+		if (fstatat(cg, paux, &st, 0) < 0) {
 			if (errno != ENOENT) {
 				pr_perror("Failed accessing file %s", paux);
 				return -1;
 			}
-			if (mkdirp(paux)) {
+
+			if (mkdirpat(cg, paux)) {
 				pr_perror("Can't make cgroup dir %s", paux);
 				return -1;
 			}
 			pr_info("Created dir %s\n", paux);
+
+			for (j = 0; j < n_controllers; j++) {
+				if (strcmp(controllers[j], "cpuset") == 0) {
+					if (restore_special_cpuset_props(paux, off2, e) < 0) {
+						pr_err("Restoring special cpuset props failed!\n");
+						return -1;
+					}
+				}
+			}
 		} else {
-			e->properties = NULL;
+			if (e->n_properties > 0) {
+				xfree(e->properties);
+				e->properties = NULL;
+				e->n_properties = 0;
+			}
 			pr_info("Determined dir %s already existed\n", paux);
 		}
 
-		if (prepare_cgroup_dirs(paux, off2, e->children, e->n_children) < 0)
+		if (prepare_cgroup_dirs(controllers, n_controllers, paux, off2,
+				e->children, e->n_children) < 0)
 			return -1;
 	}
 
@@ -1147,7 +1129,7 @@ static int prepare_cgroup_dirs(char *paux, size_t off, CgroupDirEntry **ents, si
 
 static int prepare_cgroup_sfd(CgroupEntry *ce)
 {
-	int off, i;
+	int off, i, ret;
 	char paux[PATH_MAX];
 
 	pr_info("Preparing cgroups yard\n");
@@ -1174,11 +1156,24 @@ static int prepare_cgroup_sfd(CgroupEntry *ce)
 		goto err;
 	}
 
+	pr_debug("Opening %s as cg yard\n", cg_yard);
+	i = open(cg_yard, O_DIRECTORY);
+	if (i < 0) {
+		pr_perror("Can't open cgyard");
+		goto err;
+	}
+
+	ret = install_service_fd(CGROUP_YARD, i);
+	close(i);
+	if (ret < 0)
+		goto err;
+
+
 	paux[off++] = '/';
 
 	for (i = 0; i < ce->n_controllers; i++) {
-		int ctl_off = off;
-		char opt[128];
+		int ctl_off = off, yard_off;
+		char opt[128], *yard;
 		CgControllerEntry *ctrl = ce->controllers[i];
 
 		if (ctrl->n_cnames < 1) {
@@ -1201,23 +1196,16 @@ static int prepare_cgroup_sfd(CgroupEntry *ce)
 			goto err;
 		}
 
+		/* We skip over the .criu.cgyard.XXXXXX/, since those will be
+		 * referred to by the cg yard service fd. */
+		yard = paux + strlen(cg_yard) + 1;
+		yard_off = ctl_off - (strlen(cg_yard) + 1);
 		if (opts.manage_cgroups &&
-		    prepare_cgroup_dirs(paux, ctl_off, ctrl->dirs, ctrl->n_dirs))
+		    prepare_cgroup_dirs(ctrl->cnames, ctrl->n_cnames, yard, yard_off,
+				ctrl->dirs, ctrl->n_dirs))
 			goto err;
 
 	}
-
-	pr_debug("Opening %s as cg yard\n", cg_yard);
-	i = open(cg_yard, O_DIRECTORY);
-	if (i < 0) {
-		pr_perror("Can't open cgyard");
-		goto err;
-	}
-
-	off = install_service_fd(CGROUP_YARD, i);
-	close(i);
-	if (off < 0)
-		goto err;
 
 	return 0;
 
@@ -1243,7 +1231,7 @@ static int rewrite_cgsets(CgroupEntry *cge, char **controllers, int n_controller
 
 				/* +1 for trailing NULL */
 				int newlen = strlen(to) + strlen(cg->path + off) + 1;
-				char *m = malloc(newlen * sizeof(char*));
+				char *m = xmalloc(newlen * sizeof(char*));
 				if (!m)
 					return -1;
 
@@ -1299,19 +1287,20 @@ static int rewrite_cgroup_roots(CgroupEntry *cge)
 
 int prepare_cgroup(void)
 {
-	int fd, ret;
+	int ret;
+	struct cr_img *img;
 	CgroupEntry *ce;
 
-	fd = open_image(CR_FD_CGROUP, O_RSTR | O_OPT);
-	if (fd < 0) {
+	img = open_image(CR_FD_CGROUP, O_RSTR | O_OPT);
+	if (!img) {
 		if (errno == ENOENT) /* backward compatibility */
 			return 0;
 		else
-			return fd;
+			return -1;
 	}
 
-	ret = pb_read_one_eof(fd, &ce, PB_CGROUP);
-	close(fd);
+	ret = pb_read_one_eof(img, &ce, PB_CGROUP);
+	close_image(img);
 	if (ret <= 0) /* Zero is OK -- no sets there. */
 		return ret;
 

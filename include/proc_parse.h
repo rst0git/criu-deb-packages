@@ -16,15 +16,6 @@
 #define PROC_TASK_COMM_LEN	32
 #define PROC_TASK_COMM_LEN_FMT	"(%31s"
 
-struct proc_pid_stat_small {
-	int			pid;
-	char			comm[PROC_TASK_COMM_LEN];
-	char			state;
-	int			ppid;
-	int			pgid;
-	int			sid;
-};
-
 struct proc_pid_stat {
 	int			pid;
 	char			comm[PROC_TASK_COMM_LEN];
@@ -90,6 +81,9 @@ struct proc_status_creds {
 	u32 cap_prm[PROC_CAP_SIZE];
 	u32 cap_eff[PROC_CAP_SIZE];
 	u32 cap_bnd[PROC_CAP_SIZE];
+
+	char			state;
+	int			ppid;
 };
 
 struct mount_info;
@@ -161,19 +155,43 @@ struct vm_area_list;
 
 extern struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid);
 extern int parse_pid_stat(pid_t pid, struct proc_pid_stat *s);
-extern int parse_pid_stat_small(pid_t pid, struct proc_pid_stat_small *s);
 extern int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_files);
 extern int parse_self_maps_lite(struct vm_area_list *vms);
 extern int parse_pid_status(pid_t pid, struct proc_status_creds *);
 
+struct inotify_wd_entry {
+	InotifyWdEntry e;
+	FhEntry f_handle;
+	struct list_head node;
+};
+
+struct fanotify_mark_entry {
+	FanotifyMarkEntry e;
+	FhEntry f_handle;
+	struct list_head node;
+	union {
+		FanotifyInodeMarkEntry ie;
+		FanotifyMountMarkEntry me;
+	};
+};
+
+struct eventpoll_tfd_entry {
+	EventpollTfdEntry e;
+	struct list_head node;
+};
+
 union fdinfo_entries {
 	EventfdFileEntry efd;
-	EventpollTfdEntry epl;
 	SignalfdEntry sfd;
-	InotifyWdEntry ify;
-	FanotifyMarkEntry ffy;
+	struct inotify_wd_entry ify;
+	struct fanotify_mark_entry ffy;
+	struct eventpoll_tfd_entry epl;
 	TimerfdEntry tfy;
 };
+
+extern void free_inotify_wd_entry(union fdinfo_entries *e);
+extern void free_fanotify_mark_entry(union fdinfo_entries *e);
+extern void free_event_poll_entry(union fdinfo_entries *e);
 
 struct fdinfo_common {
 	off64_t pos;
@@ -187,6 +205,7 @@ extern int parse_fdinfo_pid(int pid, int fd, int type,
 		int (*cb)(union fdinfo_entries *e, void *arg), void *arg);
 extern int parse_cpuinfo_features(int (*handler)(char *tok));
 extern int parse_file_locks(void);
+extern int get_fd_mntid(int fd, int *mnt_id);
 
 struct pid;
 extern int parse_threads(int pid, struct pid **_t, int *_n);

@@ -12,7 +12,7 @@
 #include "asm/types.h"
 #include "libnetlink.h"
 #include "cr_options.h"
-#include "fdset.h"
+#include "imgset.h"
 #include "unix_diag.h"
 #include "files.h"
 #include "file-ids.h"
@@ -133,7 +133,7 @@ static int write_unix_entry(struct unix_sk_desc *sk)
 {
 	int ret;
 
-	ret = pb_write_one(fdset_fd(glob_fdset, CR_FD_UNIXSK), sk->ue, PB_UNIX_SK);
+	ret = pb_write_one(img_from_set(glob_imgset, CR_FD_UNIXSK), sk->ue, PB_UNIX_SK);
 
 	show_one_unix_img("Dumped", sk->ue);
 
@@ -209,8 +209,8 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 		ue->file_perms = perms;
 
 		perms->mode	= sk->mode;
-		perms->uid	= sk->uid;
-		perms->gid	= sk->gid;
+		perms->uid	= userns_uid(sk->uid);
+		perms->gid	= userns_gid(sk->gid);
 	}
 
 	sk_encode_shutdown(ue, sk->shutdown);
@@ -550,7 +550,7 @@ static int dump_external_sockets(struct unix_sk_desc *peer)
 	while (!list_empty(&peer->peer_list)) {
 		sk = list_first_entry(&peer->peer_list, struct unix_sk_desc, peer_node);
 
-		ret = cr_plugin_dump_unix_sk(sk->fd, sk->sd.ino);
+		ret = run_plugins(DUMP_UNIX_SK, sk->fd, sk->sd.ino);
 		if (ret == -ENOTSUP) {
 			if (!opts.ext_unix_sk) {
 				show_one_unix("Runaway socket", peer);
@@ -604,7 +604,7 @@ int fix_external_unix_sockets(void)
 		e.fown		= &fown;
 		e.opts		= &skopts;
 
-		if (pb_write_one(fdset_fd(glob_fdset, CR_FD_UNIXSK), &e, PB_UNIX_SK))
+		if (pb_write_one(img_from_set(glob_imgset, CR_FD_UNIXSK), &e, PB_UNIX_SK))
 			goto err;
 
 		show_one_unix_img("Dumped extern", &e);
@@ -917,7 +917,7 @@ static int open_unixsk_standalone(struct unix_sk_info *ui)
 		sk = sks[0];
 	} else {
 		if (ui->ue->uflags & USK_CALLBACK) {
-			sk = cr_plugin_restore_unix_sk(ui->ue->ino);
+			sk = run_plugins(RESTORE_UNIX_SK, ui->ue->ino);
 			if (sk >= 0)
 				goto out;
 		}

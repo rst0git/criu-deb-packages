@@ -2,7 +2,7 @@
 
 #include <unistd.h>
 
-#include "fdset.h"
+#include "imgset.h"
 #include "files.h"
 #include "plugin.h"
 
@@ -11,20 +11,20 @@
 
 static int dump_one_ext_file(int lfd, u32 id, const struct fd_parms *p)
 {
-	int rfd, ret;
+	int ret;
+	struct cr_img *rimg;
 
 	ExtFileEntry xfe = EXT_FILE_ENTRY__INIT;
 
-	ret = cr_plugin_dump_file(lfd, id);
+	ret = run_plugins(DUMP_EXT_FILE, lfd, id);
 	if (ret < 0)
 		return ret;
 
 	xfe.id		= id;
 	xfe.fown	= (FownEntry *)&p->fown;
 
-	rfd = fdset_fd(glob_fdset, CR_FD_EXT_FILES);
-
-	return pb_write_one(rfd, &xfe, PB_EXT_FILE);
+	rimg = img_from_set(glob_imgset, CR_FD_EXT_FILES);
+	return pb_write_one(rimg, &xfe, PB_EXT_FILE);
 }
 
 const struct fdtype_ops ext_dump_ops = {
@@ -44,7 +44,7 @@ static int open_fd(struct file_desc *d)
 
 	xfi = container_of(d, struct ext_file_info, d);
 
-	fd = cr_plugin_restore_file(xfi->xfe->id);
+	fd = run_plugins(RESTORE_EXT_FILE, xfi->xfe->id);
 	if (fd < 0) {
 		pr_err("Unable to restore %#x\n", xfi->xfe->id);
 		return -1;
@@ -79,11 +79,11 @@ struct collect_image_info ext_file_cinfo = {
 };
 
 int dump_unsupp_fd(struct fd_parms *p, int lfd,
-			  const int fdinfo, char *more, char *info)
+			  struct cr_img *img, char *more, char *info)
 {
 	int ret;
 
-	ret = do_dump_gen_file(p, lfd, &ext_dump_ops, fdinfo);
+	ret = do_dump_gen_file(p, lfd, &ext_dump_ops, img);
 	if (ret == 0)
 		return 0;
 	if (ret == -ENOTSUP)

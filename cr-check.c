@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <linux/netlink.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/eventfd.h>
@@ -7,6 +8,7 @@
 #include <sys/signalfd.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <linux/if.h>
@@ -91,11 +93,23 @@ static int check_map_files(void)
 	return -1;
 }
 
+#ifndef NETLINK_SOCK_DIAG
+#define NETLINK_SOCK_DIAG NETLINK_INET_DIAG
+#endif
+
 static int check_sock_diag(void)
 {
 	int ret;
+	struct ns_id ns;
 
-	ret = collect_sockets(0);
+	ns.pid = 0;
+	ns.net.nlsk = socket(PF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
+	if (ns.net.nlsk < 0) {
+		pr_perror("Can't make diag socket for check");
+		return -1;
+	}
+
+	ret = collect_sockets(&ns);
 	if (!ret)
 		return 0;
 
@@ -155,6 +169,7 @@ static int check_prctl(void)
 {
 	unsigned long user_auxv = 0;
 	unsigned int *tid_addr;
+	unsigned int size = 0;
 	int ret;
 
 	ret = sys_prctl(PR_GET_TID_ADDRESS, (unsigned long)&tid_addr, 0, 0, 0);
@@ -163,25 +178,38 @@ static int check_prctl(void)
 		return -1;
 	}
 
-	ret = sys_prctl(PR_SET_MM, PR_SET_MM_BRK, sys_brk(0), 0, 0);
+	/*
+	 * Either new or old interface must be supported in the kernel.
+	 */
+	ret = sys_prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, (unsigned long)&size, 0, 0);
 	if (ret) {
-		if (ret == -EPERM)
-			pr_msg("prctl: One needs CAP_SYS_RESOURCE capability to perform testing\n");
-		else
-			pr_msg("prctl: PR_SET_MM is not supported\n");
-		return -1;
-	}
+		if (!opts.check_ms_kernel) {
+			pr_msg("prctl: PR_SET_MM_MAP is not supported, which "
+			       "is required for restoring user namespaces\n");
+			return -1;
+		} else
+			pr_warn("Skipping unssuported PR_SET_MM_MAP\n");
 
-	ret = sys_prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, -1, 0, 0);
-	if (ret != -EBADF) {
-		pr_msg("prctl: PR_SET_MM_EXE_FILE is not supported (%d)\n", ret);
-		return -1;
-	}
+		ret = sys_prctl(PR_SET_MM, PR_SET_MM_BRK, sys_brk(0), 0, 0);
+		if (ret) {
+			if (ret == -EPERM)
+				pr_msg("prctl: One needs CAP_SYS_RESOURCE capability to perform testing\n");
+			else
+				pr_msg("prctl: PR_SET_MM is not supported\n");
+			return -1;
+		}
 
-	ret = sys_prctl(PR_SET_MM, PR_SET_MM_AUXV, (long)&user_auxv, sizeof(user_auxv), 0);
-	if (ret) {
-		pr_msg("prctl: PR_SET_MM_AUXV is not supported\n");
-		return -1;
+		ret = sys_prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, -1, 0, 0);
+		if (ret != -EBADF) {
+			pr_msg("prctl: PR_SET_MM_EXE_FILE is not supported (%d)\n", ret);
+			return -1;
+		}
+
+		ret = sys_prctl(PR_SET_MM, PR_SET_MM_AUXV, (long)&user_auxv, sizeof(user_auxv), 0);
+		if (ret) {
+			pr_msg("prctl: PR_SET_MM_AUXV is not supported\n");
+			return -1;
+		}
 	}
 
 	return 0;
@@ -189,11 +217,22 @@ static int check_prctl(void)
 
 static int check_fcntl(void)
 {
-	/*
-	 * FIXME Add test for F_GETOWNER_UIDS once
-	 * it's merged into mainline and kernel part
-	 * settle down.
-	 */
+	u32 v[2];
+	int fd;
+
+	fd = open("/proc/self/comm", O_RDONLY);
+	if (fd < 0) {
+		pr_perror("Can't open self comm file");
+		return -1;
+	}
+
+	if (fcntl(fd, F_GETOWNER_UIDS, (long)v)) {
+		pr_perror("Can'r fetch file owner UIDs");
+		close(fd);
+		return -1;
+	}
+
+	close(fd);
 	return 0;
 }
 
@@ -299,7 +338,8 @@ static int check_fdinfo_signalfd(void)
 
 static int check_one_epoll(union fdinfo_entries *e, void *arg)
 {
-	*(int *)arg = e->epl.tfd;
+	*(int *)arg = e->epl.e.tfd;
+	free_event_poll_entry(e);
 	return 0;
 }
 
@@ -353,7 +393,8 @@ pipe_err:
 
 static int check_one_inotify(union fdinfo_entries *e, void *arg)
 {
-	*(int *)arg = e->ify.wd;
+	*(int *)arg = e->ify.e.wd;
+	free_inotify_wd_entry(e);
 	return 0;
 }
 
@@ -477,7 +518,7 @@ static int check_ipc(void)
 	return -1;
 }
 
-int check_sigqueuinfo()
+static int check_sigqueuinfo()
 {
 	siginfo_t info = { .si_code = 1 };
 
@@ -491,7 +532,7 @@ int check_sigqueuinfo()
 	return 0;
 }
 
-int check_ptrace_peeksiginfo()
+static int check_ptrace_peeksiginfo()
 {
 	struct ptrace_peeksiginfo_args arg;
 	siginfo_t siginfo;
@@ -536,7 +577,7 @@ static int check_mem_dirty_track(void)
 	if (kerndat_get_dirty_track() < 0)
 		return -1;
 
-	if (!kerndat_has_dirty_track)
+	if (!kdat.has_dirty_track)
 		pr_warn("Dirty tracking is OFF. Memory snapshot will not work.\n");
 	return 0;
 }

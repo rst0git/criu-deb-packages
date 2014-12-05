@@ -70,6 +70,7 @@ TST_NOFILE	=				\
 		maps03				\
 		maps04				\
 		maps05				\
+		mlock_setuid			\
 		xids00				\
 		groups				\
 		pdeath_sig			\
@@ -77,7 +78,6 @@ TST_NOFILE	=				\
 		proc-self			\
 		eventfs00			\
 		signalfd00			\
-		inotify00			\
 		inotify_irmap			\
 		fanotify00			\
 		uptime_grow			\
@@ -114,6 +114,8 @@ TST_NOFILE	=				\
 		clean_mntns			\
 		dumpable01			\
 		dumpable02			\
+		remap_dead_pid			\
+		fd				\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -136,6 +138,7 @@ TST_FILE	=				\
 		fifo-ghost			\
 		fifo_ro				\
 		fifo_wronly			\
+		console				\
 		unlink_fifo			\
 		unlink_fifo_wronly		\
 		unlink_mmap00			\
@@ -149,6 +152,10 @@ TST_FILE	=				\
 		sockets_dgram			\
 		file_locks00			\
 		file_locks01			\
+		file_locks02			\
+		file_locks03			\
+		file_locks04			\
+		file_locks05			\
 		netns-nf			\
 		maps_file_prot			\
 
@@ -162,6 +169,7 @@ TST_DIR		=				\
 		overmount_sock			\
 		tempfs				\
 		bind-mount			\
+		inotify00			\
 		cgroup00			\
 		rmdir_open			\
 		cgroup01			\
@@ -169,6 +177,8 @@ TST_DIR		=				\
 		mntns_open			\
 		mntns_link_remap		\
 		mntns_link_ghost		\
+		mntns_shared_bind		\
+		mntns_shared_bind02		\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -250,9 +260,9 @@ check_start:	$(PID:%.pid=%.is_running)
 stop:	$(STATE_OUT)
 	-kill -TERM `cat *.pid`
 
-WAIT_TIME=10
+WAIT_TIME=240
 wait_stop:
-	-for ((i = 0; i < $(WAIT_TIME); i++)); do \
+	for ((i = 0; i < $(WAIT_TIME); i++)); do \
 		kill -0 `cat *.pid 2>/dev/null` 2>/dev/null || break; \
 		sleep 1; \
 	done
@@ -284,12 +294,15 @@ socket_listen6: override CFLAGS += -D ZDTM_IPV6
 sigpending:		override LDLIBS += -lrt
 vdso01:			override LDLIBS += -lrt
 mntns_link_remap:	override CFLAGS += -DZDTM_LINK_REMAP
+mntns_shared_bind02:		override CFLAGS += -DSHARED_BIND02
+maps02:		get_smaps_bits.o
+mlock_setuid:		get_smaps_bits.o
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)
 
 clean:
-	$(RM) -f $(OBJ) $(TST) *~ criu-rtc.so criu-rtc.pb-c.c criu-rtc.pb-c.h
+	$(RM) -f $(OBJ) $(TST) *~ criu-rtc.so criu-rtc.pb-c.c criu-rtc.pb-c.h get_smaps_bits.o
 
 cleandep:	clean
 	$(RM) -f $(DEP)

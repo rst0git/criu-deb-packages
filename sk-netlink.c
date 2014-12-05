@@ -1,9 +1,8 @@
 #include <unistd.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
-#include <poll.h>
 
-#include "fdset.h"
+#include "imgset.h"
 #include "files.h"
 #include "sockets.h"
 #include "util.h"
@@ -67,13 +66,10 @@ int netlink_receive_one(struct nlmsghdr *hdr, void *arg)
 
 static bool can_dump_netlink_sk(int lfd)
 {
-	struct pollfd pfd = {lfd, POLLIN, 0};
 	int ret;
 
-	ret = poll(&pfd, 1, 0);
-	if (ret < 0) {
-		pr_perror("poll() failed");
-	} else if (ret == 1)
+	ret = fd_has_data(lfd);
+	if (ret == 1)
 		pr_err("The socket has data to read\n");
 
 	return ret == 0;
@@ -141,7 +137,7 @@ static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)
 	if (dump_socket_opts(lfd, &skopts))
 		goto err;
 
-	if (pb_write_one(fdset_fd(glob_fdset, CR_FD_NETLINK_SK), &ne, PB_NETLINK_SK))
+	if (pb_write_one(img_from_set(glob_imgset, CR_FD_NETLINK_SK), &ne, PB_NETLINK_SK))
 		goto err;
 
 	return 0;

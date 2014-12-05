@@ -24,7 +24,14 @@ extern int write_pidfile(int pid);
 
 #define DEFAULT_LOG_FILENAME "criu.log"
 
+struct cr_img;
+
 extern void print_data(unsigned long addr, unsigned char *data, size_t size);
-extern void print_image_data(int fd, unsigned int length, int show);
+extern void print_image_data(struct cr_img *, unsigned int length, int show);
+
+static inline int pr_quelled(unsigned int loglevel)
+{
+	return log_get_loglevel() < loglevel && loglevel != LOG_MSG;
+}
 
 #endif /* __CR_LOG_H__ */
