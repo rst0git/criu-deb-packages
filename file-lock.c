@@ -7,8 +7,12 @@
 #include <sys/stat.h>
 
 #include "cr_options.h"
-#include "fdset.h"
+#include "imgset.h"
+#include "files.h"
+#include "fs-magic.h"
 #include "image.h"
+#include "mount.h"
+#include "proc_parse.h"
 #include "servicefd.h"
 #include "file-lock.h"
 #include "parasite.h"
@@ -48,6 +52,8 @@ struct file_lock *alloc_file_lock(void)
 		return NULL;
 
 	INIT_LIST_HEAD(&flock->list);
+	flock->real_owner = -1;
+	flock->owners_fd = -1;
 
 	return flock;
 }
@@ -63,120 +69,51 @@ void free_file_locks(void)
 	INIT_LIST_HEAD(&file_lock_list);
 }
 
-static int dump_one_file_lock(FileLockEntry *fle, const struct cr_fdset *fdset)
+static int dump_one_file_lock(FileLockEntry *fle)
 {
-	pr_info("flag: %d,type: %d,pid: %d,fd: %d,start: %8"PRIx64",len: %8"PRIx64"\n",
+	pr_info("LOCK flag: %d,type: %d,pid: %d,fd: %d,start: %8"PRIx64",len: %8"PRIx64"\n",
 		fle->flag, fle->type, fle->pid,	fle->fd, fle->start, fle->len);
 
-	return pb_write_one(fdset_fd(glob_fdset, CR_FD_FILE_LOCKS),
+	return pb_write_one(img_from_set(glob_imgset, CR_FD_FILE_LOCKS),
 			fle, PB_FILE_LOCK);
 }
 
-static int fill_flock_entry(FileLockEntry *fle, const char *fl_flag,
-			const char *fl_type, const char *fl_option)
+static void fill_flock_entry(FileLockEntry *fle, int fl_kind, int fl_ltype)
 {
-	if (!strcmp(fl_flag, "POSIX")) {
-		fle->flag |= FL_POSIX;
-	} else if (!strcmp(fl_flag, "FLOCK")) {
-		fle->flag |= FL_FLOCK;
-	} else {
-		pr_err("Unknown file lock!\n");
-		goto err;
-	}
-
-	if (!strcmp(fl_type, "MSNFS")) {
-		fle->type |= LOCK_MAND;
-
-		if (!strcmp(fl_option, "READ")) {
-			fle->type |= LOCK_READ;
-		} else if (!strcmp(fl_option, "RW")) {
-			fle->type |= LOCK_RW;
-		} else if (!strcmp(fl_option, "WRITE")) {
-			fle->type |= LOCK_WRITE;
-		} else {
-			pr_err("Unknown lock option!\n");
-			goto err;
-		}
-	} else {
-		if (!strcmp(fl_option, "UNLCK")) {
-			fle->type |= F_UNLCK;
-		} else if (!strcmp(fl_option, "WRITE")) {
-			fle->type |= F_WRLCK;
-		} else if (!strcmp(fl_option, "READ")) {
-			fle->type |= F_RDLCK;
-		} else {
-			pr_err("Unknown lock option!\n");
-			goto err;
-		}
-	}
-
-	return 0;
-err:
-	return -1;
+	fle->flag |= fl_kind;
+	fle->type = fl_ltype;
 }
 
-static int get_fd_by_ino(unsigned long i_no, struct parasite_drain_fd *dfds,
-			pid_t pid)
-{
-	int  i;
-	char buf[PATH_MAX];
-	struct stat fd_stat;
-
-	for (i = 0; i < dfds->nr_fds; i++) {
-		snprintf(buf, sizeof(buf), "/proc/%d/fd/%d", pid,
-			dfds->fds[i]);
-
-		if (stat(buf, &fd_stat) == -1) {
-			pr_msg("Could not get %s stat!\n", buf);
-			continue;
-		}
-
-		if (fd_stat.st_ino == i_no)
-			return dfds->fds[i];
-	}
-
-	return -1;
-}
-
-int dump_task_file_locks(struct parasite_ctl *ctl,
-			struct cr_fdset *fdset,	struct parasite_drain_fd *dfds)
+int dump_file_locks(void)
 {
 	FileLockEntry	 fle;
 	struct file_lock *fl;
-
-	pid_t	pid = ctl->pid.real;
 	int	ret = 0;
 
+	pr_info("Dumping file-locks\n");
+
 	list_for_each_entry(fl, &file_lock_list, list) {
-		if (fl->fl_owner != pid)
+		if (fl->real_owner == -1) {
+			if (fl->fl_kind == FL_POSIX) {
+				pr_err("Unresolved lock found pid %d ino %ld\n",
+						fl->fl_owner, fl->i_no);
+				return -1;
+			}
+
 			continue;
-		pr_info("lockinfo: %lld:%s %s %s %d %02x:%02x:%ld %lld %s\n",
-			fl->fl_id, fl->fl_flag, fl->fl_type, fl->fl_option,
-			fl->fl_owner, fl->maj, fl->min, fl->i_no,
-			fl->start, fl->end);
-
-		file_lock_entry__init(&fle);
-		fle.pid = ctl->pid.virt;
-
-		ret = fill_flock_entry(&fle, fl->fl_flag, fl->fl_type,
-				fl->fl_option);
-		if (ret)
-			goto err;
-
-		fle.fd = get_fd_by_ino(fl->i_no, dfds, pid);
-		if (fle.fd < 0) {
-			ret = -1;
-			goto err;
 		}
 
+		file_lock_entry__init(&fle);
+		fle.pid = fl->real_owner;
+		fle.fd = fl->owners_fd;
+		fill_flock_entry(&fle, fl->fl_kind, fl->fl_ltype);
 		fle.start = fl->start;
-
 		if (!strncmp(fl->end, "EOF", 3))
 			fle.len = 0;
 		else
 			fle.len = (atoll(fl->end) + 1) - fl->start;
 
-		ret = dump_one_file_lock(&fle, fdset);
+		ret = dump_one_file_lock(&fle);
 		if (ret) {
 			pr_err("Dump file lock failed!\n");
 			goto err;
@@ -185,6 +122,145 @@ int dump_task_file_locks(struct parasite_ctl *ctl,
 
 err:
 	return ret;
+}
+
+static int lock_btrfs_file_match(pid_t pid, int fd, struct file_lock *fl, struct fd_parms *p)
+{
+	int phys_dev = MKKDEV(fl->maj, fl->min);
+	char link[PATH_MAX], t[32];
+	struct ns_id *ns;
+	int ret;
+
+	snprintf(t, sizeof(t), "/proc/%d/fd/%d", pid, fd);
+	ret = readlink(t, link, sizeof(link)) - 1;
+	if (ret < 0) {
+		pr_perror("Can't read link of fd %d", fd);
+		return -1;
+	} else if ((size_t)ret == sizeof(link)) {
+		pr_err("Buffer for read link of fd %d is too small\n", fd);
+		return -1;
+	}
+	link[ret] = 0;
+
+	ns = lookup_nsid_by_mnt_id(p->mnt_id);
+	return  phys_stat_dev_match(p->stat.st_dev, phys_dev, ns, link);
+}
+
+static inline int lock_file_match(pid_t pid, int fd, struct file_lock *fl, struct fd_parms *p)
+{
+	dev_t dev = p->stat.st_dev;
+
+	if (fl->i_no != p->stat.st_ino)
+		return 0;
+
+	/*
+	 * Get the right devices for BTRFS. Look at phys_stat_resolve_dev()
+	 * for more details.
+	 */
+	if (p->fs_type == BTRFS_SUPER_MAGIC) {
+		if (p->mnt_id != -1) {
+			struct mount_info *m;
+
+			m = lookup_mnt_id(p->mnt_id);
+			BUG_ON(m == NULL);
+			dev = kdev_to_odev(m->s_dev);
+		} else /* old kernel */
+			return lock_btrfs_file_match(pid, fd, fl, p);
+	}
+
+	return makedev(fl->maj, fl->min) == dev;
+}
+
+static int lock_check_fd(int lfd, struct file_lock *fl)
+{
+	int ret;
+
+	if (fl->fl_ltype & LOCK_MAND)
+		ret = flock(lfd, LOCK_MAND | LOCK_RW);
+	else
+		ret = flock(lfd, LOCK_EX | LOCK_NB);
+	pr_debug("   `- %d/%d\n", ret, errno);
+	if (ret != 0) {
+		if (errno != EAGAIN) {
+			pr_err("Bogus lock test result %d\n", ret);
+			return -1;
+		}
+
+		return 0;
+	} else {
+		/*
+		 * The ret == 0 means, that new lock doesn't conflict
+		 * with any others on the file. But since we do know, 
+		 * that there should be some other one (file is found
+		 * in /proc/locks), it means that the lock is already
+		 * on file pointed by fd.
+		 */
+		pr_debug("   `- downgrading lock back\n");
+		if (fl->fl_ltype & LOCK_MAND)
+			flock(lfd, fl->fl_ltype);
+		else if (fl->fl_ltype == F_RDLCK)
+			flock(lfd, LOCK_SH);
+	}
+
+	return 1;
+}
+
+int note_file_lock(struct pid *pid, int fd, int lfd, struct fd_parms *p)
+{
+	struct file_lock *fl;
+	int ret;
+
+	list_for_each_entry(fl, &file_lock_list, list) {
+		ret = lock_file_match(pid->real, fd, fl, p);
+		if (ret < 0)
+			return -1;
+		if (ret == 0)
+			continue;
+
+		if (!opts.handle_file_locks) {
+			pr_err("Some file locks are hold by dumping tasks!"
+					"You can try --" OPT_FILE_LOCKS " to dump them.\n");
+			return -1;
+		}
+
+		if (fl->fl_kind == FL_POSIX) {
+			/*
+			 * POSIX locks cannot belong to anyone
+			 * but creator.
+			 */
+			if (fl->fl_owner != pid->real)
+				continue;
+		} else /* fl->fl_kind == FL_FLOCK */ {
+			int ret;
+
+			/*
+			 * FLOCKs can be inherited across fork,
+			 * thus we can have any task as lock
+			 * owner. But the creator is preferred
+			 * anyway.
+			 */
+
+			if (fl->fl_owner != pid->real &&
+					fl->real_owner != -1)
+				continue;
+
+			pr_debug("Checking lock holder %d:%d\n", pid->real, fd);
+			ret = lock_check_fd(lfd, fl);
+			if (ret < 0)
+				return ret;
+			if (ret == 0)
+				continue;
+		}
+
+		fl->real_owner = pid->virt;
+		fl->owners_fd = fd;
+
+		pr_info("Found lock entry %d.%d %d vs %d\n",
+				pid->real, pid->virt, fd,
+				fl->fl_owner);
+	}
+
+	return 0;
 }
 
 static int restore_file_lock(FileLockEntry *fle)
@@ -262,19 +338,20 @@ static int restore_file_locks(int pid)
 
 static int restore_file_locks_legacy(int pid)
 {
-	int fd, ret = -1;
+	int ret = -1;
+	struct cr_img *img;
 	FileLockEntry *fle;
 
-	fd = open_image(CR_FD_FILE_LOCKS_PID, O_RSTR | O_OPT, pid);
-	if (fd < 0) {
-		if (fd == -ENOENT)
+	img = open_image(CR_FD_FILE_LOCKS_PID, O_RSTR | O_OPT, pid);
+	if (!img) {
+		if (errno == ENOENT)
 			return 0;
 		else
 			return -1;
 	}
 
 	while (1) {
-		ret = pb_read_one_eof(fd, &fle, PB_FILE_LOCK);
+		ret = pb_read_one_eof(img, &fle, PB_FILE_LOCK);
 		if (ret <= 0)
 			break;
 
@@ -284,7 +361,7 @@ static int restore_file_locks_legacy(int pid)
 			break;
 	}
 
-	close_safe(&fd);
+	close_image(img);
 	return ret;
 }
 

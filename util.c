@@ -1,21 +1,19 @@
 #define _XOPEN_SOURCE
 
-#include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
-#include <unistd.h>
 #include <stdbool.h>
 #include <limits.h>
 #include <signal.h>
-#include <limits.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/sendfile.h>
 #include <fcntl.h>
+#include <poll.h>
 
 #include <sys/param.h>
 #include <sys/types.h>
@@ -161,26 +159,53 @@ int move_img_fd(int *img_fd, int want_fd)
 	return 0;
 }
 
+/*
+ * Cached opened /proc/$pid and /proc/self files.
+ * Used for faster access to /proc/.../foo files
+ * by using openat()-s
+ */
+
 static pid_t open_proc_pid = PROC_NONE;
 static int open_proc_fd = -1;
+static int open_proc_self_fd = -1;
+
+static inline void set_proc_self_fd(int fd)
+{
+	if (open_proc_self_fd >= 0)
+		close(open_proc_self_fd);
+
+	open_proc_self_fd = fd;
+}
+
+static inline void set_proc_pid_fd(int pid, int fd)
+{
+	if (open_proc_fd >= 0)
+		close(open_proc_fd);
+
+	open_proc_pid = pid;
+	open_proc_fd = fd;
+}
+
+static inline int get_proc_fd(int pid)
+{
+	if (pid == PROC_SELF)
+		return open_proc_self_fd;
+	else if (pid == open_proc_pid)
+		return open_proc_fd;
+	else
+		return -1;
+}
 
 int close_pid_proc(void)
 {
-	int ret = 0;
-
-	if (open_proc_fd >= 0)
-		ret = close(open_proc_fd);
-
-	open_proc_fd = -1;
-	open_proc_pid = PROC_NONE;
-
-	return ret;
+	set_proc_self_fd(-1);
+	set_proc_pid_fd(PROC_NONE, -1);
+	return 0;
 }
 
 void close_proc()
 {
 	close_pid_proc();
-
 	close_service_fd(PROC_FD_OFF);
 }
 
@@ -194,8 +219,8 @@ int set_proc_fd(int fd)
 static int open_proc_sfd(char *path)
 {
 	int fd, ret;
-	close_proc();
 
+	close_proc();
 	fd = open(path, O_DIRECTORY | O_RDONLY);
 	if (fd == -1) {
 		pr_err("Can't open %s\n", path);
@@ -216,10 +241,9 @@ inline int open_pid_proc(pid_t pid)
 	int fd;
 	int dfd;
 
-	if (pid == open_proc_pid)
-		return open_proc_fd;
-
-	close_pid_proc();
+	fd = get_proc_fd(pid);
+	if (fd >= 0)
+		return fd;
 
 	dfd = get_service_fd(PROC_FD_OFF);
 	if (dfd < 0) {
@@ -242,12 +266,15 @@ inline int open_pid_proc(pid_t pid)
 		snprintf(path, sizeof(path), "%d", pid);
 
 	fd = openat(dfd, path, O_RDONLY);
-	if (fd < 0)
+	if (fd < 0) {
 		pr_perror("Can't open %s", path);
-	else {
-		open_proc_fd = fd;
-		open_proc_pid = pid;
+		return -1;
 	}
+
+	if (pid == PROC_SELF)
+		set_proc_self_fd(fd);
+	else
+		set_proc_pid_fd(pid, fd);
 
 	return fd;
 }
@@ -256,8 +283,9 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...)
 {
 	char path[128];
 	va_list args;
-	int dirfd = open_pid_proc(pid);
+	int dirfd;
 
+	dirfd = open_pid_proc(pid);
 	if (dirfd < 0)
 		return -1;
 
@@ -456,39 +484,6 @@ void shfree_last(void *ptr)
 	rst_mem_free_last(RM_SHARED);
 }
 
-int run_scripts(char *action)
-{
-	struct script *script;
-	int ret = 0;
-	char image_dir[PATH_MAX];
-
-	pr_debug("Running %s scripts\n", action);
-
-	if (setenv("CRTOOLS_SCRIPT_ACTION", action, 1)) {
-		pr_perror("Can't set CRTOOLS_SCRIPT_ACTION=%s", action);
-		return -1;
-	}
-
-	sprintf(image_dir, "/proc/%ld/fd/%d", (long) getpid(), get_service_fd(IMG_FD_OFF));
-	if (setenv("CRTOOLS_IMAGE_DIR", image_dir, 1)) {
-		pr_perror("Can't set CRTOOLS_IMAGE_DIR=%s", image_dir);
-		return -1;
-	}
-
-	list_for_each_entry(script, &opts.scripts, node) {
-		if (script->path == SCRIPT_RPC_NOTIFY) {
-			pr_debug("\tRPC\n");
-			ret |= send_criu_rpc_script(action, script->arg);
-		} else {
-			pr_debug("\t[%s]\n", script->path);
-			ret |= system(script->path);
-		}
-	}
-
-	unsetenv("CRTOOLS_SCRIPT_ACTION");
-	return ret;
-}
-
 #define DUP_SAFE(fd, out)						\
 	({							\
 		int ret__;					\
@@ -595,7 +590,7 @@ out:
 	return ret;
 }
 
-int cr_daemon(int nochdir, int noclose)
+int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd)
 {
 	int pid;
 
@@ -614,6 +609,12 @@ int cr_daemon(int nochdir, int noclose)
 			pr_perror("Can't change directory");
 	if (!noclose) {
 		int fd;
+
+		if (close_fd != -1)
+			close(close_fd);
+
+		if (*keep_fd != -1)
+			*keep_fd = dup2(*keep_fd, 3);
 
 		fd = open("/dev/null", O_RDWR);
 		if (fd < 0) {
@@ -686,7 +687,7 @@ struct vma_area *alloc_vma_area(void)
 	return p;
 }
 
-int mkdirp(const char *path)
+int mkdirpat(int fd, const char *path)
 {
 	size_t i;
 	char made_path[PATH_MAX], *pos;
@@ -706,8 +707,8 @@ int mkdirp(const char *path)
 		pos = strchr(made_path + i, '/');
 		if (pos)
 			*pos = '\0';
-		if (mkdir(made_path, 0755) < 0 && errno != EEXIST) {
-			pr_perror("couldn't mkdirpat directory");
+		if (mkdirat(fd, made_path, 0755) < 0 && errno != EEXIST) {
+			pr_perror("couldn't mkdirpat directory %s", made_path);
 			return -1;
 		}
 		if (pos) {
@@ -808,4 +809,17 @@ void split(char *str, char token, char ***out, int *n)
 
 		i++;
 	} while(cur);
+}
+
+int fd_has_data(int lfd)
+{
+	struct pollfd pfd = {lfd, POLLIN, 0};
+	int ret;
+
+	ret = poll(&pfd, 1, 0);
+	if (ret < 0) {
+		pr_perror("poll() failed");
+	}
+
+	return ret;
 }

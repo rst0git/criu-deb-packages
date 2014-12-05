@@ -15,11 +15,25 @@ struct ns_id {
 	pid_t pid;
 	struct ns_desc *nd;
 	struct ns_id *next;
-	futex_t created; /* boolean */
+
+	/*
+	 * For mount namespaces on restore -- indicates that
+	 * the namespace in question is created (all mounts
+	 * are mounted) and other tasks may do setns on it
+	 * and proceed.
+	 */
+	futex_t ns_created;
+
 	union {
 		struct {
+			struct mount_info *mntinfo_list;
 			struct mount_info *mntinfo_tree;
 		} mnt;
+
+		struct {
+			int nlsk;	/* for sockets collection */
+			int seqsk;	/* to talk to parasite daemons */
+		} net;
 	};
 };
 extern struct ns_id *ns_ids;
@@ -40,7 +54,9 @@ extern unsigned long root_ns_mask;
 extern const struct fdtype_ops nsfile_dump_ops;
 extern struct collect_image_info nsfile_cinfo;
 
-extern int collect_mnt_namespaces(void);
+extern int walk_namespaces(struct ns_desc *nd, int (*cb)(struct ns_id *, void *), void *oarg);
+extern int collect_namespaces(bool for_dump);
+extern int collect_mnt_namespaces(bool for_dump);
 extern int dump_mnt_namespaces(void);
 extern int dump_namespaces(struct pstree_item *item, unsigned int ns_flags);
 extern int prepare_namespace(struct pstree_item *item, unsigned long clone_flags);
@@ -50,10 +66,16 @@ extern int switch_ns(int pid, struct ns_desc *nd, int *rst);
 extern int restore_ns(int rst, struct ns_desc *nd);
 
 extern int dump_task_ns_ids(struct pstree_item *);
+extern int predump_task_ns_ids(struct pstree_item *);
 extern struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd);
 extern int rst_add_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd);
 extern struct ns_id *lookup_ns_by_id(unsigned int id, struct ns_desc *nd);
 
-extern int gen_predump_ns_mask(void);
+extern int collect_user_namespaces(bool for_dump);
+extern int prepare_userns(struct pstree_item *item);
+extern int userns_uid(int uid);
+extern int userns_gid(int gid);
+extern int dump_user_ns(pid_t pid, int ns_id);
+extern void free_userns_maps(void);
 
 #endif /* __CR_NS_H__ */

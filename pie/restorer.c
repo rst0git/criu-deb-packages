@@ -51,6 +51,8 @@ static struct task_entries *task_entries;
 static futex_t thread_inprogress;
 static futex_t zombies_inprogress;
 static int cap_last_cap;
+static pid_t *helpers;
+static int n_helpers;
 
 extern void cr_restore_rt (void) asm ("__cr_restore_rt")
 			__attribute__ ((visibility ("hidden")));
@@ -58,6 +60,13 @@ extern void cr_restore_rt (void) asm ("__cr_restore_rt")
 static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 {
 	char *r;
+	int i;
+
+	/* We can ignore helpers that die, we expect them to after
+	 * CR_STATE_RESTORE is finished. */
+	for (i = 0; i < n_helpers; i++)
+		if (siginfo->si_pid == helpers[i])
+			return;
 
 	if (futex_get(&task_entries->start) == CR_STATE_RESTORE_SIGCHLD) {
 		pr_debug("%ld: Collect a zombie with (pid %d, %d)\n",
@@ -321,6 +330,11 @@ static int restore_thread_common(struct rt_sigframe *sigframe,
 	return 0;
 }
 
+static void noinline rst_sigreturn(unsigned long new_sp)
+{
+	ARCH_RT_SIGRETURN(new_sp);
+}
+
 /*
  * Threads restoration via sigreturn. Note it's locked
  * routine and calls for unlock at the end.
@@ -372,7 +386,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 	futex_dec_and_wake(&thread_inprogress);
 
 	new_sp = (long)rt_sigframe + SIGFRAME_OFFSET;
-	ARCH_RT_SIGRETURN(new_sp);
+	rst_sigreturn(new_sp);
 
 core_restore_end:
 	pr_err("Restorer abnormal termination for %ld\n", sys_getpid());
@@ -568,7 +582,8 @@ static int timerfd_arm(struct task_restore_args *args)
 		}
 
 		ret  = sys_timerfd_settime(t->fd, t->settime_flags, &t->val, NULL);
-		ret |= sys_ioctl(t->fd, TFD_IOC_SET_TICKS, (unsigned long)&t->ticks);
+		if (t->ticks)
+			ret |= sys_ioctl(t->fd, TFD_IOC_SET_TICKS, (unsigned long)&t->ticks);
 		if (ret) {
 			pr_err("Can't restore ticks/time for timerfd - %d\n", i);
 			return ret;
@@ -701,6 +716,29 @@ static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len,
 	return 0;
 }
 
+static int wait_helpers(struct task_restore_args *task_args)
+{
+	int i;
+
+	for (i = 0; i < task_args->n_helpers; i++) {
+		int status;
+		pid_t pid = task_args->helpers[i];
+
+		/* Check that a helper completed. */
+		if (sys_wait4(pid, &status, 0, NULL) == -1) {
+			/* It has been waited in sigchld_handler */
+			continue;
+		}
+		if (!WIFEXITED(status) || WEXITSTATUS(status)) {
+			pr_err("%d exited with non-zero code (%d,%d)\n", pid,
+				WEXITSTATUS(status), WTERMSIG(status));
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
 /*
  * The main routine to restore task via sigreturn.
  * This one is very special, we never return there
@@ -716,6 +754,7 @@ long __export_restore_task(struct task_restore_args *args)
 	unsigned long va;
 
 	struct rt_sigframe *rt_sigframe;
+	struct prctl_mm_map prctl_map;
 	unsigned long new_sp;
 	k_rtsigset_t to_block;
 	pid_t my_pid = sys_getpid();
@@ -729,6 +768,9 @@ long __export_restore_task(struct task_restore_args *args)
 #endif
 
 	task_entries = args->task_entries;
+	helpers = args->helpers;
+	n_helpers = args->n_helpers;
+	*args->breakpoint = rst_sigreturn;
 
 	ksigfillset(&act.rt_sa_mask);
 	act.rt_sa_handler = sigchld_handler;
@@ -840,16 +882,6 @@ long __export_restore_task(struct task_restore_args *args)
 		if (!(vma_entry_is(vma_entry, VMA_AREA_REGULAR)))
 			continue;
 
-		if (vma_entry_is(vma_entry, VMA_ANON_SHARED)) {
-			struct shmem_info *entry;
-
-			entry = find_shmem(args->shmems, args->nr_shmems,
-						  vma_entry->shmid);
-			if (entry && entry->pid == my_pid &&
-			    entry->start == vma_entry->start)
-				futex_set_and_wake(&entry->lock, 1);
-		}
-
 		if (vma_entry->prot & PROT_WRITE)
 			continue;
 
@@ -890,30 +922,56 @@ long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * Tune up the task fields.
 	 */
-	ret |= sys_prctl_safe(PR_SET_NAME, (long)args->comm, 0, 0);
-
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_CODE,	(long)args->mm.mm_start_code, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_CODE,	(long)args->mm.mm_end_code, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_DATA,	(long)args->mm.mm_start_data, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_DATA,	(long)args->mm.mm_end_data, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_STACK,	(long)args->mm.mm_start_stack, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_BRK,	(long)args->mm.mm_start_brk, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_BRK,		(long)args->mm.mm_brk, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_START,	(long)args->mm.mm_arg_start, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_END,	(long)args->mm.mm_arg_end, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_START,	(long)args->mm.mm_env_start, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_END,	(long)args->mm.mm_env_end, 0);
-	ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_AUXV,	(long)args->mm_saved_auxv, args->mm_saved_auxv_size);
+	ret = sys_prctl_safe(PR_SET_NAME, (long)args->comm, 0, 0);
 	if (ret)
 		goto core_restore_end;
 
 	/*
-	 * Because of requirements applied from kernel side
-	 * we need to restore /proc/pid/exe symlink late,
-	 * after old existing VMAs are superseded with
-	 * new ones from image file.
+	 * New kernel interface with @PR_SET_MM_MAP will become
+	 * more widespread once kernel get deployed over the world.
+	 * Thus lets be opportunistic and use new inteface as a try.
 	 */
-	ret = restore_self_exe_late(args);
+	prctl_map = (struct prctl_mm_map) {
+		.start_code	= args->mm.mm_start_code,
+		.end_code	= args->mm.mm_end_code,
+		.start_data	= args->mm.mm_start_data,
+		.end_data	= args->mm.mm_end_data,
+		.start_stack	= args->mm.mm_start_stack,
+		.start_brk	= args->mm.mm_start_brk,
+		.brk		= args->mm.mm_brk,
+		.arg_start	= args->mm.mm_arg_start,
+		.arg_end	= args->mm.mm_arg_end,
+		.env_start	= args->mm.mm_env_start,
+		.env_end	= args->mm.mm_env_end,
+		.auxv		= (void *)args->mm_saved_auxv,
+		.auxv_size	= args->mm_saved_auxv_size,
+		.exe_fd		= args->fd_exe_link,
+	};
+	ret = sys_prctl(PR_SET_MM, PR_SET_MM_MAP, (long)&prctl_map, sizeof(prctl_map), 0);
+	if (ret == -EINVAL) {
+		ret  = sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_CODE,	(long)args->mm.mm_start_code, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_CODE,	(long)args->mm.mm_end_code, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_DATA,	(long)args->mm.mm_start_data, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_DATA,	(long)args->mm.mm_end_data, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_STACK,	(long)args->mm.mm_start_stack, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_BRK,	(long)args->mm.mm_start_brk, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_BRK,		(long)args->mm.mm_brk, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_START,	(long)args->mm.mm_arg_start, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_END,	(long)args->mm.mm_arg_end, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_START,	(long)args->mm.mm_env_start, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_END,	(long)args->mm.mm_env_end, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_AUXV,	(long)args->mm_saved_auxv, args->mm_saved_auxv_size);
+
+		/*
+		 * Because of requirements applied from kernel side
+		 * we need to restore /proc/pid/exe symlink late,
+		 * after old existing VMAs are superseded with
+		 * new ones from image file.
+		 */
+		ret |= restore_self_exe_late(args);
+	} else
+		sys_close(args->fd_exe_link);
+
 	if (ret)
 		goto core_restore_end;
 
@@ -1019,6 +1077,9 @@ long __export_restore_task(struct task_restore_args *args)
 
 	futex_wait_while_gt(&zombies_inprogress, 0);
 
+	if (wait_helpers(args) < 0)
+		goto core_restore_end;
+
 	ksigfillset(&to_block);
 	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
 	if (ret) {
@@ -1092,7 +1153,7 @@ long __export_restore_task(struct task_restore_args *args)
 	 * pure assembly since we don't need any additional
 	 * code insns from gcc.
 	 */
-	ARCH_RT_SIGRETURN(new_sp);
+	rst_sigreturn(new_sp);
 
 core_restore_end:
 	futex_abort_and_wake(&task_entries->nr_in_progress);

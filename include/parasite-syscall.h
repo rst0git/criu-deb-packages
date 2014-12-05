@@ -16,7 +16,7 @@ struct pstree_item;
 struct _CredsEntry;
 struct _CoreEntry;
 struct list_head;
-struct cr_fdset;
+struct cr_imgset;
 struct fd_opts;
 struct pid;
 
@@ -30,6 +30,7 @@ struct parasite_ctl {
 	struct pid		pid;
 	void			*remote_map;
 	void			*local_map;
+	void			*sigreturn_addr;			/* A place for the breakpoint */
 	unsigned long		map_length;
 
 	/* thread leader data */
@@ -45,7 +46,6 @@ struct parasite_ctl {
 
 	unsigned long		parasite_ip;				/* service routine start ip */
 	unsigned long		syscall_ip;				/* entry point of infection */
-	u8			code_orig[BUILTIN_SYSCALL_SIZE];
 
 	unsigned int		*addr_cmd;				/* addr for command */
 	void			*addr_args;				/* address for arguments */
@@ -56,7 +56,7 @@ struct parasite_ctl {
 	struct page_pipe	*mem_pp;
 };
 
-extern int parasite_dump_sigacts_seized(struct parasite_ctl *ctl, struct cr_fdset *cr_fdset);
+extern int parasite_dump_sigacts_seized(struct parasite_ctl *ctl, struct cr_imgset *cr_imgset);
 extern int parasite_dump_itimers_seized(struct parasite_ctl *ctl, struct pstree_item *);
 
 struct proc_posix_timers_stat;
@@ -98,14 +98,13 @@ extern int parasite_cure_local(struct parasite_ctl *ctl);
 extern int parasite_cure_seized(struct parasite_ctl *ctl);
 extern struct parasite_ctl *parasite_infect_seized(pid_t pid,
 						   struct pstree_item *item,
-						   struct vm_area_list *vma_area_list,
-						   struct parasite_drain_fd *dfds,
-						   int timer_n);
+						   struct vm_area_list *vma_area_list);
+extern void parasite_ensure_args_size(unsigned long sz);
 extern struct parasite_ctl *parasite_prep_ctl(pid_t pid,
 					      struct vm_area_list *vma_area_list);
 extern int parasite_map_exchange(struct parasite_ctl *ctl, unsigned long size);
 
-extern struct parasite_tty_args *parasite_dump_tty(struct parasite_ctl *ctl, int fd);
+extern struct parasite_tty_args *parasite_dump_tty(struct parasite_ctl *ctl, int fd, int type);
 
 extern int parasite_init_threads_seized(struct parasite_ctl *ctl, struct pstree_item *item);
 extern int parasite_fini_threads_seized(struct parasite_ctl *ctl);
@@ -124,7 +123,21 @@ extern int parasite_fixup_vdso(struct parasite_ctl *ctl, pid_t pid,
 			       struct vm_area_list *vma_area_list);
 #endif
 
-extern int parasite_stop_on_syscall(int tasks, int sys_nr);
+/*
+ * The PTRACE_SYSCALL will trap task twice -- on
+ * enter into and on exit from syscall. If we trace
+ * a single task, we may skip half of all getregs
+ * calls -- on exit we don't need them.
+ */
+enum trace_flags {
+	TRACE_ALL,
+	TRACE_ENTER,
+	TRACE_EXIT,
+};
+
+extern int parasite_stop_daemon(struct parasite_ctl *ctl);
+extern int parasite_stop_on_syscall(int tasks, int sys_nr, enum trace_flags trace);
 extern int parasite_unmap(struct parasite_ctl *ctl, unsigned long addr);
+extern int ptrace_stop_pie(pid_t pid, void *addr, enum trace_flags *tf);
 
 #endif /* __CR_PARASITE_SYSCALL_H__ */

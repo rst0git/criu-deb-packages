@@ -217,6 +217,8 @@ invalid:
 	return 1;
 }
 
+static bool doing_predump = false;
+
 char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 {
 	struct irmap *c, *h, **p;
@@ -227,7 +229,14 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 
 	pr_debug("Resolving %x:%lx path\n", s_dev, i_ino);
 
-	if (__mntns_get_root_fd(root_item->pid.real) < 0)
+	/*
+	 * If we're in predump, then processes already run
+	 * and the root_item is already freed by that time.
+	 * But the root service fd is already set by the
+	 * irmap_predump_prep, so we just go ahead and scan.
+	 */
+	if (!doing_predump &&
+			__mntns_get_root_fd(root_item->pid.real) < 0)
 		goto out;
 
 	timing_start(TIME_IRMAP_RESOLVE);
@@ -296,13 +305,30 @@ int irmap_queue_cache(unsigned int dev, unsigned long ino,
 	return 0;
 }
 
+int irmap_predump_prep(void)
+{
+	/*
+	 * Tasks are about to get released soon, but
+	 * we'll need to do FS scan for irmaps. In this
+	 * scan we will need to know the root dir tasks
+	 * live in. Need to make sure the respective fd
+	 * (service) is set to that root, so that the
+	 * scan works and doesn't race with the tasks
+	 * dying or changind root.
+	 */
+
+	doing_predump = true;
+	return __mntns_get_root_fd(root_item->pid.real) < 0 ? -1 : 0;
+}
+
 int irmap_predump_run(void)
 {
-	int ret = 0, fd;
+	int ret = 0;
+	struct cr_img *img;
 	struct irmap_predump *ip;
 
-	fd = open_image_at(AT_FDCWD, CR_FD_IRMAP_CACHE, O_DUMP);
-	if (fd < 0)
+	img = open_image_at(AT_FDCWD, CR_FD_IRMAP_CACHE, O_DUMP);
+	if (!img)
 		return -1;
 
 	pr_info("Running irmap pre-dump\n");
@@ -323,13 +349,13 @@ int irmap_predump_run(void)
 			ic.inode = ip->ino;
 			ic.path = ip->fh.path;
 
-			ret = pb_write_one(fd, &ic, PB_IRMAP_CACHE);
+			ret = pb_write_one(img, &ic, PB_IRMAP_CACHE);
 			if (ret)
 				break;
 		}
 	}
 
-	close(fd);
+	close_image(img);
 	return ret;
 }
 
@@ -366,29 +392,29 @@ static int irmap_cache_one(IrmapCacheEntry *ie)
 	return 0;
 }
 
-static int open_irmap_cache(int *fd)
+static int open_irmap_cache(struct cr_img **img)
 {
 	int dir = AT_FDCWD;
 
 	pr_info("Searching irmap cache in work dir\n");
 in:
-	*fd = open_image_at(dir, CR_FD_IRMAP_CACHE, O_RSTR | O_OPT);
+	*img = open_image_at(dir, CR_FD_IRMAP_CACHE, O_RSTR | O_OPT);
 	if (dir != AT_FDCWD)
 		close(dir);
 
-	if (*fd >= 0) {
+	if (*img) {
 		pr_info("... done\n");
 		return 1;
 	}
 
-	if (*fd == -ENOENT && dir == AT_FDCWD) {
+	if (errno == ENOENT && dir == AT_FDCWD) {
 		pr_info("Searching irmap cache in parent\n");
 		dir = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
 		if (dir >= 0)
 			goto in;
 	}
 
-	if (*fd != -ENOENT)
+	if (errno != ENOENT)
 		return -1;
 
 	pr_info("No irmap cache\n");
@@ -397,9 +423,10 @@ in:
 
 int irmap_load_cache(void)
 {
-	int fd, ret;
+	int ret;
+	struct cr_img *img;
 
-	ret = open_irmap_cache(&fd);
+	ret = open_irmap_cache(&img);
 	if (ret <= 0)
 		return ret;
 
@@ -407,7 +434,7 @@ int irmap_load_cache(void)
 	while (1) {
 		IrmapCacheEntry *ic;
 
-		ret = pb_read_one_eof(fd, &ic, PB_IRMAP_CACHE);
+		ret = pb_read_one_eof(img, &ic, PB_IRMAP_CACHE);
 		if (ret <= 0)
 			break;
 
@@ -418,6 +445,6 @@ int irmap_load_cache(void)
 		irmap_cache_entry__free_unpacked(ic, NULL);
 	}
 
-	close(fd);
+	close_image(img);
 	return ret;
 }

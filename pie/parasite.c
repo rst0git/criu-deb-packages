@@ -15,6 +15,7 @@
 #include "lock.h"
 #include "vdso.h"
 #include "log.h"
+#include "tty.h"
 
 #include <string.h>
 
@@ -235,6 +236,22 @@ static int dump_creds(struct parasite_dump_creds *args)
 		return -1;
 	}
 
+	ret = sys_getresuid(&args->uids[0], &args->uids[1], &args->uids[2]);
+	if (ret) {
+		pr_err("Unable to get uids: %d\n", ret);
+		return -1;
+	}
+
+	args->uids[3] = sys_setfsuid(-1L);
+
+	ret = sys_getresgid(&args->gids[0], &args->gids[1], &args->gids[2]);
+	if (ret) {
+		pr_err("Unable to get uids: %d\n", ret);
+		return -1;
+	}
+
+	args->gids[3] = sys_setfsgid(-1L);
+
 	return 0;
 
 grps_err:
@@ -329,44 +346,47 @@ static int parasite_dump_tty(struct parasite_tty_args *args)
 # define TIOCGEXCL	_IOR('T', 0x40, int)
 #endif
 
-	ret = tty_ioctl(args->fd, TIOCGSID, &args->sid);
-	if (ret < 0)
-		goto err;
-
-	ret = tty_ioctl(args->fd, TIOCGPGRP, &args->pgrp);
-	if (ret < 0)
-		goto err;
-
-	ret = tty_ioctl(args->fd, TIOCGPKT, &args->st_pckt);
-	if (ret < 0)
-		goto err;
-
-	ret = tty_ioctl(args->fd, TIOCGPTLCK, &args->st_lock);
-	if (ret < 0)
-		goto err;
-
-	ret = tty_ioctl(args->fd, TIOCGEXCL, &args->st_excl);
-	if (ret < 0)
-		goto err;
-
-	args->hangup = false;
-	return 0;
-
-err:
-	if (ret != -EIO) {
-		pr_err("TTY: Can't get sid/pgrp: %d\n", ret);
-		return -1;
-	}
-
-	/* kernel reports EIO for get ioctls on pair-less ptys */
 	args->sid = 0;
 	args->pgrp = 0;
 	args->st_pckt = 0;
 	args->st_lock = 0;
 	args->st_excl = 0;
-	args->hangup = true;
 
+#define __tty_ioctl(cmd, arg)					\
+	do {							\
+		ret = tty_ioctl(args->fd, cmd, &arg);		\
+		if (ret < 0) {					\
+			if (ret == -ENOTTY)			\
+				arg = 0;			\
+			else if (ret == -EIO)			\
+				goto err_io;			\
+			else					\
+				goto err;			\
+		}						\
+	} while (0)
+
+	__tty_ioctl(TIOCGSID, args->sid);
+	__tty_ioctl(TIOCGPGRP, args->pgrp);
+	__tty_ioctl(TIOCGEXCL,	args->st_excl);
+	
+	if (args->type == TTY_TYPE_PTM ||
+	    args->type == TTY_TYPE_PTS) {
+		__tty_ioctl(TIOCGPKT,	args->st_pckt);
+		__tty_ioctl(TIOCGPTLCK,	args->st_lock);
+	}
+
+	args->hangup = false;
 	return 0;
+
+err:
+	pr_err("tty: Can't fetch params: err = %d\n", ret);
+	return -1;
+err_io:
+
+	/* kernel reports EIO for get ioctls on pair-less ptys */
+	args->hangup = true;
+	return 0;
+#undef __tty_ioctl
 }
 
 #ifdef CONFIG_VDSO
@@ -438,6 +458,11 @@ static int __parasite_daemon_wait_msg(struct ctl_msg *m)
 	return -1;
 }
 
+static noinline void fini_sigreturn(unsigned long new_sp)
+{
+	ARCH_RT_SIGRETURN(new_sp);
+}
+
 static int fini()
 {
 	unsigned long new_sp;
@@ -454,7 +479,7 @@ static int fini()
 	sys_close(tsock);
 	log_set_fd(-1);
 
-	ARCH_RT_SIGRETURN(new_sp);
+	fini_sigreturn(new_sp);
 
 	BUG();
 
@@ -561,6 +586,7 @@ static noinline __used int parasite_init_daemon(void *data)
 	struct parasite_init_args *args = data;
 	int ret;
 
+	args->sigreturn_addr = fini_sigreturn;
 	sigframe = args->sigframe;
 
 	tsock = sys_socket(PF_UNIX, SOCK_SEQPACKET, 0);

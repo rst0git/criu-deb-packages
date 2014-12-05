@@ -25,6 +25,7 @@ static/maps01
 static/maps02
 static/maps04
 static/maps05
+static/mlock_setuid
 static/maps_file_prot
 static/mprotect00
 static/mtime_mmap
@@ -98,12 +99,14 @@ static/unlink_fifo_wronly
 static/zombie00
 static/rlimits00
 transition/fork
+transition/fork2
 transition/thread-bomb
 static/pty00
 static/pty01
 static/pty04
 static/tty02
 static/tty03
+static/console
 static/child_opened_proc
 static/cow01
 static/fpu00
@@ -115,6 +118,10 @@ static/pdeath_sig
 static/fdt_shared
 static/file_locks00
 static/file_locks01
+static/file_locks02
+static/file_locks03
+static/file_locks04
+static/file_locks05
 static/sigpending
 static/sigaltstack
 static/sk-netlink
@@ -175,6 +182,7 @@ static/cgroup00
 static/cgroup01
 static/cgroup02
 ns/static/clean_mntns
+static/remap_dead_pid
 "
 
 TEST_CR_KERNEL="
@@ -188,16 +196,86 @@ if [ $? -eq 0 ]; then
 ns/static/mntns_open
 ns/static/mntns_link_remap
 ns/static/mntns_link_ghost
+ns/static/mntns_shared_bind
+ns/static/mntns_shared_bind02
 "
 else
 	export ZDTM_NOSUBNS=1
 fi
 
+BLACKLIST_FOR_USERNS="
+ns/static/maps01
+ns/static/mlock_setuid
+ns/static/sched_prio00
+ns/static/sched_policy00
+ns/static/sockets00
+ns/static/sockets01
+ns/static/sockets02
+ns/static/sock_opts00
+ns/static/sock_opts01
+ns/static/sockets_spair
+ns/static/sockets_dgram
+ns/static/socket_queues
+ns/static/deleted_unix_sock
+ns/static/sk-unix-unconn
+ns/static/socket_listen
+ns/static/socket_listen6
+ns/static/packet_sock
+ns/static/socket_udp
+ns/static/sock_filter
+ns/static/socket6_udp
+ns/static/socket_udplite
+ns/static/inotify00
+ns/static/inotify_irmap
+ns/static/fanotify00
+ns/static/unbound_sock
+ns/static/fifo-ghost
+ns/static/unlink_fifo
+ns/static/unlink_fifo_wronly
+ns/static/pty00
+ns/static/pty01
+ns/static/tty02
+ns/static/tty03
+ns/static/sk-netlink
+ns/static/dumpable02
+ns/static/deleted_dev
+ns/static/tempfs
+ns/static/clean_mntns
+ns/static/mntns_link_remap
+ns/static/mntns_link_ghost
+ns/static/console
+ns/static/rtc
+ns/static/mntns_shared_bind
+ns/static/mntns_shared_bind02
+"
+
+source $(readlink -f `dirname $0`/env.sh) || exit 1
+
+can_cr_userns() {
+	[ ! -f /proc/self/ns/user ] && return 1
+	$CRIU check | fgrep -q 'PR_SET_MM_MAP is not supported' && return 1
+
+	return 0 # this means TRUE in bash :\
+}
+
+# Add tests which can be executed in an user namespace
+if can_cr_userns ; then
+	blist=`mktemp /tmp/zdtm.black.XXXXXX`
+	echo "$BLACKLIST_FOR_USERNS" | sort > $blist
+
+
+	TEST_LIST="$TEST_LIST
+	`echo "$TEST_LIST" | grep "^ns/" | sort | \
+	diff --changed-group-format="%<" --unchanged-group-format="" - $blist | \
+	sed s#ns/#ns/user/#`"
+	unlink $blist
+fi
 
 TEST_SUID_LIST="
 pid00
 caps00
 maps01
+mlock_setuid
 groups
 sched_prio00
 sched_policy00
@@ -210,6 +288,7 @@ sk-netlink
 tun
 chroot
 chroot-file
+console
 rtc
 tempfs
 maps007
@@ -225,10 +304,10 @@ deleted_dev
 mntns_open
 mntns_link_remap
 mntns_link_ghost
+mntns_shared_bind
+mntns_shared_bind02
 sockets00
 "
-
-source $(readlink -f `dirname $0`/env.sh) || exit 1
 
 CRIU_CPT=$CRIU
 TMP_TREE=""
@@ -287,7 +366,7 @@ git://git.kernel.org/pub/scm/linux/kernel/git/gorcunov/linux-cr.git
 ===================================================================
 EOF
 
-	set -- `uname -r | sed 's/\./ /g'`
+	set -- `uname -r | sed 's/[\.-]/ /g'`
 
 	[ $1 -gt 3 ] && return 0
 	[ $1 -eq 3 -a $2 -ge 11 ] && return 0
@@ -400,7 +479,16 @@ start_test()
 	if ! echo $TEST_SUID_LIST | grep -q $tname; then
 		export ZDTM_UID=18943
 		export ZDTM_GID=58467
-		chown $ZDTM_UID:$ZDTM_GID $tdir
+		chmod a+w $tdir
+	fi
+
+	if [ -z "$USERNS" ]; then
+		unset ZDTM_USERNS
+	else
+		# we need to be able to create a temporary directory in a test
+		# root for restoring mount namespaces
+		chmod go+wxr .
+		export ZDTM_USERNS=1
 	fi
 
 	if [ -z "$PIDNS" ]; then
@@ -442,17 +530,29 @@ stop_test()
 
 save_fds()
 {
-	test -n "$PIDNS" && return 0
-	ls -l /proc/$1/fd | sed 's/\(-> \(pipe\|socket\)\):.*/\1/' | sed -e 's/\/.nfs[0-9a-zA-Z]*/.nfs-silly-rename/' | awk '{ print $9,$10,$11; }' > $2
+	test -z "$PIDNS" && return 0
+	echo -n > $2 # Busybox doesn't have truncate
+	for p in `ls /proc/$1/root/proc/ | grep "^[0-9]*$"`; do
+		ls -l /proc/$1/root/proc/$p/fd |
+			sed 's/\(-> \(pipe\|socket\)\):.*/\1/' |
+			sed -e 's/\/.nfs[0-9a-zA-Z]*/.nfs-silly-rename/' |
+			sed 's/net:\[[0-9].*\]/net/' |
+			awk '{ print $9,$10,$11; }' | sort >> $2
+	done
 }
 
 save_maps()
 {
-	cat /proc/$1/maps | python maps.py > $2
+	test -z "$PIDNS" && return 0
+	echo -n > $2 # Busybox doesn't have truncate
+	for p in `ls /proc/$1/root/proc/ | grep "^[0-9]*$"`; do
+		cat /proc/$1/root/proc/$p/maps | python maps.py >> $2
+	done
 }
 
 diff_maps()
 {
+	test -z "$PIDNS" && return 0
 	if ! diff -up $1 $2; then
 		echo ERROR: Sets of mappings differ:
 		echo $1
@@ -463,7 +563,7 @@ diff_maps()
 
 diff_fds()
 {
-	test -n "$PIDNS" && return 0
+	test -z "$PIDNS" && return 0
 	if ! diff -up $1 $2; then
 		echo ERROR: Sets of descriptors differ:
 		echo $1
@@ -474,19 +574,29 @@ diff_fds()
 
 run_test()
 {
+	local test_name=$1
 	local test=$1
 	local snappdir=
 	local ps_pid=
 
 	[ -n "$EXCLUDE_PATTERN" ] && echo $test | grep "$EXCLUDE_PATTERN" && return 0
 
-	if [ -n "$MAINSTREAM_KERNEL" ] && [ $COMPILE_ONLY -eq 0 ] && echo $TEST_CR_KERNEL | grep -q ${test#ns/}; then
-		echo "Skip $test"
-		return 0
+	if [ -n "$MAINSTREAM_KERNEL" ] && [ $COMPILE_ONLY -eq 0 ]; then
+		if echo $TEST_CR_KERNEL | grep -q ${test#ns/}; then
+			echo "Skip $test"
+			return 0
+		fi
+		expr $test : 'ns/user' > /dev/null && {
+			echo "Skip $test"
+			return 0
+		}
 	fi
 
 	expr "$test" : 'ns/' > /dev/null && PIDNS=1 || PIDNS=""
-	test=${ZP}/${test#ns/}
+	test=${test#ns/}
+	expr "$test" : 'user/' > /dev/null && USERNS=1 || USERNS=""
+	test=${test#user/}
+	test=${ZP}/${test}
 
 	shift
 	local gen_args=$*
@@ -499,7 +609,7 @@ run_test()
 		make -C $tdir $tname && return 0 || return 1
 	fi
 
-	echo "Execute $test"
+	echo "Execute $test_name"
 
 	start_test $tdir $tname || return 1
 
@@ -540,11 +650,12 @@ EOF
 		gen_args="$gen_args --force-irmap"
 	fi
 
+	ddump=`readlink -fm dump/$test_name/$PID/$i`
 	for i in `seq $ITERATIONS`; do
 		local cpt_args=
 		local dump_only=
 		local dump_cmd="dump"
-		ddump=`readlink -fm dump/$(basename $tdir)/$tname/$PID/$i`
+		ddump=`dirname $ddump`/$i
 		DUMP_PATH=$ddump
 		echo Dump $PID
 		mkdir -p $ddump
@@ -552,8 +663,8 @@ EOF
 		[ -n "$DUMP_ONLY" ] && dump_only=1
 
 		if [ $PAGE_SERVER -eq 1 ]; then
-			$CRIU page-server -D $ddump -o page_server.log -v4 --port $PS_PORT $ps_args --daemon || return 1
-			ps_pid=`lsof -s TCP:LISTEN -i :$PS_PORT -t`
+			$CRIU page-server -D $ddump -o page_server.log -v4 --port $PS_PORT $ps_args --daemon --pidfile $ddump/page-server.pid || return 1
+			ps_pid=`cat $ddump/page-server.pid`
 			ps -p "$ps_pid" -o cmd h | grep -q page-server || {
 				echo "Unable to determing PID of page-server"
 				return 1
@@ -573,8 +684,10 @@ EOF
 
 		[ -n "$dump_only" ] && cpt_args="$cpt_args $POSTDUMP"
 
-		save_fds $PID  $ddump/dump.fd
-		save_maps $PID  $ddump/dump.maps
+		expr $tname : "static" > /dev/null && {
+			save_fds $PID  $ddump/dump.fd
+			save_maps $PID  $ddump/dump.maps
+		}
 		setsid $CRIU_CPT $dump_cmd -D $ddump -o dump.log -v4 -t $PID $gen_args $cpt_args
 		retcode=$?
 
@@ -590,6 +703,7 @@ EOF
 			fi
 			return 1
 		fi
+		cat $ddump/dump.log* | grep Error
 
 		if [ -n "$SNAPSHOT" ]; then
 			snappdir=../`basename $ddump`
@@ -605,11 +719,11 @@ EOF
 		fi
 
 		if [ -n "$dump_only" ]; then
-			save_fds $PID  $ddump/dump.fd.after
-			diff_fds $ddump/dump.fd $ddump/dump.fd.after || return 1
-
-			save_maps $PID  $ddump/dump.maps.after
 			expr $tname : "static" > /dev/null && {
+				save_fds $PID  $ddump/dump.fd.after
+				diff_fds $ddump/dump.fd $ddump/dump.fd.after || return 1
+
+				save_maps $PID  $ddump/dump.maps.after
 				diff_maps $ddump/dump.maps $ddump/dump.maps.after || return 1
 			}
 
@@ -634,21 +748,22 @@ EOF
 				"${test}.hook" --pre-restore || return 2
 			fi
 
+			# Restore fails if --pidfile exists, so remove it.
+			rm -f $TPID || true
+
 			echo Restore
 			setsid $CRIU restore -D $ddump -o restore.log -v4 -d $gen_args || return 2
+			cat $ddump/restore.log* | grep Error
 
 			[ -n "$PIDNS" ] && PID=`cat $TPID`
-			for i in `seq 5`; do
-				save_fds $PID  $ddump/restore.fd
-				diff_fds $ddump/dump.fd $ddump/restore.fd && break
-				sleep 0.2
-			done
-			[ $i -eq 5 ] && return 2
 
-			save_maps $PID $ddump/restore.maps
 			expr $tname : "static" > /dev/null && {
+				save_fds $PID  $ddump/restore.fd
+				save_maps $PID $ddump/restore.maps
+				diff_fds $ddump/dump.fd $ddump/restore.fd || return 2
 				diff_maps $ddump/dump.maps $ddump/restore.maps || return 2
 			}
+			[ "$CLEANUP" -ne 0 ] && rm -f --one-file-system $ddump/pages-*.img
 		fi
 
 	done
@@ -686,7 +801,7 @@ EOF
 
 	cat $test.out
 	cat $test.out | grep -q PASS || return 2
-	[ "$CLEANUP" -ne 0 ] && rm -rf `dirname $ddump`
+	[ "$CLEANUP" -ne 0 ] && rm -rf --one-file-system `dirname $ddump`
 	echo "Test: $test, Result: PASS"
 	return 0
 }
@@ -951,5 +1066,5 @@ else
 	fi
 fi
 
-[ -n "$TMP_TREE" ] && rm -rf $TMP_TREE
+[ -n "$TMP_TREE" ] && rm -rf --one-file-system $TMP_TREE
 [ -n "$ZDTM_FAILED" ] && exit 1 || exit 0

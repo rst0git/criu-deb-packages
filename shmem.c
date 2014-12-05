@@ -7,6 +7,7 @@
 #include "shmem.h"
 #include "image.h"
 #include "cr_options.h"
+#include "kerndat.h"
 #include "page-pipe.h"
 #include "page-xfer.h"
 #include "rst-malloc.h"
@@ -55,6 +56,7 @@ int collect_shmem(int pid, VmaEntry *vi)
 
 		if (si->size < size)
 			si->size = size;
+		si->count++;
 
 		/*
 		 * Only the shared mapping with a lowest
@@ -62,12 +64,17 @@ int collect_shmem(int pid, VmaEntry *vi)
 		 * will wait until the kernel propagate this mapping
 		 * into /proc
 		 */
-		if (!pid_rst_prio(pid, si->pid))
+		if (!pid_rst_prio(pid, si->pid)) {
+			if (si->pid == pid)
+				si->self_count++;
+
 			return 0;
+		}
 
 		si->pid	 = pid;
 		si->start = vi->start;
 		si->end	 = vi->end;
+		si->self_count = 1;
 
 		return 0;
 	}
@@ -85,6 +92,8 @@ int collect_shmem(int pid, VmaEntry *vi)
 	si->pid	  = pid;
 	si->size  = size;
 	si->fd    = -1;
+	si->count = 1;
+	si->self_count = 1;
 
 	nr_shmems++;
 	futex_init(&si->lock);
@@ -97,30 +106,32 @@ static int shmem_wait_and_open(int pid, struct shmem_info *si)
 	char path[128];
 	int ret;
 
-	snprintf(path, sizeof(path), "/proc/%d/map_files/%lx-%lx",
-		si->pid, si->start, si->end);
+	pr_info("Waiting for the %lx shmem to appear\n", si->shmid);
+	futex_wait_while(&si->lock, 0);
 
-	pr_info("Waiting for [%s] to appear\n", path);
-	futex_wait_until(&si->lock, 1);
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d",
+		si->pid, si->fd);
 
 	pr_info("Opening shmem [%s] \n", path);
-	ret = open_proc_rw(si->pid, "map_files/%lx-%lx", si->start, si->end);
+	ret = open_proc_rw(si->pid, "fd/%d", si->fd);
 	if (ret < 0)
 		pr_perror("     %d: Can't stat shmem at %s",
 				si->pid, path);
+	futex_inc_and_wake(&si->lock);
 	return ret;
 }
 
 static int restore_shmem_content(void *addr, struct shmem_info *si)
 {
-	int ret = 0;
+	int ret = 0, fd_pg;
 	struct page_read pr;
 	unsigned long off_real;
 
 	ret = open_page_read(si->shmid, &pr, opts.auto_dedup ? O_RDWR : O_RSTR, true);
 	if (ret)
-		goto err_unmap;
+		return -1;
 
+	fd_pg = img_raw_fd(pr.pi);
 	while (1) {
 		unsigned long vaddr;
 		unsigned nr_pages;
@@ -136,9 +147,9 @@ static int restore_shmem_content(void *addr, struct shmem_info *si)
 		if (vaddr + nr_pages * PAGE_SIZE > si->size)
 			break;
 
-		off_real = lseek(pr.fd_pg, 0, SEEK_CUR);
+		off_real = lseek(fd_pg, 0, SEEK_CUR);
 
-		ret = read(pr.fd_pg, addr + vaddr, nr_pages * PAGE_SIZE);
+		ret = read(fd_pg, addr + vaddr, nr_pages * PAGE_SIZE);
 		if (ret != nr_pages * PAGE_SIZE) {
 			ret = -1;
 			break;
@@ -157,16 +168,14 @@ static int restore_shmem_content(void *addr, struct shmem_info *si)
 
 	pr.close(&pr);
 	return ret;
-err_unmap:
-	munmap(addr,  si->size);
-	return -1;
 }
 
 int get_shmem_fd(int pid, VmaEntry *vi)
 {
 	struct shmem_info *si;
-	void *addr;
-	int f;
+	void *addr = MAP_FAILED;
+	int f = -1;
+	int flags;
 
 	si = find_shmem_by_id(vi->shmid);
 	pr_info("Search for 0x%016"PRIx64" shmem 0x%"PRIx64" %p/%d\n", vi->start, vi->shmid, si, si ? si->pid : -1);
@@ -181,6 +190,22 @@ int get_shmem_fd(int pid, VmaEntry *vi)
 	if (si->fd != -1)
 		return dup(si->fd);
 
+	flags = MAP_SHARED;
+	if (kdat.has_memfd) {
+		f = sys_memfd_create("", 0);
+		if (f < 0) {
+			pr_perror("Unable to create memfd");
+			goto err;
+		}
+
+		if (ftruncate(f, si->size)) {
+			pr_perror("Unable to truncate memfd");
+			goto err;
+		}
+		flags |= MAP_FILE;
+	} else
+		flags |= MAP_ANONYMOUS;
+
 	/*
 	 * The following hack solves problems:
 	 * vi->pgoff may be not zero in a target process.
@@ -188,29 +213,43 @@ int get_shmem_fd(int pid, VmaEntry *vi)
 	 * The restorer doesn't have snprintf.
 	 * Here is a good place to restore content
 	 */
-	addr = mmap(NULL, si->size,
-			PROT_WRITE | PROT_READ,
-			MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	addr = mmap(NULL, si->size, PROT_WRITE | PROT_READ, flags, f, 0);
 	if (addr == MAP_FAILED) {
 		pr_err("Can't mmap shmid=0x%"PRIx64" size=%ld\n",
 				vi->shmid, si->size);
-		return -1;
+		goto err;
 	}
 
 	if (restore_shmem_content(addr, si) < 0) {
 		pr_err("Can't restore shmem content\n");
-		return -1;
+		goto err;
 	}
 
-	f = open_proc_rw(getpid(), "map_files/%lx-%lx",
-			(unsigned long) addr,
-			(unsigned long) addr + si->size);
+	if (f == -1) {
+		f = open_proc_rw(getpid(), "map_files/%lx-%lx",
+				(unsigned long) addr,
+				(unsigned long) addr + si->size);
+		if (f < 0)
+			goto err;
+	}
 	munmap(addr, si->size);
-	if (f < 0)
-		return -1;
 
 	si->fd = f;
+
+	/* Send signal to slaves, that they can open fd for this shmem */
+	futex_inc_and_wake(&si->lock);
+	/*
+	 * All other regions in this process will duplicate
+	 * the file descriptor, so we don't wait them.
+	 */
+	futex_wait_until(&si->lock, si->count - si->self_count + 1);
+
 	return f;
+err:
+	if (addr != MAP_FAILED)
+		munmap(addr, si->size);
+	close_safe(&f);
+	return -1;
 }
 
 struct shmem_info_dump {

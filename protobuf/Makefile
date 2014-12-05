@@ -14,6 +14,7 @@ proto-obj-y	+= core.o
 proto-obj-y	+= core-x86.o
 proto-obj-y	+= core-arm.o
 proto-obj-y	+= core-aarch64.o
+proto-obj-y	+= cpuinfo.o
 proto-obj-y	+= inventory.o
 proto-obj-y	+= fdinfo.o
 proto-obj-y	+= fown.o
@@ -61,6 +62,7 @@ proto-obj-y	+= siginfo.o
 proto-obj-y	+= rpc.o
 proto-obj-y	+= ext-file.o
 proto-obj-y	+= cgroup.o
+proto-obj-y	+= userns.o
 
 proto		:= $(proto-obj-y:.o=)
 proto-c		:= $(proto-obj-y:.o=.pb-c.c)

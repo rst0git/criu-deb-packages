@@ -17,6 +17,7 @@
 #include "cr_options.h"
 #include "util.h"
 #include "log.h"
+#include "cpu.h"
 #include "pstree.h"
 #include "cr-service.h"
 #include "cr-service-const.h"
@@ -25,6 +26,9 @@
 #include "net.h"
 #include "mount.h"
 #include "cgroup.h"
+#include "action-scripts.h"
+
+#include "setproctitle.h"
 
 unsigned int service_sk_ino = -1;
 
@@ -126,7 +130,7 @@ int send_criu_restore_resp(int socket_fd, bool success, int pid)
 	return send_criu_msg(socket_fd, &msg);
 }
 
-int send_criu_rpc_script(char *script, int fd)
+int send_criu_rpc_script(enum script_actions act, char *name, int fd)
 {
 	int ret;
 	CriuResp msg = CRIU_RESP__INIT;
@@ -136,9 +140,10 @@ int send_criu_rpc_script(char *script, int fd)
 	msg.type = CRIU_REQ_TYPE__NOTIFY;
 	msg.success = true;
 	msg.notify = &cn;
-	cn.script = script;
+	cn.script = name;
 
-	if (!strcmp(script, "setup-namespaces")) {
+	switch (act) {
+	case ACT_SETUP_NS:
 		/*
 		 * FIXME pid is required only once on
 		 * restore. Need some more sane way of
@@ -146,6 +151,9 @@ int send_criu_rpc_script(char *script, int fd)
 		 */
 		cn.has_pid = true;
 		cn.pid = root_item->pid.real;
+		break;
+	default:
+		break;
 	}
 
 	ret = send_criu_msg(fd, &msg);
@@ -164,6 +172,8 @@ int send_criu_rpc_script(char *script, int fd)
 	criu_req__free_unpacked(req, NULL);
 	return 0;
 }
+
+static char images_dir[PATH_MAX];
 
 static int setup_opts_from_req(int sk, CriuOpts *req)
 {
@@ -198,6 +208,12 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (open_image_dir(images_dir_path) < 0) {
 		pr_perror("Can't open images directory");
+		return -1;
+	}
+
+	/* get full path to images_dir to use in process title */
+	if (readlink(images_dir_path, images_dir, PATH_MAX) == -1) {
+		pr_perror("Can't readlink %s", images_dir_path);
 		return -1;
 	}
 
@@ -287,19 +303,18 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		opts.use_page_server = true;
 		opts.addr = req->ps->address;
 		opts.ps_port = htons((short)req->ps->port);
+
+		if (req->ps->has_fd) {
+			if (!opts.swrk_restore)
+				return -1;
+
+			opts.ps_socket = req->ps->fd;
+		}
 	}
 
-	if (req->notify_scripts) {
-		struct script *script;
-
-		script = xmalloc(sizeof(struct script));
-		if (script == NULL)
-			return -1;
-
-		script->path = SCRIPT_RPC_NOTIFY;
-		script->arg = sk;
-		list_add(&script->node, &opts.scripts);
-	}
+	if (req->notify_scripts &&
+			add_script(SCRIPT_RPC_NOTIFY, sk))
+		return -1;
 
 	for (i = 0; i < req->n_veths; i++) {
 		if (veth_pair_add(req->veths[i]->if_in, req->veths[i]->if_out))
@@ -333,6 +348,8 @@ static int dump_using_req(int sk, CriuOpts *req)
 
 	if (setup_opts_from_req(sk, req))
 		goto exit;
+
+	setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
 
 	/*
 	 * FIXME -- cr_dump_tasks() may return code from custom
@@ -369,6 +386,8 @@ static int restore_using_req(int sk, CriuOpts *req)
 
 	if (setup_opts_from_req(sk, req))
 		goto exit;
+
+	setproctitle("restore --rpc -D %s", images_dir);
 
 	if (cr_restore_tasks())
 		goto exit;
@@ -407,6 +426,8 @@ static int check(int sk)
 
 	resp.type = CRIU_REQ_TYPE__CHECK;
 
+	setproctitle("check --rpc");
+
 	/* Check only minimal kernel support */
 	opts.check_ms_kernel = true;
 
@@ -432,6 +453,8 @@ static int pre_dump_using_req(int sk, CriuOpts *req)
 
 		if (setup_opts_from_req(sk, req))
 			goto cout;
+
+		setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
 
 		if (cr_pre_dump_tasks(req->pid))
 			goto cout;
@@ -481,30 +504,78 @@ static int pre_dump_loop(int sk, CriuReq *msg)
 	return dump_using_req(sk, msg->opts);
 }
 
+struct ps_info {
+	int pid;
+	unsigned short port;
+};
+
 static int start_page_server_req(int sk, CriuOpts *req)
 {
-	int ret;
+	int ret = -1, pid, start_pipe[2];
+	ssize_t count;
 	bool success = false;
 	CriuResp resp = CRIU_RESP__INIT;
 	CriuPageServerInfo ps = CRIU_PAGE_SERVER_INFO__INIT;
+	struct ps_info info;
 
-	if (!req->ps) {
-		pr_err("No page server info in message\n");
+	if (pipe(start_pipe)) {
+		pr_perror("No start pipe");
 		goto out;
 	}
 
-	if (setup_opts_from_req(sk, req))
+	pid = fork();
+	if (pid == 0) {
+		close(start_pipe[0]);
+
+		if (setup_opts_from_req(sk, req))
+			goto out_ch;
+
+		setproctitle("page-server --rpc --address %s --port %hu", opts.addr, opts.ps_port);
+
+		pr_debug("Starting page server\n");
+
+		pid = cr_page_server(true, start_pipe[1]);
+		if (pid <= 0)
+			goto out_ch;
+
+		info.pid = pid;
+		info.port = opts.ps_port;
+
+		count = write(start_pipe[1], &info, sizeof(info));
+		if (count != sizeof(info))
+			goto out_ch;
+
+		ret = 0;
+out_ch:
+		if (ret < 0 && pid > 0)
+			kill(pid, SIGKILL);
+		close(start_pipe[1]);
+		exit(ret);
+	}
+
+	close(start_pipe[1]);
+	wait(&ret);
+	if (WIFEXITED(ret)) {
+		if (WEXITSTATUS(ret)) {
+			pr_err("Child exited with an error\n");
+			goto out;
+		}
+	} else {
+		pr_err("Child wasn't terminated normally\n");
+		goto out;
+	}
+
+	count = read(start_pipe[0], &info, sizeof(info));
+	close(start_pipe[0]);
+	if (count != sizeof(info))
 		goto out;
 
-	pr_debug("Starting page server\n");
-
-	ret = cr_page_server(true);
-	if (ret > 0) {
-		success = true;
-		ps.has_pid = true;
-		ps.pid = ret;
-		resp.ps = &ps;
-	}
+	success = true;
+	ps.has_pid = true;
+	ps.pid = info.pid;
+	ps.has_port = true;
+	ps.port = info.port;
+	resp.ps = &ps;
 
 	pr_debug("Page server started\n");
 out:
@@ -513,34 +584,121 @@ out:
 	return send_criu_msg(sk, &resp);
 }
 
+static int chk_keepopen_req(CriuReq *msg)
+{
+	if (!msg->keep_open)
+		return 0;
+
+	/*
+	 * Service may (well, it will) leave some
+	 * resources leaked after processing e.g.
+	 * dump or restore requests. Before we audit
+	 * the code for this, let's first enable
+	 * mreq RPCs for those requests we know do
+	 * good work
+	 */
+
+	if (msg->type == CRIU_REQ_TYPE__PAGE_SERVER)
+		/* This just fork()-s so no leaks */
+		return 0;
+	else if (msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ||
+		 msg->type == CRIU_REQ_TYPE__CPUINFO_CHECK)
+		return 0;
+
+	return -1;
+}
+
+static int handle_cpuinfo(int sk, CriuReq *msg)
+{
+	CriuResp resp = CRIU_RESP__INIT;
+	bool success = false;
+	int pid, status;
+
+	pid = fork();
+	if (pid < 0) {
+		pr_perror("Can't fork");
+		goto out;
+	}
+
+	if (pid == 0) {
+		int ret = 1;
+
+		if (setup_opts_from_req(sk, msg->opts))
+			goto cout;
+
+		setproctitle("cpuinfo %s --rpc -D %s",
+			     msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ?
+			     "dump" : "check",
+			     images_dir);
+
+		if (msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP)
+			ret = cpuinfo_dump();
+		else
+			ret = cpuinfo_check();
+cout:
+		exit(ret);
+	}
+
+	wait(&status);
+	if (!WIFEXITED(status) || WEXITSTATUS(status))
+		goto out;
+
+	success = true;
+out:
+	resp.type = msg->type;
+	resp.success = success;
+
+	return send_criu_msg(sk, &resp);
+}
+
 int cr_service_work(int sk)
 {
+	int ret = -1;
 	CriuReq *msg = 0;
 
+more:
 	if (recv_criu_msg(sk, &msg) == -1) {
 		pr_perror("Can't recv request");
 		goto err;
 	}
 
+	if (chk_keepopen_req(msg))
+		goto err;
+
 	switch (msg->type) {
 	case CRIU_REQ_TYPE__DUMP:
-		return dump_using_req(sk, msg->opts);
+		ret = dump_using_req(sk, msg->opts);
+		break;
 	case CRIU_REQ_TYPE__RESTORE:
-		return restore_using_req(sk, msg->opts);
+		ret = restore_using_req(sk, msg->opts);
+		break;
 	case CRIU_REQ_TYPE__CHECK:
-		return check(sk);
+		ret = check(sk);
+		break;
 	case CRIU_REQ_TYPE__PRE_DUMP:
-		return pre_dump_loop(sk, msg);
+		ret = pre_dump_loop(sk, msg);
+		break;
 	case CRIU_REQ_TYPE__PAGE_SERVER:
-		return start_page_server_req(sk, msg->opts);
+		ret =  start_page_server_req(sk, msg->opts);
+		break;
+	case CRIU_REQ_TYPE__CPUINFO_DUMP:
+	case CRIU_REQ_TYPE__CPUINFO_CHECK:
+		ret = handle_cpuinfo(sk, msg);
+		break;
 
 	default:
 		send_criu_err(sk, "Invalid req");
-		goto err;
+		break;
+	}
+
+	if (!ret && msg->keep_open) {
+		criu_req__free_unpacked(msg, NULL);
+		ret = -1;
+		goto more;
 	}
 
 err:
-	return -1;
+	return ret;
 }
 
 static void reap_worker(int signo)

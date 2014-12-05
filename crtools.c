@@ -36,6 +36,10 @@
 #include "plugin.h"
 #include "mount.h"
 #include "cgroup.h"
+#include "cpu.h"
+#include "action-scripts.h"
+
+#include "setproctitle.h"
 
 struct cr_options opts;
 
@@ -50,8 +54,9 @@ void init_opts(void)
 	INIT_LIST_HEAD(&opts.ext_mounts);
 	INIT_LIST_HEAD(&opts.new_cgroup_roots);
 
-	opts.cpu_cap = CPU_CAP_ALL;
+	opts.cpu_cap = CPU_CAP_DEFAULT;
 	opts.manage_cgroups = false;
+	opts.ps_socket = -1;
 }
 
 static int parse_ns_string(const char *ptr)
@@ -94,6 +99,11 @@ static int parse_cpu_cap(struct cr_options *opts, const char *optarg)
 			(__opts)->cpu_cap |=  (__cap);	\
 	} while (0)
 
+	if (!optarg) {
+		____cpu_set_cap(opts, CPU_CAP_ALL, false);
+		return 0;
+	}
+
 	for (; *optarg; optarg++) {
 		if (optarg[0] == '^') {
 			inverse = !inverse;
@@ -105,8 +115,12 @@ static int parse_cpu_cap(struct cr_options *opts, const char *optarg)
 
 		if (!strncmp(optarg, "fpu", 3))
 			____cpu_set_cap(opts, CPU_CAP_FPU, inverse);
-		if (!strncmp(optarg, "all", 3))
+		else if (!strncmp(optarg, "all", 3))
 			____cpu_set_cap(opts, CPU_CAP_ALL, inverse);
+		else if (!strncmp(optarg, "none", 3))
+			____cpu_set_cap(opts, CPU_CAP_NONE, inverse);
+		else if (!strncmp(optarg, "cpu", 3))
+			____cpu_set_cap(opts, CPU_CAP_CPU, inverse);
 		else
 			goto Esyntax;
 	}
@@ -119,7 +133,7 @@ Esyntax:
 	return -1;
 }
 
-int main(int argc, char *argv[])
+int main(int argc, char *argv[], char *envp[])
 {
 	pid_t pid = 0, tree_id = 0;
 	int ret = -1;
@@ -167,7 +181,7 @@ int main(int argc, char *argv[])
 		{ "track-mem", no_argument, 0, 1055},
 		{ "auto-dedup", no_argument, 0, 1056},
 		{ "libdir", required_argument, 0, 'L'},
-		{ "cpu-cap", required_argument, 0, 1057},
+		{ "cpu-cap", optional_argument, 0, 1057},
 		{ "force-irmap", no_argument, 0, 1058},
 		{ "ext-mount-map", required_argument, 0, 'M'},
 		{ "exec-cmd", no_argument, 0, 1059},
@@ -181,6 +195,8 @@ int main(int argc, char *argv[])
 	cr_pb_init();
 	if (restrict_uid(getuid(), getgid()))
 		return 1;
+
+	setproctitle_init(argc, argv, envp);
 
 	if (argc < 2)
 		goto usage;
@@ -309,16 +325,9 @@ int main(int argc, char *argv[])
 			}
 			break;
 		case 1049:
-			{
-				struct script *script;
+			if (add_script(optarg, 0))
+				return 1;
 
-				script = xmalloc(sizeof(struct script));
-				if (script == NULL)
-					return 1;
-
-				script->path = optarg;
-				list_add(&script->node, &opts.scripts);
-			}
 			break;
 		case 1050:
 			opts.use_page_server = true;
@@ -464,6 +473,8 @@ int main(int argc, char *argv[])
 		pr_info("Will do snapshot from %s\n", opts.img_parent);
 
 	if (!strcmp(argv[optind], "dump")) {
+		preload_socket_modules();
+
 		if (!tree_id)
 			goto opt_pid_missing;
 		return cr_dump_tasks(tree_id);
@@ -506,13 +517,22 @@ int main(int argc, char *argv[])
 	}
 
 	if (!strcmp(argv[optind], "page-server"))
-		return cr_page_server(opts.restore_detach) > 0 ? 0 : 1;
+		return cr_page_server(opts.restore_detach, -1) > 0 ? 0 : 1;
 
 	if (!strcmp(argv[optind], "service"))
 		return cr_service(opts.restore_detach);
 
 	if (!strcmp(argv[optind], "dedup"))
 		return cr_dedup() != 0;
+
+	if (!strcmp(argv[optind], "cpuinfo")) {
+		if (!argv[optind + 1])
+			goto usage;
+		if (!strcmp(argv[optind + 1], "dump"))
+			return cpuinfo_dump();
+		else if (!strcmp(argv[optind + 1], "check"))
+			return cpuinfo_check();
+	}
 
 	pr_msg("Error: unknown command: %s\n", argv[optind]);
 usage:
@@ -537,6 +557,8 @@ usage:
 "  page-server    launch page server\n"
 "  service        launch service\n"
 "  dedup          remove duplicates in memory dump\n"
+"  cpuinfo dump   writes cpu information into image file\n"
+"  cpuinfo check  validates cpu information read from image file\n"
 	);
 
 	if (usage_error) {
@@ -557,8 +579,8 @@ usage:
 "     --pidfile FILE     write root task, service or page-server pid to FILE\n"
 "  -W|--work-dir DIR     directory to cd and write logs/pidfiles/stats to\n"
 "                        (if not specified, value of --images-dir is used)\n"
-"     --cpu-cap CAP      require certain cpu capability. CAP: may be one of:\n"
-"                        'fpu','all'. To disable capability, prefix it with '^'.\n"
+"     --cpu-cap [CAP]    require certain cpu capability. CAP: may be one of:\n"
+"                        'cpu','fpu','all','none'. To disable capability, prefix it with '^'.\n"
 "     --exec-cmd         execute the command specified after '--' on successful\n"
 "                        restore making it the parent of the restored process\n"
 "\n"

@@ -4,6 +4,9 @@
 #include <linux/falloc.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
 
 #include "cr_options.h"
 #include "servicefd.h"
@@ -38,8 +41,11 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, long id);
 #define PS_IOV_ADD	1
 #define PS_IOV_HOLE	2
 #define PS_IOV_OPEN	3
+#define PS_IOV_OPEN2	4
+#define PS_IOV_PARENT	5
 
 #define PS_IOV_FLUSH		0x1023
+#define PS_IOV_FLUSH_N_CLOSE	0x1024
 
 #define PS_TYPE_BITS	8
 #define PS_TYPE_MASK	((1 << PS_TYPE_BITS) - 1)
@@ -76,7 +82,8 @@ static void page_server_close(void)
 		cxfer.loc_xfer.close(&cxfer.loc_xfer);
 }
 
-static int page_server_open(struct page_server_iov *pi)
+static void close_page_xfer(struct page_xfer *xfer);
+static int page_server_open(int sk, struct page_server_iov *pi)
 {
 	int type;
 	long id;
@@ -91,6 +98,17 @@ static int page_server_open(struct page_server_iov *pi)
 		return -1;
 
 	cxfer.dst_id = pi->dst_id;
+
+	if (sk >= 0) {
+		char has_parent = !!cxfer.loc_xfer.parent;
+
+		if (write(sk, &has_parent, 1) != 1) {
+			pr_perror("Unable to send reponse");
+			close_page_xfer(&cxfer.loc_xfer);
+			return -1;
+		}
+	}
+
 	return 0;
 }
 
@@ -98,7 +116,7 @@ static int prep_loc_xfer(struct page_server_iov *pi)
 {
 	if (cxfer.dst_id != pi->dst_id) {
 		pr_warn("Deprecated IO w/o open\n");
-		return page_server_open(pi);
+		return page_server_open(-1, pi);
 	} else
 		return 0;
 }
@@ -158,6 +176,8 @@ static int page_server_hole(int sk, struct page_server_iov *pi)
 	return 0;
 }
 
+static int page_server_check_parent(int sk, struct page_server_iov *pi);
+
 static int page_server_serve(int sk)
 {
 	int ret = -1;
@@ -189,7 +209,13 @@ static int page_server_serve(int sk)
 
 		switch (pi.cmd) {
 		case PS_IOV_OPEN:
-			ret = page_server_open(&pi);
+			ret = page_server_open(-1, &pi);
+			break;
+		case PS_IOV_OPEN2:
+			ret = page_server_open(sk, &pi);
+			break;
+		case PS_IOV_PARENT:
+			ret = page_server_check_parent(sk, &pi);
 			break;
 		case PS_IOV_ADD:
 			ret = page_server_add(sk, &pi);
@@ -198,8 +224,11 @@ static int page_server_serve(int sk)
 			ret = page_server_hole(sk, &pi);
 			break;
 		case PS_IOV_FLUSH:
+		case PS_IOV_FLUSH_N_CLOSE:
 		{
 			int32_t status = 0;
+
+			ret = 0;
 
 			/*
 			 * An answer must be sent back to inform another side,
@@ -211,7 +240,6 @@ static int page_server_serve(int sk)
 			}
 
 			flushed = true;
-			ret = 0;
 			break;
 		}
 		default:
@@ -220,7 +248,7 @@ static int page_server_serve(int sk)
 			break;
 		}
 
-		if (ret)
+		if (ret || (pi.cmd == PS_IOV_FLUSH_N_CLOSE))
 			break;
 	}
 
@@ -252,13 +280,21 @@ static int get_sockaddr_in(struct sockaddr_in *addr)
 	return 0;
 }
 
-int cr_page_server(bool daemon_mode)
+int cr_page_server(bool daemon_mode, int cfd)
 {
-	int sk, ask = -1, ret;
+	int sk = -1, ask = -1, ret;
 	struct sockaddr_in saddr, caddr;
+	socklen_t slen = sizeof(saddr);
 	socklen_t clen = sizeof(caddr);
 
 	up_page_ids_base();
+
+	if (opts.ps_socket != -1) {
+		ret = 0;
+		ask = opts.ps_socket;
+		pr_info("Re-using ps socket %d\n", ask);
+		goto no_server;
+	}
 
 	pr_info("Starting page server on port %u\n", (int)ntohs(opts.ps_port));
 
@@ -271,7 +307,7 @@ int cr_page_server(bool daemon_mode)
 	if (get_sockaddr_in(&saddr))
 		goto out;
 
-	if (bind(sk, (struct sockaddr *)&saddr, sizeof(saddr))) {
+	if (bind(sk, (struct sockaddr *)&saddr, slen)) {
 		pr_perror("Can't bind page server");
 		goto out;
 	}
@@ -281,28 +317,46 @@ int cr_page_server(bool daemon_mode)
 		goto out;
 	}
 
-	if (daemon_mode) {
-		ret = cr_daemon(1, 0);
-		if (ret == -1) {
-			pr_perror("Can't run in the background");
+	/* Get socket port in case of autobind */
+	if (opts.ps_port == 0) {
+		if (getsockname(sk, (struct sockaddr *)&saddr, &slen)) {
+			pr_perror("Can't get page server name");
 			goto out;
 		}
-		if (ret > 0) /* parent task, daemon started */
-			return ret;
+
+		opts.ps_port = ntohs(saddr.sin_port);
+		pr_info("Using %u port\n", opts.ps_port);
 	}
 
-	if (opts.pidfile) {
-		if (write_pidfile(getpid()) == -1) {
-			pr_perror("Can't write pidfile");
-			return -1;
+no_server:
+	if (daemon_mode) {
+		ret = cr_daemon(1, 0, &ask, cfd);
+		if (ret == -1) {
+			pr_err("Can't run in the background\n");
+			goto out;
+		}
+		if (ret > 0) { /* parent task, daemon started */
+			close_safe(&sk);
+			if (opts.pidfile) {
+				if (write_pidfile(ret) == -1) {
+					pr_perror("Can't write pidfile");
+					kill(ret, SIGKILL);
+					waitpid(ret, NULL, 0);
+					return -1;
+				}
+			}
+
+			return ret;
 		}
 	}
 
-	ret = ask = accept(sk, (struct sockaddr *)&caddr, &clen);
-	if (ask < 0)
-		pr_perror("Can't accept connection to server");
+	if (sk >= 0) {
+		ret = ask = accept(sk, (struct sockaddr *)&caddr, &clen);
+		if (ask < 0)
+			pr_perror("Can't accept connection to server");
 
-	close(sk);
+		close(sk);
+	}
 
 	if (ask >= 0) {
 		pr_info("Accepted connection from %s:%u\n",
@@ -331,6 +385,12 @@ int connect_to_page_server(void)
 	if (!opts.use_page_server)
 		return 0;
 
+	if (opts.ps_socket != -1) {
+		page_server_sk = opts.ps_socket;
+		pr_info("Re-using ps socket %d\n", page_server_sk);
+		return 0;
+	}
+
 	pr_info("Connecting to server %s:%u\n",
 			opts.addr, (int)ntohs(opts.ps_port));
 
@@ -353,7 +413,7 @@ int connect_to_page_server(void)
 
 int disconnect_from_page_server(void)
 {
-	struct page_server_iov pi = { .cmd = PS_IOV_FLUSH };
+	struct page_server_iov pi = { };
 	int32_t status = -1;
 	int ret = -1;
 
@@ -365,6 +425,16 @@ int disconnect_from_page_server(void)
 
 	pr_info("Disconnect from the page server %s:%u\n",
 			opts.addr, (int)ntohs(opts.ps_port));
+
+	if (opts.ps_socket != -1)
+		/*
+		 * The socket might not get closed (held by
+		 * the parent process) so we must order the
+		 * page-server to terminate itself.
+		 */
+		pi.cmd = PS_IOV_FLUSH_N_CLOSE;
+	else
+		pi.cmd = PS_IOV_FLUSH;
 
 	if (write(page_server_sk, &pi, sizeof(pi)) != sizeof(pi)) {
 		pr_perror("Can't write the fini command to server");
@@ -391,7 +461,7 @@ static int write_pagemap_to_server(struct page_xfer *xfer,
 	pi.dst_id = xfer->dst_id;
 	iovec2psi(iov, &pi);
 
-	if (write(xfer->fd, &pi, sizeof(pi)) != sizeof(pi)) {
+	if (write(xfer->sk, &pi, sizeof(pi)) != sizeof(pi)) {
 		pr_perror("Can't write pagemap to server");
 		return -1;
 	}
@@ -404,7 +474,7 @@ static int write_pages_to_server(struct page_xfer *xfer,
 {
 	pr_debug("Splicing %lu bytes / %lu pages into socket\n", len, len / PAGE_SIZE);
 
-	if (splice(p, NULL, xfer->fd, NULL, len, SPLICE_F_MOVE) != len) {
+	if (splice(p, NULL, xfer->sk, NULL, len, SPLICE_F_MOVE) != len) {
 		pr_perror("Can't write pages to socket");
 		return -1;
 	}
@@ -420,7 +490,7 @@ static int write_hole_to_server(struct page_xfer *xfer, struct iovec *iov)
 	pi.dst_id = xfer->dst_id;
 	iovec2psi(iov, &pi);
 
-	if (write(xfer->fd, &pi, sizeof(pi)) != sizeof(pi)) {
+	if (write(xfer->sk, &pi, sizeof(pi)) != sizeof(pi)) {
 		pr_perror("Can't write pagehole to server");
 		return -1;
 	}
@@ -430,29 +500,39 @@ static int write_hole_to_server(struct page_xfer *xfer, struct iovec *iov)
 
 static void close_server_xfer(struct page_xfer *xfer)
 {
-	xfer->fd = -1;
+	xfer->sk = -1;
 }
 
 static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, long id)
 {
 	struct page_server_iov pi;
+	char has_parent;
 
-	xfer->fd = page_server_sk;
+	xfer->sk = page_server_sk;
 	xfer->write_pagemap = write_pagemap_to_server;
 	xfer->write_pages = write_pages_to_server;
 	xfer->write_hole = write_hole_to_server;
 	xfer->close = close_server_xfer;
 	xfer->dst_id = encode_pm_id(fd_type, id);
+	xfer->parent = NULL;
 
-	pi.cmd = PS_IOV_OPEN;
+	pi.cmd = PS_IOV_OPEN2;
 	pi.dst_id = xfer->dst_id;
 	pi.vaddr = 0;
 	pi.nr_pages = 0;
 
-	if (write(xfer->fd, &pi, sizeof(pi)) != sizeof(pi)) {
+	if (write(xfer->sk, &pi, sizeof(pi)) != sizeof(pi)) {
 		pr_perror("Can't write to page server");
 		return -1;
 	}
+
+	if (read(xfer->sk, &has_parent, 1) != 1) {
+		pr_perror("The page server doesn't answer");
+		return -1;
+	}
+
+	if (has_parent)
+		xfer->parent = (void *) 1; /* This is required for generate_iovs() */
 
 	return 0;
 }
@@ -471,14 +551,15 @@ static int write_pagemap_loc(struct page_xfer *xfer,
 			return ret;
 		}
 	}
-	return pb_write_one(xfer->fd, &pe, PB_PAGEMAP);
+	return pb_write_one(xfer->pmi, &pe, PB_PAGEMAP);
 }
 
 static int write_pages_loc(struct page_xfer *xfer,
 		int p, unsigned long len)
 {
 	ssize_t ret;
-	ret = splice(p, NULL, xfer->fd_pg, NULL, len, SPLICE_F_MOVE);
+
+	ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len, SPLICE_F_MOVE);
 	if (ret == -1) {
 		pr_perror("Unable to spice data");
 		return -1;
@@ -552,7 +633,7 @@ static int write_pagehole_loc(struct page_xfer *xfer, struct iovec *iov)
 	pe.has_in_parent = true;
 	pe.in_parent = true;
 
-	if (pb_write_one(xfer->fd, &pe, PB_PAGEMAP) < 0)
+	if (pb_write_one(xfer->pmi, &pe, PB_PAGEMAP) < 0)
 		return -1;
 
 	return 0;
@@ -565,8 +646,8 @@ static void close_page_xfer(struct page_xfer *xfer)
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
-	close(xfer->fd_pg);
-	close(xfer->fd);
+	close_image(xfer->pi);
+	close_image(xfer->pmi);
 }
 
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp,
@@ -627,13 +708,13 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp,
 
 static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, long id)
 {
-	xfer->fd = open_image(fd_type, O_DUMP, id);
-	if (xfer->fd < 0)
+	xfer->pmi = open_image(fd_type, O_DUMP, id);
+	if (!xfer->pmi)
 		return -1;
 
-	xfer->fd_pg = open_pages_image(O_DUMP, xfer->fd);
-	if (xfer->fd_pg < 0) {
-		close(xfer->fd);
+	xfer->pi = open_pages_image(O_DUMP, xfer->pmi);
+	if (!xfer->pi) {
+		close_image(xfer->pmi);
 		return -1;
 	}
 
@@ -684,4 +765,81 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, long id)
 		return open_page_server_xfer(xfer, fd_type, id);
 	else
 		return open_page_local_xfer(xfer, fd_type, id);
+}
+
+/*
+ * Return:
+ *	 1 - if a parent image exists
+ *	 0 - if a parent image doesn't exist
+ *	-1 - in error cases
+ */
+int check_parent_local_xfer(int fd_type, int id)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	int ret, pfd;
+
+	pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
+	if (pfd < 0 && errno == ENOENT)
+		return 0;;
+
+	snprintf(path, sizeof(path), imgset_template[fd_type].fmt, id);
+	ret = fstatat(pfd, path, &st, 0);
+	if (ret == -1 && errno != ENOENT) {
+		pr_perror("Unable to stat %s", path);
+		close(pfd);
+		return -1;
+	}
+
+	close(pfd);
+	return (ret == 0);
+}
+
+static int page_server_check_parent(int sk, struct page_server_iov *pi)
+{
+	int type, ret;
+	long id;
+
+	type = decode_pm_type(pi->dst_id);
+	id = decode_pm_id(pi->dst_id);
+
+	ret = check_parent_local_xfer(type, id);
+	if (ret < 0)
+		return -1;
+
+	if (write(sk, &ret, sizeof(ret)) != sizeof(ret)) {
+		pr_perror("Unable to send reponse");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int check_parent_server_xfer(int fd_type, long id)
+{
+	struct page_server_iov pi = {};
+	int has_parent;
+
+	pi.cmd = PS_IOV_PARENT;
+	pi.dst_id = encode_pm_id(fd_type, id);
+
+	if (write(page_server_sk, &pi, sizeof(pi)) != sizeof(pi)) {
+		pr_perror("Can't write to page server");
+		return -1;
+	}
+
+	if (read(page_server_sk, &has_parent, sizeof(int)) != sizeof(int)) {
+		pr_perror("The page server doesn't answer");
+		return -1;
+	}
+
+	return has_parent;
+}
+
+int check_parent_page_xfer(int fd_type, long id)
+{
+	if (opts.use_page_server)
+		return check_parent_server_xfer(fd_type, id);
+	else
+		return check_parent_local_xfer(fd_type, id);
 }

@@ -13,7 +13,7 @@
 #define SILLYNAME_SUFF_LEN (((unsigned)sizeof(u64) << 1) + ((unsigned)sizeof(unsigned int) << 1))
 
 #include "cr_options.h"
-#include "fdset.h"
+#include "imgset.h"
 #include "file-ids.h"
 #include "mount.h"
 #include "files.h"
@@ -24,6 +24,7 @@
 #include "asm/atomic.h"
 #include "namespaces.h"
 #include "proc_parse.h"
+#include "pstree.h"
 
 #include "protobuf.h"
 #include "protobuf/regfile.pb-c.h"
@@ -68,7 +69,7 @@ static LIST_HEAD(link_remaps);
  */
 #define MAX_GHOST_FILE_SIZE	(1 * 1024 * 1024)
 
-static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, char *root, int ifd)
+static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, char *root, struct cr_img *img)
 {
 	int gfd, ghost_flags, ret = -1;
 	char path[PATH_MAX];
@@ -112,7 +113,7 @@ static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, char *root, 
 	}
 
 	if (S_ISREG(gfe->mode)) {
-		if (copy_file(ifd, gfd, 0) < 0)
+		if (copy_file(img_raw_fd(img), gfd, 0) < 0)
 			goto err_c;
 	}
 
@@ -128,10 +129,9 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 {
 	struct ghost_file *gf;
 	GhostFileEntry *gfe = NULL;
-	int ifd;
+	struct cr_img *img;
 	char *root;
 
-	rfe->remap_id &= ~REMAP_GHOST;
 	list_for_each_entry(gf, &ghost_files, list)
 		if (gf->id == rfe->remap_id)
 			goto gf_found;
@@ -158,11 +158,11 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	if (!gf->remap.path)
 		goto err;
 
-	ifd = open_image(CR_FD_GHOST_FILE, O_RSTR, rfe->remap_id);
-	if (ifd < 0)
+	img = open_image(CR_FD_GHOST_FILE, O_RSTR, rfe->remap_id);
+	if (!img)
 		goto err;
 
-	if (pb_read_one(ifd, &gfe, PB_GHOST_FILE) < 0)
+	if (pb_read_one(img, &gfe, PB_GHOST_FILE) < 0)
 		goto close_ifd;
 
 	/*
@@ -173,13 +173,16 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	gf->dev = gfe->dev;
 	gf->ino = gfe->ino;
 
-	snprintf(gf->remap.path, PATH_MAX, "%s.cr.%x.ghost", rfi->path, rfe->remap_id);
+	if (S_ISDIR(gfe->mode))
+		strncpy(gf->remap.path, rfi->path, PATH_MAX);
+	else
+		snprintf(gf->remap.path, PATH_MAX, "%s.cr.%x.ghost", rfi->path, rfe->remap_id);
 
-	if (create_ghost(gf, gfe, root, ifd))
+	if (create_ghost(gf, gfe, root, img))
 		goto close_ifd;
 
 	ghost_file_entry__free_unpacked(gfe, NULL);
-	close(ifd);
+	close_image(img);
 
 	gf->id = rfe->remap_id;
 	gf->remap.users = 0;
@@ -190,7 +193,7 @@ gf_found:
 	return 0;
 
 close_ifd:
-	close_safe(&ifd);
+	close_image(img);
 err:
 	if (gfe)
 		ghost_file_entry__free_unpacked(gfe, NULL);
@@ -227,6 +230,34 @@ static int open_remap_linked(struct reg_file_info *rfi,
 	return 0;
 }
 
+static int open_remap_dead_process(struct reg_file_info *rfi,
+		RemapFilePathEntry *rfe)
+{
+	struct pstree_item *helper;
+
+	for_each_pstree_item(helper) {
+		/* don't need to add multiple tasks */
+		if (helper->pid.virt == rfe->remap_id) {
+			pr_info("Skipping helper for restoring /proc/%d; pid exists\n", rfe->remap_id);
+			return 0;
+		}
+	}
+
+	helper = alloc_pstree_helper();
+	if (!helper)
+		return -1;
+
+	helper->sid = root_item->sid;
+	helper->pgid = root_item->pgid;
+	helper->pid.virt = rfe->remap_id;
+	helper->parent = root_item;
+	list_add_tail(&helper->sibling, &root_item->children);
+
+	pr_info("Added a helper for restoring /proc/%d\n", helper->pid.virt);
+
+	return 0;
+}
+
 static int collect_one_remap(void *obj, ProtobufCMessage *msg)
 {
 	int ret = -1;
@@ -246,10 +277,32 @@ static int collect_one_remap(void *obj, ProtobufCMessage *msg)
 	rfi = container_of(fdesc, struct reg_file_info, d);
 	pr_info("Configuring remap %#x -> %#x\n", rfi->rfe->id, rfe->remap_id);
 
-	if (rfe->remap_id & REMAP_GHOST)
-		ret = open_remap_ghost(rfi, rfe);
-	else
+
+	if (!rfe->has_remap_type) {
+		rfe->has_remap_type = true;
+		/* backward compatibility with images */
+		if (rfe->remap_id & REMAP_GHOST) {
+			rfe->remap_id &= ~REMAP_GHOST;
+			rfe->remap_type = REMAP_TYPE__GHOST;
+		} else
+			rfe->remap_type = REMAP_TYPE__LINKED;
+	}
+
+	switch (rfe->remap_type) {
+	case REMAP_TYPE__LINKED:
 		ret = open_remap_linked(rfi, rfe);
+		break;
+	case REMAP_TYPE__GHOST:
+		ret = open_remap_ghost(rfi, rfe);
+		break;
+	case REMAP_TYPE__PROCFS:
+		ret = open_remap_dead_process(rfi, rfe);
+		break;
+	default:
+		pr_err("unknown remap type %u\n", rfe->remap_type);
+		goto out;
+	}
+
 out:
 	return ret;
 }
@@ -262,7 +315,7 @@ struct collect_image_info remap_cinfo = {
 
 static int dump_ghost_file(int _fd, u32 id, const struct stat *st, dev_t phys_dev)
 {
-	int img;
+	struct cr_img *img;
 	GhostFileEntry gfe = GHOST_FILE_ENTRY__INIT;
 
 	pr_info("Dumping ghost file contents (id %#x)\n", id);
@@ -271,8 +324,8 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st, dev_t phys_de
 	if (img < 0)
 		return -1;
 
-	gfe.uid = st->st_uid;
-	gfe.gid = st->st_gid;
+	gfe.uid = userns_uid(st->st_uid);
+	gfe.gid = userns_gid(st->st_gid);
 	gfe.mode = st->st_mode;
 
 	gfe.has_dev = gfe.has_ino = true;
@@ -301,13 +354,13 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st, dev_t phys_de
 			pr_perror("Can't open ghost original file");
 			return -1;
 		}
-		ret = copy_file(fd, img, st->st_size);
+		ret = copy_file(fd, img_raw_fd(img), st->st_size);
 		close(fd);
 		if (ret)
 			return -1;
 	}
 
-	close(img);
+	close_image(img);
 	return 0;
 }
 
@@ -375,12 +428,12 @@ static int dump_ghost_remap(char *path, const struct stat *st,
 		return -1;
 
 dump_entry:
-	BUG_ON(gf->id & REMAP_GHOST);
-
 	rpe.orig_id = id;
-	rpe.remap_id = gf->id | REMAP_GHOST;
+	rpe.remap_id = gf->id;
+	rpe.has_remap_type = true;
+	rpe.remap_type = REMAP_TYPE__GHOST;
 
-	return pb_write_one(fdset_fd(glob_fdset, CR_FD_REMAP_FPATH),
+	return pb_write_one(img_from_set(glob_imgset, CR_FD_REMAP_FPATH),
 			&rpe, PB_REMAP_FPATH);
 }
 
@@ -473,7 +526,7 @@ static int create_link_remap(char *path, int len, int lfd,
 	rlb->mnt_ns = nsid;
 	list_add(&rlb->list, &link_remaps);
 
-	return pb_write_one(fdset_fd(glob_fdset, CR_FD_REG_FILES), &rfe, PB_REG_FILE);
+	return pb_write_one(img_from_set(glob_imgset, CR_FD_REG_FILES), &rfe, PB_REG_FILE);
 
 err2:
 	xfree(rlb);
@@ -494,7 +547,48 @@ static int dump_linked_remap(char *path, int len, const struct stat *ost,
 	rpe.orig_id = id;
 	rpe.remap_id = lid;
 
-	return pb_write_one(fdset_fd(glob_fdset, CR_FD_REMAP_FPATH),
+	return pb_write_one(img_from_set(glob_imgset, CR_FD_REMAP_FPATH),
+			&rpe, PB_REMAP_FPATH);
+}
+
+static int have_seen_dead_pid(pid_t pid)
+{
+	static pid_t *dead_pids = NULL;
+	static int n_dead_pids = 0;
+	size_t i;
+
+	for (i = 0; i < n_dead_pids; i++) {
+		if (dead_pids[i] == pid)
+			return 1;
+	}
+
+	if (xrealloc_safe(&dead_pids, sizeof(*dead_pids) * (n_dead_pids + 1)))
+		return -1;
+	dead_pids[n_dead_pids++] = pid;
+
+	return 0;
+}
+
+static int dump_dead_process_remap(pid_t pid, char *path, int len, const struct stat *ost,
+				int lfd, u32 id, struct ns_id *nsid)
+{
+	RemapFilePathEntry rpe = REMAP_FILE_PATH_ENTRY__INIT;
+	int ret;
+
+	ret = have_seen_dead_pid(pid);
+	if (ret < 0)
+		return -1;
+	if (ret) {
+		pr_info("Found dead pid %d already, skipping remap\n", pid);
+		return 0;
+	}
+
+	rpe.orig_id = id;
+	rpe.remap_id = pid;
+	rpe.has_remap_type = true;
+	rpe.remap_type = REMAP_TYPE__PROCFS;
+
+	return pb_write_one(img_from_set(glob_imgset, CR_FD_REMAP_FPATH),
 			&rpe, PB_REMAP_FPATH);
 }
 
@@ -532,21 +626,90 @@ static inline bool nfs_silly_rename(char *rpath, const struct fd_parms *parms)
 	return (parms->fs_type == NFS_SUPER_MAGIC) && is_sillyrename_name(rpath);
 }
 
-static int check_path_remap(char *rpath, int plen, const struct fd_parms *parms,
+static void strip_deleted(struct fd_link *link)
+{
+	const char postfix[] = " (deleted)";
+	const size_t plen = strlen(postfix);
+
+	if (link->len > plen) {
+		size_t at = link->len - plen;
+		if (!strcmp(&link->name[at], postfix)) {
+			pr_debug("Stip %s' tag from '%s'\n",
+				 postfix, link->name);
+			link->name[at] = '\0';
+			link->len -= plen;
+		}
+	}
+}
+
+static int check_path_remap(struct fd_link *link, const struct fd_parms *parms,
 				int lfd, u32 id, struct ns_id *nsid)
 {
+	char *rpath = link->name;
+	int plen = link->len;
 	int ret, mntns_root;
 	struct stat pst;
 	const struct stat *ost = &parms->stat;
 
-	if (ost->st_nlink == 0)
+	if (parms->fs_type == PROC_SUPER_MAGIC) {
+		/* The file points to /proc/pid/<foo> where pid is a dead
+		 * process. We remap this file by adding this pid to be
+		 * fork()ed into a TASK_HELPER state so that we can point to it
+		 * on restore.
+		 */
+		pid_t pid;
+		char *start, *end;
+
+		/* skip "./proc/" */
+		start = strstr(rpath, "/") + 1;
+		if (!start)
+			return -1;
+		start = strstr(start, "/") + 1;
+		if (!start)
+			return -1;
+		pid = strtol(start, &end, 10);
+
+		/* if we didn't find another /, this path something
+		 * like ./proc/kmsg, which we shouldn't mess with. */
+		if (*end == '/') {
+			*end = 0;
+			ret = access(rpath, F_OK);
+			*end = '/';
+
+			if (ret) {
+				pr_info("Dumping dead process remap of %d\n", pid);
+				return dump_dead_process_remap(pid, rpath + 1, plen - 1, ost, lfd, id, nsid);
+			}
+		}
+
+		return 0;
+	} else if (parms->fs_type == DEVPTS_SUPER_MAGIC) {
+		/*
+		 * It's safe to call stripping here because
+		 * file paths are having predefined format for
+		 * this FS and can't have a valid " (deleted)"
+		 * postfix as a part of not deleted filename.
+		 */
+		strip_deleted(link);
+		/*
+		 * Devpts devices/files are generated by the
+		 * kernel itself so we should not try to generate
+		 * any kind of ghost files here even if file is
+		 * no longer exist.
+		 */
+		return 0;
+	}
+
+	if (ost->st_nlink == 0) {
 		/*
 		 * Unpleasant, but easy case. File is completely invisible
 		 * from the FS. Just dump its contents and that's it. But
 		 * be careful whether anybody still has any of its hardlinks
 		 * also open.
 		 */
+		strip_deleted(link);
 		return dump_ghost_remap(rpath + 1, ost, lfd, id, nsid);
+	}
 
 	if (nfs_silly_rename(rpath, parms)) {
 		/*
@@ -613,7 +776,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 {
 	struct fd_link _link, *link;
 	struct ns_id *nsid;
-	int rfd;
+	struct cr_img *rimg;
 
 	RegFileEntry rfe = REG_FILE_ENTRY__INIT;
 
@@ -646,7 +809,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 		return -1;
 	}
 
-	if (check_path_remap(link->name, link->len, p, lfd, id, nsid))
+	if (check_path_remap(link, p, lfd, id, nsid))
 		return -1;
 
 	rfe.id		= id;
@@ -660,9 +823,8 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 		rfe.size = p->stat.st_size;
 	}
 
-	rfd = fdset_fd(glob_fdset, CR_FD_REG_FILES);
-
-	return pb_write_one(rfd, &rfe, PB_REG_FILE);
+	rimg = img_from_set(glob_imgset, CR_FD_REG_FILES);
+	return pb_write_one(rimg, &rfe, PB_REG_FILE);
 }
 
 const struct fdtype_ops regfile_dump_ops = {
@@ -852,7 +1014,7 @@ int open_path(struct file_desc *d,
 	return tmp;
 }
 
-static int do_open_reg_noseek_flags(int ns_root_fd, struct reg_file_info *rfi, void *arg)
+int do_open_reg_noseek_flags(int ns_root_fd, struct reg_file_info *rfi, void *arg)
 {
 	u32 flags = *(u32 *)arg;
 	int fd;
@@ -923,7 +1085,7 @@ int get_filemap_fd(struct vma_area *vma)
 	 * We open file w/o lseek, as mappings don't care about it
 	 */
 
-	BUG_ON(vma->fd == NULL);
+	BUG_ON(vma->vmfd == NULL);
 	if (vma->e->has_fdflags)
 		flags = vma->e->fdflags;
 	else if ((vma->e->prot & PROT_WRITE) &&
@@ -932,7 +1094,7 @@ int get_filemap_fd(struct vma_area *vma)
 	else
 		flags = O_RDONLY;
 
-	return open_path(vma->fd, do_open_reg_noseek_flags, &flags);
+	return open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
 }
 
 static void remap_get(struct file_desc *fdesc, char typ)
@@ -968,7 +1130,7 @@ static struct file_desc_ops reg_desc_ops = {
 	.collect_fd = collect_reg_fd,
 };
 
-struct file_desc *collect_special_file(u32 id)
+struct file_desc *try_collect_special_file(u32 id, int optional)
 {
 	struct file_desc *fdesc;
 
@@ -981,7 +1143,8 @@ struct file_desc *collect_special_file(u32 id)
 
 	fdesc = find_file_desc_raw(FD_TYPES__REG, id);
 	if (fdesc == NULL) {
-		pr_err("No entry for reg-file-ID %#x\n", id);
+		if (!optional)
+			pr_err("No entry for reg-file-ID %#x\n", id);
 		return NULL;
 	}
 

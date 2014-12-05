@@ -16,6 +16,7 @@
 #include "files.h"
 #include "file-ids.h"
 #include "files-reg.h"
+#include "file-lock.h"
 #include "image.h"
 #include "list.h"
 #include "util.h"
@@ -33,7 +34,7 @@
 #include "namespaces.h"
 #include "tun.h"
 #include "timerfd.h"
-#include "fdset.h"
+#include "imgset.h"
 #include "fs-magic.h"
 #include "proc_parse.h"
 
@@ -59,14 +60,19 @@ int prepare_shared_fdinfo(void)
 	return 0;
 }
 
+void file_desc_init(struct file_desc *d, u32 id, struct file_desc_ops *ops)
+{
+	INIT_LIST_HEAD(&d->fd_info_head);
+	INIT_HLIST_NODE(&d->hash);
+
+	d->id	= id;
+	d->ops	= ops;
+}
+
 int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops)
 {
-	d->id = id;
-	d->ops = ops;
-	INIT_LIST_HEAD(&d->fd_info_head);
-
+	file_desc_init(d, id, ops);
 	hlist_add_head(&d->hash, &file_desc_hash[id % FDESC_HASH_SIZE]);
-
 	return 0; /* this is to make tail-calls in collect_one_foo look nice */
 }
 
@@ -162,7 +168,7 @@ static u32 make_gen_id(const struct fd_parms *p)
 }
 
 int do_dump_gen_file(struct fd_parms *p, int lfd,
-		const struct fdtype_ops *ops, const int fdinfo)
+		const struct fdtype_ops *ops, struct cr_img *img)
 {
 	FdinfoEntry e = FDINFO_ENTRY__INIT;
 	int ret = -1;
@@ -182,7 +188,7 @@ int do_dump_gen_file(struct fd_parms *p, int lfd,
 	pr_info("fdinfo: type: 0x%2x flags: %#o/%#o pos: 0x%8"PRIx64" fd: %d\n",
 		ops->type, p->flags, (int)p->fd_flags, p->pos, p->fd);
 
-	return pb_write_one(fdinfo, &e, PB_FDINFO);
+	return pb_write_one(img, &e, PB_FDINFO);
 }
 
 int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
@@ -263,7 +269,7 @@ static const struct fdtype_ops *get_misc_dev_ops(int minor)
 	return NULL;
 }
 
-static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
+static int dump_chrdev(struct fd_parms *p, int lfd, struct cr_img *img)
 {
 	int maj = major(p->stat.st_rdev);
 	const struct fdtype_ops *ops;
@@ -271,11 +277,6 @@ static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
 	switch (maj) {
 	case MEM_MAJOR:
 		ops = &regfile_dump_ops;
-		break;
-	case TTYAUX_MAJOR:
-	case UNIX98_PTY_MASTER_MAJOR ... (UNIX98_PTY_MASTER_MAJOR + UNIX98_PTY_MAJOR_COUNT - 1):
-	case UNIX98_PTY_SLAVE_MAJOR:
-		ops = &tty_dump_ops;
 		break;
 	case MISC_MAJOR:
 		ops = get_misc_dev_ops(minor(p->stat.st_rdev));
@@ -285,16 +286,26 @@ static int dump_chrdev(struct fd_parms *p, int lfd, const int fdinfo)
 	default: {
 		char more[32];
 
+		if (is_tty(maj, minor(p->stat.st_rdev))) {
+			struct fd_link link;
+
+			if (fill_fdlink(lfd, p, &link))
+				return -1;
+			p->link = &link;
+			ops = &tty_dump_ops;
+			break;
+		}
+
 		sprintf(more, "%d:%d", maj, minor(p->stat.st_rdev));
-		return dump_unsupp_fd(p, lfd, fdinfo, "chr", more);
+		return dump_unsupp_fd(p, lfd, img, "chr", more);
 	}
 	}
 
-	return do_dump_gen_file(p, lfd, ops, fdinfo);
+	return do_dump_gen_file(p, lfd, ops, img);
 }
 
 static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_opts *opts,
-		       const int fdinfo)
+		       struct cr_img *img)
 {
 	struct fd_parms p = FD_PARMS_INIT;
 	const struct fdtype_ops *ops;
@@ -304,11 +315,14 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 		return -1;
 	}
 
+	if (note_file_lock(&ctl->pid, fd, lfd, &p))
+		return -1;
+
 	if (S_ISSOCK(p.stat.st_mode))
-		return dump_socket(&p, lfd, fdinfo);
+		return dump_socket(&p, lfd, img);
 
 	if (S_ISCHR(p.stat.st_mode))
-		return dump_chrdev(&p, lfd, fdinfo);
+		return dump_chrdev(&p, lfd, img);
 
 	if (p.fs_type == ANON_INODE_FS_MAGIC) {
 		char link[32];
@@ -329,9 +343,9 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 		else if (is_timerfd_link(link))
 			ops = &timerfd_dump_ops;
 		else
-			return dump_unsupp_fd(&p, lfd, fdinfo, "anon", link);
+			return dump_unsupp_fd(&p, lfd, img, "anon", link);
 
-		return do_dump_gen_file(&p, lfd, ops, fdinfo);
+		return do_dump_gen_file(&p, lfd, ops, img);
 	}
 
 	if (S_ISREG(p.stat.st_mode) || S_ISDIR(p.stat.st_mode)) {
@@ -342,12 +356,12 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 
 		p.link = &link;
 		if (link.name[1] == '/')
-			return do_dump_gen_file(&p, lfd, &regfile_dump_ops, fdinfo);
+			return do_dump_gen_file(&p, lfd, &regfile_dump_ops, img);
 
 		if (check_ns_proc(&link))
-			return do_dump_gen_file(&p, lfd, &nsfile_dump_ops, fdinfo);
+			return do_dump_gen_file(&p, lfd, &nsfile_dump_ops, img);
 
-		return dump_unsupp_fd(&p, lfd, fdinfo, "reg", link.name + 1);
+		return dump_unsupp_fd(&p, lfd, img, "reg", link.name + 1);
 	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {
@@ -356,16 +370,17 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 		else
 			ops = &fifo_dump_ops;
 
-		return do_dump_gen_file(&p, lfd, ops, fdinfo);
+		return do_dump_gen_file(&p, lfd, ops, img);
 	}
 
-	return dump_unsupp_fd(&p, lfd, fdinfo, "unknown", NULL);
+	return dump_unsupp_fd(&p, lfd, img, "unknown", NULL);
 }
 
 int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 		struct parasite_drain_fd *dfds)
 {
-	int *lfds, fdinfo;
+	int *lfds;
+	struct cr_img *img;
 	struct fd_opts *opts;
 	int i, ret = -1;
 
@@ -385,18 +400,18 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 	if (ret)
 		goto err2;
 
-	fdinfo = open_image(CR_FD_FDINFO, O_DUMP, item->ids->files_id);
-	if (fdinfo < 0)
+	img = open_image(CR_FD_FDINFO, O_DUMP, item->ids->files_id);
+	if (!img)
 		goto err2;
 
 	for (i = 0; i < dfds->nr_fds; i++) {
-		ret = dump_one_file(ctl, dfds->fds[i], lfds[i], opts + i, fdinfo);
+		ret = dump_one_file(ctl, dfds->fds[i], lfds[i], opts + i, img);
 		close(lfds[i]);
 		if (ret)
 			break;
 	}
 
-	close(fdinfo);
+	close_image(img);
 
 	pr_info("----------------------------------------\n");
 err2:
@@ -583,18 +598,19 @@ int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
 
 int prepare_fd_pid(struct pstree_item *item)
 {
-	int fdinfo_fd, ret = 0;
+	int ret = 0;
+	struct cr_img *img;
 	pid_t pid = item->pid.virt;
-	struct rst_info *rst_info = item->rst;
+	struct rst_info *rst_info = rsti(item);
 
 	INIT_LIST_HEAD(&rst_info->fds);
 	INIT_LIST_HEAD(&rst_info->eventpoll);
 	INIT_LIST_HEAD(&rst_info->tty_slaves);
 
 	if (!fdinfo_per_id) {
-		fdinfo_fd = open_image(CR_FD_FDINFO, O_RSTR | O_OPT, pid);
-		if (fdinfo_fd < 0) {
-			if (fdinfo_fd == -ENOENT)
+		img = open_image(CR_FD_FDINFO, O_RSTR | O_OPT, pid);
+		if (!img) {
+			if (errno == ENOENT)
 				return 0;
 			return -1;
 		}
@@ -602,18 +618,18 @@ int prepare_fd_pid(struct pstree_item *item)
 		if (item->ids == NULL) /* zombie */
 			return 0;
 
-		if (item->rst->fdt && item->rst->fdt->pid != item->pid.virt)
+		if (rsti(item)->fdt && rsti(item)->fdt->pid != item->pid.virt)
 			return 0;
 
-		fdinfo_fd = open_image(CR_FD_FDINFO, O_RSTR, item->ids->files_id);
-		if (fdinfo_fd < 0)
+		img = open_image(CR_FD_FDINFO, O_RSTR, item->ids->files_id);
+		if (!img)
 			return -1;
 	}
 
 	while (1) {
 		FdinfoEntry *e;
 
-		ret = pb_read_one_eof(fdinfo_fd, &e, PB_FDINFO);
+		ret = pb_read_one_eof(img, &e, PB_FDINFO);
 		if (ret <= 0)
 			break;
 
@@ -624,7 +640,7 @@ int prepare_fd_pid(struct pstree_item *item)
 		}
 	}
 
-	close(fdinfo_fd);
+	close_image(img);
 	return ret;
 }
 
@@ -733,18 +749,21 @@ static int open_transport_fd(int pid, struct fdinfo_list_entry *fle)
 	ret = bind(sock, &saddr, sun_len);
 	if (ret < 0) {
 		pr_perror("Can't bind unix socket %s", saddr.sun_path + 1);
-		return -1;
+		goto err;
 	}
 
 	ret = reopen_fd_as(fle->fe->fd, sock);
 	if (ret < 0)
-		return -1;
+		goto err;
 
 	pr_info("\t\tWake up fdinfo pid=%d fd=%d\n", fle->pid, fle->fe->fd);
 	futex_set_and_wake(&fle->real_pid, getpid());
 	want_recv_stage();
 
 	return 0;
+err:
+	close(sock);
+	return -1;
 }
 
 int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle, int sock)
@@ -943,8 +962,17 @@ int prepare_fds(struct pstree_item *me)
 
 	pr_info("Opening fdinfo-s\n");
 
-	if (me->rst->fdt) {
-		struct fdt *fdt = me->rst->fdt;
+	/*
+	 * This must be done after forking to allow child
+	 * to get the cgroup fd so it can move into the
+	 * correct /tasks file if it is in a different cgroup
+	 * set than its parent
+	 */
+	close_service_fd(CGROUP_YARD);
+	close_pid_proc(); /* flush any proc cached fds we may have */
+
+	if (rsti(me)->fdt) {
+		struct fdt *fdt = rsti(me)->fdt;
 
 		/*
 		 * Wait all tasks, who share a current fd table.
@@ -967,7 +995,7 @@ int prepare_fds(struct pstree_item *me)
 			continue;
 		}
 
-		ret = open_fdinfos(me->pid.virt, &me->rst->fds, state);
+		ret = open_fdinfos(me->pid.virt, &rsti(me)->fds, state);
 		if (ret)
 			break;
 
@@ -975,7 +1003,7 @@ int prepare_fds(struct pstree_item *me)
 		 * Now handle TTYs. Slaves are delayed to be sure masters
 		 * are already opened.
 		 */
-		ret = open_fdinfos(me->pid.virt, &me->rst->tty_slaves, state);
+		ret = open_fdinfos(me->pid.virt, &rsti(me)->tty_slaves, state);
 		if (ret)
 			break;
 
@@ -984,13 +1012,13 @@ int prepare_fds(struct pstree_item *me)
 		 * to be already restored, thus we store them in a separate
 		 * list and restore at the very end.
 		 */
-		ret = open_fdinfos(me->pid.virt, &me->rst->eventpoll, state);
+		ret = open_fdinfos(me->pid.virt, &rsti(me)->eventpoll, state);
 		if (ret)
 			break;
 	}
 
-	if (me->rst->fdt)
-		futex_inc_and_wake(&me->rst->fdt->fdt_lock);
+	if (rsti(me)->fdt)
+		futex_inc_and_wake(&rsti(me)->fdt->fdt_lock);
 out:
 	close_service_fd(CR_PROC_FD_OFF);
 	tty_fini_fds();
@@ -1024,7 +1052,7 @@ static int fchroot(int fd)
 int restore_fs(struct pstree_item *me)
 {
 	int dd_root, dd_cwd, ret, err = -1;
-	struct rst_info *ri = me->rst;
+	struct rst_info *ri = rsti(me);
 
 	/*
 	 * First -- open both descriptors. We will not
@@ -1076,22 +1104,22 @@ out:
 int prepare_fs_pid(struct pstree_item *item)
 {
 	pid_t pid = item->pid.virt;
-	struct rst_info *ri = item->rst;
-	int ifd;
+	struct rst_info *ri = rsti(item);
+	struct cr_img *img;
 	FsEntry *fe;
 
-	ifd = open_image(CR_FD_FS, O_RSTR | O_OPT, pid);
-	if (ifd < 0) {
-		if (ifd == -ENOENT)
+	img = open_image(CR_FD_FS, O_RSTR | O_OPT, pid);
+	if (!img) {
+		if (errno == ENOENT)
 			goto ok;
 		else
 			goto out;
 	}
 
-	if (pb_read_one(ifd, &fe, PB_FS) < 0)
+	if (pb_read_one(img, &fe, PB_FS) < 0)
 		goto out_i;
 
-	close(ifd);
+	close_image(img);
 
 	ri->cwd = collect_special_file(fe->cwd_id);
 	if (!ri->cwd) {
@@ -1117,7 +1145,7 @@ out_f:
 	return -1;
 
 out_i:
-	close(ifd);
+	close_image(img);
 out:
 	return -1;
 }
@@ -1127,21 +1155,21 @@ int shared_fdt_prepare(struct pstree_item *item)
 	struct pstree_item *parent = item->parent;
 	struct fdt *fdt;
 
-	if (!parent->rst->fdt) {
-		fdt = shmalloc(sizeof(*item->rst->fdt));
+	if (!rsti(parent)->fdt) {
+		fdt = shmalloc(sizeof(*rsti(item)->fdt));
 		if (fdt == NULL)
 			return -1;
 
-		parent->rst->fdt = fdt;
+		rsti(parent)->fdt = fdt;
 
 		futex_init(&fdt->fdt_lock);
 		fdt->nr = 1;
 		fdt->pid = parent->pid.virt;
 	} else
-		fdt = parent->rst->fdt;
+		fdt = rsti(parent)->fdt;
 
-	item->rst->fdt = fdt;
-	item->rst->service_fd_id = fdt->nr;
+	rsti(item)->fdt = fdt;
+	rsti(item)->service_fd_id = fdt->nr;
 	fdt->nr++;
 	if (pid_rst_prio(item->pid.virt, fdt->pid))
 		fdt->pid = item->pid.virt;

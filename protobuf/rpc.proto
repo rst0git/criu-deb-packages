@@ -2,6 +2,7 @@ message criu_page_server_info {
 	optional string		address	= 1;
 	optional int32		port	= 2;
 	optional int32		pid	= 3;
+	optional int32		fd	= 4;
 }
 
 message criu_veth_pair {
@@ -78,6 +79,9 @@ enum criu_req_type {
 	PAGE_SERVER	= 5;
 
 	NOTIFY		= 6;
+
+	CPUINFO_DUMP	= 7;
+	CPUINFO_CHECK	= 8;
 }
 
 /*
@@ -90,6 +94,13 @@ message criu_req {
 
 	optional criu_opts		opts		= 2;
 	optional bool			notify_success	= 3;
+
+	/*
+	 * When set service won't close the connection but
+	 * will wait for more req-s to appear. Works not
+	 * for all request types.
+	 */
+	optional bool			keep_open	= 4;
 }
 
 /*

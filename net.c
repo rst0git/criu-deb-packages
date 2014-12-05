@@ -8,7 +8,7 @@
 #include <sched.h>
 #include <sys/mount.h>
 
-#include "fdset.h"
+#include "imgset.h"
 #include "syscall-types.h"
 #include "namespaces.h"
 #include "net.h"
@@ -18,9 +18,15 @@
 #include "tun.h"
 #include "util-pie.h"
 #include "plugin.h"
-
+#include "action-scripts.h"
+#include "sockets.h"
+#include "pstree.h"
 #include "protobuf.h"
 #include "protobuf/netdev.pb-c.h"
+
+#ifndef NETLINK_SOCK_DIAG
+#define NETLINK_SOCK_DIAG NETLINK_INET_DIAG
+#endif
 
 static int ns_fd = -1;
 static int ns_sysfs_fd = -1;
@@ -46,14 +52,14 @@ int read_ns_sys_file(char *path, char *buf, int len)
 	return rlen;
 }
 
-int write_netdev_img(NetDeviceEntry *nde, struct cr_fdset *fds)
+int write_netdev_img(NetDeviceEntry *nde, struct cr_imgset *fds)
 {
-	return pb_write_one(fdset_fd(fds, CR_FD_NETDEV), nde, PB_NETDEV);
+	return pb_write_one(img_from_set(fds, CR_FD_NETDEV), nde, PB_NETDEV);
 }
 
 static int dump_one_netdev(int type, struct ifinfomsg *ifi,
-		struct rtattr **tb, struct cr_fdset *fds,
-		int (*dump)(NetDeviceEntry *, struct cr_fdset *))
+		struct rtattr **tb, struct cr_imgset *fds,
+		int (*dump)(NetDeviceEntry *, struct cr_imgset *))
 {
 	NetDeviceEntry netdev = NET_DEVICE_ENTRY__INIT;
 
@@ -102,11 +108,11 @@ static char *link_kind(struct ifinfomsg *ifi, struct rtattr **tb)
 }
 
 static int dump_unknown_device(struct ifinfomsg *ifi, char *kind,
-		struct rtattr **tb, struct cr_fdset *fds)
+		struct rtattr **tb, struct cr_imgset *fds)
 {
 	int ret;
 
-	ret = cr_plugin_dump_ext_link(ifi->ifi_index, ifi->ifi_type, kind);
+	ret = run_plugins(DUMP_EXT_LINK, ifi->ifi_index, ifi->ifi_type, kind);
 	if (ret == 0)
 		return dump_one_netdev(ND_TYPE__EXTLINK, ifi, tb, fds, NULL);
 
@@ -117,7 +123,7 @@ static int dump_unknown_device(struct ifinfomsg *ifi, char *kind,
 }
 
 static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind,
-		struct rtattr **tb, struct cr_fdset *fds)
+		struct rtattr **tb, struct cr_imgset *fds)
 {
 	if (!strcmp(kind, "veth"))
 		/*
@@ -136,7 +142,7 @@ static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind,
 }
 
 static int dump_one_gendev(struct ifinfomsg *ifi, char *kind,
-		struct rtattr **tb, struct cr_fdset *fds)
+		struct rtattr **tb, struct cr_imgset *fds)
 {
 	if (!strcmp(kind, "tun"))
 		return dump_one_netdev(ND_TYPE__TUN, ifi, tb, fds, dump_tun_link);
@@ -145,7 +151,7 @@ static int dump_one_gendev(struct ifinfomsg *ifi, char *kind,
 }
 
 static int dump_one_voiddev(struct ifinfomsg *ifi, char *kind,
-		struct rtattr **tb, struct cr_fdset *fds)
+		struct rtattr **tb, struct cr_imgset *fds)
 {
 	if (!strcmp(kind, "venet"))
 		/*
@@ -160,7 +166,7 @@ static int dump_one_voiddev(struct ifinfomsg *ifi, char *kind,
 
 static int dump_one_link(struct nlmsghdr *hdr, void *arg)
 {
-	struct cr_fdset *fds = arg;
+	struct cr_imgset *fds = arg;
 	struct ifinfomsg *ifi;
 	int ret = 0, len = hdr->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
 	struct rtattr *tb[IFLA_MAX + 1];
@@ -202,7 +208,7 @@ unk:
 	return ret;
 }
 
-static int dump_links(struct cr_fdset *fds)
+static int dump_links(struct cr_imgset *fds)
 {
 	int sk, ret;
 	struct {
@@ -368,22 +374,23 @@ static int restore_link(NetDeviceEntry *nde, int nlsk)
 
 static int restore_links(int pid)
 {
-	int fd, nlsk, ret;
+	int nlsk, ret;
+	struct cr_img *img;
 	NetDeviceEntry *nde;
 
-	fd = open_image(CR_FD_NETDEV, O_RSTR, pid);
-	if (fd < 0)
+	img = open_image(CR_FD_NETDEV, O_RSTR, pid);
+	if (!img)
 		return -1;
 
 	nlsk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (nlsk < 0) {
 		pr_perror("Can't create nlk socket");
-		close_safe(&fd);
+		close_image(img);
 		return -1;
 	}
 
 	while (1) {
-		ret = pb_read_one_eof(fd, &nde, PB_NETDEV);
+		ret = pb_read_one_eof(img, &nde, PB_NETDEV);
 		if (ret <= 0)
 			break;
 
@@ -394,7 +401,7 @@ static int restore_links(int pid)
 	}
 
 	close(nlsk);
-	close(fd);
+	close_image(img);
 	return ret;
 }
 
@@ -435,29 +442,33 @@ static int run_iptables_tool(char *def_cmd, int fdin, int fdout)
 	return ret;
 }
 
-static inline int dump_ifaddr(struct cr_fdset *fds)
+static inline int dump_ifaddr(struct cr_imgset *fds)
 {
-	return run_ip_tool("addr", "save", -1, fdset_fd(fds, CR_FD_IFADDR));
+	struct cr_img *img = img_from_set(fds, CR_FD_IFADDR);
+	return run_ip_tool("addr", "save", -1, img_raw_fd(img));
 }
 
-static inline int dump_route(struct cr_fdset *fds)
+static inline int dump_route(struct cr_imgset *fds)
 {
-	return run_ip_tool("route", "save", -1, fdset_fd(fds, CR_FD_ROUTE));
+	struct cr_img *img = img_from_set(fds, CR_FD_ROUTE);
+	return run_ip_tool("route", "save", -1, img_raw_fd(img));
 }
 
-static inline int dump_iptables(struct cr_fdset *fds)
+static inline int dump_iptables(struct cr_imgset *fds)
 {
-	return run_iptables_tool("iptables-save", -1, fdset_fd(fds, CR_FD_IPTABLES));
+	struct cr_img *img = img_from_set(fds, CR_FD_IPTABLES);
+	return run_iptables_tool("iptables-save", -1, img_raw_fd(img));
 }
 
 static int restore_ip_dump(int type, int pid, char *cmd)
 {
-	int fd, ret;
+	int ret = -1;
+	struct cr_img *img;
 
-	ret = fd = open_image(type, O_RSTR, pid);
-	if (fd >= 0) {
-		ret = run_ip_tool(cmd, "restore", fd, -1);
-		close(fd);
+	img = open_image(type, O_RSTR, pid);
+	if (img) {
+		ret = run_ip_tool(cmd, "restore", img_raw_fd(img), -1);
+		close_image(img);
 	}
 
 	return ret;
@@ -475,12 +486,13 @@ static inline int restore_route(int pid)
 
 static inline int restore_iptables(int pid)
 {
-	int ret, fd;
+	int ret = -1;
+	struct cr_img *img;
 
-	ret = fd = open_image(CR_FD_IPTABLES, O_RSTR, pid);
-	if (fd >= 0) {
-		ret = run_iptables_tool("iptables-restore", fd, -1);
-		close(fd);
+	img = open_image(CR_FD_IPTABLES, O_RSTR, pid);
+	if (img) {
+		ret = run_iptables_tool("iptables-restore", img_raw_fd(img), -1);
+		close_image(img);
 	}
 
 	return ret;
@@ -526,18 +538,16 @@ static int mount_ns_sysfs(void)
 	return ns_sysfs_fd >= 0 ? 0 : -1;
 }
 
-int dump_net_ns(int pid, int ns_id)
+int dump_net_ns(int ns_id)
 {
-	struct cr_fdset *fds;
+	struct cr_imgset *fds;
 	int ret;
 
-	fds = cr_fdset_open(ns_id, NETNS, O_DUMP);
+	fds = cr_imgset_open(ns_id, NETNS, O_DUMP);
 	if (fds == NULL)
 		return -1;
 
-	ret = switch_ns(pid, &net_ns_desc, NULL);
-	if (!ret)
-		ret = mount_ns_sysfs();
+	ret = mount_ns_sysfs();
 	if (!ret)
 		ret = dump_links(fds);
 	if (!ret)
@@ -550,7 +560,7 @@ int dump_net_ns(int pid, int ns_id)
 	close(ns_sysfs_fd);
 	ns_sysfs_fd = -1;
 
-	close_cr_fdset(&fds);
+	close_cr_imgset(&fds);
 	return ret;
 }
 
@@ -591,7 +601,7 @@ int network_lock(void)
 	if  (!(root_ns_mask & CLONE_NEWNET))
 		return 0;
 
-	return run_scripts("network-lock");
+	return run_scripts(ACT_NET_LOCK);
 }
 
 void network_unlock(void)
@@ -602,7 +612,7 @@ void network_unlock(void)
 	rst_unlock_tcp_connections();
 
 	if (root_ns_mask & CLONE_NEWNET)
-		run_scripts("network-unlock");
+		run_scripts(ACT_NET_UNLOCK);
 }
 
 int veth_pair_add(char *in, char *out)
@@ -618,6 +628,82 @@ int veth_pair_add(char *in, char *out)
 	list_add(&n->node, &opts.veth_pairs);
 	pr_debug("Added %s:%s veth map\n", in, out);
 	return 0;
+}
+
+/*
+ * The setns() syscall (called by switch_ns()) can be extremely
+ * slow. If we call it two or more times from the same task the
+ * kernel will synchonously go on a very slow routine called
+ * synchronize_rcu() trying to put a reference on old namespaces.
+ *
+ * To avoid doing this more than once we pre-create all the
+ * needed other-ns sockets in advance.
+ */
+
+static int prep_ns_sockets(struct ns_id *ns, bool for_dump)
+{
+	int nsret = -1, ret;
+
+	if (ns->pid != getpid()) {
+		pr_info("Switching to %d's net for collecting sockets\n", ns->pid);
+		if (switch_ns(ns->pid, &net_ns_desc, &nsret))
+			return -1;
+	}
+
+	if (for_dump) {
+		ret = ns->net.nlsk = socket(PF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
+		if (ret < 0) {
+			pr_perror("Can't create sock diag socket");
+			goto err_nl;
+		}
+	} else
+		ns->net.nlsk = -1;
+
+	ret = ns->net.seqsk = socket(PF_UNIX, SOCK_SEQPACKET, 0);
+	if (ret < 0) {
+		pr_perror("Can't create seqsk for parasite");
+		goto err_sq;
+	}
+
+	ret = 0;
+out:
+	if (nsret >= 0 && restore_ns(nsret, &net_ns_desc) < 0) {
+		nsret = -1;
+		if (ret == 0)
+			goto err_ret;
+	}
+
+	return ret;
+
+err_ret:
+	close(ns->net.seqsk);
+err_sq:
+	if (ns->net.nlsk >= 0)
+		close(ns->net.nlsk);
+err_nl:
+	goto out;
+}
+
+static int collect_net_ns(struct ns_id *ns, void *oarg)
+{
+	bool for_dump = (oarg == (void *)1);
+	int ret;
+
+	pr_info("Collecting netns %d/%d\n", ns->id, ns->pid);
+	ret = prep_ns_sockets(ns, for_dump);
+	if (ret)
+		return ret;
+
+	if (!for_dump)
+		return 0;
+
+	return collect_sockets(ns);
+}
+
+int collect_net_namespaces(bool for_dump)
+{
+	return walk_namespaces(&net_ns_desc, collect_net_ns,
+			(void *)(for_dump ? 1UL : 0));
 }
 
 struct ns_desc net_ns_desc = NS_DESC_ENTRY(CLONE_NEWNET, "net");

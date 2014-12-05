@@ -28,24 +28,38 @@ struct vma_area {
 	VmaEntry		*e;
 
 	union {
-		int		vm_file_fd;
-		int		vm_socket_id;
-		struct file_desc *fd;
-	};
-	union {
-		unsigned long	*page_bitmap;	/* existent pages, restore only */
-		char		*aufs_rpath;	/* path from aufs root, dump only */
-	};
-	union {
-		unsigned long	*ppage_bitmap;	/* parent's existent pages */
-		char		*aufs_fpath;	/* full path from global root, dump only */
-	};
+		struct /* for dump */ {
+			union {
+				/*
+				 * These two cannot be assigned at once.
+				 * The file_fd is an fd for a regular file and
+				 * the socket_id is the inode number of the
+				 * mapped (PF_PACKET) socket.
+				 */
+				int	vm_file_fd;
+				int	vm_socket_id;
+			};
 
-	unsigned long		premmaped_addr;
+			char		*aufs_rpath;	/* path from aufs root */
+			char		*aufs_fpath;	/* full path from global root */
 
-	bool			file_borrowed;
+			/*
+			 * When several subsequent vmas have the same 
+			 * dev:ino pair all 'tail' ones set this to true
+			 * and the vmst points to the head's stat buf.
+			 */
+			bool		file_borrowed;
+			struct stat	*vmst;
+			int		mnt_id;
+		};
 
-	struct stat		*st;
+		struct /* for restore */ {
+			struct file_desc *vmfd;
+			unsigned long	*page_bitmap;	/* existent pages */
+			unsigned long	*ppage_bitmap;	/* parent's existent pages */
+			unsigned long	premmaped_addr;	/* restore only */
+		};
+	};
 };
 
 extern struct vma_area *alloc_vma_area(void);

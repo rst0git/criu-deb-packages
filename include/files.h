@@ -16,7 +16,7 @@
 
 struct pstree_item;
 struct file_desc;
-struct cr_fdset;
+struct cr_imgset;
 struct rst_info;
 struct parasite_ctl;
 
@@ -125,14 +125,17 @@ struct fdtype_ops {
 	int			(*pre_dump)(int pid, int lfd);
 };
 
+struct cr_img;
+
 extern int do_dump_gen_file(struct fd_parms *p, int lfd,
 			    const struct fdtype_ops *ops,
-			    const int fdinfo);
+			    struct cr_img *);
 struct parasite_drain_fd;
 int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 		struct parasite_drain_fd *dfds);
 int predump_task_files(int pid);
 
+extern void file_desc_init(struct file_desc *d, u32 id, struct file_desc_ops *ops);
 extern int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops);
 extern struct fdinfo_list_entry *file_master(struct file_desc *d);
 extern struct file_desc *find_file_desc_raw(int type, u32 id);
@@ -163,6 +166,6 @@ extern int shared_fdt_prepare(struct pstree_item *item);
 
 extern struct collect_image_info ext_file_cinfo;
 extern int dump_unsupp_fd(struct fd_parms *p, int lfd,
-			  const int fdinfo, char *more, char *info);
+			  struct cr_img *, char *more, char *info);
 
 #endif /* __CR_FILES_H__ */

@@ -5,19 +5,14 @@
 
 #include "list.h"
 
-struct script {
-	struct list_head node;
-	char *path;
-	int arg;
-};
-
-#define SCRIPT_RPC_NOTIFY	(char *)0x1
-
 /*
  * CPU capability options.
  */
-#define CPU_CAP_FPU		(1u)
+#define CPU_CAP_NONE		(0u)
 #define CPU_CAP_ALL		(-1u)
+#define CPU_CAP_FPU		(1u)		/* Only FPU capability required */
+#define CPU_CAP_CPU		(2u)		/* CPU capability required */
+#define CPU_CAP_DEFAULT		(CPU_CAP_FPU)
 
 struct cg_root_opt {
 	struct list_head node;
@@ -52,6 +47,7 @@ struct cr_options {
 	bool			use_page_server;
 	unsigned short		ps_port;
 	char			*addr;
+	int			ps_socket;
 	bool			track_mem;
 	char			*img_parent;
 	bool			auto_dedup;

@@ -3,6 +3,8 @@
 
 #include "asm/types.h"
 
+struct stat;
+
 /*
  * kerndat stands for "kernel data" and is a collection
  * of run-time information about current kernel
@@ -12,16 +14,31 @@ extern int kerndat_init(void);
 extern int kerndat_init_rst(void);
 extern int kerndat_get_dirty_track(void);
 
-extern dev_t kerndat_shmem_dev;
-extern bool kerndat_has_dirty_track;
+struct kerndat_s {
+	dev_t shmem_dev;
+	int tcp_max_wshare;
+	int tcp_max_rshare;
+	int last_cap;
+	u64 zero_page_pfn;
+	bool has_dirty_track;
+	bool has_memfd;
+};
 
-extern int tcp_max_wshare;
-extern int tcp_max_rshare;
+extern struct kerndat_s kdat;
 
-extern int kern_last_cap;
-extern u64 zero_page_pfn;
+enum {
+	KERNDAT_FS_STAT_DEVPTS,
+	KERNDAT_FS_STAT_DEVTMPFS,
 
-struct stat;
-extern struct stat *kerndat_get_devpts_stat(void);
+	KERNDAT_FS_STAT_MAX
+};
+
+/*
+ * Check whether the fs @which with kdevice @kdev
+ * is the same as host's. If yes, this means that
+ * the fs mount is shared with host, if no -- it's
+ * a new (likely virtuzlized) fs instance.
+ */
+extern int kerndat_fs_virtualized(unsigned int which, u32 kdev);
 
 #endif /* __CR_KERNDAT_H__ */
