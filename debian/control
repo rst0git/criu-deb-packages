@@ -8,7 +8,7 @@ Build-Depends:
  libprotobuf-c-dev,
  protobuf-c-compiler,
  xmlto
-Standards-Version: 3.9.5
+Standards-Version: 3.9.6
 Homepage: http://www.criu.org/
 Vcs-Browser: https://anonscm.debian.org/cgit/collab-maint/criu.git
 Vcs-Git: git://anonscm.debian.org/collab-maint/criu.git
