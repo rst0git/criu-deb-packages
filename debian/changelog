@@ -1,3 +1,12 @@
+criu (1.4-1) experimental; urgency=medium
+
+  * Imported Upstream version 1.4
+  * Refresh 0002-unused-function.patch patch
+  * Declare compliance with Debian Policy 3.9.6
+  * Install contrib/docker_cr.sh to examples
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Fri, 05 Dec 2014 21:32:13 +0100
+
 criu (1.3.1-1) unstable; urgency=medium
 
   * Imported Upstream version 1.3.1
