@@ -106,8 +106,6 @@ struct task_restore_args {
 	int				nr_zombies;
 	thread_restore_fcall_t		clone_restore_fn;	/* helper address for clone() call */
 	struct thread_restore_args	*thread_args;		/* array of thread arguments */
-	struct shmem_info		*shmems;
-	unsigned int			nr_shmems;
 	struct task_entries		*task_entries;
 	void				*rst_mem;
 	unsigned long			rst_mem_size;
@@ -147,6 +145,9 @@ struct task_restore_args {
 
 	struct rst_tcp_sock		*tcp_socks;
 	int				tcp_socks_nr;
+
+	struct rst_aio_ring		*rings;
+	int				nr_rings;
 
 	int				fd_last_pid; /* sys.ns_last_pid for threads rst */
 

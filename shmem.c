@@ -16,34 +16,63 @@
 #include "protobuf.h"
 #include "protobuf/pagemap.pb-c.h"
 
-unsigned long nr_shmems;
-unsigned long rst_shmems;
+/*
+ * pid is a pid of a creater
+ * start, end are used for open mapping
+ * fd is a file discriptor, which is valid for creater,
+ * it's opened in cr-restor, because pgoff may be non zero
+ */
+struct shmem_info {
+	unsigned long	shmid;
+	unsigned long	size;
+	int		pid;
+	int		fd;
 
-int prepare_shmem_restore(void)
-{
-	rst_shmems = rst_mem_cpos(RM_SHREMAP);
-	return 0;
-}
+	/*
+	 * 0. lock is initilized to zero
+	 * 1. the master opens a descriptor and set lock to 1
+	 * 2. slaves open their descriptors and increment lock
+	 * 3. the master waits all slaves on lock. After that
+	 *    it can close the descriptor.
+	 */
+	futex_t		lock;
+
+	/*
+	 * Here is a problem, that we don't know, which process will restore
+	 * an region. Each time when we	found a process with a smaller pid,
+	 * we reset self_count, so we can't have only one counter.
+	 */
+	int		count;		/* the number of regions */
+	int		self_count;	/* the number of regions, which belongs to "pid" */
+
+	struct list_head l;
+};
+
+/*
+ * This list is filled with shared objects before we fork
+ * any tasks. Thus the head is private (COW-ed) and the
+ * entries are all in shmem.
+ */
+static LIST_HEAD(shmems); /* XXX hash? tree? */
 
 void show_saved_shmems(void)
 {
-	int i;
 	struct shmem_info *si;
 
 	pr_info("\tSaved shmems:\n");
-	si = rst_mem_remap_ptr(rst_shmems, RM_SHREMAP);
-	for (i = 0; i < nr_shmems; i++, si++)
-		pr_info("\t\tstart: 0x%016lx shmid: 0x%lx pid: %d\n",
-				si->start, si->shmid, si->pid);
+	list_for_each_entry(si, &shmems, l)
+		pr_info("\t\tshmid: 0x%lx pid: %d\n", si->shmid, si->pid);
 }
 
-
-static struct shmem_info *find_shmem_by_id(unsigned long id)
+static struct shmem_info *find_shmem_by_id(unsigned long shmid)
 {
 	struct shmem_info *si;
 
-	si = rst_mem_remap_ptr(rst_shmems, RM_SHREMAP);
-	return find_shmem(si, nr_shmems, id);
+	list_for_each_entry(si, &shmems, l)
+		if (si->shmid == shmid)
+			return si;
+
+	return NULL;
 }
 
 int collect_shmem(int pid, VmaEntry *vi)
@@ -72,31 +101,26 @@ int collect_shmem(int pid, VmaEntry *vi)
 		}
 
 		si->pid	 = pid;
-		si->start = vi->start;
-		si->end	 = vi->end;
 		si->self_count = 1;
 
 		return 0;
 	}
 
-	si = rst_mem_alloc(sizeof(struct shmem_info), RM_SHREMAP);
+	si = shmalloc(sizeof(struct shmem_info));
 	if (!si)
 		return -1;
 
 	pr_info("Add new shmem 0x%"PRIx64" (0x%016"PRIx64"-0x%016"PRIx64")\n",
 				vi->shmid, vi->start, vi->end);
 
-	si->start = vi->start;
-	si->end	  = vi->end;
 	si->shmid = vi->shmid;
 	si->pid	  = pid;
 	si->size  = size;
 	si->fd    = -1;
 	si->count = 1;
 	si->self_count = 1;
-
-	nr_shmems++;
 	futex_init(&si->lock);
+	list_add_tail(&si->l, &shmems);
 
 	return 0;
 }

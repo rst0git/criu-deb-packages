@@ -43,6 +43,12 @@ static char *buf = __buf.buf;
 
 #define BUF_SIZE sizeof(__buf.buf)
 
+/*
+ * This is how AIO ring buffers look like in proc
+ */
+
+#define AIO_FNAME	"/[aio]"
+
 int parse_cpuinfo_features(int (*handler)(char *tok))
 {
 	FILE *cpuinfo;
@@ -191,13 +197,10 @@ static inline int vfi_equal(struct vma_file_info *a, struct vma_file_info *b)
 			(a->dev_min ^ b->dev_min)) == 0;
 }
 
-static int vma_get_mapfile(struct vma_area *vma, DIR *mfd,
+static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 		struct vma_file_info *vfi, struct vma_file_info *prev_vfi)
 {
 	char path[32];
-
-	if (!mfd)
-		return 0;
 
 	if (prev_vfi->vma && vfi_equal(vfi, prev_vfi)) {
 		struct vma_area *prev = prev_vfi->vma;
@@ -237,23 +240,64 @@ static int vma_get_mapfile(struct vma_area *vma, DIR *mfd,
 	 */
 	vma->vm_file_fd = openat(dirfd(mfd), path, O_RDONLY);
 	if (vma->vm_file_fd < 0) {
+		if (errno == ENOENT)
+			/* Just mapping w/o map_files link */
+			return 0;
+
 		if (errno == ENXIO) {
 			struct stat buf;
 
 			if (fstatat(dirfd(mfd), path, &buf, 0))
 				return -1;
 
-			if (!S_ISSOCK(buf.st_mode))
-				return -1;
+			if (S_ISSOCK(buf.st_mode)) {
+				pr_info("Found socket mapping @%"PRIx64"\n", vma->e->start);
+				vma->vm_socket_id = buf.st_ino;
+				vma->e->status |= VMA_AREA_SOCKET | VMA_AREA_REGULAR;
+				return 0;
+			}
 
-			pr_info("Found socket %"PRIu64" mapping @%"PRIx64"\n",
-					buf.st_ino, vma->e->start);
-			vma->e->status |= VMA_AREA_SOCKET | VMA_AREA_REGULAR;
-			vma->vm_socket_id = buf.st_ino;
-		} else if (errno != ENOENT)
-			return -1;
-	} else if (opts.aufs && fixup_aufs_vma_fd(vma) < 0)
+			if ((buf.st_mode & S_IFMT) == 0 && !strcmp(fname, AIO_FNAME)) {
+				/* AIO ring, let's try */
+				close(vma->vm_file_fd);
+				vma->aio_nr_req = -1;
+				vma->e->status = VMA_AREA_AIORING;
+				return 0;
+			}
+
+			pr_err("Unknown shit %o (%s)\n", buf.st_mode, fname);
+		}
+
 		return -1;
+	}
+
+	vma->vmst = xmalloc(sizeof(struct stat));
+	if (!vma->vmst)
+		return -1;
+
+	/*
+	 * For AUFS support, we need to check if the symbolic link
+	 * points to a branch.  If it does, we cannot fstat() its file
+	 * descriptor because it would return a different dev/ino than
+	 * the real file.  If fixup_aufs_vma_fd() returns positive,
+	 * it means that it has stat()'ed using the full pathname.
+	 * Zero return means that the symbolic link does not point to
+	 * a branch and we can do fstat() below.
+	 */
+	if (opts.aufs) {
+		int ret;
+
+		ret = fixup_aufs_vma_fd(vma);
+		if (ret < 0)
+			return -1;
+		if (ret > 0)
+			return 0;
+	}
+
+	if (fstat(vma->vm_file_fd, vma->vmst) < 0) {
+		pr_perror("Failed fstat on map %"PRIx64"", vma->e->start);
+		return -1;
+	}
 
 	return 0;
 }
@@ -292,7 +336,7 @@ int parse_self_maps_lite(struct vm_area_list *vms)
 	return 0;
 }
 
-int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_files)
+int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list)
 {
 	struct vma_area *vma_area = NULL;
 	unsigned long start, end, pgoff, prev_end = 0;
@@ -305,6 +349,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 	struct bfd f;
 
 	vma_area_list->nr = 0;
+	vma_area_list->nr_aios = 0;
 	vma_area_list->longest = 0;
 	vma_area_list->priv_size = 0;
 	INIT_LIST_HEAD(&vma_area_list->h);
@@ -316,11 +361,9 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 	if (bfdopen(&f, O_RDONLY))
 		goto err_n;
 
-	if (use_map_files) {
-		map_files_dir = opendir_proc(pid, "map_files");
-		if (!map_files_dir) /* old kernel? */
-			goto err;
-	}
+	map_files_dir = opendir_proc(pid, "map_files");
+	if (!map_files_dir) /* old kernel? */
+		goto err;
 
 	while (1) {
 		int num;
@@ -399,7 +442,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 		vma_area->e->pgoff	= pgoff;
 		vma_area->e->prot	= PROT_NONE;
 
-		if (vma_get_mapfile(vma_area, map_files_dir, &vfi, &prev_vfi))
+		if (vma_get_mapfile(file_path, vma_area, map_files_dir, &vfi, &prev_vfi))
 			goto err_bogus_mapfile;
 
 		if (r == 'r')
@@ -419,6 +462,8 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 		}
 
 		if (vma_area->e->status != 0) {
+			if (vma_area->e->status & VMA_AREA_AIORING)
+				vma_area_list->nr_aios++;
 			continue;
 		} else if (!strcmp(file_path, "[vsyscall]") ||
 			   !strcmp(file_path, "[vectors]")) {
@@ -465,32 +510,14 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 			vma_area->vmst = prev->vmst;
 			vma_area->mnt_id = prev->mnt_id;
 		} else if (vma_area->vm_file_fd >= 0) {
-			struct stat *st_buf;
+			struct stat *st_buf = vma_area->vmst;
 
-			st_buf = vma_area->vmst = xmalloc(sizeof(*st_buf));
-			if (!st_buf)
-				goto err;
-
-			/*
-			 * For AUFS support, we cannot fstat() a file descriptor that
-			 * is a symbolic link to a branch (it would return different
-			 * dev/ino than the real file).  Instead, we stat() using the
-			 * full pathname that we saved before.
-			 */
-			if (vma_area->aufs_fpath) {
-				if (stat(vma_area->aufs_fpath, st_buf) < 0) {
-					pr_perror("Failed stat on %d's map %lu (%s)",
-						pid, start, vma_area->aufs_fpath);
-					goto err;
-				}
-			} else if (fstat(vma_area->vm_file_fd, st_buf) < 0) {
-				pr_perror("Failed fstat on %d's map %lu", pid, start);
-				goto err;
-			}
-
-			if (!S_ISREG(st_buf->st_mode) &&
-			    !(S_ISCHR(st_buf->st_mode) && st_buf->st_rdev == DEVZERO)) {
-				pr_err("Can't handle non-regular mapping on %d's map %lu\n", pid, start);
+			if (S_ISREG(st_buf->st_mode))
+				/* regular file mapping -- supported */;
+			else if (S_ISCHR(st_buf->st_mode) && (st_buf->st_rdev == DEVZERO))
+				/* devzero mapping -- also makes sense */;
+			else {
+				pr_err("Can't handle non-regular mapping on %d's map %#lx\n", pid, start);
 				goto err;
 			}
 
@@ -516,7 +543,15 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, bool use_map_file
 					vma_area->e->status |= VMA_FILE_SHARED;
 			}
 
-			if (get_fd_mntid(vma_area->vm_file_fd, &vma_area->mnt_id))
+			/*
+			 * We cannot use the mnt_id value provided by the kernel
+			 * for vm_file_fd if it is an AUFS file (the value is
+			 * wrong).  In such a case, fixup_aufs_vma_fd() has set
+			 * mnt_id to -1 to mimic pre-3.15 kernels that didn't
+			 * have mnt_id.
+			 */
+			if (vma_area->mnt_id != -1 &&
+			    get_fd_mntid(vma_area->vm_file_fd, &vma_area->mnt_id))
 				return -1;
 		} else {
 			/*
@@ -702,7 +737,6 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 		return -1;
 
 	while (done < 8 && (str = breadline(&f))) {
-		pr_debug("str: `%s'\n", str);
 		if (!strncmp(str, "State:", 6)) {
 			cr->state = str[7];
 			done++;
@@ -884,7 +918,7 @@ static int parse_mnt_opt(char *str, struct mount_info *mi, int *off)
 	return 0;
 }
 
-static int parse_mountinfo_ent(char *str, struct mount_info *new)
+static int parse_mountinfo_ent(char *str, struct mount_info *new, char **r_fstype)
 {
 	unsigned int kmaj, kmin;
 	int ret, n;
@@ -925,6 +959,8 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new)
 
 	ret = -1;
 	new->fstype = find_fstype_by_name(fstype);
+	if (new->fstype->code == FSTYPE__UNSUPPORTED)
+		*r_fstype = fstype; /* keep for logging */
 
 	new->options = xmalloc(strlen(opt) + 1);
 	if (!new->options)
@@ -936,7 +972,8 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new)
 	ret = 0;
 err:
 	free(opt);
-	free(fstype);
+	if (!*r_fstype)
+		free(fstype);
 	return ret;
 }
 
@@ -955,6 +992,7 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid)
 	while (fgets(str, sizeof(str), f)) {
 		struct mount_info *new;
 		int ret;
+		char *fst = NULL;
 
 		new = mnt_entry_alloc();
 		if (!new)
@@ -965,14 +1003,14 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid)
 		new->next = list;
 		list = new;
 
-		ret = parse_mountinfo_ent(str, new);
+		ret = parse_mountinfo_ent(str, new, &fst);
 		if (ret < 0) {
 			pr_err("Bad format in %d mountinfo\n", pid);
 			goto err;
 		}
 
 		pr_info("\ttype %s source %s mnt_id %#x s_dev %#x %s @ %s flags %#x options %s\n",
-				new->fstype->name, new->source,
+				fst ? : new->fstype->name, new->source,
 				new->mnt_id, new->s_dev, new->root, new->mountpoint,
 				new->flags, new->options);
 

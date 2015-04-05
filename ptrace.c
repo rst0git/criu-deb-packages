@@ -19,6 +19,7 @@
 #include "ptrace.h"
 #include "proc_parse.h"
 #include "crtools.h"
+#include "security.h"
 
 int unseize_task(pid_t pid, int orig_st, int st)
 {
@@ -49,7 +50,7 @@ int seize_task(pid_t pid, pid_t ppid)
 {
 	siginfo_t si;
 	int status;
-	int ret, ret2, ptrace_errno;
+	int ret, ret2, ptrace_errno, wait_errno = 0;
 	struct proc_status_creds cr;
 
 	ret = ptrace(PTRACE_SEIZE, pid, NULL, 0);
@@ -79,6 +80,12 @@ int seize_task(pid_t pid, pid_t ppid)
 	 * we might nead at that early point.
 	 */
 
+try_again:
+	if (!ret) {
+		ret = wait4(pid, &status, __WALL, NULL);
+		wait_errno = errno;
+	}
+
 	ret2 = parse_pid_status(pid, &cr);
 	if (ret2)
 		goto err;
@@ -93,8 +100,8 @@ int seize_task(pid_t pid, pid_t ppid)
 			if (pid == getpid())
 				pr_err("The criu itself is within dumped tree.\n");
 			else
-				pr_err("Unseizable non-zombie %d found, state %c, err %d/%d\n",
-						pid, cr.state, ret, ptrace_errno);
+				pr_err("Unseizable non-zombie %d found, state %c, err %d/%d/%d\n",
+						pid, cr.state, ret, ptrace_errno, wait_errno);
 			return -1;
 		}
 
@@ -104,18 +111,6 @@ int seize_task(pid_t pid, pid_t ppid)
 	if ((ppid != -1) && (cr.ppid != ppid)) {
 		pr_err("Task pid reused while suspending (%d: %d -> %d)\n",
 				pid, ppid, cr.ppid);
-		goto err;
-	}
-
-try_again:
-	ret = wait4(pid, &status, __WALL, NULL);
-	if (ret < 0) {
-		pr_perror("SEIZE %d: can't wait task", pid);
-		goto err;
-	}
-
-	if (ret != pid) {
-		pr_err("SEIZE %d: wrong task attached (%d)\n", pid, ret);
 		goto err;
 	}
 
@@ -143,6 +138,7 @@ try_again:
 			goto err;
 		}
 
+		ret = 0;
 		goto try_again;
 	}
 

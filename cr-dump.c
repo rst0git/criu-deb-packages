@@ -72,6 +72,8 @@
 #include "irmap.h"
 #include "sysfs_parse.h"
 #include "action-scripts.h"
+#include "aio.h"
+#include "security.h"
 
 #include "asm/dump.h"
 
@@ -150,7 +152,7 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list)
 	pr_info("Collecting mappings (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
 
-	ret = parse_smaps(pid, vma_area_list, true);
+	ret = parse_smaps(pid, vma_area_list);
 	if (ret < 0)
 		goto err;
 
@@ -464,6 +466,12 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
 			goto err;
 
 		mme.vmas[i++] = vma;
+
+		if (vma_entry_is(vma, VMA_AREA_AIORING)) {
+			ret = dump_aio_ring(&mme, vma_area);
+			if (ret)
+				goto err;
+		}
 	}
 
 	mme.mm_start_code = stat->start_code;
@@ -496,6 +504,7 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
 
 	ret = pb_write_one(img_from_set(imgset, CR_FD_MM), &mme, PB_MM);
 	xfree(mme.mm_saved_auxv);
+	free_aios(&mme);
 err:
 	return ret;
 }
@@ -1566,6 +1575,12 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure_imgset;
 	}
 
+	ret = parasite_check_aios(parasite_ctl, &vmas); /* FIXME -- merge with above */
+	if (ret) {
+		pr_err("Failed to check aio rings (pid: %d)\n", pid);
+		goto err_cure_imgset;
+	}
+
 	ret = parasite_dump_misc_seized(parasite_ctl, &misc);
 	if (ret) {
 		pr_err("Can't dump misc (pid: %d)\n", pid);
@@ -1818,7 +1833,7 @@ int cr_dump_tasks(pid_t pid)
 	if (write_img_inventory())
 		goto err;
 
-	if (opts.cpu_cap & CPU_CAP_CPU) {
+	if (opts.cpu_cap & (CPU_CAP_CPU | CPU_CAP_INS)) {
 		if (cpu_dump_cpuinfo())
 			goto err;
 	}

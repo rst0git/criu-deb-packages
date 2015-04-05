@@ -10,6 +10,8 @@ struct task_entries {
 	futex_t nr_in_progress;
 	futex_t start;
 	mutex_t	zombie_lock;
+	atomic_t cr_err;
+	mutex_t userns_sync_lock;
 };
 
 struct fdt {

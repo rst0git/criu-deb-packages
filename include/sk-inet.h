@@ -65,7 +65,7 @@ static inline void tcp_repair_off(int fd)
 
 	ret = sys_setsockopt(fd, SOL_TCP, TCP_REPAIR, &aux, sizeof(aux));
 	if (ret < 0)
-		pr_perror("Failed to turn off repair mode on socket (%d)", ret);
+		pr_err("Failed to turn off repair mode on socket (%d)", ret);
 }
 
 extern void tcp_locked_conn_add(struct inet_sk_info *);
@@ -79,5 +79,6 @@ extern int restore_one_tcp(int sk, struct inet_sk_info *si);
 
 extern int check_tcp(void);
 extern int rst_tcp_socks_add(int fd, bool reuseaddr);
+extern mutex_t *inet_get_reuseaddr_lock(struct inet_sk_info *ii);
 
 #endif /* __CR_SK_INET_H__ */

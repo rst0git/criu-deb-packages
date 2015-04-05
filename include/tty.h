@@ -2,6 +2,7 @@
 #define __CR_TTY_H__
 
 #include <linux/major.h>
+#include <linux/vt.h>
 
 #include "files.h"
 
@@ -13,6 +14,7 @@ enum {
 	TTY_TYPE_PTM		= 1,
 	TTY_TYPE_PTS		= 2,
 	TTY_TYPE_CONSOLE	= 3,
+	TTY_TYPE_VT		= 4,
 
 	TTY_TYPE_MAX
 };
@@ -29,11 +31,19 @@ static inline int tty_type(int major, int minor)
 {
 	switch (major) {
 	case TTYAUX_MAJOR:
-		if (minor == 0 || minor == 2)
+		if (minor == 2)
 			return TTY_TYPE_PTM;
 		else if (minor == 1)
 			return TTY_TYPE_CONSOLE;
 		break;
+	case TTY_MAJOR:
+		if (minor > MIN_NR_CONSOLES && minor < MAX_NR_CONSOLES)
+			/*
+			 * Minors [MIN_NR_CONSOLES; MAX_NR_CONSOLES] stand
+			 * for consoles (virtual terminals, VT in terms
+			 * of kernel).
+			 */
+			return TTY_TYPE_VT;
 	case UNIX98_PTY_MASTER_MAJOR ... (UNIX98_PTY_MASTER_MAJOR + UNIX98_PTY_MAJOR_COUNT - 1):
 		return TTY_TYPE_PTM;
 	case UNIX98_PTY_SLAVE_MAJOR:

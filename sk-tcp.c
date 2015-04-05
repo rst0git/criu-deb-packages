@@ -25,6 +25,11 @@
 #include "protobuf.h"
 #include "protobuf/tcp-stream.pb-c.h"
 
+#ifndef SIOCOUTQNSD
+/* MAO - Define SIOCOUTQNSD ioctl if we don't have it */
+#define SIOCOUTQNSD     0x894B
+#endif
+
 #ifndef CONFIG_HAS_TCP_REPAIR
 /*
  * It's been reported that both tcp_repair_opt
@@ -456,7 +461,7 @@ static int restore_tcp_seqs(int sk, TcpStreamEntry *tse)
 static int __send_tcp_queue(int sk, int queue, u32 len, struct cr_img *img)
 {
 	int ret, err = -1;
-	int off, max;
+	int off;
 	char *buf;
 
 	buf = xmalloc(len);
@@ -466,10 +471,12 @@ static int __send_tcp_queue(int sk, int queue, u32 len, struct cr_img *img)
 	if (read_img_buf(img, buf, len) < 0)
 		goto err;
 
-	max = (queue == TCP_SEND_QUEUE) ? kdat.tcp_max_wshare : kdat.tcp_max_rshare;
 	off = 0;
 	while (len) {
-		int chunk = (len > max ? max : len);
+		int chunk = len;
+
+		if (queue == TCP_RECV_QUEUE && len > kdat.tcp_max_rshare)
+			chunk = kdat.tcp_max_rshare;
 
 		ret = send(sk, buf + off, chunk, 0);
 		if (ret <= 0) {
@@ -500,7 +507,7 @@ static int send_tcp_queue(int sk, int queue, u32 len, struct cr_img *img)
 	return __send_tcp_queue(sk, queue, len, img);
 }
 
-static int restore_tcp_queues(int sk, TcpStreamEntry *tse, struct cr_img *img)
+static int restore_tcp_queues(int sk, TcpStreamEntry *tse, struct cr_img *img, mutex_t *reuse_lock)
 {
 	u32 len;
 
@@ -527,11 +534,17 @@ static int restore_tcp_queues(int sk, TcpStreamEntry *tse, struct cr_img *img)
 	 * they can be restored without any tricks.
 	 */
 	len = tse->unsq_len;
+	mutex_lock(reuse_lock);
 	tcp_repair_off(sk);
-	if (len && __send_tcp_queue(sk, TCP_SEND_QUEUE, len, img))
+	if (len && __send_tcp_queue(sk, TCP_SEND_QUEUE, len, img)) {
+		mutex_unlock(reuse_lock);
 		return -1;
-	if (tcp_repair_on(sk))
+	}
+	if (tcp_repair_on(sk)) {
+		mutex_unlock(reuse_lock);
 		return -1;
+	}
+	mutex_unlock(reuse_lock);
 
 	return 0;
 }
@@ -614,7 +627,7 @@ static int restore_tcp_conn_state(int sk, struct inet_sk_info *ii)
 	if (restore_tcp_opts(sk, tse))
 		goto err_c;
 
-	if (restore_tcp_queues(sk, tse, img))
+	if (restore_tcp_queues(sk, tse, img, inet_get_reuseaddr_lock(ii)))
 		goto err_c;
 
 	if (tse->has_nodelay && tse->nodelay) {

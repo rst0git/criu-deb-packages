@@ -27,8 +27,11 @@
 #include "mount.h"
 #include "cgroup.h"
 #include "action-scripts.h"
+#include "security.h"
 
 #include "setproctitle.h"
+
+#include "cr-errno.h"
 
 unsigned int service_sk_ino = -1;
 
@@ -86,7 +89,10 @@ static void send_criu_err(int sk, char *msg)
 
 	resp.type = CRIU_REQ_TYPE__EMPTY;
 	resp.success = false;
-	/* XXX -- add optional error code to CriuResp */
+	if (get_cr_errno()) {
+		resp.has_cr_errno = true;
+		resp.cr_errno = get_cr_errno();
+	}
 
 	send_criu_msg(sk, &resp);
 }
@@ -98,6 +104,10 @@ int send_criu_dump_resp(int socket_fd, bool success, bool restored)
 
 	msg.type = CRIU_REQ_TYPE__DUMP;
 	msg.success = success;
+	if (get_cr_errno()) {
+		msg.has_cr_errno = true;
+		msg.cr_errno = get_cr_errno();
+	}
 	msg.dump = &resp;
 
 	resp.has_restored = true;
@@ -112,6 +122,10 @@ static int send_criu_pre_dump_resp(int socket_fd, bool success)
 
 	msg.type = CRIU_REQ_TYPE__PRE_DUMP;
 	msg.success = success;
+	if (get_cr_errno()) {
+		msg.has_cr_errno = true;
+		msg.cr_errno = get_cr_errno();
+	}
 
 	return send_criu_msg(socket_fd, &msg);
 }
@@ -123,6 +137,10 @@ int send_criu_restore_resp(int socket_fd, bool success, int pid)
 
 	msg.type = CRIU_REQ_TYPE__RESTORE;
 	msg.success = success;
+	if (get_cr_errno()) {
+		msg.has_cr_errno = true;
+		msg.cr_errno = get_cr_errno();
+	}
 	msg.restore = &resp;
 
 	resp.pid = pid;
@@ -186,15 +204,15 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (getsockopt(sk, SOL_SOCKET, SO_PEERCRED, &ids, &ids_len)) {
 		pr_perror("Can't get socket options");
-		return -1;
+		goto err;
 	}
 
 	if (restrict_uid(ids.uid, ids.gid))
-		return -1;
+		goto err;
 
 	if (fstat(sk, &st)) {
 		pr_perror("Can't get socket stat");
-		return -1;
+		goto err;
 	}
 
 	BUG_ON(st.st_ino == -1);
@@ -208,13 +226,13 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (open_image_dir(images_dir_path) < 0) {
 		pr_perror("Can't open images directory");
-		return -1;
+		goto err;
 	}
 
 	/* get full path to images_dir to use in process title */
 	if (readlink(images_dir_path, images_dir, PATH_MAX) == -1) {
 		pr_perror("Can't readlink %s", images_dir_path);
-		return -1;
+		goto err;
 	}
 
 	/* chdir to work dir */
@@ -225,14 +243,14 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (chdir(work_dir_path)) {
 		pr_perror("Can't chdir to work_dir");
-		return -1;
+		goto err;
 	}
 
 	/* initiate log file in work dir */
 	if (req->log_file) {
 		if (strchr(req->log_file, '/')) {
 			pr_perror("No subdirs are allowed in log_file name");
-			return -1;
+			goto err;
 		}
 
 		opts.output = req->log_file;
@@ -242,7 +260,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	log_set_loglevel(req->log_level);
 	if (log_init(opts.output) == -1) {
 		pr_perror("Can't initiate log");
-		return -1;
+		goto err;
 	}
 
 	/* checking flags from client */
@@ -263,7 +281,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_rst_sibling) {
 		if (!opts.swrk_restore) {
 			pr_err("rst_sibling is not allowed in standalone service\n");
-			return -1;
+			goto err;
 		}
 
 		opts.restore_sibling = req->rst_sibling;
@@ -306,7 +324,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 		if (req->ps->has_fd) {
 			if (!opts.swrk_restore)
-				return -1;
+				goto err;
 
 			opts.ps_socket = req->ps->fd;
 		}
@@ -314,22 +332,22 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (req->notify_scripts &&
 			add_script(SCRIPT_RPC_NOTIFY, sk))
-		return -1;
+		goto err;
 
 	for (i = 0; i < req->n_veths; i++) {
 		if (veth_pair_add(req->veths[i]->if_in, req->veths[i]->if_out))
-			return -1;
+			goto err;
 	}
 
 	for (i = 0; i < req->n_ext_mnt; i++) {
 		if (ext_mount_add(req->ext_mnt[i]->key, req->ext_mnt[i]->val))
-			return -1;
+			goto err;
 	}
 
 	for (i = 0; i < req->n_cg_root; i++) {
 		if (new_cg_root_add(req->cg_root[i]->ctrl,
 					req->cg_root[i]->path))
-			return -1;
+			goto err;
 	}
 
 	if (req->has_cpu_cap)
@@ -339,6 +357,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		opts.manage_cgroups = req->manage_cgroups;
 
 	return 0;
+
+err:
+	set_cr_errno(EBADRQC);
+	return -1;
 }
 
 static int dump_using_req(int sk, CriuOpts *req)

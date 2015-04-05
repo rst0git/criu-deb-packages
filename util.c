@@ -41,6 +41,9 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "cr-service.h"
+#include "files.h"
+
+#include "cr-errno.h"
 
 #define VMA_OPT_LEN	128
 
@@ -80,12 +83,13 @@ void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
 		return;
 
 	vma_opt_str(vma_area, opt);
-	print_on_level(loglevel, "%#"PRIx64"-%#"PRIx64" (%"PRIi64"K) prot %#x flags %#x off %#"PRIx64" "
+	print_on_level(loglevel, "%#"PRIx64"-%#"PRIx64" (%"PRIi64"K) prot %#x flags %#x st %#x off %#"PRIx64" "
 			"%s shmid: %#"PRIx64"\n",
 			vma_area->e->start, vma_area->e->end,
 			KBYTES(vma_area_len(vma_area)),
 			vma_area->e->prot,
 			vma_area->e->flags,
+			vma_area->e->status,
 			vma_area->e->pgoff,
 			opt, vma_area->e->shmid);
 }
@@ -93,6 +97,7 @@ void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
 int close_safe(int *fd)
 {
 	int ret = 0;
+
 	if (*fd > -1) {
 		ret = close(*fd);
 		if (!ret)
@@ -109,6 +114,9 @@ int reopen_fd_as_safe(char *file, int line, int new_fd, int old_fd, bool allow_r
 	int tmp;
 
 	if (old_fd != new_fd) {
+		/* make sure we won't clash with an inherit fd */
+		if (inherit_fd_resolve_clash(new_fd) < 0)
+			return -1;
 
 		if (!allow_reuse_fd) {
 			if (fcntl(new_fd, F_GETFD) != -1 || errno != EBADF) {
@@ -268,6 +276,7 @@ inline int open_pid_proc(pid_t pid)
 	fd = openat(dfd, path, O_RDONLY);
 	if (fd < 0) {
 		pr_perror("Can't open %s", path);
+		set_cr_errno(ESRCH);
 		return -1;
 	}
 

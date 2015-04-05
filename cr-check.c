@@ -14,6 +14,7 @@
 #include <linux/if.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <sys/mman.h>
 
 #include "proc_parse.h"
 #include "sockets.h"
@@ -92,10 +93,6 @@ static int check_map_files(void)
 	pr_msg("/proc/<pid>/map_files directory is missing.\n");
 	return -1;
 }
-
-#ifndef NETLINK_SOCK_DIAG
-#define NETLINK_SOCK_DIAG NETLINK_INET_DIAG
-#endif
 
 static int check_sock_diag(void)
 {
@@ -548,8 +545,11 @@ static int check_ptrace_peeksiginfo()
 		exit(1);
 	}
 
-	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1)
-		return -1;
+	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
+		pr_perror("Unable to ptrace the child");
+		ret = -1;
+		goto out;
+	}
 
 	waitpid(pid, NULL, 0);
 
@@ -567,8 +567,8 @@ static int check_ptrace_peeksiginfo()
 		ret = -1;
 	}
 
-	ptrace(PTRACE_KILL, pid, NULL, NULL);
-
+out:
+	kill(pid, SIGKILL);
 	return ret;
 }
 
@@ -594,12 +594,89 @@ static int check_posix_timers(void)
 	return -1;
 }
 
+static unsigned long get_ring_len(unsigned long addr)
+{
+	FILE *maps;
+	char buf[256];
+
+	maps = fopen("/proc/self/maps", "r");
+	if (!maps) {
+		pr_perror("No maps proc file");
+		return 0;
+	}
+
+	while (fgets(buf, sizeof(buf), maps)) {
+		unsigned long start, end;
+		int r, tail;
+
+		r = sscanf(buf, "%lx-%lx %*s %*s %*s %*s %n\n", &start, &end, &tail);
+		if (r != 2) {
+			fclose(maps);
+			pr_err("Bad maps format %d.%d (%s)\n", r, tail, buf + tail);
+			return 0;
+		}
+
+		if (start == addr) {
+			fclose(maps);
+			if (strcmp(buf + tail, "/[aio] (deleted)\n"))
+				goto notfound;
+
+			return end - start;
+		}
+	}
+
+	fclose(maps);
+notfound:
+	pr_err("No AIO ring at expected location\n");
+	return 0;
+}
+
+static int check_aio_remap(void)
+{
+	aio_context_t ctx = 0;
+	unsigned long len;
+	void *naddr;
+	int r;
+
+	if (sys_io_setup(16, &ctx) < 0) {
+		pr_err("No AIO syscall");
+		return -1;
+	}
+
+	len = get_ring_len((unsigned long) ctx);
+	if (!len)
+		return -1;
+
+	naddr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, 0, 0);
+	if (naddr == MAP_FAILED) {
+		pr_perror("Can't find place for new AIO ring\n");
+		return -1;
+	}
+
+	if (mremap((void *)ctx, len, len, MREMAP_FIXED | MREMAP_MAYMOVE, naddr) == MAP_FAILED) {
+		pr_perror("Can't remap AIO ring\n");
+		return -1;
+	}
+
+	ctx = (aio_context_t)naddr;
+	r = sys_io_getevents(ctx, 0, 1, NULL, NULL);
+	if (r < 0) {
+		if (!opts.check_ms_kernel) {
+			pr_err("AIO remap doesn't work properly\n");
+			return -1;
+		} else
+			pr_warn("Skipping unsupported AIO remap\n");
+	}
+
+	return 0;
+}
+
+static int (*chk_feature)(void);
+
 int cr_check(void)
 {
 	struct ns_id ns = { .pid = getpid(), .nd = &mnt_ns_desc };
 	int ret = 0;
-
-	log_set_loglevel(LOG_WARN);
 
 	if (!is_root_user())
 		return -1;
@@ -619,6 +696,11 @@ int cr_check(void)
 	if (mntinfo == NULL)
 		return -1;
 
+	if (chk_feature) {
+		ret = chk_feature();
+		goto out;
+	}
+
 	ret |= check_map_files();
 	ret |= check_sock_diag();
 	ret |= check_ns_last_pid();
@@ -637,12 +719,65 @@ int cr_check(void)
 	ret |= check_ptrace_peeksiginfo();
 	ret |= check_mem_dirty_track();
 	ret |= check_posix_timers();
-	ret |= check_tun();
+	ret |= check_tun_cr(0);
 	ret |= check_timerfd();
 	ret |= check_mnt_id();
+	ret |= check_aio_remap();
 
+out:
 	if (!ret)
-		pr_msg("Looks good.\n");
+		print_on_level(DEFAULT_LOGLEVEL, "Looks good.\n");
 
 	return ret;
+}
+
+static int check_tun(void)
+{
+	/*
+	 * In case there's no TUN support at all we
+	 * should report error. Unlike this plain criu
+	 * check would report "Looks good" in this case
+	 * since C/R effectively works, just not for TUN.
+	 */
+	return check_tun_cr(-1);
+}
+
+static int check_userns(void)
+{
+	int ret;
+	unsigned long size = 0;
+
+	ret = access("/proc/self/ns/user", F_OK);
+	if (ret) {
+		pr_perror("No userns proc file");
+		return -1;
+	}
+
+	ret = sys_prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, (unsigned long)&size, 0, 0);
+	if (ret) {
+		pr_perror("No new prctl API");
+		return -1;
+	}
+
+	return 0;
+}
+
+int check_add_feature(char *feat)
+{
+	if (!strcmp(feat, "mnt_id"))
+		chk_feature = check_mnt_id;
+	else if (!strcmp(feat, "aio_remap"))
+		chk_feature = check_aio_remap;
+	else if (!strcmp(feat, "timerfd"))
+		chk_feature = check_timerfd;
+	else if (!strcmp(feat, "tun"))
+		chk_feature = check_tun;
+	else if (!strcmp(feat, "userns"))
+		chk_feature = check_userns;
+	else {
+		pr_err("Unknown feature %s\n", feat);
+		return -1;
+	}
+
+	return 0;
 }

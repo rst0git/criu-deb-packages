@@ -1,3 +1,4 @@
+import "opts.proto";
 import "fown.proto";
 
 message winsize_entry {
@@ -27,6 +28,7 @@ enum TtyType {
 	UNKNOWN		= 0;
 	PTY		= 1;
 	CONSOLE		= 2;
+	VT		= 3;
 }
 
 message tty_info_entry {
@@ -63,6 +65,6 @@ message tty_file_entry {
 	required uint32			id		= 1;
 	required uint32			tty_info_id	= 2;
 
-	required uint32			flags		= 3;
+	required uint32			flags		= 3 [(criu).hex = true];
 	required fown_entry		fown		= 4;
 }
