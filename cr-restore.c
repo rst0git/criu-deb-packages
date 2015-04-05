@@ -1786,6 +1786,11 @@ static int restore_root_task(struct pstree_item *init)
 	if (ret < 0)
 		goto out_kill;
 
+	ret = prepare_cgroup_properties();
+	fini_cgroup();
+	if (ret < 0)
+		goto out_kill;
+
 	ret = run_scripts(ACT_POST_RESTORE);
 	if (ret != 0) {
 		pr_err("Aborting restore due to script ret code %d\n", ret);
@@ -1856,6 +1861,7 @@ out_kill:
 	}
 
 out:
+	fini_cgroup();
 	stop_usernsd();
 	__restore_switch_stage(CR_STATE_FAIL);
 	pr_err("Restoring FAILED.\n");
@@ -1922,13 +1928,8 @@ int cr_restore_tasks(void)
 	if (criu_signals_setup() < 0)
 		goto err;
 
-	if (restore_root_task(root_item) < 0)
-		goto err;
-
-	ret = prepare_cgroup_properties();
-
+	ret = restore_root_task(root_item);
 err:
-	fini_cgroup();
 	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
 	return ret;
 }
