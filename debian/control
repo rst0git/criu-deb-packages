@@ -6,7 +6,9 @@ Build-Depends:
  asciidoc,
  debhelper (>= 9),
  libprotobuf-c-dev,
+ libprotobuf-dev,
  protobuf-c-compiler,
+ protobuf-compiler,
  xmlto
 Standards-Version: 3.9.6
 Homepage: http://www.criu.org/
