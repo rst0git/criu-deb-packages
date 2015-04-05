@@ -10,7 +10,7 @@ CHROOT_ARCH=armhf
 HOST_DEPENDENCIES="debootstrap qemu-user-static binfmt-support sbuild"
 
 # Debian package dependencies for the chrooted environment
-GUEST_DEPENDENCIES="build-essential git m4 sudo python protobuf-c-compiler libprotobuf-c0-dev gcc make bsdmainutils bash"
+GUEST_DEPENDENCIES="build-essential git m4 sudo python protobuf-c-compiler libprotobuf-c0-dev gcc make bsdmainutils bash libaio-dev libprotobuf-dev protobuf-compiler python-ipaddr"
 
 # Command used to run the tests
 TEST_COMMAND="make -j 4 && make -j 4 -C test/zdtm"
@@ -64,6 +64,7 @@ else
   fi
 fi
 
+export LIBRARY_PATH=/usr/lib/${ARCH}-linux-gnu/
 echo "Running tests"
 echo "Environment: $(uname -a)"
 

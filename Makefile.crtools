@@ -61,6 +61,7 @@ obj-y	+= kerndat.o
 obj-y	+= stats.o
 obj-y	+= cgroup.o
 obj-y	+= timerfd.o
+obj-y	+= aio.o
 obj-y	+= string.o
 obj-y	+= sigframe.o
 ifeq ($(VDSO),y)
@@ -69,6 +70,7 @@ endif
 obj-y	+= cr-service.o
 obj-y	+= sd-daemon.o
 obj-y	+= plugin.o
+obj-y	+= cr-errno.o
 
 ifneq ($(MAKECMDGOALS),clean)
 incdeps := y

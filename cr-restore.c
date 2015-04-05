@@ -72,6 +72,8 @@
 #include "timerfd.h"
 #include "file-lock.h"
 #include "action-scripts.h"
+#include "aio.h"
+#include "security.h"
 
 #include "parasite-syscall.h"
 
@@ -84,6 +86,9 @@
 #include "protobuf/siginfo.pb-c.h"
 
 #include "asm/restore.h"
+#include "asm/atomic.h"
+
+#include "cr-errno.h"
 
 static struct pstree_item *current;
 
@@ -162,9 +167,6 @@ static int root_prepare_shared(void)
 		return -1;
 
 	if (prepare_shared_reg_files())
-		return -1;
-
-	if (prepare_shmem_restore())
 		return -1;
 
 	for (i = 0; i < ARRAY_SIZE(cinfos); i++) {
@@ -799,6 +801,9 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (collect_helper_pids() < 0)
 		return -1;
 
+	if (inherit_fd_fini() < 0)
+		return -1;
+
 	return sigreturn_restore(pid, core);
 }
 
@@ -860,6 +865,9 @@ static int restore_one_zombie(int pid, CoreEntry *core)
 	int exit_code = core->tc->exit_code;
 
 	pr_info("Restoring zombie with %d code\n", exit_code);
+
+	if (inherit_fd_fini() < 0)
+		return -1;
 
 	sys_prctl(PR_SET_NAME, (long)(void *)core->tc->comm, 0, 0, 0);
 
@@ -1412,6 +1420,7 @@ static int restore_task_with_children(void *_arg)
 	pid = getpid();
 	if (current->pid.virt != pid) {
 		pr_err("Pid %d do not match expected %d\n", pid, current->pid.virt);
+		set_task_cr_err(EEXIST);
 		goto err;
 	}
 
@@ -1535,8 +1544,10 @@ static int restore_wait_inprogress_tasks()
 
 	futex_wait_while_gt(np, 0);
 	ret = (int)futex_get(np);
-	if (ret < 0)
+	if (ret < 0) {
+		set_cr_errno(get_task_cr_err());
 		return ret;
+	}
 
 	return 0;
 }
@@ -1701,6 +1712,9 @@ static int restore_root_task(struct pstree_item *init)
 		return -1;
 	}
 
+	if (start_usernsd())
+		return -1;
+
 	futex_set(&task_entries->nr_in_progress,
 			stage_participants(CR_STATE_RESTORE_NS));
 
@@ -1761,6 +1775,14 @@ static int restore_root_task(struct pstree_item *init)
 		goto out_kill;
 
 	ret = restore_switch_stage(CR_STATE_RESTORE_SIGCHLD);
+	if (ret < 0)
+		goto out_kill;
+
+	ret = stop_usernsd();
+	if (ret < 0)
+		goto out_kill;
+
+	ret = move_veth_to_bridge();
 	if (ret < 0)
 		goto out_kill;
 
@@ -1834,6 +1856,7 @@ out_kill:
 	}
 
 out:
+	stop_usernsd();
 	__restore_switch_stage(CR_STATE_FAIL);
 	pr_err("Restoring FAILED.\n");
 	return -1;
@@ -1853,6 +1876,7 @@ static int prepare_task_entries(void)
 	task_entries->nr_helpers = 0;
 	futex_set(&task_entries->start, CR_STATE_RESTORE_NS);
 	mutex_init(&task_entries->zombie_lock);
+	mutex_init(&task_entries->userns_sync_lock);
 
 	return 0;
 }
@@ -1881,7 +1905,7 @@ int cr_restore_tasks(void)
 	if (vdso_init())
 		goto err;
 
-	if (opts.cpu_cap & CPU_CAP_CPU) {
+	if (opts.cpu_cap & (CPU_CAP_INS | CPU_CAP_CPU)) {
 		if (cpu_validate_cpuinfo())
 			goto err;
 	}
@@ -2590,6 +2614,9 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	unsigned long vdso_rt_delta = 0;
 #endif
 
+	unsigned long aio_rings;
+	MmEntry *mm = rsti(current)->mm;
+
 	struct vm_area_list self_vmas;
 	struct vm_area_list *vmas = &rsti(current)->vmas;
 	int i;
@@ -2622,6 +2649,23 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 		if (vma_priv(vma->e))
 			vma_premmaped_start(vme) = vma->premmaped_addr;
+	}
+
+	/*
+	 * Put info about AIO rings, they will get remapped
+	 */
+
+	aio_rings = rst_mem_cpos(RM_PRIVATE);
+	for (i = 0; i < mm->n_aios; i++) {
+		struct rst_aio_ring *raio;
+
+		raio = rst_mem_alloc(sizeof(*raio), RM_PRIVATE);
+		if (!raio)
+			goto err_nv;
+
+		raio->addr = mm->aios[i]->id;
+		raio->nr_req = mm->aios[i]->nr_req;
+		raio->len = mm->aios[i]->ring_len;
 	}
 
 	/*
@@ -2755,9 +2799,6 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	task_args->premmapped_addr = (unsigned long)rsti(current)->premmapped_addr;
 	task_args->premmapped_len = rsti(current)->premmapped_len;
 
-	task_args->shmems = rst_mem_remap_ptr(rst_shmems, RM_SHREMAP);
-	task_args->nr_shmems = nr_shmems;
-
 	task_args->nr_vmas = vmas->nr;
 	task_args->tgt_vmas = rst_mem_remap_ptr(tgt_vmas, RM_PRIVATE);
 
@@ -2772,6 +2813,9 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 	task_args->tcp_socks_nr = rst_tcp_socks_nr;
 	task_args->tcp_socks = rst_mem_remap_ptr(tcp_socks, RM_PRIVATE);
+
+	task_args->nr_rings = mm->n_aios;
+	task_args->rings = rst_mem_remap_ptr(aio_rings, RM_PRIVATE);
 
 	task_args->n_helpers = n_helpers;
 	if (n_helpers > 0)
@@ -2920,6 +2964,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	close_image_dir();
 	close_proc();
 	close_service_fd(ROOT_FD_OFF);
+	close_service_fd(USERNSD_SK);
 
 	__gcov_flush();
 

@@ -448,6 +448,9 @@ again:
 		}
 	}
 
+	if ((*resp)->has_cr_errno)
+		saved_errno = (*resp)->cr_errno;
+
 exit:
 	return ret;
 }
@@ -658,6 +661,7 @@ int criu_restore_child(void)
 		sprintf(fds, "%d", sks[1]);
 
 		execlp("criu", "criu", "swrk", fds, NULL);
+		perror("Can't exec criu swrk");
 		exit(1);
 	}
 

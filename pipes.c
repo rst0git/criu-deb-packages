@@ -293,6 +293,20 @@ static int recv_pipe_fd(struct pipe_info *pi)
 	return fd;
 }
 
+static char *pipe_d_name(struct file_desc *d, char *buf, size_t s)
+{
+	struct pipe_info *pi;
+
+	pi = container_of(d, struct pipe_info, d);
+	if (snprintf(buf, s, "pipe:[%d]", pi->pe->pipe_id) >= s) {
+		pr_err("Not enough room for pipe %d identifier string\n",
+				pi->pe->pipe_id);
+		return NULL;
+	}
+
+	return buf;
+}
+
 static int open_pipe(struct file_desc *d)
 {
 	struct pipe_info *pi, *p;
@@ -300,8 +314,10 @@ static int open_pipe(struct file_desc *d)
 	int pfd[2];
 	int sock;
 
-	pi = container_of(d, struct pipe_info, d);
+	if (inherited_fd(d, &tmp))
+		return tmp;
 
+	pi = container_of(d, struct pipe_info, d);
 	pr_info("\t\tCreating pipe pipe_id=%#x id=%#x\n", pi->pe->pipe_id, pi->pe->id);
 
 	if (!pi->create)
@@ -363,6 +379,7 @@ static struct file_desc_ops pipe_desc_ops = {
 	.type		= FD_TYPES__PIPE,
 	.open		= open_pipe,
 	.want_transport	= want_transport,
+	.name		= pipe_d_name,
 };
 
 static int collect_one_pipe(void *o, ProtobufCMessage *base)

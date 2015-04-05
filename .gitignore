@@ -10,6 +10,7 @@
 *.so
 .git-ignore
 *.patch
+*.pyc
 criu
 cscope*
 tags
@@ -19,6 +20,8 @@ include/syscall.h
 include/syscall-codes.h
 protobuf/*.c
 protobuf/*.h
+protobuf/google/protobuf/*.c
+protobuf/google/protobuf/*.h
 include/version.h
 arch/x86/sys-exec-tbl.c
 arch/x86/syscalls.S
@@ -26,3 +29,4 @@ pie/pie.lds.S
 include/config.h
 protobuf-desc-gen.h
 criu.pc
+build

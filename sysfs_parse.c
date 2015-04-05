@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 #include "cr_options.h"
 #include "criu-log.h"
@@ -261,7 +262,8 @@ err:
 
 /*
  * AUFS support to compensate for the kernel bug
- * exposing branch pathnames in map_files.
+ * exposing branch pathnames in map_files and providing
+ * a wrong mnt_id value in /proc/<pid>/fdinfo/<fd>.
  *
  * If the link points inside a branch, save the
  * relative pathname from the root of the mount
@@ -280,25 +282,32 @@ int fixup_aufs_vma_fd(struct vma_area *vma)
 		return -1;
 
 	len = fixup_aufs_path(&path[1], sizeof path - 1);
-	if (len < 0)
+	if (len <= 0)
+		return len;
+
+	vma->aufs_rpath = xmalloc(len + 2);
+	if (!vma->aufs_rpath)
 		return -1;
 
-	if (len > 0) {
-		vma->aufs_rpath = xmalloc(len + 2);
-		if (!vma->aufs_rpath)
+	strcpy(vma->aufs_rpath, path);
+	if (opts.root) {
+		vma->aufs_fpath = xmalloc(strlen(opts.root) + 1 + len + 1);
+		if (!vma->aufs_fpath)
 			return -1;
-		strcpy(vma->aufs_rpath, path);
-		if (opts.root) {
-			vma->aufs_fpath = xmalloc(strlen(opts.root) + 1 + len + 1);
-			if (!vma->aufs_fpath)
-				return -1;
-			/* skip ./ in path */
-			sprintf(vma->aufs_fpath, "%s/%s", opts.root, &path[2]);
-		}
-		pr_debug("Saved AUFS paths %s and %s\n", vma->aufs_rpath, vma->aufs_fpath);
+		/* skip ./ in path */
+		sprintf(vma->aufs_fpath, "%s/%s", opts.root, &path[2]);
+	}
+	pr_debug("Saved AUFS paths %s and %s\n", vma->aufs_rpath, vma->aufs_fpath);
+
+	if (stat(vma->aufs_fpath, vma->vmst) < 0) {
+		pr_perror("Failed stat on map %"PRIx64" (%s)",
+				vma->e->start, vma->aufs_fpath);
+		return -1;
 	}
 
-	return 0;
+	/* tell parse_smap() not to call get_fd_mntid() */
+	vma->mnt_id = -1;
+	return len;
 }
 
 void free_aufs_branches(void)

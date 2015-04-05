@@ -1,5 +1,5 @@
 VERSION_MAJOR		:= 1
-VERSION_MINOR		:= 4
+VERSION_MINOR		:= 5
 VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
@@ -63,6 +63,8 @@ ifeq ($(shell echo $(ARCH) | sed -e 's/arm.*/arm/'),arm)
 	ARMV         := $(shell echo $(ARCH) | sed -nr 's/armv([[:digit:]]).*/\1/p; t; i7')
 	SRCARCH      := arm
 	DEFINES      := -DCONFIG_ARMV$(ARMV)
+
+	USERCFLAGS += -Wa,-mimplicit-it=always
 
 	ifeq ($(ARMV),6)
 		USERCFLAGS += -march=armv6
@@ -140,7 +142,7 @@ build-crtools := -r -R -f scripts/Makefile.build makefile=Makefile.crtools obj
 PROGRAM		:= criu
 
 .PHONY: all zdtm test rebuild clean distclean tags cscope	\
-	docs help pie protobuf $(ARCH_DIR) clean-built lib
+	docs help pie protobuf $(ARCH_DIR) clean-built lib crit
 
 ifeq ($(GCOV),1)
 %.o $(PROGRAM): override CFLAGS += --coverage
@@ -148,6 +150,7 @@ endif
 
 all: config pie $(VERSION_HEADER) $(CRIU-LIB)
 	$(Q) $(MAKE) $(PROGRAM)
+	$(Q) $(MAKE) crit
 
 protobuf/%::
 	$(Q) $(MAKE) $(build)=protobuf $@
@@ -194,6 +197,9 @@ $(PROGRAM): $(SYSCALL-LIB) $(ARCH-LIB) $(PROGRAM-BUILTINS)
 	$(E) "  LINK    " $@
 	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@
 
+crit:
+	$(Q) $(MAKE) -C pycriu all
+
 zdtm: all
 	$(Q) $(MAKE) -C test/zdtm all
 
@@ -224,6 +230,9 @@ clean: clean-built
 	$(Q) $(RM) -r ./gcov
 	$(Q) $(RM) protobuf-desc-gen.h
 	$(Q) $(MAKE) -C test $@
+	$(Q) $(MAKE) -C pycriu $@
+	$(Q) $(RM) ./*.pyc
+	$(Q) $(RM) -r build
 
 distclean: clean
 	$(E) "  DISTCLEAN"
@@ -250,7 +259,7 @@ criu-$(CRTOOLSVERSION).tar.bz2:
 		v$(CRTOOLSVERSION) | bzip2 > $@
 .PHONY: dist tar
 
-install: $(PROGRAM) $(CRIU-LIB) install-man
+install: $(PROGRAM) $(CRIU-LIB) install-man install-crit
 	$(E) "  INSTALL " $(PROGRAM)
 	$(Q) mkdir -p $(DESTDIR)$(SBINDIR)
 	$(Q) install -m 755 $(PROGRAM) $(DESTDIR)$(SBINDIR)
@@ -278,7 +287,11 @@ install: $(PROGRAM) $(CRIU-LIB) install-man
 install-man:
 	$(Q) $(MAKE) -C Documentation install
 
-.PHONY: install install-man
+install-crit: crit
+	$(E) "  INSTALL crit"
+	$(Q) python scripts/crit-setup.py install --prefix=$(DESTDIR)
+
+.PHONY: install install-man install-crit
 
 help:
 	@echo '    Targets:'

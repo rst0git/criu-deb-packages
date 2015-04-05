@@ -28,6 +28,7 @@
 #include "proc_parse.h"
 #include "file-ids.h"
 #include "files-reg.h"
+#include "namespaces.h"
 
 #include "protobuf.h"
 #include "protobuf/tty.pb-c.h"
@@ -116,8 +117,15 @@ static LIST_HEAD(all_ttys);
  */
 
 #define MAX_TTYS	1024
+
+/*
+ * Custom indices should be even numbers just in case if we
+ * need odds for pair numbering someday.
+ */
+
 #define MAX_PTY_INDEX	1000
 #define CONSOLE_INDEX	1002
+#define VT_INDEX	1004
 
 static DECLARE_BITMAP(tty_bitmap, (MAX_TTYS << 1));
 static DECLARE_BITMAP(tty_active_pairs, (MAX_TTYS << 1));
@@ -235,11 +243,16 @@ static int parse_tty_index(u32 id, int lfd, const struct fd_parms *p, int type)
 	case TTY_TYPE_CONSOLE:
 		index = CONSOLE_INDEX;
 		break;
+
+	case TTY_TYPE_VT:
+		index = VT_INDEX;
+		break;
 	default:
 		BUG();
 	}
 
 	if (type != TTY_TYPE_CONSOLE &&
+	    type != TTY_TYPE_VT &&
 	    index > MAX_PTY_INDEX) {
 		pr_err("Index %d on tty %x is too big\n", index, id);
 		return -1;
@@ -268,6 +281,7 @@ static struct file_desc *pty_alloc_reg(struct tty_info *info, bool add)
 	TtyFileEntry *tfe = info->tfe;
 	const size_t namelen = 64;
 	struct reg_file_info *r;
+	static struct file_desc_ops noops = {};
 
 	r = xzalloc(sizeof(*r) + sizeof(*r->rfe) + namelen);
 	if (!r)
@@ -284,9 +298,9 @@ static struct file_desc *pty_alloc_reg(struct tty_info *info, bool add)
 			 info->tie->pty->index);
 
 	if (add)
-		file_desc_add(&r->d, tfe->id, NULL);
+		file_desc_add(&r->d, tfe->id, &noops);
 	else
-		file_desc_init(&r->d, tfe->id, NULL);
+		file_desc_init(&r->d, tfe->id, &noops);
 
 	r->rfe->id	= tfe->id;
 	r->rfe->flags	= tfe->flags;
@@ -508,6 +522,13 @@ static int tty_restore_ctl_terminal(struct file_desc *d, int fd)
 			pr_perror("Can't open %s", path_from_reg(info->reg_d));
 			goto err;
 		}
+	} else if (info->type == TTY_TYPE_VT) {
+		slave = open_pty_reg(info->reg_d, O_RDONLY);
+		index = VT_INDEX;
+		if (slave < 0) {
+			pr_perror("Can't open %s", path_from_reg(info->reg_d));
+			goto err;
+		}
 	} else
 		BUG();
 
@@ -534,13 +555,21 @@ static char *tty_name(int type)
 		return "pts";
 	case TTY_TYPE_CONSOLE:
 		return "console";
+	case TTY_TYPE_VT:
+		return "tty";
 	}
 	return "unknown";
 }
 
 static bool tty_is_master(struct tty_info *info)
 {
-	return info->type == TTY_TYPE_PTM || info->type == TTY_TYPE_CONSOLE;
+	if (info->type == TTY_TYPE_PTM || info->type == TTY_TYPE_CONSOLE)
+		return true;
+
+	if (info->type == TTY_TYPE_VT && !opts.shell_job)
+		return true;
+
+	return false;
 }
 
 static bool tty_is_hung(struct tty_info *info)
@@ -558,16 +587,74 @@ static bool tty_has_active_pair(struct tty_info *info)
 
 static void tty_show_pty_info(char *prefix, struct tty_info *info)
 {
+	int index = -1;
+
+	switch (info->type) {
+	case TTY_TYPE_CONSOLE:
+		index = CONSOLE_INDEX;
+		break;
+	case TTY_TYPE_VT:
+		index = VT_INDEX;
+		break;
+	case TTY_TYPE_PTM:
+	case TTY_TYPE_PTS:
+		index = info->tie->pty->index;
+		break;
+	}
+
 	pr_info("%s type %s id %#x index %d (master %d sid %d pgrp %d inherit %d)\n",
-		prefix, tty_name(info->type), info->tfe->id,
-		info->type == TTY_TYPE_CONSOLE ? CONSOLE_INDEX : info->tie->pty->index,
+		prefix, tty_name(info->type), info->tfe->id, index,
 		tty_is_master(info), info->tie->sid, info->tie->pgrp, info->inherit);
+}
+
+struct tty_parms {
+	int tty_id;
+	unsigned has;
+#define HAS_TERMIOS_L	0x1
+#define HAS_TERMIOS	0x2
+#define HAS_WINS	0x4
+	struct termios tl;
+	struct termios t;
+	struct winsize w;
+};
+
+static int do_restore_tty_parms(void *arg, int fd)
+{
+	struct tty_parms *p = arg;
+
+	/*
+	 * Only locked termios need CAP_SYS_ADMIN, but we
+	 * restore them all here, since the regular tremios
+	 * restore is affected by locked and thus we would
+	 * have to do synchronous usernsd call which is not
+	 * nice.
+	 *
+	 * Window size is restored here as it might depend
+	 * on termios too. Just to be on the safe side.
+	 */
+
+	if ((p->has & HAS_TERMIOS_L) &&
+			ioctl(fd, TIOCSLCKTRMIOS, &p->tl) < 0)
+		goto err;
+
+	if ((p->has & HAS_TERMIOS) &&
+			ioctl(fd, TCSETS, &p->t) < 0)
+		goto err;
+
+	if ((p->has & HAS_WINS) &&
+			ioctl(fd, TIOCSWINSZ, &p->w) < 0)
+		goto err;
+
+	return 0;
+
+err:
+	pr_perror("Can't set tty params on %d", p->tty_id);
+	return -1;
 }
 
 static int restore_tty_params(int fd, struct tty_info *info)
 {
-	struct winsize w;
-	struct termios t;
+	struct tty_parms p;
 
 	/*
 	 * It's important to zeroify termios
@@ -578,31 +665,28 @@ static int restore_tty_params(int fd, struct tty_info *info)
 	 * never be extended.
 	 */
 
+	p.has = 0;
+	p.tty_id = info->tfe->id;
+
 	if (info->tie->termios_locked) {
-		memzero(&t, sizeof(t));
-		termios_copy(&t, info->tie->termios_locked);
-		if (ioctl(fd, TIOCSLCKTRMIOS, &t) < 0)
-			goto err;
+		memzero(&p.tl, sizeof(p.tl));
+		p.has |= HAS_TERMIOS_L;
+		termios_copy(&p.tl, info->tie->termios_locked);
 	}
 
 	if (info->tie->termios) {
-		memzero(&t, sizeof(t));
-		termios_copy(&t, info->tie->termios);
-		if (ioctl(fd, TCSETS, &t) < 0)
-			goto err;
+		memzero(&p.t, sizeof(p.t));
+		p.has |= HAS_TERMIOS;
+		termios_copy(&p.t, info->tie->termios);
 	}
 
 	if (info->tie->winsize) {
-		memzero(&w, sizeof(w));
-		winsize_copy(&w, info->tie->winsize);
-		if (ioctl(fd, TIOCSWINSZ, &w) < 0)
-			goto err;
+		memzero(&p.w, sizeof(p.w));
+		p.has |= HAS_WINS;
+		winsize_copy(&p.w, info->tie->winsize);
 	}
 
-	return 0;
-err:
-	pr_perror("Can't set tty params on %d", info->tfe->id);
-		return -1;
+	return userns_call(do_restore_tty_parms, UNS_ASYNC, &p, sizeof(p), fd);
 }
 
 static int pty_open_slaves(struct tty_info *info)
@@ -788,14 +872,15 @@ err:
 	return -1;
 }
 
-static int open_console(struct tty_info *info)
+static int open_simple_tty(struct tty_info *info)
 {
 	int fd = -1;
 
 	fd = open_pty_reg(info->reg_d, info->tfe->flags);
 	if (fd < 0) {
-		pr_perror("Can't open console %x",
-			  info->tfe->id);
+		pr_perror("Can't open %s %x",
+		info->type == TTY_TYPE_CONSOLE ? "console" : "virtual terminal",
+		info->tfe->id);
 		return -1;
 	}
 
@@ -820,8 +905,8 @@ static int tty_open(struct file_desc *d)
 	if (!tty_is_master(info))
 		return pty_open_unpaired_slave(d, info);
 
-	if (info->type == TTY_TYPE_CONSOLE)
-		return open_console(info);
+	if (info->type == TTY_TYPE_CONSOLE || info->type == TTY_TYPE_VT)
+		return open_simple_tty(info);
 
 	return pty_open_ptmx(info);
 }
@@ -1002,12 +1087,12 @@ int tty_setup_slavery(void)
 	list_for_each_entry(info, &all_ttys, list) {
 		if (tty_find_restoring_task(info))
 			return -1;
-		if (info->type == TTY_TYPE_CONSOLE)
+		if (info->type == TTY_TYPE_CONSOLE || info->type == TTY_TYPE_VT)
 			continue;
 
 		peer = info;
 		list_for_each_entry_safe_continue(peer, m, &all_ttys, list) {
-			if (peer->type == TTY_TYPE_CONSOLE)
+			if (peer->type == TTY_TYPE_CONSOLE || peer->type == TTY_TYPE_VT)
 				continue;
 			if (peer->tie->pty->index != info->tie->pty->index)
 				continue;
@@ -1057,7 +1142,8 @@ static int verify_info(struct tty_info *info)
 {
 	if (info->type != TTY_TYPE_PTM &&
 	    info->type != TTY_TYPE_PTS &&
-	    info->type != TTY_TYPE_CONSOLE) {
+	    info->type != TTY_TYPE_CONSOLE &&
+	    info->type != TTY_TYPE_VT) {
 		pr_err("Unknown type %d master peer %x\n",
 		       info->type, info->tfe->id);
 		return -1;
@@ -1115,6 +1201,7 @@ static int collect_one_tty_info_entry(void *obj, ProtobufCMessage *msg)
 		}
 		break;
 	case TTY_TYPE__CONSOLE:
+	case TTY_TYPE__VT:
 		if (info->tie->pty) {
 			pr_err("PTY data found (id %x), corrupted image?\n",
 			       info->tie->id);
@@ -1311,6 +1398,9 @@ static int dump_tty_info(int lfd, u32 id, const struct fd_parms *p, int type, in
 		break;
 	case TTY_TYPE_CONSOLE:
 		info.type	= TTY_TYPE__CONSOLE;
+		break;
+	case TTY_TYPE_VT:
+		info.type	= TTY_TYPE__VT;
 		break;
 	default:
 		BUG();

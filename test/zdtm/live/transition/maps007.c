@@ -12,8 +12,8 @@
 #include "zdtmtst.h"
 #include "lock.h"
 
-#define MAP_SIZE (1 << 20)
-#define MEM_SIZE (1 << 29)
+#define MAP_SIZE (1UL << 20)
+#define MEM_SIZE (1UL << 29)
 #define PAGE_SIZE 4096
 
 const char *test_doc	= "create random mappings and touch memory";
@@ -70,20 +70,22 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (child)
-		test_daemon();
-
-	while (test_go()) {
+	while (1) {
 		void *ret;
 		unsigned long size;
 		int prot = PROT_NONE;
 
 		if (child) {
+			if (!test_go())
+				break;
 			futex_wait_while_gt(&shm->delta, 2 * MAX_DELTA);
 			futex_inc_and_wake(&shm->delta);
 		} else {
 			if (!futex_get(&shm->stop))
-				futex_wait_while_lt(&shm->delta, MAX_DELTA);
+				/* shm->delta must be always bigger than MAX_DELTA */
+				futex_wait_while_lt(&shm->delta, MAX_DELTA + 2);
+			else if (count % 100 == 0)
+				test_msg("count %d delta %d\n", count, futex_get(&shm->delta)); /* heartbeat */
 
 			if (futex_get(&shm->stop) && atomic_get(&shm->delta.raw) == MAX_DELTA)
 				break;
@@ -91,9 +93,12 @@ int main(int argc, char **argv)
 		}
 
 		count++;
+		if (child && count == MAX_DELTA + 1)
+			test_daemon();
 
 		p = start + ((lrand48() * PAGE_SIZE) % MEM_SIZE);
-		size = (lrand48() * PAGE_SIZE) % (end - p);
+		size = lrand48() * PAGE_SIZE;
+		size %= (end - p);
 		size %= MAP_SIZE;
 		if (size == 0)
 			size = PAGE_SIZE;
@@ -122,6 +127,8 @@ int main(int argc, char **argv)
 	test_msg("count %d\n", count);
 
 	if (child == 0) {
+		if (!test_go())
+			err("unexpected state");
 		futex_set_and_wake(&shm->stop, 2);
 		test_waitsig();
 	} else {

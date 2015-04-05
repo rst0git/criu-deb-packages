@@ -38,6 +38,7 @@
 #include "cgroup.h"
 #include "cpu.h"
 #include "action-scripts.h"
+#include "security.h"
 
 #include "setproctitle.h"
 
@@ -52,6 +53,7 @@ void init_opts(void)
 	INIT_LIST_HEAD(&opts.veth_pairs);
 	INIT_LIST_HEAD(&opts.scripts);
 	INIT_LIST_HEAD(&opts.ext_mounts);
+	INIT_LIST_HEAD(&opts.inherit_fds);
 	INIT_LIST_HEAD(&opts.new_cgroup_roots);
 
 	opts.cpu_cap = CPU_CAP_DEFAULT;
@@ -104,24 +106,36 @@ static int parse_cpu_cap(struct cr_options *opts, const char *optarg)
 		return 0;
 	}
 
-	for (; *optarg; optarg++) {
+	while (*optarg) {
 		if (optarg[0] == '^') {
 			inverse = !inverse;
+			optarg++;
 			continue;
 		} else if (optarg[0] == ',') {
 			inverse = false;
+			optarg++;
 			continue;
 		}
 
-		if (!strncmp(optarg, "fpu", 3))
+		if (!strncmp(optarg, "fpu", 3)) {
 			____cpu_set_cap(opts, CPU_CAP_FPU, inverse);
-		else if (!strncmp(optarg, "all", 3))
+			optarg += 3;
+		} else if (!strncmp(optarg, "all", 3)) {
 			____cpu_set_cap(opts, CPU_CAP_ALL, inverse);
-		else if (!strncmp(optarg, "none", 3))
-			____cpu_set_cap(opts, CPU_CAP_NONE, inverse);
-		else if (!strncmp(optarg, "cpu", 3))
+			optarg += 3;
+		} else if (!strncmp(optarg, "none", 4)) {
+			if (inverse)
+				opts->cpu_cap = CPU_CAP_ALL;
+			else
+				opts->cpu_cap = CPU_CAP_NONE;
+			optarg += 4;
+		} else if (!strncmp(optarg, "cpu", 3)) {
 			____cpu_set_cap(opts, CPU_CAP_CPU, inverse);
-		else
+			optarg += 3;
+		} else if (!strncmp(optarg, "ins", 3)) {
+			____cpu_set_cap(opts, CPU_CAP_INS, inverse);
+			optarg += 3;
+		} else
 			goto Esyntax;
 	}
 #undef ____cpu_set_cap
@@ -187,6 +201,8 @@ int main(int argc, char *argv[], char *envp[])
 		{ "exec-cmd", no_argument, 0, 1059},
 		{ "manage-cgroups", no_argument, 0, 1060},
 		{ "cgroup-root", required_argument, 0, 1061},
+		{ "inherit-fd", required_argument, 0, 1062},
+		{ "feature", required_argument, 0, 1063},
 		{ },
 	};
 
@@ -392,6 +408,14 @@ int main(int argc, char *argv[], char *envp[])
 					return -1;
 			}
 			break;
+		case 1062:
+			if (inherit_fd_add(optarg) < 0)
+				return 1;
+			break;
+		case 1063:
+			if (check_add_feature(optarg) < 0)
+				return 1;
+			break;
 		case 'M':
 			{
 				char *aux;
@@ -450,6 +474,9 @@ int main(int argc, char *argv[], char *envp[])
 		opts.exec_cmd = xmalloc((argc - optind) * sizeof(char *));
 		memcpy(opts.exec_cmd, &argv[optind + 1], (argc - optind - 1) * sizeof(char *));
 		opts.exec_cmd[argc - optind - 1] = NULL;
+	} else if (optind + 1 != argc) {
+		pr_err("Unable to handle more than one command\n");
+		goto usage;
 	}
 
 	/* We must not open imgs dir, if service is called */
@@ -468,6 +495,15 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (log_init(opts.output))
 		return 1;
+
+	if (!list_empty(&opts.inherit_fds)) {
+		if (strcmp(argv[optind], "restore")) {
+			pr_err("--inherit-fd is restore-only option\n");
+			return 1;
+		}
+		/* now that log file is set up, print inherit fd list */
+		inherit_fd_log();
+	}
 
 	if (opts.img_parent)
 		pr_info("Will do snapshot from %s\n", opts.img_parent);
@@ -580,7 +616,7 @@ usage:
 "  -W|--work-dir DIR     directory to cd and write logs/pidfiles/stats to\n"
 "                        (if not specified, value of --images-dir is used)\n"
 "     --cpu-cap [CAP]    require certain cpu capability. CAP: may be one of:\n"
-"                        'cpu','fpu','all','none'. To disable capability, prefix it with '^'.\n"
+"                        'cpu','fpu','all','ins','none'. To disable capability, prefix it with '^'.\n"
 "     --exec-cmd         execute the command specified after '--' on successful\n"
 "                        restore making it the parent of the restored process\n"
 "\n"
@@ -591,6 +627,8 @@ usage:
 "  --evasive-devices     use any path to a device file if the original one\n"
 "                        is inaccessible\n"
 "  --veth-pair IN=OUT    map inside veth device name to outside one\n"
+"                        can optionally append @<bridge-name> to OUT for moving\n"
+"                        the outside veth to the named bridge\n"
 "  --link-remap          allow to link unlinked files back when possible\n"
 "  --action-script FILE  add an external action script\n"
 "  -j|--" OPT_SHELL_JOB "        allow to dump and restore shell jobs\n"

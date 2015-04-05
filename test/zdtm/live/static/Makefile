@@ -34,6 +34,7 @@ TST_NOFILE	=				\
 		socket_udplite			\
 		socket_aio			\
 		packet_sock			\
+		packet_sock_mmap		\
 		sock_filter			\
 		msgque				\
 		inotify_system			\
@@ -115,6 +116,7 @@ TST_NOFILE	=				\
 		dumpable01			\
 		dumpable02			\
 		remap_dead_pid			\
+		aio00				\
 		fd				\
 #		jobctl00			\
 
@@ -139,6 +141,7 @@ TST_FILE	=				\
 		fifo_ro				\
 		fifo_wronly			\
 		console				\
+		vt				\
 		unlink_fifo			\
 		unlink_fifo_wronly		\
 		unlink_mmap00			\
@@ -179,6 +182,7 @@ TST_DIR		=				\
 		mntns_link_ghost		\
 		mntns_shared_bind		\
 		mntns_shared_bind02		\
+		mntns_root_bind			\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -262,13 +266,16 @@ stop:	$(STATE_OUT)
 
 WAIT_TIME=240
 wait_stop:
-	for ((i = 0; i < $(WAIT_TIME); i++)); do \
+		i=0; \
+		while [ $$i -lt $(WAIT_TIME) ] ; do \
 		kill -0 `cat *.pid 2>/dev/null` 2>/dev/null || break; \
 		sleep 1; \
+		i=`expr $$i + 1`; \
 	done
 
 $(TST):	$(LIB)
 
+aio00:			override LDLIBS += -laio
 futex.o:		override CFLAGS += -pthread
 futex:			override LDFLAGS += -pthread
 futex-rl.o:		override CFLAGS += -pthread
@@ -308,7 +315,7 @@ cleandep:	clean
 	$(RM) -f $(DEP)
 
 cleanout:
-	$(RM) -f -r *.pid *.out* *.test* *.state
+	$(RM) -f -r *.pid *.out* *.test* *.state ip.dump ip.rst
 
 %.cleanout: %
 	$(Q) $(RM) -f -r $<.pid $<.out* *$<.test* $<.*.test $<.state
