@@ -5,10 +5,12 @@ Maintainer: Salvatore Bonaccorso <carnil@debian.org>
 Build-Depends:
  asciidoc,
  debhelper (>= 9),
+ dh-python,
  libprotobuf-c-dev,
  libprotobuf-dev,
  protobuf-c-compiler,
  protobuf-compiler,
+ python-all (>= 2.6.6-3~),
  xmlto
 Standards-Version: 3.9.6
 Homepage: http://www.criu.org/
@@ -17,7 +19,7 @@ Vcs-Git: git://anonscm.debian.org/collab-maint/criu.git
 
 Package: criu
 Architecture: amd64 armhf
-Depends: ${misc:Depends}, ${shlibs:Depends}
+Depends: ${misc:Depends}, ${python:Depends}, ${shlibs:Depends}
 Recommends: iproute2 | iproute
 Description: checkpoint and restore in userspace
  criu contains the utilities to checkpoint and restore processes in
