@@ -1,3 +1,19 @@
+criu (1.5.1-1) experimental; urgency=medium
+
+  * Imported Upstream version 1.5 and 1.5.1 (Closes: #780213)
+  * Add Build-Depends on libprotobuf-dev and protobuf-compiler
+  * Install new crit utility.
+    Add Build-Depends on dh-python and python-all (>= 2.6.6-3~).
+    Use the python2 dh addon in debian/rules
+    Add Depends on ${python:Depends} to add proper runtime dependencies on
+    python for crit.
+  * Correct installation path for crit utility
+  * Add Depends on python-ipaddr for crit utility
+  * Add Depends on python-protobuf for crit utility
+  * Add minimal manpage for the crit
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 06 Apr 2015 11:51:48 +0200
+
 criu (1.4-1) experimental; urgency=medium
 
   * Imported Upstream version 1.4
