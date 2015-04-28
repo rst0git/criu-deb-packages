@@ -1,3 +1,10 @@
+criu (1.5.2-1) unstable; urgency=low
+
+  * Imported Upstream version 1.5.2
+  * Update copyright years for debian/* packaging files
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Tue, 28 Apr 2015 08:57:13 +0200
+
 criu (1.5.1-2) unstable; urgency=low
 
   * Upload to unstable
