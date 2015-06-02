@@ -211,7 +211,7 @@ struct watch_list {
 static int dump_inotify_entry(union fdinfo_entries *e, void *arg)
 {
 	struct watch_list *wd_list = (struct watch_list *) arg;
-	struct inotify_wd_entry *wd_entry = (struct inotify_wd_entry *) e;;
+	struct inotify_wd_entry *wd_entry = (struct inotify_wd_entry *) e;
 	InotifyWdEntry *we = &wd_entry->e;
 
 	pr_info("wd: wd 0x%08x s_dev 0x%08x i_ino 0x%16"PRIx64" mask 0x%08x\n",
@@ -526,7 +526,7 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 
 		target = openat(mntns_root, m->mountpoint, O_PATH);
 		if (target == -1) {
-			pr_perror("Unable to open %s\n", m->mountpoint);
+			pr_perror("Unable to open %s", m->mountpoint);
 			goto err;
 		}
 
@@ -756,7 +756,6 @@ struct collect_image_info inotify_cinfo = {
 	.pb_type	= PB_INOTIFY_FILE,
 	.priv_size	= sizeof(struct fsnotify_file_info),
 	.collect	= collect_one_inotify,
-	.flags		= COLLECT_OPTIONAL,
 };
 
 static int collect_one_fanotify(void *o, ProtobufCMessage *msg)
@@ -792,7 +791,6 @@ struct collect_image_info fanotify_cinfo = {
 	.pb_type	= PB_FANOTIFY_FILE,
 	.priv_size	= sizeof(struct fsnotify_file_info),
 	.collect	= collect_one_fanotify,
-	.flags		= COLLECT_OPTIONAL,
 };
 
 static int collect_one_inotify_mark(void *o, ProtobufCMessage *msg)
@@ -811,7 +809,6 @@ struct collect_image_info inotify_mark_cinfo = {
 	.pb_type	= PB_INOTIFY_WD,
 	.priv_size	= sizeof(struct fsnotify_mark_info),
 	.collect	= collect_one_inotify_mark,
-	.flags		= COLLECT_OPTIONAL,
 };
 
 static int collect_one_fanotify_mark(void *o, ProtobufCMessage *msg)
@@ -830,5 +827,4 @@ struct collect_image_info fanotify_mark_cinfo = {
 	.pb_type	= PB_FANOTIFY_MARK,
 	.priv_size	= sizeof(struct fsnotify_mark_info),
 	.collect	= collect_one_fanotify_mark,
-	.flags		= COLLECT_OPTIONAL,
 };

@@ -649,12 +649,12 @@ static int check_aio_remap(void)
 
 	naddr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, 0, 0);
 	if (naddr == MAP_FAILED) {
-		pr_perror("Can't find place for new AIO ring\n");
+		pr_perror("Can't find place for new AIO ring");
 		return -1;
 	}
 
 	if (mremap((void *)ctx, len, len, MREMAP_FIXED | MREMAP_MAYMOVE, naddr) == MAP_FAILED) {
-		pr_perror("Can't remap AIO ring\n");
+		pr_perror("Can't remap AIO ring");
 		return -1;
 	}
 
@@ -666,6 +666,23 @@ static int check_aio_remap(void)
 			return -1;
 		} else
 			pr_warn("Skipping unsupported AIO remap\n");
+	}
+
+	return 0;
+}
+
+static int check_fdinfo_lock(void)
+{
+	if (kerndat_fdinfo_has_lock())
+		return -1;
+
+	if (!kdat.has_fdinfo_lock) {
+		if (!opts.check_ms_kernel) {
+			pr_err("fdinfo doesn't contain the lock field\n");
+			return -1;
+		} else {
+			pr_warn("fdinfo doesn't contain the lock field\n");
+		}
 	}
 
 	return 0;
@@ -692,7 +709,7 @@ int cr_check(void)
 
 	ns.id = root_item->ids->mnt_ns_id;
 
-	mntinfo = collect_mntinfo(&ns);
+	mntinfo = collect_mntinfo(&ns, false);
 	if (mntinfo == NULL)
 		return -1;
 
@@ -723,6 +740,7 @@ int cr_check(void)
 	ret |= check_timerfd();
 	ret |= check_mnt_id();
 	ret |= check_aio_remap();
+	ret |= check_fdinfo_lock();
 
 out:
 	if (!ret)
@@ -774,6 +792,8 @@ int check_add_feature(char *feat)
 		chk_feature = check_tun;
 	else if (!strcmp(feat, "userns"))
 		chk_feature = check_userns;
+	else if (!strcmp(feat, "fdinfo_lock"))
+		chk_feature = check_fdinfo_lock;
 	else {
 		pr_err("Unknown feature %s\n", feat);
 		return -1;

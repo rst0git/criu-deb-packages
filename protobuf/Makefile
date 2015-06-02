@@ -3,6 +3,7 @@ proto-obj-y	+= core.o
 proto-obj-y	+= core-x86.o
 proto-obj-y	+= core-arm.o
 proto-obj-y	+= core-aarch64.o
+proto-obj-y	+= core-ppc64.o
 proto-obj-y	+= cpuinfo.o
 proto-obj-y	+= inventory.o
 proto-obj-y	+= fdinfo.o
@@ -74,7 +75,7 @@ define gen-proto-rules
 $(obj)/$(1).pb-c.c $(obj)/$(1).pb-c.h: $(obj)/$(1).proto $(addsuffix .pb-c.c,$(addprefix $(obj)/,$(2)))
 	$$(E) "  PBCC    " $$@
 	$$(Q) protoc-c --proto_path=$(obj)/ --c_out=$(obj)/ $$<
-ifeq ($(SRCARCH),arm)
+ifeq ($(PROTOUFIX),y)
 	$$(Q) sed -i -e 's/4294967295/0xFFFFFFFF/g' $$@
 	$$(Q) sed -i -e 's/4294967295/0xFFFFFFFF/g' $$(patsubst %.c,%.h,$$@)
 	$$(Q) sed -i -e 's/4294967295/0xFFFFFFFF/g' $$(patsubst %.h,%.c,$$@)
@@ -95,7 +96,7 @@ $(obj)/%.o: $(obj)/%.pb-c.c $(obj)/%.pb-c.h
 
 $(obj)/built-in.o: $(addprefix $(obj)/,$(proto-obj-y))
 	$(E) "  LINK    " $@
-	$(Q) $(LD) -r -o $@ $^
+	$(Q) $(LD) $(ldflags-y) -r -o $@ $^
 
 _all += $(obj)/built-in.o
 

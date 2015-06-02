@@ -62,7 +62,6 @@ static void vma_opt_str(const struct vma_area *v, char *opt)
 	opt2s(VMA_AREA_VSYSCALL, "vsys");
 	opt2s(VMA_AREA_VDSO, "vdso");
 	opt2s(VMA_AREA_VVAR, "vvar");
-	opt2s(VMA_FORCE_READ, "frd");
 	opt2s(VMA_AREA_HEAP, "heap");
 	opt2s(VMA_FILE_PRIVATE, "fp");
 	opt2s(VMA_FILE_SHARED, "fs");
@@ -175,6 +174,7 @@ int move_img_fd(int *img_fd, int want_fd)
 
 static pid_t open_proc_pid = PROC_NONE;
 static int open_proc_fd = -1;
+static pid_t open_proc_self_pid;
 static int open_proc_self_fd = -1;
 
 static inline void set_proc_self_fd(int fd)
@@ -183,6 +183,7 @@ static inline void set_proc_self_fd(int fd)
 		close(open_proc_self_fd);
 
 	open_proc_self_fd = fd;
+	open_proc_self_pid = getpid();
 }
 
 static inline void set_proc_pid_fd(int pid, int fd)
@@ -196,9 +197,13 @@ static inline void set_proc_pid_fd(int pid, int fd)
 
 static inline int get_proc_fd(int pid)
 {
-	if (pid == PROC_SELF)
+	if (pid == PROC_SELF) {
+		if (open_proc_self_fd != -1 && open_proc_self_pid != getpid()) {
+			close(open_proc_self_fd);
+			open_proc_self_fd = -1;
+		}
 		return open_proc_self_fd;
-	else if (pid == open_proc_pid)
+	} else if (pid == open_proc_pid)
 		return open_proc_fd;
 	else
 		return -1;
@@ -658,7 +663,7 @@ int vaddr_to_pfn(unsigned long vaddr, u64 *pfn)
 	if (fd < 0)
 		return -1;
 
-	off = (vaddr / PAGE_SIZE) * sizeof(u64);
+	off = (vaddr / page_size()) * sizeof(u64);
 	if (lseek(fd, off, SEEK_SET) != off) {
 		pr_perror("Failed to seek address %lx", vaddr);
 		goto out;

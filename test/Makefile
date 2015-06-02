@@ -1,6 +1,7 @@
 RM := rm -f --one-file-system
 
 ZDTM_ARGS ?= -C
+export ZDTM_ARGS
 
 .FORCE:
 
@@ -16,7 +17,7 @@ TESTS = unix-callback mem-snap rpc libcriu mounts/ext security pipes crit
 
 other: .FORCE
 	for t in $(TESTS); do			\
-		$(MAKE) -C $$t run || break;	\
+		$(MAKE) -C $$t run || exit 1;	\
 	done					\
 
 zdtm-tst-list: zdtm.sh

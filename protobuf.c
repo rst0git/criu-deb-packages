@@ -528,7 +528,10 @@ int do_pb_read_one(struct cr_img *img, void **pobj, int type, bool eof)
 
 	*pobj = NULL;
 
-	ret = bread(&img->_x, &size, sizeof(size));
+	if (unlikely(empty_image(img)))
+		ret = 0;
+	else
+		ret = bread(&img->_x, &size, sizeof(size));
 	if (ret == 0) {
 		if (eof) {
 			return 0;
@@ -600,6 +603,9 @@ int pb_write_one(struct cr_img *img, void *obj, int type)
 		return -1;
 	}
 
+	if (lazy_image(img) && open_image_lazy(img))
+		return -1;
+
 	size = cr_pb_descs[type].getpksize(obj);
 	if (size > (u32)sizeof(local)) {
 		buf = xmalloc(size);
@@ -633,7 +639,6 @@ err:
 
 int collect_image(struct collect_image_info *cinfo)
 {
-	bool optional = !!(cinfo->flags & COLLECT_OPTIONAL);
 	int ret;
 	struct cr_img *img;
 	void *(*o_alloc)(size_t size) = malloc;
@@ -642,13 +647,9 @@ int collect_image(struct collect_image_info *cinfo)
 	pr_info("Collecting %d/%d (flags %x)\n",
 			cinfo->fd_type, cinfo->pb_type, cinfo->flags);
 
-	img = open_image(cinfo->fd_type, O_RSTR | (optional ? O_OPT : 0));
-	if (!img) {
-		if (optional && errno == ENOENT)
-			return 0;
-		else
-			return -1;
-	}
+	img = open_image(cinfo->fd_type, O_RSTR);
+	if (!img)
+		return -1;
 
 	cinfo->flags |= COLLECT_HAPPENED;
 	if (cinfo->flags & COLLECT_SHARED) {

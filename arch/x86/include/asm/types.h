@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <signal.h>
 
-#include "asm-generic/page.h"
+#include "asm/page.h"
 #include "asm/bitops.h"
 #include "asm/int.h"
 #include "asm/prlimit.h"
@@ -126,7 +126,7 @@ typedef u32 tls_t;
 
 typedef UserX86RegsEntry UserRegsEntry;
 
-static inline u64 encode_pointer(void *p) { return (u64)p; }
-static inline void *decode_pointer(u64 v) { return (void*)v; }
+static inline u64 encode_pointer(void *p) { return (u64)(long)p; }
+static inline void *decode_pointer(u64 v) { return (void*)(long)v; }
 
 #endif /* __CR_ASM_TYPES_H__ */

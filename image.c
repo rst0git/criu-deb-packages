@@ -8,14 +8,17 @@
 #include "pstree.h"
 #include "stats.h"
 #include "cgroup.h"
+#include "lsm.h"
 #include "protobuf.h"
 #include "protobuf/inventory.pb-c.h"
 #include "protobuf/pagemap.pb-c.h"
 
 bool fdinfo_per_id = false;
 bool ns_per_id = false;
+bool img_common_magic = true;
 TaskKobjIdsEntry *root_ids;
 u32 root_cg_set;
+Lsmtype image_lsm;
 
 int check_img_inventory(void)
 {
@@ -50,10 +53,21 @@ int check_img_inventory(void)
 		root_cg_set = he->root_cg_set;
 	}
 
-	if (he->img_version != CRTOOLS_IMAGES_V1) {
+	image_lsm = he->lsmtype;
+
+	switch (he->img_version) {
+	case CRTOOLS_IMAGES_V1:
+		/* good old images. OK */
+		img_common_magic = false;
+		break;
+	case CRTOOLS_IMAGES_V1_1:
+		/* newer images with extra magic in the head */
+		break;
+	default:
 		pr_err("Not supported images version %u\n", he->img_version);
 		goto out_err;
 	}
+
 	ret = 0;
 
 out_err:
@@ -78,11 +92,12 @@ int write_img_inventory(void)
 	if (!img)
 		return -1;
 
-	he.img_version = CRTOOLS_IMAGES_V1;
+	he.img_version = CRTOOLS_IMAGES_V1_1;
 	he.fdinfo_per_id = true;
 	he.has_fdinfo_per_id = true;
 	he.ns_per_id = true;
 	he.has_ns_per_id = true;
+	he.lsmtype = host_lsm_type();
 
 	crt.i.state = TASK_ALIVE;
 	crt.i.pid.real = getpid();
@@ -202,30 +217,103 @@ struct cr_imgset *cr_glob_imgset_open(int mode)
 	return cr_imgset_open(-1 /* ignored */, GLOB, mode);
 }
 
+static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long flags, char *path);
+
 struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 {
 	struct cr_img *img;
-	unsigned long oflags = flags;
+	unsigned long oflags;
 	char path[PATH_MAX];
 	va_list args;
-	int ret;
+	bool lazy = false;
+
+	if (dfd == -1) {
+		dfd = get_service_fd(IMG_FD_OFF);
+		lazy = (flags & O_CREAT);
+	}
 
 	img = xmalloc(sizeof(*img));
 	if (!img)
-		goto errn;
+		return NULL;
 
-	oflags |= imgset_template[type].oflags;
-	flags &= ~(O_OPT | O_NOBUF);
+	oflags = flags | imgset_template[type].oflags;
 
 	va_start(args, flags);
 	vsnprintf(path, PATH_MAX, imgset_template[type].fmt, args);
 	va_end(args);
 
+	if (lazy) {
+		img->fd = LAZY_IMG_FD;
+		img->type = type;
+		img->oflags = oflags;
+		img->path = xstrdup(path);
+		return img;
+	} else
+		img->fd = EMPTY_IMG_FD;
+
+	if (do_open_image(img, dfd, type, oflags, path)) {
+		close_image(img);
+		return NULL;
+	}
+
+	return img;
+}
+
+static inline u32 head_magic(int oflags)
+{
+	return oflags & O_SERVICE ? IMG_SERVICE_MAGIC : IMG_COMMON_MAGIC;
+}
+
+static int img_check_magic(struct cr_img *img, int oflags, int type, char *path)
+{
+	u32 magic;
+
+	if (read_img(img, &magic) < 0)
+		return -1;
+
+	if (img_common_magic && (type != CR_FD_INVENTORY)) {
+		if (magic != head_magic(oflags)) {
+			pr_err("Head magic doesn't match for %s\n", path);
+			return -1;
+		}
+
+		if (read_img(img, &magic) < 0)
+			return -1;
+	}
+
+	if (magic != imgset_template[type].magic) {
+		pr_err("Magic doesn't match for %s\n", path);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int img_write_magic(struct cr_img *img, int oflags, int type)
+{
+	if (img_common_magic && (type != CR_FD_INVENTORY)) {
+		u32 cmagic;
+
+		cmagic = head_magic(oflags);
+		if (write_img(img, &cmagic))
+			return -1;
+	}
+
+	return write_img(img, &imgset_template[type].magic);
+}
+
+static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long oflags, char *path)
+{
+	int ret, flags;
+
+	flags = oflags & ~(O_NOBUF | O_SERVICE);
+
 	ret = openat(dfd, path, flags, CR_FD_PERM);
 	if (ret < 0) {
-		if ((oflags & O_OPT) && errno == ENOENT) {
-			xfree(img);
-			return NULL;
+		if (!(flags & O_CREAT) && (errno == ENOENT)) {
+			pr_info("No %s image\n", path);
+			img->_x.fd = EMPTY_IMG_FD;
+			goto skip_magic;
 		}
 
 		pr_perror("Unable to open %s", path);
@@ -235,41 +323,63 @@ struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 	img->_x.fd = ret;
 	if (oflags & O_NOBUF)
 		bfd_setraw(&img->_x);
-	else if (bfdopen(&img->_x, flags))
-		goto err_close;
+	else {
+		if (flags == O_RDONLY)
+			ret = bfdopenr(&img->_x);
+		else
+			ret = bfdopenw(&img->_x);
+
+		if (ret)
+			goto err;
+	}
 
 	if (imgset_template[type].magic == RAW_IMAGE_MAGIC)
 		goto skip_magic;
 
-	if (flags == O_RDONLY) {
-		u32 magic;
-
-		if (read_img(img, &magic) < 0)
-			goto err_close;
-		if (magic != imgset_template[type].magic) {
-			pr_err("Magic doesn't match for %s\n", path);
-			goto err_close;
-		}
-	} else {
-		if (write_img(img, &imgset_template[type].magic))
-			goto err_close;
-	}
+	if (flags == O_RDONLY)
+		ret = img_check_magic(img, oflags, type, path);
+	else
+		ret = img_write_magic(img, oflags, type);
+	if (ret)
+		goto err;
 
 skip_magic:
-	return img;
+	return 0;
 
 err:
-	xfree(img);
-errn:
-	return NULL;
-err_close:
-	close_image(img);
-	return NULL;
+	return -1;
+}
+
+int open_image_lazy(struct cr_img *img)
+{
+	int dfd;
+	char *path = img->path;
+
+	img->path = NULL;
+
+	dfd = get_service_fd(IMG_FD_OFF);
+	if (do_open_image(img, dfd, img->type, img->oflags, path)) {
+		xfree(path);
+		return -1;
+	}
+
+	xfree(path);
+	return 0;
 }
 
 void close_image(struct cr_img *img)
 {
-	bclose(&img->_x);
+	if (lazy_image(img)) {
+		/*
+		 * Remove the image file if it's there so that
+		 * subsequent restore doesn't read wrong or fake
+		 * data from it.
+		 */
+		unlinkat(get_service_fd(IMG_FD_OFF), img->path, 0);
+		xfree(img->path);
+	} else if (!empty_image(img))
+		bclose(&img->_x);
+
 	xfree(img);
 }
 

@@ -159,6 +159,24 @@ void criu_set_manage_cgroups(bool manage)
 	opts->manage_cgroups = manage;
 }
 
+void criu_set_auto_ext_mnt(bool val)
+{
+	opts->has_auto_ext_mnt = true;
+	opts->auto_ext_mnt = val;
+}
+
+void criu_set_ext_sharing(bool val)
+{
+	opts->has_ext_sharing = true;
+	opts->ext_sharing = val;
+}
+
+void criu_set_ext_masters(bool val)
+{
+	opts->has_ext_masters = true;
+	opts->ext_masters = val;
+}
+
 void criu_set_log_file(char *log_file)
 {
 	opts->log_file = strdup(log_file);
@@ -307,6 +325,68 @@ er_i:
 er_p:
 	free(p);
 er:
+	return -ENOMEM;
+}
+
+int criu_add_enable_fs(char *fs)
+{
+	int nr;
+	char *str = NULL;
+	char **ptr = NULL;
+
+	str = strdup(fs);
+	if (!str)
+		goto err;
+
+	nr = opts->n_enable_fs + 1;
+	ptr = realloc(opts->enable_fs, nr * sizeof(*ptr));
+	if (!ptr)
+		goto err;
+
+	ptr[nr - 1] = str;
+
+	opts->n_enable_fs = nr;
+	opts->enable_fs = ptr;
+
+	return 0;
+
+err:
+	if (str)
+		free(str);
+	if (ptr)
+		free(ptr);
+
+	return -ENOMEM;
+}
+
+int criu_add_skip_mnt(char *mnt)
+{
+	int nr;
+	char *str = NULL;
+	char **ptr = NULL;
+
+	str = strdup(mnt);
+	if (!str)
+		goto err;
+
+	nr = opts->n_skip_mnt + 1;
+	ptr = realloc(opts->skip_mnt, nr * sizeof(*ptr));
+	if (!ptr)
+		goto err;
+
+	ptr[nr - 1] = str;
+
+	opts->n_skip_mnt = nr;
+	opts->skip_mnt = ptr;
+
+	return 0;
+
+err:
+	if (str)
+		free(str);
+	if (ptr)
+		free(ptr);
+
 	return -ENOMEM;
 }
 

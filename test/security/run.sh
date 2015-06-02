@@ -1,25 +1,33 @@
 #!/bin/bash
 
+set -x
+
 PID=
 
 function run_as {
 	echo "== Run ${LOOP} as $1"
 	echo ${PIDFILE}
 	rm -f ${PIDFILE}
-	su $1 -c "${LOOP} $2 < /dev/null 2> /dev/null > ${PIDFILE} &"
+	su $1 -c "setsid ${LOOP} ${PIDFILE} $2 < /dev/null &> /dev/null &"
+	for i in `seq 100`; do
+		test -f ${PIDFILE} && break
+		sleep 1
+	done
 	PID=`cat ${PIDFILE}`
 	echo ${PID}
 }
 
 function dump_as {
+	test -d ${IMGS} && rm -rf ${IMGS}
+	mkdir -p ${IMGS}
 	echo "== Dump ${PID} as $@"
-	su $@ -c "${CRIU} dump --tree ${PID} --images-dir ${IMGS} --shell-job"
+	su $@ -c "${CRIU} dump --tree ${PID} --images-dir ${IMGS}"
 	return $?
 }
 
 function rstr_as {
 	echo "== Restore ${IMGS} as $@"
-	su $@ -c "${CRIU} restore --images-dir ${IMGS} --shell-job --restore-detached"
+	su $@ -c "${CRIU} restore --images-dir ${IMGS} --restore-detached"
 	return $?
 }
 
@@ -30,6 +38,7 @@ function result {
 
 	if [ $1 -ne 0 ]; then
 		echo -e "${BGRED}FAIL${NORMAL}"
+		exit 1
 	else
 		echo -e "${BGGREEN}PASS${NORMAL}"
 	fi

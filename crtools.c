@@ -159,50 +159,54 @@ int main(int argc, char *argv[], char *envp[])
 	char *work_dir = NULL;
 	static const char short_opts[] = "dSsRf:F:t:p:hcD:o:n:v::xVr:jlW:L:M:";
 	static struct option long_opts[] = {
-		{ "tree", required_argument, 0, 't' },
-		{ "pid", required_argument, 0, 'p' },
-		{ "leave-stopped", no_argument, 0, 's' },
-		{ "leave-running", no_argument, 0, 'R' },
-		{ "restore-detached", no_argument, 0, 'd' },
-		{ "restore-sibling", no_argument, 0, 'S' },
-		{ "daemon", no_argument, 0, 'd' },
-		{ "contents", no_argument, 0, 'c' },
-		{ "file", required_argument, 0, 'f' },
-		{ "fields", required_argument, 0, 'F' },
-		{ "images-dir", required_argument, 0, 'D' },
-		{ "work-dir", required_argument, 0, 'W' },
-		{ "log-file", required_argument, 0, 'o' },
-		{ "namespaces", required_argument, 0, 'n' },
-		{ "root", required_argument, 0, 'r' },
-		{ USK_EXT_PARAM, no_argument, 0, 'x' },
-		{ "help", no_argument, 0, 'h' },
-		{ SK_EST_PARAM, no_argument, 0, 1042 },
-		{ "close", required_argument, 0, 1043 },
-		{ "log-pid", no_argument, 0, 1044},
-		{ "version", no_argument, 0, 'V'},
-		{ "evasive-devices", no_argument, 0, 1045},
-		{ "pidfile", required_argument, 0, 1046},
-		{ "veth-pair", required_argument, 0, 1047},
-		{ "action-script", required_argument, 0, 1049},
-		{ LREMAP_PARAM, no_argument, 0, 1041},
-		{ OPT_SHELL_JOB, no_argument, 0, 'j'},
-		{ OPT_FILE_LOCKS, no_argument, 0, 'l'},
-		{ "page-server", no_argument, 0, 1050},
-		{ "address", required_argument, 0, 1051},
-		{ "port", required_argument, 0, 1052},
-		{ "prev-images-dir", required_argument, 0, 1053},
-		{ "ms", no_argument, 0, 1054},
-		{ "track-mem", no_argument, 0, 1055},
-		{ "auto-dedup", no_argument, 0, 1056},
-		{ "libdir", required_argument, 0, 'L'},
-		{ "cpu-cap", optional_argument, 0, 1057},
-		{ "force-irmap", no_argument, 0, 1058},
-		{ "ext-mount-map", required_argument, 0, 'M'},
-		{ "exec-cmd", no_argument, 0, 1059},
-		{ "manage-cgroups", no_argument, 0, 1060},
-		{ "cgroup-root", required_argument, 0, 1061},
-		{ "inherit-fd", required_argument, 0, 1062},
-		{ "feature", required_argument, 0, 1063},
+		{ "tree",			required_argument,	0, 't'	},
+		{ "pid",			required_argument,	0, 'p'	},
+		{ "leave-stopped",		no_argument,		0, 's'	},
+		{ "leave-running",		no_argument,		0, 'R'	},
+		{ "restore-detached",		no_argument,		0, 'd'	},
+		{ "restore-sibling",		no_argument,		0, 'S'	},
+		{ "daemon",			no_argument,		0, 'd'	},
+		{ "contents",			no_argument,		0, 'c'	},
+		{ "file",			required_argument,	0, 'f'	},
+		{ "fields",			required_argument,	0, 'F'	},
+		{ "images-dir",			required_argument,	0, 'D'	},
+		{ "work-dir",			required_argument,	0, 'W'	},
+		{ "log-file",			required_argument,	0, 'o'	},
+		{ "namespaces",			required_argument,	0, 'n'	},
+		{ "root",			required_argument,	0, 'r'	},
+		{ USK_EXT_PARAM,		no_argument,		0, 'x'	},
+		{ "help",			no_argument,		0, 'h'	},
+		{ SK_EST_PARAM,			no_argument,		0, 1042	},
+		{ "close",			required_argument,	0, 1043	},
+		{ "log-pid",			no_argument,		0, 1044	},
+		{ "version",			no_argument,		0, 'V'	},
+		{ "evasive-devices",		no_argument,		0, 1045	},
+		{ "pidfile",			required_argument,	0, 1046	},
+		{ "veth-pair",			required_argument,	0, 1047	},
+		{ "action-script",		required_argument,	0, 1049	},
+		{ LREMAP_PARAM,			no_argument,		0, 1041	},
+		{ OPT_SHELL_JOB,		no_argument,		0, 'j'	},
+		{ OPT_FILE_LOCKS,		no_argument,		0, 'l'	},
+		{ "page-server",		no_argument,		0, 1050	},
+		{ "address",			required_argument,	0, 1051	},
+		{ "port",			required_argument,	0, 1052	},
+		{ "prev-images-dir",		required_argument,	0, 1053	},
+		{ "ms",				no_argument,		0, 1054	},
+		{ "track-mem",			no_argument,		0, 1055	},
+		{ "auto-dedup",			no_argument,		0, 1056	},
+		{ "libdir",			required_argument,	0, 'L'	},
+		{ "cpu-cap",			optional_argument,	0, 1057	},
+		{ "force-irmap",		no_argument,		0, 1058	},
+		{ "ext-mount-map",		required_argument,	0, 'M'	},
+		{ "exec-cmd",			no_argument,		0, 1059	},
+		{ "manage-cgroups",		no_argument,		0, 1060	},
+		{ "cgroup-root",		required_argument,	0, 1061	},
+		{ "inherit-fd",			required_argument,	0, 1062	},
+		{ "feature",			required_argument,	0, 1063	},
+		{ "skip-mnt",			required_argument,	0, 1064 },
+		{ "enable-fs",			required_argument,	0, 1065 },
+		{ "enable-external-sharing", 	no_argument, 		0, 1066 },
+		{ "enable-external-masters", 	no_argument, 		0, 1067 },
 		{ },
 	};
 
@@ -416,9 +420,28 @@ int main(int argc, char *argv[], char *envp[])
 			if (check_add_feature(optarg) < 0)
 				return 1;
 			break;
+		case 1064:
+			if (!add_skip_mount(optarg))
+				return 1;
+			break;
+		case 1065:
+			if (!add_fsname_auto(optarg))
+				return 1;
+			break;
+		case 1066:
+			opts.enable_external_sharing = true;
+			break;
+		case 1067:
+			opts.enable_external_masters = true;
+			break;
 		case 'M':
 			{
 				char *aux;
+
+				if (strcmp(optarg, "auto") == 0) {
+					opts.autodetect_ext_mounts = true;
+					break;
+				}
 
 				aux = strchr(optarg, ':');
 				if (aux == NULL)
@@ -444,6 +467,11 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (!opts.restore_detach && opts.restore_sibling) {
 		pr_msg("--restore-sibling only makes sense with --restore-detach\n");
+		return 1;
+	}
+
+	if (!opts.autodetect_ext_mounts && (opts.enable_external_masters || opts.enable_external_sharing)) {
+		pr_msg("must specify --ext-mount-map auto with --enable-external-{sharing|masters}");
 		return 1;
 	}
 
@@ -553,10 +581,10 @@ int main(int argc, char *argv[], char *envp[])
 	}
 
 	if (!strcmp(argv[optind], "page-server"))
-		return cr_page_server(opts.restore_detach, -1) > 0 ? 0 : 1;
+		return cr_page_server(opts.daemon_mode, -1) > 0 ? 0 : 1;
 
 	if (!strcmp(argv[optind], "service"))
-		return cr_service(opts.restore_detach);
+		return cr_service(opts.daemon_mode);
 
 	if (!strcmp(argv[optind], "dedup"))
 		return cr_dedup() != 0;
@@ -576,7 +604,6 @@ usage:
 "Usage:\n"
 "  criu dump|pre-dump -t PID [<options>]\n"
 "  criu restore [<options>]\n"
-"  criu show (-D DIR)|(-f FILE) [<options>]\n"
 "  criu check [--ms]\n"
 "  criu exec -p PID <syscall-string>\n"
 "  criu page-server\n"
@@ -587,7 +614,6 @@ usage:
 "  dump           checkpoint a process/tree identified by pid\n"
 "  pre-dump       pre-dump task(s) minimizing their frozen time\n"
 "  restore        restore a process/tree\n"
-"  show           show dump file(s) contents\n"
 "  check          checks whether the kernel support is up-to-date\n"
 "  exec           execute a system call by other task\n"
 "  page-server    launch page server\n"
@@ -637,11 +663,21 @@ usage:
 "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
 "  -M|--ext-mount-map KEY:VALUE\n"
 "                        add external mount mapping\n"
+"  -M|--ext-mount-map auto\n"
+"                        attempt to autodetect external mount mapings\n"
+"  --enable-external-sharing\n"
+"                        allow autoresolving mounts with external sharing\n"
+"  --enable-external-masters\n"
+"                        allow autoresolving mounts with external masters\n"
 "  --manage-cgroups      dump or restore cgroups the process is in\n"
 "  --cgroup-root [controller:]/newroot\n"
 "                        change the root cgroup the controller will be\n"
 "                        installed into. No controller means that root is the\n"
 "                        default for all controllers not specified.\n"
+"  --skip-mnt PATH       ignore this mountpoint when dumping the mount namespace.\n"
+"  --enable-fs FSNAMES   a comma separated list of filesystem names or \"all\".\n"
+"                        force criu to (try to) dump/restore these filesystem's\n"
+"                        mountpoints even if fs is not supported.\n"
 "\n"
 "* Logging:\n"
 "  -o|--log-file FILE    log file name\n"
@@ -665,13 +701,6 @@ usage:
 "  --address ADDR        address of server or service\n"
 "  --port PORT           port of page server\n"
 "  -d|--daemon           run in the background after creating socket\n"
-"\n"
-"Show options:\n"
-"  -f|--file FILE        show contents of a checkpoint file\n"
-"  -F|--fields FIELDS    show specified fields (comma separated)\n"
-"  -D|--images-dir DIR   directory where to get images from\n"
-"  -c|--contents         show contents of pages dumped in hexdump format\n"
-"  -p|--pid PID          show files relevant to PID (filter -D flood)\n"
 "\n"
 "Other options:\n"
 "  -h|--help             show this text\n"

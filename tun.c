@@ -342,7 +342,7 @@ static int tunfile_open(struct file_desc *d)
 	tl = find_tun_link(ti->tfe->netdev);
 	if (!tl) {
 		pr_err("No tun device for file %s\n", ti->tfe->netdev);
-		return -1;
+		goto err;
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
@@ -400,7 +400,6 @@ struct collect_image_info tunfile_cinfo = {
 	.pb_type = PB_TUNFILE,
 	.priv_size = sizeof(struct tunfile_info),
 	.collect = collect_one_tunfile,
-	.flags = COLLECT_OPTIONAL,
 };
 
 int dump_tun_link(NetDeviceEntry *nde, struct cr_imgset *fds)

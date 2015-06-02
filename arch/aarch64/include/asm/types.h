@@ -3,9 +3,10 @@
 
 #include <stdbool.h>
 #include <signal.h>
+#include <asm/ptrace.h>
 #include "protobuf/core.pb-c.h"
 
-#include "asm-generic/page.h"
+#include "asm/page.h"
 #include "asm/bitops.h"
 #include "asm/int.h"
 

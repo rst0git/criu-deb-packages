@@ -70,6 +70,7 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 	FD_ENTRY(TCP_STREAM,	"tcp-stream-%x"),
 	FD_ENTRY(MNTS,		"mountpoints-%d"),
 	FD_ENTRY(NETDEV,	"netdev-%d"),
+	FD_ENTRY(NETNS,		"netns-%d"),
 	FD_ENTRY_F(IFADDR,	"ifaddr-%d", O_NOBUF),
 	FD_ENTRY_F(ROUTE,	"route-%d", O_NOBUF),
 	FD_ENTRY_F(IPTABLES,	"iptables-%d", O_NOBUF),
@@ -93,11 +94,13 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 	[CR_FD_STATS] = {
 		.fmt	= "stats-%s",
 		.magic	= STATS_MAGIC,
+		.oflags = O_SERVICE,
 	},
 
 	[CR_FD_IRMAP_CACHE] = {
 		.fmt	= "irmap-cache",
 		.magic	= IRMAP_CACHE_MAGIC,
+		.oflags = O_SERVICE,
 	},
 
 	[CR_FD_FILE_LOCKS_PID] = {

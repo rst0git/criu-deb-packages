@@ -67,8 +67,8 @@ static int cr_dedup_one_pagemap(int pid)
 	struct page_read * prp;
 	struct iovec iov;
 
-	ret = open_page_read(pid, &pr, O_RDWR, false);
-	if (ret) {
+	ret = open_page_read(pid, &pr, PR_TASK | PR_MOD);
+	if (ret <= 0) {
 		ret = -1;
 		goto exit;
 	}

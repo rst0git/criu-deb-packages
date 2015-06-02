@@ -1,4 +1,4 @@
-DIR	:= /tmp/criu-test
+DIR	:= $(shell pwd)/data
 LOOP	:= $(DIR)/loop.sh
 PIDFILE := $(DIR)/loop.pid
 IMGS	:= $(DIR)/imgs
@@ -22,6 +22,8 @@ testdir: ../../criu
 	chmod 777 $(DIR)
 
 users:
+	-userdel -f $(USR1)
+	-userdel -f $(USR2)
 	useradd -M -U $(USR1)
 	useradd -M -U $(USR2)
 	usermod -a -G $(USR2) $(USR1)

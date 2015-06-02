@@ -324,6 +324,7 @@ static struct show_image_info show_infos[] = {
 	SHOW_PLAIN(IRMAP_CACHE),
 	SHOW_PLAIN(CPUINFO),
 	SHOW_PLAIN(USERNS),
+	SHOW_PLAIN(NETNS),
 
 	{ FILE_LOCKS_MAGIC,	PB_FILE_LOCK,		false,	NULL, "3:%u", },
 	{ TCP_STREAM_MAGIC,	PB_TCP_STREAM,		true,	show_tcp_stream, "1:%u 2:%u 3:%u 4:%u 12:%u", },
@@ -378,6 +379,11 @@ out:
 int cr_parse_fd(struct cr_img *img, u32 magic)
 {
 	int ret = 0, i;
+
+	if (magic == IMG_COMMON_MAGIC || magic == IMG_SERVICE_MAGIC) {
+		if (read_img(img, &magic) < 0)
+			goto out;
+	}
 
 	if (magic == PSTREE_MAGIC) {
 		show_collect_pstree(img, 0);
@@ -454,7 +460,7 @@ static int cr_show_pstree_item(struct pstree_item *item)
 			cr_parse_fd(img_from_set(cr_imgset, i), imgset_template[i].magic);
 		}
 
-	img = open_image(CR_FD_RLIMIT, O_SHOW | O_OPT, item->pid.virt);
+	img = open_image(CR_FD_RLIMIT, O_SHOW, item->pid.virt);
 	if (img) {
 		pr_msg("* ");
 		pr_msg(imgset_template[CR_FD_RLIMIT].fmt, item->pid.virt);
@@ -552,6 +558,12 @@ out:
 
 int cr_show(int pid)
 {
+	if (isatty(STDOUT_FILENO)) {
+		pr_msg("The \"show\" action is deprecated by the CRIT utility.\n");
+		pr_msg("To view an image use the \"crit decode -i $name --pretty\" command.\n");
+		return -1;
+	}
+
 	if (opts.show_dump_file)
 		return cr_parse_file();
 

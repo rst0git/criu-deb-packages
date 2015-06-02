@@ -354,17 +354,15 @@ no_server:
 		ret = ask = accept(sk, (struct sockaddr *)&caddr, &clen);
 		if (ask < 0)
 			pr_perror("Can't accept connection to server");
-
+		else
+			pr_info("Accepted connection from %s:%u\n",
+					inet_ntoa(caddr.sin_addr),
+					(int)ntohs(caddr.sin_port));
 		close(sk);
 	}
 
-	if (ask >= 0) {
-		pr_info("Accepted connection from %s:%u\n",
-				inet_ntoa(caddr.sin_addr),
-				(int)ntohs(caddr.sin_port));
-
+	if (ask >= 0)
 		ret = page_server_serve(ask);
-	}
 
 	if (daemon_mode)
 		exit(ret);
@@ -740,8 +738,8 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, long id)
 			return -1;
 		}
 
-		ret = open_page_read_at(pfd, id, xfer->parent, O_RDWR, false);
-		if (ret) {
+		ret = open_page_read_at(pfd, id, xfer->parent, PR_TASK);
+		if (ret <= 0) {
 			pr_perror("No parent image found, though parent directory is set");
 			xfree(xfer->parent);
 			xfer->parent = NULL;
@@ -781,7 +779,7 @@ int check_parent_local_xfer(int fd_type, int id)
 
 	pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
 	if (pfd < 0 && errno == ENOENT)
-		return 0;;
+		return 0;
 
 	snprintf(path, sizeof(path), imgset_template[fd_type].fmt, id);
 	ret = fstatat(pfd, path, &st, 0);

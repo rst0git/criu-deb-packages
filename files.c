@@ -131,7 +131,8 @@ static inline struct file_desc *find_file_desc(FdinfoEntry *fe)
 struct fdinfo_list_entry *file_master(struct file_desc *d)
 {
 	if (list_empty(&d->fd_info_head)) {
-		pr_err("Empty list on file desc id %#x\n", d->id);
+		pr_err("Empty list on file desc id %#x(%d)\n", d->id,
+				d->ops ? d->ops->type : -1);
 		BUG();
 	}
 
@@ -213,7 +214,7 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 {
 	int ret;
 	struct statfs fsbuf;
-	struct fdinfo_common fdinfo = { .mnt_id = -1 };
+	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = ctl->pid.virt };
 
 	if (fstat(lfd, &p->stat) < 0) {
 		pr_perror("Can't stat fd %d", lfd);
@@ -225,7 +226,7 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 		return -1;
 	}
 
-	if (parse_fdinfo(lfd, FD_TYPES__UND, NULL, &fdinfo))
+	if (parse_fdinfo_pid(ctl->pid.real, fd, FD_TYPES__UND, NULL, &fdinfo))
 		return -1;
 
 	p->fs_type	= fsbuf.f_type;
@@ -607,14 +608,12 @@ int prepare_fd_pid(struct pstree_item *item)
 	INIT_LIST_HEAD(&rst_info->fds);
 	INIT_LIST_HEAD(&rst_info->eventpoll);
 	INIT_LIST_HEAD(&rst_info->tty_slaves);
+	INIT_LIST_HEAD(&rst_info->tty_ctty);
 
 	if (!fdinfo_per_id) {
-		img = open_image(CR_FD_FDINFO, O_RSTR | O_OPT, pid);
-		if (!img) {
-			if (errno == ENOENT)
-				return 0;
+		img = open_image(CR_FD_FDINFO, O_RSTR, pid);
+		if (!img)
 			return -1;
-		}
 	} else {
 		if (item->ids == NULL) /* zombie */
 			return 0;
@@ -846,12 +845,14 @@ static int serve_out_fd(int pid, int fd, struct file_desc *d)
 
 		if (ret) {
 			pr_err("Can't sent fd %d to %d\n", fd, fle->pid);
-			return -1;
+			goto out;
 		}
 	}
 
+	ret = 0;
+out:
 	close(sock);
-	return 0;
+	return ret;
 }
 
 static int open_fd(int pid, struct fdinfo_list_entry *fle)
@@ -1025,6 +1026,24 @@ int prepare_fds(struct pstree_item *me)
 			break;
 	}
 
+	if (ret)
+		goto out_w;
+
+	for (state = 0; state < ARRAY_SIZE(states); state++) {
+		if (!states[state].required) {
+			pr_debug("Skipping %s fd stage\n", states[state].name);
+			continue;
+		}
+
+		/*
+		 * Opening current TTYs require session to be already set up,
+		 * thus slave peers already handled now it's time for cttys,
+		 */
+		ret = open_fdinfos(me->pid.virt, &rsti(me)->tty_ctty, state);
+		if (ret)
+			break;
+	}
+out_w:
 	if (rsti(me)->fdt)
 		futex_inc_and_wake(&rsti(me)->fdt->fdt_lock);
 out:
@@ -1059,7 +1078,7 @@ static int fchroot(int fd)
 
 int restore_fs(struct pstree_item *me)
 {
-	int dd_root, dd_cwd, ret, err = -1;
+	int dd_root = -1, dd_cwd = -1, ret, err = -1;
 	struct rst_info *ri = rsti(me);
 
 	/*
@@ -1086,14 +1105,12 @@ int restore_fs(struct pstree_item *me)
 	 */
 
 	ret = fchroot(dd_root);
-	close(dd_root);
 	if (ret < 0) {
 		pr_perror("Can't change root");
 		goto out;
 	}
 
 	ret = fchdir(dd_cwd);
-	close(dd_cwd);
 	if (ret < 0) {
 		pr_perror("Can't change cwd");
 		goto out;
@@ -1106,6 +1123,11 @@ int restore_fs(struct pstree_item *me)
 
 	err = 0;
 out:
+	if (dd_cwd >= 0)
+		close(dd_cwd);
+	if (dd_root >= 0)
+		close(dd_root);
+
 	return err;
 }
 
@@ -1115,19 +1137,16 @@ int prepare_fs_pid(struct pstree_item *item)
 	struct rst_info *ri = rsti(item);
 	struct cr_img *img;
 	FsEntry *fe;
+	int ret = -1;
 
-	img = open_image(CR_FD_FS, O_RSTR | O_OPT, pid);
-	if (!img) {
-		if (errno == ENOENT)
-			goto ok;
-		else
-			goto out;
-	}
+	img = open_image(CR_FD_FS, O_RSTR, pid);
+	if (!img)
+		goto out;
 
-	if (pb_read_one(img, &fe, PB_FS) < 0)
-		goto out_i;
-
+	ret = pb_read_one_eof(img, &fe, PB_FS);
 	close_image(img);
+	if (ret <= 0)
+		goto out;
 
 	ri->cwd = collect_special_file(fe->cwd_id);
 	if (!ri->cwd) {
@@ -1144,18 +1163,11 @@ int prepare_fs_pid(struct pstree_item *item)
 	ri->has_umask = fe->has_umask;
 	ri->umask = fe->umask;
 
-	fs_entry__free_unpacked(fe, NULL);
-ok:
-	return 0;
-
+	ret = 0;
 out_f:
 	fs_entry__free_unpacked(fe, NULL);
-	return -1;
-
-out_i:
-	close_image(img);
 out:
-	return -1;
+	return ret;
 }
 
 int shared_fdt_prepare(struct pstree_item *item)

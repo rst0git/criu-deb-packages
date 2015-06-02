@@ -340,7 +340,7 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st, dev_t phys_de
 	pr_info("Dumping ghost file contents (id %#x)\n", id);
 
 	img = open_image(CR_FD_GHOST_FILE, O_DUMP, id);
-	if (img < 0)
+	if (!img)
 		return -1;
 
 	gfe.uid = userns_uid(st->st_uid);
@@ -791,6 +791,16 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms,
 	return 0;
 }
 
+static bool should_check_size(int flags)
+{
+	/* Skip size if file has O_APPEND and O_WRONLY flags (e.g. log file). */
+	if (((flags & O_ACCMODE) == O_WRONLY) &&
+			(flags & O_APPEND))
+		return false;
+
+	return true;
+}
+
 int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 {
 	struct fd_link _link, *link;
@@ -808,7 +818,8 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 
 	nsid = lookup_nsid_by_mnt_id(p->mnt_id);
 	if (nsid == NULL) {
-		pr_err("Unable to look up the %d mount\n", p->mnt_id);
+		pr_err("Can't lookup mount=%d for fd=%d path=%s\n",
+			p->mnt_id, p->fd, link->name + 1);
 		return -1;
 	}
 
@@ -837,7 +848,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	rfe.fown	= (FownEntry *)&p->fown;
 	rfe.name	= &link->name[1];
 
-	if (S_ISREG(p->stat.st_mode)) {
+	if (S_ISREG(p->stat.st_mode) && should_check_size(rfe.flags)) {
 		rfe.has_size = true;
 		rfe.size = p->stat.st_size;
 	}

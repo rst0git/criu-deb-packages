@@ -11,7 +11,11 @@
 #include "bfd.h"
 #include "bug.h"
 
+#ifdef _ARCH_PPC64
+#define PAGE_IMAGE_SIZE	65536
+#else
 #define PAGE_IMAGE_SIZE	4096
+#endif /* _ARCH_PPC64 */
 #define PAGE_RSS	1
 #define PAGE_ANON	2
 
@@ -38,12 +42,57 @@
 #define USK_SERVICE	(1 << 1)
 #define USK_CALLBACK	(1 << 2)
 
+/*
+ * VMA_AREA status:
+ *
+ *  - none
+ *	VmaEntry is just allocated and has not been used
+ *	for anything yet
+ *  - regular
+ *  	VmaEntry represent some memory area which should be
+ *  	dumped and restored; this is a general sign that we
+ *  	should not skip the area content from processing in
+ *  	compare with special areas such as vsyscall
+ *  - stack
+ *  	the memory area is used in application stack so we
+ *  	should be careful about guard page here
+ *  - vsyscall
+ *  	special memory area injected into the task memory
+ *  	space by the kernel itself, represent virtual syscall
+ *  	implementation and it is specific to every kernel version,
+ *  	its contents should not be dumped ever
+ *  - vdso,vvar
+ *  	the vDSO area, it might reqire additional memory
+ *  	contents modification especially when tasks are
+ *  	migrating between different kernel versions
+ *  - heap
+ *  	"heap" area in application, currently for inforamtion only
+ *  - file private
+ *  	stands for privately memory mapped files
+ *  - file shared
+ *  	stands for shared memory mapped files
+ *  - anon shared
+ *  	represent shared anonymous memory areas
+ *  - anon private
+ *  	represent private anonymous memory areas
+ *  - SysV IPC
+ *  	IPC shared memory area
+ *  - socket
+ *  	memory map for socket
+ *  - AIO ring
+ *  	memory area serves AIO buffers
+ *  - unsupported
+ *  	stands for any unknown memory areas, usually means
+ *  	we don't know how to work with it and should stop
+ *  	processing exiting with error; while the rest of bits
+ *  	are part of image ABI, this particular one must never
+ *  	be used in image.
+ */
 #define VMA_AREA_NONE		(0 <<  0)
-#define VMA_AREA_REGULAR	(1 <<  0)	/* Dumpable area */
+#define VMA_AREA_REGULAR	(1 <<  0)
 #define VMA_AREA_STACK		(1 <<  1)
 #define VMA_AREA_VSYSCALL	(1 <<  2)
 #define VMA_AREA_VDSO		(1 <<  3)
-#define VMA_FORCE_READ		(1 <<  4)	/* VMA changed to be readable */
 #define VMA_AREA_HEAP		(1 <<  5)
 
 #define VMA_FILE_PRIVATE	(1 <<  6)
@@ -56,7 +105,7 @@
 #define VMA_AREA_VVAR		(1 <<  12)
 #define VMA_AREA_AIORING	(1 <<  13)
 
-#define VMA_UNSUPP		(1 <<  31)	/* Unsupported VMA */
+#define VMA_UNSUPP		(1 <<  31)
 
 #define CR_CAP_SIZE	2
 
@@ -71,20 +120,46 @@
 
 extern bool fdinfo_per_id;
 extern bool ns_per_id;
+extern bool img_common_magic;
 
-#define O_OPT	(O_PATH)
-#define O_NOBUF	(O_DIRECT)
-
-#define O_DUMP	(O_RDWR | O_CREAT | O_TRUNC)
-#define O_SHOW	(O_RDONLY | O_NOBUF)
-#define O_RSTR	(O_RDONLY)
+#define O_NOBUF		(O_DIRECT)
+#define O_SERVICE	(O_DIRECTORY)
+#define O_DUMP		(O_WRONLY | O_CREAT | O_TRUNC)
+#define O_SHOW		(O_RDONLY | O_NOBUF)
+#define O_RSTR		(O_RDONLY)
 
 struct cr_img {
-	struct bfd _x;
+	union {
+		struct bfd _x;
+		struct {
+			int fd; /* should be first to coincide with _x.fd */
+			int type;
+			unsigned long oflags;
+			char *path;
+		};
+	};
 };
+
+#define EMPTY_IMG_FD	(-404)
+#define LAZY_IMG_FD	(-505)
+
+static inline bool empty_image(struct cr_img *img)
+{
+	return img && img->_x.fd == EMPTY_IMG_FD;
+}
+
+static inline bool lazy_image(struct cr_img *img)
+{
+	return img->_x.fd == LAZY_IMG_FD;
+}
+
+extern int open_image_lazy(struct cr_img *img);
 
 static inline int img_raw_fd(struct cr_img *img)
 {
+	if (lazy_image(img) && open_image_lazy(img))
+		return -1;
+
 	BUG_ON(bfd_buffered(&img->_x));
 	return img->_x.fd;
 }
@@ -93,7 +168,8 @@ extern int open_image_dir(char *dir);
 extern void close_image_dir(void);
 
 extern struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...);
-#define open_image(typ, flags, ...) open_image_at(get_service_fd(IMG_FD_OFF), typ, flags, ##__VA_ARGS__)
+#define open_image(typ, flags, ...) open_image_at(-1, typ, flags, ##__VA_ARGS__)
+extern int open_image_lazy(struct cr_img *img);
 extern struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi);
 extern struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi);
 extern void up_page_ids_base(void);
