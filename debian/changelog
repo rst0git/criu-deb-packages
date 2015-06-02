@@ -1,3 +1,14 @@
+criu (1.6-1) experimental; urgency=low
+
+  * Imported Upstream version 1.6
+  * Drop 0002-unused-function.patch patch
+  * Drop crit-install-prefix.patch patch
+  * Update copyright years for upstream files
+  * Add 0001-Fix-spelling-errors-in-documentation.patch patch
+  * Add 0002-Fix-spelling-error-in-usage-text.patch patch
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Tue, 02 Jun 2015 12:01:12 +0200
+
 criu (1.5.2-1) unstable; urgency=low
 
   * Imported Upstream version 1.5.2
