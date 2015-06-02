@@ -137,6 +137,8 @@ static int __sysctl_op(int dir, struct sysctl_req *req, int op)
 
 	fd = openat(dir, req->name, flags);
 	if (fd < 0) {
+		if (errno == ENOENT && (req->flags & CTL_FLAGS_OPTIONAL))
+			return 0;
 		pr_perror("Can't open sysctl %s", req->name);
 		return -1;
 	}
@@ -166,7 +168,7 @@ static int __sysctl_op(int dir, struct sysctl_req *req, int op)
 	return ret;
 }
 
-int sysctl_op(struct sysctl_req *req, int op)
+int sysctl_op(struct sysctl_req *req, size_t nr_req, int op)
 {
 	int ret = 0;
 	int dir = -1;
@@ -177,7 +179,7 @@ int sysctl_op(struct sysctl_req *req, int op)
 		return -1;
 	}
 
-	while (req->name) {
+	while (nr_req--) {
 		ret = __sysctl_op(dir, req, op);
 		if (ret < 0)
 			break;

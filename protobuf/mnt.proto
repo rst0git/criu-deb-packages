@@ -16,6 +16,8 @@ enum fstype {
 	CGROUP			= 12;
 	AUFS			= 13;
 	MQUEUE			= 14;
+	FUSE			= 15;
+	AUTO			= 16;
 };
 
 message mnt_entry {
@@ -35,4 +37,7 @@ message mnt_entry {
 
 	optional bool		with_plugin		= 12;
 	optional bool		ext_mount		= 13;
+
+	optional string		fsname			= 14;
+	optional bool		internal_sharing	= 15;
 }

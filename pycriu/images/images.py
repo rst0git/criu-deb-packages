@@ -4,6 +4,7 @@
 #
 # According to http://criu.org/Images, criu images can be described
 # with such IOW:
+#
 # IMAGE_FILE ::= MAGIC { ENTRY }
 # ENTRY      ::= SIZE PAYLOAD [ EXTRA ]
 # PAYLOAD    ::= "message encoded in ProtocolBuffer format"
@@ -11,6 +12,10 @@
 #
 # MAGIC      ::= "32 bit integer"
 # SIZE       ::= "32 bit integer, equals the PAYLOAD length"
+#
+# Images v1.1 NOTE: MAGIC now consist of 2 32 bit integers, first one is
+#	MAGIC_COMMON or MAGIC_SERVICE and the second one is same as MAGIC
+#	in images V1.0. We don't keep "first" magic in json images.
 #
 # In order to convert images to human-readable format, we use dict(json).
 # Using json not only allows us to easily read\write images, but also
@@ -44,6 +49,10 @@ import pb2dict
 
 import magic
 from pb import *
+
+class MagicException(Exception):
+	def __init__(self, magic):
+		self.magic = magic
 
 # Generic class to handle loading/dumping criu images entries from/to bin
 # format to/from dict(json).
@@ -274,7 +283,8 @@ handlers = {
 	'SK_QUEUES'		: entry_handler(sk_packet_entry, sk_queues_extra_handler()),
 	'IPCNS_SHM'		: entry_handler(ipc_shm_entry),
 	'IPCNS_SEM'		: entry_handler(ipc_sem_entry),
-	'IPCNS_MSG'		: entry_handler(ipc_msg_entry)
+	'IPCNS_MSG'		: entry_handler(ipc_msg_entry),
+	'NETNS'			: entry_handler(netns_entry)
 	}
 
 def load(f, pretty = False):
@@ -285,14 +295,16 @@ def load(f, pretty = False):
 	"""
 	image = {}
 
+	# Images v1.1 NOTE: First read "first" magic.
 	img_magic, = struct.unpack('i', f.read(4))
+
+	if img_magic in (magic.by_name['IMG_COMMON'], magic.by_name['IMG_SERVICE']):
+		img_magic, = struct.unpack('i', f.read(4))
 
 	try:
 		m = magic.by_val[img_magic]
 	except:
-		raise Exception("Unknown magic "+str(img_magic)+".\n"\
-				"Maybe you are feeding me an image with "\
-				"raw data(i.e. pages.img)?")
+		raise MagicException(img_magic)
 
 	try:
 		handler = handlers[m]
@@ -319,6 +331,14 @@ def dump(img, f):
 	"""
 	m = img['magic']
 	magic_val = magic.by_name[img['magic']]
+
+	# Images v1.1 NOTE: use "second" magic to identify what "first"
+	# should be written.
+	if m != 'INVENTORY':
+		if m in ('STATS', 'IRMAP_CACHE'):
+			f.write(struct.pack('i', magic.by_name['IMG_SERVICE']))
+		else:
+			f.write(struct.pack('i', magic.by_name['IMG_COMMON']))
 
 	f.write(struct.pack('i', magic_val))
 

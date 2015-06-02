@@ -191,17 +191,23 @@ generate_test_list()
 		transition/ipc
 		static/netns-nf
 		static/netns
+		ns/static/netns-dev
 		static/cgroup00
 		static/cgroup01
 		static/cgroup02
 		ns/static/clean_mntns
 		static/remap_dead_pid
+		static/poll
+		static/apparmor
+		ns/static/apparmor
 	"
 
 	TEST_CR_KERNEL="
 	"
 
 	TEST_MNTNS="
+		ns/static/mnt_ext_auto
+		ns/static/mnt_ext_master
 		ns/static/mntns_open
 		ns/static/mntns_link_remap
 		ns/static/mntns_link_ghost
@@ -264,6 +270,7 @@ generate_test_list()
 		ns/static/mntns_shared_bind
 		ns/static/mntns_shared_bind02
 		ns/static/mntns_root_bind
+		ns/static/cow01
 	"
 
 	# Add tests which can be executed in an user namespace
@@ -321,7 +328,11 @@ mntns_link_ghost
 mntns_shared_bind
 mntns_shared_bind02
 mntns_root_bind
+mntns_rw_ro_rw
+netns-dev
 sockets00
+cow01
+apparmor
 "
 
 CRIU_CPT=$CRIU
@@ -343,6 +354,7 @@ START_ONLY=0
 BATCH_TEST=0
 SPECIFIED_NAME_USED=0
 START_FROM="."
+RESTORE_SIBLING=""
 
 zdtm_sep()
 { (
@@ -439,9 +451,9 @@ construct_root()
 
 	local libs=$(ldd $test_path $ps_path | awk '
 		!/^[ \t]/ { next }
-		/\<linux-vdso\.so\>/ { next }
-		/\<linux-gate\.so\>/ { next }
-		/\<not a dynamic executable$/ { next }
+		/linux-vdso\.so/ { next }
+		/linux-gate\.so/ { next }
+		/not a dynamic executable$/ { next }
 		$2 ~ /^=>$/ { print $3; next }
 		{ print $1 }
 	')
@@ -475,6 +487,9 @@ construct_root()
 			[ -f $tname ] && unlink $tname
 		done
 	done
+
+	mkdir $root/dev
+	mknod -m 0666 $root/dev/tty c 5 0
 
 	# make 'tmp' dir under new root
 	mkdir -p $tmpdir
@@ -548,6 +563,12 @@ start_test()
 	if ! kill -0 $PID ; then
 		echo "Test failed to start"
 		return 1
+	fi
+
+	if [ -n "$ZDTM_ROOT" ]; then
+		mount --make-private "$ZDTM_ROOT"
+		umount -l "$ZDTM_ROOT"
+		mount --make-private --bind . $ZDTM_ROOT || return 1
 	fi
 }
 
@@ -630,7 +651,13 @@ run_test()
 	local gen_args=$*
 	local tname=`basename $test`
 	local tdir=`dirname $test`
+	local rst_args=
 	DUMP_PATH=""
+
+	if [ -f "$test".checkskip ] && ! "$test".checkskip; then
+		echo "Skip $test"
+		return 0
+	fi
 
 	if [ $COMPILE_ONLY -eq 1 ]; then
 		echo "Compile $test"
@@ -672,6 +699,10 @@ EOF
 	if [ -n "$AUTO_DEDUP" ]; then
 		gen_args="$gen_args --auto-dedup"
 		ps_args="--auto-dedup"
+	fi
+
+	if [ -n "$RESTORE_SIBLING" ]; then
+		rst_args="$rst_args --restore-sibling"
 	fi
 
 	if echo $tname | fgrep -q 'irmap'; then
@@ -781,7 +812,7 @@ EOF
 			rm -f $TPID || true
 
 			echo Restore
-			setsid $CRIU restore -D $ddump -o restore.log -v4 -d $gen_args || return 2
+			setsid $CRIU restore -D $ddump -o restore.log -v4 -d $gen_args $rst_args || return 2
 			cat $ddump/restore.log* | grep Error
 
 			[ -n "$PIDNS" ] && PID=`cat $TPID`
@@ -1050,6 +1081,10 @@ while :; do
 			./zdtm_ct ./zdtm.sh "$@"
 			exit
 		}
+		shift
+		;;
+	  --restore-sibling)
+		RESTORE_SIBLING=1
 		shift
 		;;
 	  -*)

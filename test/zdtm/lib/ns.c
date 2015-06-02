@@ -36,7 +36,7 @@ static int prepare_mntns()
 		 * under them. So we need to create another mount for the
 		 * new root.
 		 */
-		if (mount("/", "/", NULL, MS_PRIVATE | MS_REC, NULL)) {
+		if (mount(root, root, NULL, MS_SLAVE , NULL)) {
 			fprintf(stderr, "Can't bind-mount root: %m\n");
 			return -1;
 		}
@@ -69,6 +69,11 @@ static int prepare_mntns()
 
 		if (pivot_root(".", "./old")) {
 			fprintf(stderr, "pivot_root(., ./old) failed: %m\n");
+			return -1;
+		}
+
+		if (mount("./old", "./old", NULL, MS_PRIVATE | MS_REC , NULL)) {
+			fprintf(stderr, "Can't bind-mount root: %m\n");
 			return -1;
 		}
 
@@ -119,6 +124,14 @@ static int prepare_mntns()
 				chmod("/dev/ptmx", 0666);
 			} else if (errno != EEXIST) {
 				fprintf(stderr, "mknod(/dev/ptmx) failed: %m\n");
+				return -1;
+			}
+		}
+		if (access("/dev/tty", F_OK)) {
+			if (mknod("/dev/tty", 0666 | S_IFCHR, makedev(5, 0)) == 0) {
+				chmod("/dev/tty", 0666);
+			} else if (errno != EEXIST) {
+				fprintf(stderr, "mknod(/dev/tty) failed: %m\n");
 				return -1;
 			}
 		}

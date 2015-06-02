@@ -74,48 +74,13 @@
 #include "action-scripts.h"
 #include "aio.h"
 #include "security.h"
+#include "lsm.h"
 
 #include "asm/dump.h"
 
 #define NR_ATTEMPTS 5
 
 static char loc_buf[PAGE_SIZE];
-
-bool privately_dump_vma(struct vma_area *vma)
-{
-	/*
-	 * The special areas are not dumped.
-	 */
-	if (!(vma->e->status & VMA_AREA_REGULAR))
-		return false;
-
-	/* No dumps for file-shared mappings */
-	if (vma->e->status & VMA_FILE_SHARED)
-		return false;
-
-	/* No dumps for SYSV IPC mappings */
-	if (vma->e->status & VMA_AREA_SYSVIPC)
-		return false;
-
-#ifdef CONFIG_VDSO
-	/* No dumps for vDSO VVAR data */
-	if (vma->e->status & VMA_AREA_VVAR)
-		return false;
-#endif
-	if (vma_area_is(vma, VMA_ANON_SHARED))
-		return false;
-
-	if (!vma_area_is(vma, VMA_ANON_PRIVATE) &&
-			!vma_area_is(vma, VMA_FILE_PRIVATE)) {
-		pr_warn("Unexpected VMA area found\n");
-		return false;
-	}
-
-	if (vma->e->end > TASK_SIZE)
-		return false;
-
-	return true;
-}
 
 static void close_vma_file(struct vma_area *vma)
 {
@@ -519,6 +484,9 @@ static int dump_task_creds(struct parasite_ctl *ctl,
 	pr_info("----------------------------------------\n");
 
 	if (parasite_dump_creds(ctl, &ce) < 0)
+		return -1;
+
+	if (collect_lsm_profile(ctl->pid.real, &ce) < 0)
 		return -1;
 
 	return pb_write_one(img_from_set(fds, CR_FD_CREDS), &ce, PB_CREDS);

@@ -1,6 +1,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -17,6 +18,7 @@
 #include "asm/types.h"
 #include "cr_options.h"
 #include "util.h"
+#include "lsm.h"
 
 struct kerndat_s kdat = {
 	.tcp_max_rshare = 3U << 20,
@@ -42,7 +44,7 @@ static int kerndat_get_shmemdev(void)
 	}
 
 	sprintf(maps, "/proc/self/map_files/%lx-%lx",
-			(unsigned long)map, (unsigned long)map + PAGE_SIZE);
+			(unsigned long)map, (unsigned long)map + page_size());
 	if (stat(maps, &buf) < 0) {
 		munmap(map, PAGE_SIZE);
 		pr_perror("Can't stat self map_files");
@@ -197,14 +199,13 @@ static int tcp_read_sysctl_limits(void)
 
 	struct sysctl_req req[] = {
 		{ "net/ipv4/tcp_rmem", &vect[1], CTL_U32A(ARRAY_SIZE(vect[1])) },
-		{ },
 	};
 
 	/*
 	 * Lets figure out which exactly amount of memory is
 	 * availabe for send/read queues on restore.
 	 */
-	ret = sysctl_op(req, CTL_READ);
+	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_READ);
 	if (ret) {
 		pr_warn("TCP mem sysctls are not available. Using defaults.\n");
 		goto out;
@@ -249,10 +250,9 @@ static int get_last_cap(void)
 {
 	struct sysctl_req req[] = {
 		{ "kernel/cap_last_cap", &kdat.last_cap, CTL_U32 },
-		{ },
 	};
 
-	return sysctl_op(req, CTL_READ);
+	return sysctl_op(req, ARRAY_SIZE(req), CTL_READ);
 }
 
 static bool kerndat_has_memfd_create(void)
@@ -273,6 +273,43 @@ static bool kerndat_has_memfd_create(void)
 	return 0;
 }
 
+int kerndat_fdinfo_has_lock()
+{
+	int fd, pfd = -1, exit_code = -1, len;
+	char buf[PAGE_SIZE];
+
+	fd = open("/proc/locks", O_RDONLY);
+	if (fd < 0) {
+		pr_perror("Unable to open /proc/locks");
+		return -1;
+	}
+
+	if (flock(fd, LOCK_SH)) {
+		pr_perror("Can't take a lock");
+		goto out;
+	}
+
+	pfd = open_proc(PROC_SELF, "fdinfo/%d", fd);
+	if (pfd < 0)
+		goto out;
+
+	len = read(pfd, buf, sizeof(buf) - 1);
+	if (len < 0) {
+		pr_perror("Unable to read");
+		goto out;
+	}
+	buf[len] = 0;
+
+	kdat.has_fdinfo_lock = (strstr(buf, "lock:") != NULL);
+
+	exit_code = 0;
+out:
+	close(pfd);
+	close(fd);
+
+	return exit_code;
+}
+
 int kerndat_init(void)
 {
 	int ret;
@@ -284,6 +321,10 @@ int kerndat_init(void)
 		ret = init_zero_page_pfn();
 	if (!ret)
 		ret = get_last_cap();
+	if (!ret)
+		ret = kerndat_fdinfo_has_lock();
+
+	kerndat_lsm();
 
 	return ret;
 }
@@ -303,6 +344,8 @@ int kerndat_init_rst(void)
 		ret = get_last_cap();
 	if (!ret)
 		ret = kerndat_has_memfd_create();
+
+	kerndat_lsm();
 
 	return ret;
 }

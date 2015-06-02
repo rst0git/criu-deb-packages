@@ -501,7 +501,7 @@ static int parasite_init_daemon(struct parasite_ctl *ctl, struct ns_id *net)
 	args->log_level = log_get_loglevel();
 
 	if (prepare_tsock(ctl, pid, args, net))
-		goto err;;
+		goto err;
 
 	/* after this we can catch parasite errors in chld handler */
 	if (setup_child_handler())
@@ -1129,7 +1129,7 @@ int parasite_map_exchange(struct parasite_ctl *ctl, unsigned long size)
 		return -1;
 	}
 
-	ctl->map_length = round_up(size, PAGE_SIZE);
+	ctl->map_length = round_up(size, page_size());
 
 	fd = open_proc_rw(ctl->pid.real, "map_files/%p-%p",
 		 ctl->remote_map, ctl->remote_map + ctl->map_length);
@@ -1175,7 +1175,7 @@ static int parasite_start_daemon(struct parasite_ctl *ctl, struct pstree_item *i
 		return -1;
 
 	if (parasite_init_daemon(ctl, dmpi(item)->netns))
-		return -1;;
+		return -1;
 
 	return 0;
 }
@@ -1271,7 +1271,7 @@ int ptrace_stop_pie(pid_t pid, void *addr, enum trace_flags *tf)
 	 */
 	ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
 	if (ret) {
-		pr_perror("ptrace");
+		pr_perror("Unable to restart the %d process", pid);
 		return -1;
 	}
 

@@ -23,26 +23,27 @@ function start_server {
 function stop_server {
 	title_print "Shutdown service server"
 	kill -SIGTERM $(cat build/pidfile)
+	unlink build/pidfile
 }
 
 function test_c {
 	mkdir -p build/imgs_c
 
 	title_print "Run test-c"
-	./test-c build/criu_service.socket build/imgs_c
+	setsid ./test-c build/criu_service.socket build/imgs_c < /dev/null &>> build/output_c
 
 	title_print "Restore test-c"
-	${CRIU} restore -v4 -o restore-c.log -D build/imgs_c --shell-job
+	${CRIU} restore -v4 -o restore-c.log -D build/imgs_c
 }
 
 function test_py {
 	mkdir -p build/imgs_py
 
 	title_print "Run test-py"
-	./test.py build/criu_service.socket build/imgs_py
+	setsid ./test.py build/criu_service.socket build/imgs_py < /dev/null &>> build/output_py
 
 	title_print "Restore test-py"
-	${CRIU} restore -v4 -o restore-py.log -D build/imgs_py --shell-job
+	${CRIU} restore -v4 -o restore-py.log -D build/imgs_py
 }
 
 function test_restore_loop {
@@ -65,14 +66,14 @@ function test_ps {
 	mkdir -p build/imgs_ps
 
 	title_print "Run ps_test"
-	./ps_test.py build/criu_service.socket build/imgs_ps
+	setsid ./ps_test.py build/criu_service.socket build/imgs_ps < /dev/null &>> build/output_ps
 }
 
 function test_errno {
 	mkdir -p build/imgs_errno
 
 	title_print "Run cr_errno test"
-	./errno.py build/criu_service.socket build/imgs_errno
+	setsid ./errno.py build/criu_service.socket build/imgs_errno < /dev/null &>> build/output_errno
 }
 
 trap 'echo "FAIL"; stop_server' EXIT

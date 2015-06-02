@@ -48,10 +48,15 @@ void criu_set_log_file(char *log_file);
 void criu_set_cpu_cap(unsigned int cap);
 void criu_set_root(char *root);
 void criu_set_manage_cgroups(bool manage);
+void criu_set_auto_ext_mnt(bool val);
+void criu_set_ext_sharing(bool val);
+void criu_set_ext_masters(bool val);
 int criu_set_exec_cmd(int argc, char *argv[]);
 int criu_add_ext_mount(char *key, char *val);
 int criu_add_veth_pair(char *in, char *out);
 int criu_add_cg_root(char *ctrl, char *path);
+int criu_add_enable_fs(char *fs);
+int criu_add_skip_mnt(char *mnt);
 
 /*
  * The criu_notify_arg_t na argument is an opaque

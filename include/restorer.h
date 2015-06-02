@@ -154,6 +154,10 @@ struct task_restore_args {
 	pid_t				*helpers /* the TASK_HELPERS to wait on at the end of restore */;
 	int				n_helpers;
 
+	int				proc_attr_current;
+	char				*lsm_profile;
+	int				lsm_profile_len;
+
 #ifdef CONFIG_VDSO
 	unsigned long			vdso_rt_size;
 	struct vdso_symtable		vdso_sym_rt;		/* runtime vdso symbols */
@@ -195,10 +199,8 @@ enum {
 
 
 /* the restorer_blob_offset__ prefix is added by gen_offsets.sh */
-#define restorer_sym(rblob, name)	((void *)(rblob) + restorer_blob_offset__##name)
-
-#define vma_priv(vma) ((vma_entry_is(vma, VMA_AREA_REGULAR)) &&	\
-			(vma_entry_is(vma, VMA_ANON_PRIVATE) || \
-			vma_entry_is(vma, VMA_FILE_PRIVATE)))
+#define __blob_offset(name)	restorer_blob_offset__ ## name
+#define _blob_offset(name)	__blob_offset(name)
+#define restorer_sym(rblob, name)	(void*)(rblob + _blob_offset(name))
 
 #endif /* __CR_RESTORER_H__ */

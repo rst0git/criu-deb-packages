@@ -33,7 +33,7 @@ const char code_syscall[] = {
 
 const int code_syscall_size = round_up(sizeof(code_syscall), sizeof(long));
 
-static inline void __check_code_syscall(void)
+static inline __always_unused void __check_code_syscall(void)
 {
 	BUILD_BUG_ON(sizeof(code_syscall) != BUILTIN_SYSCALL_SIZE);
 	BUILD_BUG_ON(!is_log2(sizeof(code_syscall)));
@@ -129,8 +129,8 @@ int get_task_regs(pid_t pid, user_regs_struct_t regs, CoreEntry *core)
 			regs.ip -= 2;
 			break;
 		case -ERESTART_RESTARTBLOCK:
-			regs.ax = __NR_restart_syscall;
-			regs.ip -= 2;
+			pr_warn("Will restore %d with interrupted system call\n", pid);
+			regs.ax = -EINTR;
 			break;
 		}
 	}
@@ -361,9 +361,9 @@ static void show_rt_xsave_frame(struct xsave_struct *x)
 		 (int)i387->fop, (int)i387->mxcsr, (int)i387->mxcsr_mask);
 
 	pr_debug("magic1:%x extended_size:%x xstate_bv:%lx xstate_size:%x\n",
-		 fpx->magic1, fpx->extended_size, fpx->xstate_bv, fpx->xstate_size);
+		 fpx->magic1, fpx->extended_size, (long)fpx->xstate_bv, fpx->xstate_size);
 
-	pr_debug("xstate_bv: %lx\n", xsave_hdr->xstate_bv);
+	pr_debug("xstate_bv: %lx\n", (long)xsave_hdr->xstate_bv);
 
 	pr_debug("-----------------------\n");
 }
@@ -445,8 +445,15 @@ void *mmap_seized(struct parasite_ctl *ctl,
 
 	err = syscall_seized(ctl, __NR_mmap, &map,
 			(unsigned long)addr, length, prot, flags, fd, offset);
-	if (err < 0 || map > TASK_SIZE)
-		map = 0;
+	if (err < 0)
+		return NULL;
+
+	if (IS_ERR_VALUE(map)) {
+		if (map == -EACCES && (prot & PROT_WRITE) && (prot & PROT_EXEC))
+			pr_warn("mmap(PROT_WRITE | PROT_EXEC) failed for %d, "
+				"check selinux execmem policy\n", ctl->pid.real);
+		return NULL;
+	}
 
 	return (void *)map;
 }
@@ -520,7 +527,7 @@ int ptrace_set_breakpoint(pid_t pid, void *addr)
 	if (ptrace(PTRACE_POKEUSER, pid,
 			offsetof(struct user, u_debugreg[DR_FIRSTADDR]),
 			addr)) {
-		pr_err("Unable to setup a breakpoint\n");
+		pr_perror("Unable to setup a breakpoint into %d", pid);
 		return -1;
 	}
 
@@ -528,13 +535,13 @@ int ptrace_set_breakpoint(pid_t pid, void *addr)
 	if (ptrace(PTRACE_POKEUSER, pid,
 			offsetof(struct user, u_debugreg[DR_CONTROL]),
 			X86_DR_LOCAL_ENABLE(DR_FIRSTADDR))) {
-		pr_err("Unable to enable the breakpoint\n");
+		pr_perror("Unable to enable the breakpoint for %d", pid);
 		return -1;
 	}
 
 	ret = ptrace(PTRACE_CONT, pid, NULL, NULL);
 	if (ret) {
-		pr_perror("Unable to restart  the  stopped tracee process");
+		pr_perror("Unable to restart the  stopped tracee process %d", pid);
 		return -1;
 	}
 
@@ -547,7 +554,7 @@ int ptrace_flush_breakpoints(pid_t pid)
 	if (ptrace(PTRACE_POKEUSER, pid,
 			offsetof(struct user, u_debugreg[DR_CONTROL]),
 			0)) {
-		pr_err("Unable to disable the breakpoint\n");
+		pr_perror("Unable to disable the breakpoint for %d", pid);
 		return -1;
 	}
 

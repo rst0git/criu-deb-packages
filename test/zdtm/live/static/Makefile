@@ -46,6 +46,7 @@ TST_NOFILE	=				\
 		pipe02				\
 		pthread00			\
 		pthread01			\
+		pthread02			\
 		vdso00				\
 		vdso01				\
 		utsname				\
@@ -92,8 +93,10 @@ TST_NOFILE	=				\
 		tty00				\
 		tty02				\
 		tty03				\
+		poll				\
 		mountpoints			\
 		netns				\
+		netns-dev			\
 		session01			\
 		session02			\
 		session03			\
@@ -113,11 +116,13 @@ TST_NOFILE	=				\
 		stopped				\
 		rtc				\
 		clean_mntns			\
+		mntns_rw_ro_rw			\
 		dumpable01			\
 		dumpable02			\
 		remap_dead_pid			\
 		aio00				\
 		fd				\
+		apparmor				\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -183,6 +188,8 @@ TST_DIR		=				\
 		mntns_shared_bind		\
 		mntns_shared_bind02		\
 		mntns_root_bind			\
+		mnt_ext_auto			\
+		mnt_ext_master			\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -220,7 +227,7 @@ install: all
 .PHONY: all install
 
 inotify_system_nodel.c: inotify_system.c
-	ln -s inotify_system.c inotify_system_nodel.c
+	ln -sf inotify_system.c inotify_system_nodel.c
 
 $(TST_NOFILE:%=%.pid):	%.pid:	%
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out
@@ -288,6 +295,7 @@ unlink_largefile:	override CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURC
 inotify_system_nodel:	override CFLAGS += -DNODEL
 pthread00:		override LDLIBS += -pthread
 pthread01:		override LDLIBS += -pthread
+pthread02:		override LDLIBS += -pthread
 sigpending:		override LDLIBS += -pthread
 sigaltstack:		override LDLIBS += -pthread
 shm:			override CFLAGS += -DNEW_IPC_NS

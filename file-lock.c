@@ -10,6 +10,7 @@
 #include "imgset.h"
 #include "files.h"
 #include "fs-magic.h"
+#include "kerndat.h"
 #include "image.h"
 #include "mount.h"
 #include "proc_parse.h"
@@ -40,7 +41,6 @@ struct collect_image_info file_locks_cinfo = {
 	.pb_type = PB_FILE_LOCK,
 	.priv_size = sizeof(struct file_lock_rst),
 	.collect = collect_one_file_lock,
-	.flags = COLLECT_OPTIONAL,
 };
 
 struct file_lock *alloc_file_lock(void)
@@ -210,6 +210,9 @@ int note_file_lock(struct pid *pid, int fd, int lfd, struct fd_parms *p)
 	struct file_lock *fl;
 	int ret;
 
+	if (kdat.has_fdinfo_lock)
+		return 0;
+
 	list_for_each_entry(fl, &file_lock_list, list) {
 		ret = lock_file_match(pid->real, fd, fl, p);
 		if (ret < 0)
@@ -342,13 +345,9 @@ static int restore_file_locks_legacy(int pid)
 	struct cr_img *img;
 	FileLockEntry *fle;
 
-	img = open_image(CR_FD_FILE_LOCKS_PID, O_RSTR | O_OPT, pid);
-	if (!img) {
-		if (errno == ENOENT)
-			return 0;
-		else
-			return -1;
-	}
+	img = open_image(CR_FD_FILE_LOCKS_PID, O_RSTR, pid);
+	if (!img)
+		return -1;
 
 	while (1) {
 		ret = pb_read_one_eof(img, &fle, PB_FILE_LOCK);

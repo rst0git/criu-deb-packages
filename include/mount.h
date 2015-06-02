@@ -13,9 +13,10 @@ struct proc_mountinfo;
 
 extern int open_mount(unsigned int s_dev);
 extern struct fstype *find_fstype_by_name(char *fst);
+extern bool add_fsname_auto(const char *names);
 
 struct cr_imgset;
-extern struct mount_info * collect_mntinfo(struct ns_id *ns);
+extern struct mount_info * collect_mntinfo(struct ns_id *ns, bool for_dump);
 extern int prepare_mnt_ns(void);
 
 extern int pivot_root(const char *new_root, const char *put_old);

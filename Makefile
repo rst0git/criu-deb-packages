@@ -1,6 +1,6 @@
 VERSION_MAJOR		:= 1
-VERSION_MINOR		:= 5
-VERSION_SUBLEVEL	:= 2
+VERSION_MINOR		:= 6
+VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
 VERSION_SO_MAJOR	:= 1
@@ -43,7 +43,6 @@ ARCH ?= $(shell uname -m | sed		\
 		-e s/sun4u/sparc64/	\
 		-e s/s390x/s390/	\
 		-e s/parisc64/parisc/	\
-		-e s/ppc.*/powerpc/	\
 		-e s/mips.*/mips/	\
 		-e s/sh[234].*/sh/)
 
@@ -51,6 +50,8 @@ ifeq ($(ARCH),i386)
 	SRCARCH      := x86-32
 	DEFINES      := -DCONFIG_X86_32
 	VDSO         := y
+	PROTOUFIX    := y
+	export PROTOUFIX
 endif
 ifeq ($(ARCH),x86_64)
 	SRCARCH      := x86
@@ -78,11 +79,32 @@ ifeq ($(ARCH),aarch64)
 	VDSO         := y
 endif
 
+ifeq ($(SRCARCH),arm)
+	PROTOUFIX    := y
+	export PROTOUFIX
+endif
+
+#
+# The PowerPC 64 bits architecture could be big or little endian.
+# They are handled in the same way.
+#
+ifeq ($(shell echo $(ARCH) | sed -e 's/ppc64.*/ppc64/'),ppc64)
+	ifeq ($(ARCH),ppc64)
+		error	:= $(error ppc64 big endian not yet supported)
+	endif
+	SRCARCH	:= ppc64
+	DEFINES := -DCONFIG_PPC64
+	LDARCH	:= powerpc:common64
+	VDSO	:= y
+endif
+
 SRCARCH		?= $(ARCH)
 LDARCH		?= $(SRCARCH)
 
 SRC_DIR		?= $(CURDIR)
 ARCH_DIR	:= arch/$(SRCARCH)
+
+export ARCH SRCARCH
 
 $(if $(wildcard $(ARCH_DIR)),,$(error "The architecture $(ARCH) isn't supported"))
 
@@ -184,6 +206,9 @@ PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-pie.o
 ifeq ($(SRCARCH),aarch64)
 PROGRAM-BUILTINS	+= $(ARCH_DIR)/intraprocedure.o
 endif
+ifeq ($(SRCARCH),ppc64)
+PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-trampoline.o
+endif
 endif
 
 PROGRAM-BUILTINS	+= pie/util-fd.o
@@ -242,11 +267,11 @@ distclean: clean
 tags:
 	$(E) "  GEN     " $@
 	$(Q) $(RM) tags
-	$(Q) $(FIND) . -name '*.[hcS]' ! -path './.*' -print | xargs ctags -a
+	$(Q) $(FIND) . -name '*.[hcS]' ! -path './.*' ! -path './test/*' -print | xargs ctags -a
 
 cscope:
 	$(E) "  GEN     " $@
-	$(Q) $(FIND) . -name '*.[hcS]' ! -path './.*' -print > cscope.files
+	$(Q) $(FIND) . -name '*.[hcS]' ! -path './.*' ! -path './test/*' ! -type l -print > cscope.files
 	$(Q) $(CSCOPE) -bkqu
 
 docs:
@@ -289,7 +314,7 @@ install-man:
 
 install-crit: crit
 	$(E) "  INSTALL crit"
-	$(Q) python scripts/crit-setup.py install --prefix=$(DESTDIR)
+	$(Q) python scripts/crit-setup.py install --prefix=$(DESTDIR)$(PREFIX)
 
 .PHONY: install install-man install-crit
 
@@ -319,4 +344,13 @@ gcov:
 	genhtml -o html crtools.info
 .PHONY: gcov
 
+docker-build:
+	docker build -t criu .
+
+docker-test:
+	docker run --rm -it --privileged criu ./test/zdtm.sh -C -x tcp6 -x tcpbuf6 -x static/rtc -x cgroup -x mountpoint
+
 .DEFAULT_GOAL	:= all
+
+# include optional local rules
+-include Makefile.local

@@ -74,6 +74,7 @@
 #include "action-scripts.h"
 #include "aio.h"
 #include "security.h"
+#include "lsm.h"
 
 #include "parasite-syscall.h"
 
@@ -89,6 +90,18 @@
 #include "asm/atomic.h"
 
 #include "cr-errno.h"
+
+#ifndef arch_export_restore_thread
+#define arch_export_restore_thread	__export_restore_thread
+#endif
+
+#ifndef arch_export_restore_task
+#define arch_export_restore_task	__export_restore_task
+#endif
+
+#ifndef arch_export_unmap
+#define arch_export_unmap		__export_unmap
+#endif
 
 static struct pstree_item *current;
 
@@ -252,7 +265,7 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
 		if (p->e->start > vma->e->start)
 			 break;
 
-		if (!vma_priv(p->e))
+		if (!vma_area_is_private(p))
 			continue;
 
 		 if (p->e->end != vma->e->end ||
@@ -337,6 +350,44 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
 	return 0;
 }
 
+static int premap_priv_vmas(pid_t pid, struct vm_area_list *vmas, void *at)
+{
+	struct list_head *parent_vmas;
+	struct vma_area *pvma, *vma;
+	unsigned long pstart = 0;
+	int ret = 0;
+	LIST_HEAD(empty);
+
+	/*
+	 * Keep parent vmas at hands to check whether we can "inherit" them.
+	 * See comments in map_private_vma.
+	 */
+	if (current->parent)
+		parent_vmas = &rsti(current->parent)->vmas.h;
+	else
+		parent_vmas = &empty;
+
+	pvma = list_first_entry(parent_vmas, struct vma_area, list);
+
+	list_for_each_entry(vma, &vmas->h, list) {
+		if (pstart > vma->e->start) {
+			ret = -1;
+			pr_err("VMA-s are not sorted in the image file\n");
+			break;
+		}
+		pstart = vma->e->start;
+
+		if (!vma_area_is_private(vma))
+			continue;
+
+		ret = map_private_vma(pid, vma, &at, &pvma, parent_vmas);
+		if (ret < 0)
+			break;
+	}
+
+	return ret;
+}
+
 static int restore_priv_vma_content(pid_t pid)
 {
 	struct vma_area *vma;
@@ -352,16 +403,15 @@ static int restore_priv_vma_content(pid_t pid)
 
 	vma = list_first_entry(vmas, struct vma_area, list);
 
-	ret = open_page_read(pid, &pr,
-			opts.auto_dedup ? O_RDWR : O_RSTR, false);
-	if (ret)
+	ret = open_page_read(pid, &pr, PR_TASK);
+	if (ret <= 0)
 		return -1;
 
 	/*
 	 * Read page contents.
 	 */
 	while (1) {
-		unsigned long off, i, nr_pages;;
+		unsigned long off, i, nr_pages;
 		struct iovec iov;
 
 		ret = pr.get_pagemap(&pr, &iov);
@@ -393,7 +443,7 @@ static int restore_priv_vma_content(pid_t pid)
 			 */
 			if (va < vma->e->start)
 				goto err_addr;
-			else if (unlikely(!vma_priv(vma->e))) {
+			else if (unlikely(!vma_area_is_private(vma))) {
 				pr_err("Trying to restore page for non-private VMA\n");
 				goto err_addr;
 			}
@@ -484,33 +534,22 @@ err_addr:
 static int prepare_mappings(int pid)
 {
 	int ret = 0;
-	struct vma_area *pvma, *vma;
 	void *addr;
 	struct vm_area_list *vmas;
-	struct list_head *parent_vmas = NULL;
-	LIST_HEAD(empty);
 
 	void *old_premmapped_addr = NULL;
-	unsigned long old_premmapped_len, pstart = 0;
+	unsigned long old_premmapped_len;
 
 	vmas = &rsti(current)->vmas;
 	if (vmas->nr == 0) /* Zombie */
 		goto out;
 
-	/*
-	 * Keep parent vmas at hands to check whether we can "inherit" them.
-	 * See comments in map_private_vma.
-	 */
-	if (current->parent)
-		parent_vmas = &rsti(current->parent)->vmas.h;
-	else
-		parent_vmas = &empty;
-
 	/* Reserve a place for mapping private vma-s one by one */
 	addr = mmap(NULL, vmas->priv_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	if (addr == MAP_FAILED) {
+		ret = -1;
 		pr_perror("Unable to reserve memory (%lu bytes)", vmas->priv_size);
-		return -1;
+		goto out;
 	}
 
 	old_premmapped_addr = rsti(current)->premmapped_addr;
@@ -518,36 +557,22 @@ static int prepare_mappings(int pid)
 	rsti(current)->premmapped_addr = addr;
 	rsti(current)->premmapped_len = vmas->priv_size;
 
-	pvma = list_first_entry(parent_vmas, struct vma_area, list);
+	ret = premap_priv_vmas(pid, vmas, addr);
+	if (ret < 0)
+		goto out;
 
-	list_for_each_entry(vma, &vmas->h, list) {
-		if (pstart > vma->e->start) {
-			ret = -1;
-			pr_err("VMA-s are not sorted in the image file\n");
-			break;
-		}
-		pstart = vma->e->start;
+	ret = restore_priv_vma_content(pid);
+	if (ret < 0)
+		goto out;
 
-		if (!vma_priv(vma->e))
-			continue;
-
-		ret = map_private_vma(pid, vma, &addr, &pvma, parent_vmas);
+	if (old_premmapped_addr) {
+		ret = munmap(old_premmapped_addr, old_premmapped_len);
 		if (ret < 0)
-			break;
+			pr_perror("Unable to unmap %p(%lx)",
+					old_premmapped_addr, old_premmapped_len);
 	}
-
-	if (ret >= 0)
-		ret = restore_priv_vma_content(pid);
 
 out:
-	if (old_premmapped_addr &&
-	    munmap(old_premmapped_addr, old_premmapped_len)) {
-		pr_perror("Unable to unmap %p(%lx)",
-				old_premmapped_addr, old_premmapped_len);
-		return -1;
-	}
-
-
 	return ret;
 }
 
@@ -561,7 +586,7 @@ static int unmap_guard_pages()
 	struct list_head *vmas = &rsti(current)->vmas.h;
 
 	list_for_each_entry(vma, vmas, list) {
-		if (!vma_priv(vma->e))
+		if (!vma_area_is_private(vma))
 			continue;
 
 		if (vma->e->flags & MAP_GROWSDOWN) {
@@ -1111,8 +1136,11 @@ static inline int fork_with_pid(struct pstree_item *item)
 	}
 
 
-	if (item == root_item)
+	if (item == root_item) {
 		item->pid.real = ret;
+		pr_debug("PID: real %d virt %d\n",
+				item->pid.real, item->pid.virt);
+	}
 
 	if (opts.pidfile && root_item == item) {
 		int pid;
@@ -1594,13 +1622,13 @@ static int attach_to_tasks(bool root_seized, enum trace_flags *flag)
 				 * and SYSCALL below work.
 				 */
 				if (ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
-					pr_perror("Can't interrupt task");
+					pr_perror("Can't interrupt the %d task", pid);
 					return -1;
 				}
 			}
 
 			if (wait4(pid, &status, __WALL, NULL) != pid) {
-				pr_perror("waitpid() failed");
+				pr_perror("waitpid(%d) failed", pid);
 				return -1;
 			}
 
@@ -1810,7 +1838,7 @@ static int restore_root_task(struct pstree_item *init)
 
 	/*
 	 * -------------------------------------------------------------
-	 * Below this line nothing can fail, because network is unlocked
+	 * Below this line nothing should fail, because network is unlocked
 	 */
 
 	ret = restore_switch_stage(CR_STATE_RESTORE_CREDS);
@@ -2159,12 +2187,8 @@ static int prepare_posix_timers_from_fd(int pid)
 	struct restore_posix_timer *t;
 
 	img = open_image(CR_FD_POSIX_TIMERS, O_RSTR, pid);
-	if (!img) {
-		if (errno == ENOENT) /* backward compatibility */
-			return 0;
-		else
-			return -1;
-	}
+	if (!img)
+		return -1;
 
 	while (1) {
 		PosixTimerEntry *pte;
@@ -2225,7 +2249,7 @@ static inline int verify_cap_size(CredsEntry *ce)
 		(ce->n_cap_prm == CR_CAP_SIZE) && (ce->n_cap_bnd == CR_CAP_SIZE));
 }
 
-static int prepare_creds(int pid, struct task_restore_args *args)
+static int prepare_creds(int pid, struct task_restore_args *args, char **lsm_profile)
 {
 	int ret;
 	struct cr_img *img;
@@ -2270,6 +2294,17 @@ static int prepare_creds(int pid, struct task_restore_args *args)
 	if (setgroups(ce->n_groups, ce->groups) < 0) {
 		pr_perror("Can't set supplementary groups");
 		return -1;
+	}
+
+	*lsm_profile = NULL;
+
+	if (ce->lsm_profile) {
+		if (validate_lsm(ce) < 0)
+			return -1;
+
+		*lsm_profile = xstrdup(ce->lsm_profile);
+		if (!*lsm_profile)
+			return -1;
 	}
 
 	creds_entry__free_unpacked(ce, NULL);
@@ -2408,15 +2443,9 @@ static int prepare_rlimits_from_fd(int pid)
 	/*
 	 * Old image -- read from the file.
 	 */
-	img = open_image(CR_FD_RLIMIT, O_RSTR | O_OPT, pid);
-	if (!img) {
-		if (errno == ENOENT) {
-			pr_info("Skip rlimits for %d\n", pid);
-			return 0;
-		}
-
+	img = open_image(CR_FD_RLIMIT, O_RSTR, pid);
+	if (!img)
 		return -1;
-	}
 
 	while (1) {
 		RlimitEntry *re;
@@ -2500,13 +2529,9 @@ static int open_signal_image(int type, pid_t pid, unsigned int *nr)
 	int ret;
 	struct cr_img *img;
 
-	img = open_image(type, O_RSTR | O_OPT, pid);
-	if (!img) {
-		if (errno == ENOENT) /* backward compatibility */
-			return 0;
-		else
-			return -1;
-	}
+	img = open_image(type, O_RSTR, pid);
+	if (!img)
+		return -1;
 
 	*nr = 0;
 	while (1) {
@@ -2618,6 +2643,10 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	unsigned long aio_rings;
 	MmEntry *mm = rsti(current)->mm;
 
+	char *lsm = NULL;
+	int lsm_profile_len = 0;
+	unsigned long lsm_pos = 0;
+
 	struct vm_area_list self_vmas;
 	struct vm_area_list *vmas = &rsti(current)->vmas;
 	int i;
@@ -2648,7 +2677,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 		*vme = *vma->e;
 
-		if (vma_priv(vma->e))
+		if (vma_area_is_private(vma))
 			vma_premmaped_start(vme) = vma->premmaped_addr;
 	}
 
@@ -2749,9 +2778,9 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	 * Prepare a memory map for restorer. Note a thread space
 	 * might be completely unused so it's here just for convenience.
 	 */
-	restore_thread_exec_start	= restorer_sym(exec_mem_hint, __export_restore_thread);
-	restore_task_exec_start		= restorer_sym(exec_mem_hint, __export_restore_task);
-	rsti(current)->munmap_restorer	= restorer_sym(exec_mem_hint, __export_unmap);
+	restore_thread_exec_start	= restorer_sym(exec_mem_hint, arch_export_restore_thread);
+	restore_task_exec_start		= restorer_sym(exec_mem_hint, arch_export_restore_task);
+	rsti(current)->munmap_restorer	= restorer_sym(exec_mem_hint, arch_export_unmap);
 
 	exec_mem_hint += restorer_len;
 
@@ -2769,6 +2798,32 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	memzero(mem, args_len);
 	task_args	= mem;
 	thread_args	= (struct thread_restore_args *)(task_args + 1);
+
+	ret = prepare_creds(pid, task_args, &lsm);
+	if (ret < 0)
+		goto err;
+
+	if (lsm) {
+		char *rendered;
+		int ret;
+
+		ret = render_lsm_profile(lsm, &rendered);
+		xfree(lsm);
+		if (ret < 0) {
+			goto err_nv;
+		}
+
+		lsm_pos = rst_mem_cpos(RM_PRIVATE);
+		lsm_profile_len = strlen(rendered);
+		lsm = rst_mem_alloc(lsm_profile_len + 1, RM_PRIVATE);
+		if (!lsm) {
+			xfree(rendered);
+			goto err_nv;
+		}
+
+		strncpy(lsm, rendered, lsm_profile_len);
+		xfree(rendered);
+	}
 
 	/*
 	 * Get a reference to shared memory area which is
@@ -2823,6 +2878,19 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 		task_args->helpers = rst_mem_remap_ptr(helpers_pos, RM_PRIVATE);
 	else
 		task_args->helpers = NULL;
+
+	if (lsm) {
+		task_args->proc_attr_current = open_proc_rw(PROC_SELF, "attr/current");
+		if (task_args->proc_attr_current < 0) {
+			pr_perror("Can't open attr/current");
+			goto err;
+		}
+
+		task_args->lsm_profile = rst_mem_remap_ptr(lsm_pos, RM_PRIVATE);
+		task_args->lsm_profile_len = lsm_profile_len;
+	} else {
+		task_args->lsm_profile = NULL;
+	}
 
 	/*
 	 * Arguments for task restoration.
@@ -2921,10 +2989,6 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	new_sp = restorer_stack(task_args->t);
 
 	ret = prepare_itimers(pid, core, task_args);
-	if (ret < 0)
-		goto err;
-
-	ret = prepare_creds(pid, task_args);
 	if (ret < 0)
 		goto err;
 
