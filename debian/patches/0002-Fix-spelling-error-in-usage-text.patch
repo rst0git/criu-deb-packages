@@ -1,0 +1,28 @@
+From 89b0809f568f6eb53983c64c70401f0b3950457a Mon Sep 17 00:00:00 2001
+From: Salvatore Bonaccorso <carnil@debian.org>
+Date: Tue, 2 Jun 2015 08:46:47 +0200
+Subject: [PATCH 2/2] Fix spelling error in usage text
+
+---
+ crtools.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crtools.c b/crtools.c
+index 6da7afe..f83db27 100644
+--- a/crtools.c
++++ b/crtools.c
+@@ -655,9 +655,9 @@ usage:
+ "  --veth-pair IN=OUT    map inside veth device name to outside one\n"
+ "                        can optionally append @<bridge-name> to OUT for moving\n"
+ "                        the outside veth to the named bridge\n"
+-"  --link-remap          allow to link unlinked files back when possible\n"
++"  --link-remap          allow one to link unlinked files back when possible\n"
+ "  --action-script FILE  add an external action script\n"
+-"  -j|--" OPT_SHELL_JOB "        allow to dump and restore shell jobs\n"
++"  -j|--" OPT_SHELL_JOB "        allow one to dump and restore shell jobs\n"
+ "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
+ "  -L|--libdir           path to a plugin directory (by default " CR_PLUGIN_DEFAULT ")\n"
+ "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
+-- 
+2.1.4
+
