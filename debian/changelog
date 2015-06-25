@@ -1,3 +1,10 @@
+criu (1.6-2) unstable; urgency=low
+
+  * Upload to unstable
+  * Fix position for optional arguments in crit's manpage
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 25 Jun 2015 07:37:25 +0200
+
 criu (1.6-1) experimental; urgency=low
 
   * Imported Upstream version 1.6
