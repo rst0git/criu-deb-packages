@@ -37,6 +37,7 @@
 #include "image.h"
 #include "vma.h"
 #include "mem.h"
+#include "namespaces.h"
 
 #include "cr_options.h"
 #include "servicefd.h"
@@ -119,17 +120,9 @@ int reopen_fd_as_safe(char *file, int line, int new_fd, int old_fd, bool allow_r
 
 		if (!allow_reuse_fd) {
 			if (fcntl(new_fd, F_GETFD) != -1 || errno != EBADF) {
-				if (new_fd < 3) {
-					/*
-					 * Standard descriptors.
-					 */
-					pr_warn("fd %d already in use (called at %s:%d)\n",
-						new_fd, file, line);
-				} else {
-					pr_err("fd %d already in use (called at %s:%d)\n",
-						new_fd, file, line);
-					return -1;
-				}
+				pr_err("fd %d already in use (called at %s:%d)\n",
+					new_fd, file, line);
+				return -1;
 			}
 		}
 
@@ -515,6 +508,12 @@ void shfree_last(void *ptr)
  */
 int cr_system(int in, int out, int err, char *cmd, char *const argv[])
 {
+	return cr_system_userns(in, out, err, cmd, argv, -1);
+}
+
+int cr_system_userns(int in, int out, int err, char *cmd,
+			char *const argv[], int userns_pid)
+{
 	sigset_t blockmask, oldmask;
 	int ret = -1, status;
 	pid_t pid;
@@ -531,6 +530,15 @@ int cr_system(int in, int out, int err, char *cmd, char *const argv[])
 		pr_perror("fork() failed");
 		goto out;
 	} else if (pid == 0) {
+		if (userns_pid > 0) {
+			if (switch_ns(userns_pid, &user_ns_desc, NULL))
+				goto out_chld;
+			if (setuid(0) || setgid(0)) {
+				pr_perror("Unable to set uid or gid");
+				goto out_chld;
+			}
+		}
+
 		if (out < 0)
 			out = log_get_fd();
 		if (err < 0)

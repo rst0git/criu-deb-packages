@@ -1020,7 +1020,7 @@ int userns_call(uns_call_t call, int flags,
 		goto out;
 	}
 
-	/* Get the responce back */
+	/* Get the response back */
 
 	unsc_msg_init(&um, &call, &res, NULL, 0, 0);
 	ret = recvmsg(sk, &um.h, 0);
@@ -1183,15 +1183,15 @@ int collect_namespaces(bool for_dump)
 {
 	int ret;
 
+	ret = collect_user_namespaces(for_dump);
+	if (ret < 0)
+		return ret;
+
 	ret = collect_mnt_namespaces(for_dump);
 	if (ret < 0)
 		return ret;
 
 	ret = collect_net_namespaces(for_dump);
-	if (ret < 0)
-		return ret;
-
-	ret = collect_user_namespaces(for_dump);
 	if (ret < 0)
 		return ret;
 

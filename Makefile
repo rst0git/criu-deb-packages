@@ -1,6 +1,6 @@
 VERSION_MAJOR		:= 1
-VERSION_MINOR		:= 6
-VERSION_SUBLEVEL	:= 1
+VERSION_MINOR		:= 7
+VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
 VERSION_SO_MAJOR	:= 1
@@ -59,6 +59,16 @@ ifeq ($(ARCH),x86_64)
 	LDARCH       := i386:x86-64
 	VDSO         := y
 endif
+ifeq ($(ARCH),ia32)
+	SRCARCH      := x86
+	DEFINES      := -DCONFIG_X86_32
+	LDARCH       := i386
+	ldflags-y    += -m elf_i386
+	VDSO         := y
+	USERCFLAGS   += -m32
+	PROTOUFIX    := y
+	export PROTOUFIX ldflags-y
+endif
 
 ifeq ($(shell echo $(ARCH) | sed -e 's/arm.*/arm/'),arm)
 	ARMV         := $(shell echo $(ARCH) | sed -nr 's/armv([[:digit:]]).*/\1/p; t; i7')
@@ -108,6 +118,16 @@ export ARCH SRCARCH
 
 $(if $(wildcard $(ARCH_DIR)),,$(error "The architecture $(ARCH) isn't supported"))
 
+#
+# piegen might be disabled by hands. Don't use it  until
+# you know what you're doing.
+ifneq ($(filter i386 ia32 x86_64 ppc64le, $(ARCH)),)
+ifneq ($(PIEGEN),no)
+	piegen-y := y
+	export piegen-y
+endif
+endif
+
 cflags-y		+= -iquote include -iquote pie -iquote .
 cflags-y		+= -iquote $(ARCH_DIR) -iquote $(ARCH_DIR)/include
 cflags-y		+= -fno-strict-aliasing
@@ -142,6 +162,9 @@ ARCH-LIB	:= $(ARCH_DIR)/crtools.built-in.o
 CRIU-SO		:= libcriu
 CRIU-LIB	:= lib/$(CRIU-SO).so
 CRIU-INC	:= lib/criu.h include/criu-plugin.h include/criu-log.h protobuf/rpc.proto
+ifeq ($(piegen-y),y)
+piegen		:= pie/piegen/piegen
+endif
 
 export CC MAKE CFLAGS LIBS SRCARCH DEFINES MAKEFLAGS CRIU-SO
 export SRC_DIR SYSCALL-LIB SH RM ARCH_DIR OBJCOPY LDARCH LD
@@ -184,9 +207,20 @@ $(ARCH_DIR)/%:: protobuf config
 $(ARCH_DIR): protobuf config
 	$(Q) $(MAKE) $(build)=$(ARCH_DIR) all
 
-pie/%:: $(ARCH_DIR)
+ifeq ($(piegen-y),y)
+pie/piegen/%: config
+	$(Q) $(MAKE) $(build)=pie/piegen $@
+pie/piegen: config
+	$(Q) $(MAKE) $(build)=pie/piegen all
+$(piegen): pie/piegen/built-in.o
+	$(E) "  LINK    " $@
+	$(Q) $(CC) $(CFLAGS) pie/piegen/built-in.o $(LDFLAGS) -o $@
+.PHONY: pie/piegen
+endif
+
+pie/%:: $(ARCH_DIR) $(piegen)
 	$(Q) $(MAKE) $(build)=pie $@
-pie: $(ARCH_DIR)
+pie: $(ARCH_DIR) $(piegen)
 	$(Q) $(MAKE) $(build)=pie all
 
 %.o %.i %.s %.d: $(VERSION_HEADER) pie
@@ -235,6 +269,7 @@ clean-built:
 	$(Q) $(RM) $(VERSION_HEADER)
 	$(Q) $(MAKE) $(build)=$(ARCH_DIR) clean
 	$(Q) $(MAKE) $(build)=protobuf clean
+	$(Q) $(MAKE) $(build)=pie/piegen clean
 	$(Q) $(MAKE) $(build)=pie clean
 	$(Q) $(MAKE) $(build)=lib clean
 	$(Q) $(MAKE) $(build-crtools)=. clean
@@ -284,7 +319,9 @@ criu-$(CRTOOLSVERSION).tar.bz2:
 		v$(CRTOOLSVERSION) | bzip2 > $@
 .PHONY: dist tar
 
-install: $(PROGRAM) $(CRIU-LIB) install-man install-crit
+install: install-criu install-man 
+
+install-criu: $(PROGRAM) $(CRIU-LIB) install-crit
 	$(E) "  INSTALL " $(PROGRAM)
 	$(Q) mkdir -p $(DESTDIR)$(SBINDIR)
 	$(Q) install -m 755 $(PROGRAM) $(DESTDIR)$(SBINDIR)
@@ -302,7 +339,7 @@ install: $(PROGRAM) $(CRIU-LIB) install-man install-crit
 	$(Q) install -m 644 scripts/sd/criu.service $(DESTDIR)$(SYSTEMDUNITDIR)
 	$(Q) mkdir -p $(DESTDIR)$(LOGROTATEDIR)
 	$(Q) install -m 644 scripts/logrotate.d/criu-service $(DESTDIR)$(LOGROTATEDIR)
-	$(Q) sed -e 's,@version@,$(GITID),' \
+	$(Q) sed -e 's,@version@,$(CRTOOLSVERSION),' \
 		-e 's,@libdir@,$(LIBDIR),' \
 		-e 's,@includedir@,$(dir $(INCLUDEDIR)),' \
 		lib/criu.pc.in > criu.pc
@@ -314,9 +351,9 @@ install-man:
 
 install-crit: crit
 	$(E) "  INSTALL crit"
-	$(Q) python scripts/crit-setup.py install --prefix=$(DESTDIR)$(PREFIX)
+	$(Q) python scripts/crit-setup.py install --root=$(DESTDIR) --prefix=$(PREFIX)
 
-.PHONY: install install-man install-crit
+.PHONY: install install-man install-crit install-criu
 
 help:
 	@echo '    Targets:'

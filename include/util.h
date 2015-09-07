@@ -31,8 +31,8 @@
 #define GBYTES(size)	PREF_SHIFT_OP(G, >>, size)
 
 #define KILO(size)	PREF_SHIFT_OP(K, <<, size)
-#define MEGA(size)	PREF_SHIFT_OP(K, <<, size)
-#define GIGA(size)	PREF_SHIFT_OP(K, <<, size)
+#define MEGA(size)	PREF_SHIFT_OP(M, <<, size)
+#define GIGA(size)	PREF_SHIFT_OP(G, <<, size)
 
 struct vma_area;
 struct list_head;
@@ -170,6 +170,8 @@ extern void *shmalloc(size_t bytes);
 extern void shfree_last(void *ptr);
 
 extern int cr_system(int in, int out, int err, char *cmd, char *const argv[]);
+extern int cr_system_userns(int in, int out, int err, char *cmd,
+				char *const argv[], int userns_pid);
 extern int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd);
 extern int is_root_user(void);
 

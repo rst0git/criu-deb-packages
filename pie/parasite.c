@@ -480,6 +480,12 @@ static int parasite_check_vdso_mark(struct parasite_vdso_vma_entry *args)
 
 	return 0;
 }
+#else
+static inline int parasite_check_vdso_mark(struct parasite_vdso_vma_entry *args)
+{
+	pr_err("Unexpected VDSO check command\n");
+	return -1;
+}
 #endif
 
 static int __parasite_daemon_reply_ack(unsigned int cmd, int err)
@@ -504,7 +510,7 @@ static int __parasite_daemon_wait_msg(struct ctl_msg *m)
 {
 	int ret;
 
-	pr_debug("Daemon wais for command\n");
+	pr_debug("Daemon waits for command\n");
 
 	while (1) {
 		*m = (struct ctl_msg){ };
@@ -609,11 +615,9 @@ static noinline __used int noinline parasite_daemon(void *args)
 		case PARASITE_CMD_CHECK_AIOS:
 			ret = parasite_check_aios(args);
 			break;
-#ifdef CONFIG_VDSO
 		case PARASITE_CMD_CHECK_VDSO_MARK:
 			ret = parasite_check_vdso_mark(args);
 			break;
-#endif
 		default:
 			pr_err("Unknown command in parasite daemon thread leader: %d\n", m.cmd);
 			ret = -1;
@@ -641,8 +645,8 @@ static noinline int unmap_itself(void *data)
 
 	sys_munmap(args->parasite_start, args->parasite_len);
 	/*
-	 * sys_munmap never return back. The controll process must
-	 * trap us on the exit from munmap
+	 * This call to sys_munmap must never return. Instead, the controlling
+	 * process must trap us on the exit from munmap.
 	 */
 
 	BUG();
@@ -686,7 +690,11 @@ err:
 	return -1;
 }
 
-int __used parasite_service(unsigned int cmd, void *args)
+#ifndef __parasite_entry
+# define __parasite_entry
+#endif
+
+int __used __parasite_entry parasite_service(unsigned int cmd, void *args)
 {
 	pr_info("Parasite cmd %d/%x process\n", cmd, cmd);
 

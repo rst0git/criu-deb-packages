@@ -2,9 +2,10 @@
 #define _VIMITESU_H_
 
 #include <sys/types.h>
+#include <unistd.h>
 
 #ifndef PAGE_SIZE
-# define PAGE_SIZE 4096
+# define PAGE_SIZE (unsigned int)(sysconf(_SC_PAGESIZE))
 #endif
 
 #ifndef PR_SET_CHILD_SUBREAPER
@@ -24,6 +25,7 @@ extern void test_init_ns(int argc, char **argv, unsigned long clone_flags, int (
 #define CLONE_NEWIPC 0x08000000
 #endif
 
+#define TEST_MSG_BUFFER_SIZE	2048
 /*wrapper for fork: init log offset*/
 #define test_fork() test_fork_id(-1)
 extern int test_fork_id(int id);
@@ -99,6 +101,7 @@ extern int parse_opt_string(char *param, void *arg);
 /* message helpers */
 extern void setup_outfile(void);
 extern int test_log_init(const char *outfile, const char *suffix);
+extern int zdtm_seccomp;
 #define err(format, arg...)	\
 	test_msg("ERR: %s:%d: " format " (errno = %d (%s))\n", \
 		__FILE__, __LINE__, ## arg, errno, strerror(errno))

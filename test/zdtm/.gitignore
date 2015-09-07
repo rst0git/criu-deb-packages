@@ -21,6 +21,7 @@
 /live/static/cwd02
 /live/static/deleted_dev
 /live/static/deleted_unix_sock
+/live/static/different_creds
 /live/static/dumpable01
 /live/static/dumpable02
 /live/static/env00
@@ -101,6 +102,7 @@
 /live/static/rtc
 /live/static/sched_policy00
 /live/static/sched_prio00
+/live/static/seccomp_strict
 /live/static/selfexe00
 /live/static/sem
 /live/static/session00

@@ -14,6 +14,7 @@ ifeq ($(SRCARCH), ppc64)
 asm-e			+= $(ARCH_DIR)/vdso-trampoline.o
 asm-e			+= $(ARCH_DIR)/memcpy_power7.o
 asm-e			+= $(ARCH_DIR)/memcmp_64.o
+asm-e			+= $(ARCH_DIR)/misc.o
 endif
 endif
 
@@ -23,9 +24,6 @@ parasite-libs-e		+= $(SYSCALL-LIB)
 
 restorer-obj-y		+= restorer.o
 restorer-obj-e		+= $(ARCH_DIR)/restorer.o
-ifeq ($(SRCARCH), ppc64)
-restorer-asm-e		+= $(ARCH_DIR)/restorer-trampoline.o
-endif
 restorer-libs-e		+= $(SYSCALL-LIB)
 
 #
@@ -34,9 +32,14 @@ restorer-libs-e		+= $(SYSCALL-LIB)
 # applications, which is not the target of the
 # project.
 #
-CFLAGS			:= $(filter-out -pg,$(CFLAGS))
+CFLAGS			:= $(filter-out -pg,$(CFLAGS)) -iquote pie/piegen
 
-cflags-y		+= -DCR_NOGLIBC -fpie  -Wa,--noexecstack -fno-stack-protector
+ifneq ($(filter-out i386 ia32, $(ARCH)),)
+cflags-y		+= -DCR_NOGLIBC -fpie -Wa,--noexecstack -fno-stack-protector
+else
+cflags-y		+= -DCR_NOGLIBC -fno-pic -Wa,--noexecstack -fno-stack-protector
+endif
+
 ifeq ($(SRCARCH), arm)
 	cflags-y	+= -marm
 endif
@@ -48,6 +51,45 @@ BLOBS			:= $(obj)/parasite-blob.h $(obj)/restorer-blob.h
 PIELDS			:= pie.lds.S
 
 .SECONDARY:
+
+ifeq ($(piegen-y),y)
+ldflags-y += -r
+target-name = $(patsubst pie/%-blob.h,%,$(1))
+
+ifeq ($(SRCARCH),ppc64)
+$(obj)/$(PIELDS): $(obj)/pie-reloc.lds.S.in
+	$(E) "  GEN     " $@
+	$(Q) echo "OUTPUT_ARCH($(LDARCH))"              >  $(obj)/$(PIELDS)
+	$(Q) cat $<					>> $(obj)/$(PIELDS)
+else
+ifeq ($(ARCH),x86_64)
+$(obj)/$(PIELDS): $(obj)/pie-reloc.lds.S.in
+	$(E) "  GEN     " $@
+	$(Q) echo "OUTPUT_ARCH(i386:x86-64)"		>  $(obj)/$(PIELDS)
+	$(Q) echo "TARGET(elf64-x86-64)"		>> $(obj)/$(PIELDS)
+	$(Q) cat $<					>> $(obj)/$(PIELDS)
+else # i386 ia32
+$(obj)/$(PIELDS): $(obj)/pie-reloc.lds.S.in
+	$(E) "  GEN     " $@
+	$(Q) echo "OUTPUT_ARCH(i386)"			>  $(obj)/$(PIELDS)
+	$(Q) echo "TARGET(elf32-i386)"			>> $(obj)/$(PIELDS)
+	$(Q) cat $<					>> $(obj)/$(PIELDS)
+endif
+endif
+
+ifeq ($(strip $(V)),)
+piegen_stdout = >/dev/null
+endif
+
+$(obj)/%.built-in.bin.o: $(obj)/%.built-in.o $(obj)/$(PIELDS)
+	$(E) "  GEN     " $@
+	$(Q) $(LD) $(ldflags-y) -T $(obj)/$(PIELDS) -o $@ $<
+
+$(obj)/%-blob.h: $(obj)/%.built-in.bin.o $(obj)/$(PIELDS) pie/piegen
+	$(E) "  GEN     " $@
+	$(Q) pie/piegen/piegen -f $< -v $(call target-name,$@)_relocs -p $(call target-name,$@)_blob_offset__ -s $(call target-name,$@)_blob -o $@ $(piegen_stdout)
+
+else
 
 $(obj)/$(PIELDS): $(obj)/$(PIELDS).in
 	$(E) "  GEN     " $@
@@ -65,6 +107,8 @@ $(obj)/%.built-in.bin: $(obj)/%.built-in.bin.o
 $(obj)/%-blob.h: $(obj)/%.built-in.bin $(obj)/$(GEN-OFFSETS)
 	$(E) "  GEN     " $@
 	$(Q) $(SH) $(obj)/$(GEN-OFFSETS) $(@:-blob.h=) $(notdir $(@:-blob.h=)) $(CROSS_COMPILE) > $@
+
+endif
 
 $(BLOBS): $(obj)/$(PIELDS)
 _all += $(BLOBS)

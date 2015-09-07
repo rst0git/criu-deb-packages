@@ -10,15 +10,16 @@ all:
 	$(MAKE) zdtm-pre-dump
 	$(MAKE) zdtm-snapshot
 	$(MAKE) zdtm-iter
+	$(MAKE) zdtm-freezer
 
 .PHONY: all
 
-TESTS = unix-callback mem-snap rpc libcriu mounts/ext security pipes crit
+TESTS = unix-callback mem-snap rpc libcriu mounts/ext security pipes crit socketpairs overlayfs
 
 other: .FORCE
-	for t in $(TESTS); do			\
-		$(MAKE) -C $$t run || exit 1;	\
-	done					\
+	for t in $(TESTS); do				\
+		setsid $(MAKE) -C $$t run || exit 1;	\
+	done						\
 
 zdtm-tst-list: zdtm.sh
 	./zdtm.sh -l > zdtm-tst-list
@@ -37,6 +38,10 @@ zdtm-snapshot: zdtm-tst-list
 
 zdtm-iter: zdtm-tst-list
 	ZDTM_ARGS="-i 3 -C" $(MAKE) -f Makefile.zdtm ns/static/pipe00
+
+zdtm-freezer:
+	ZDTM_ARGS="--freeze-cgroup /sys/fs/cgroup/freezer/test -i 3" $(MAKE) -f Makefile.zdtm transition/thread-bomb
+	ZDTM_ARGS="--freeze-cgroup /sys/fs/cgroup/freezer/test -d --frozen" $(MAKE) -f Makefile.zdtm transition/thread-bomb
 
 .PHONY: zdtm
 

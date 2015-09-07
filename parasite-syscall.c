@@ -37,8 +37,7 @@
 #include "asm/parasite-syscall.h"
 #include "asm/dump.h"
 #include "asm/restorer.h"
-
-#define parasite_size		(round_up(sizeof(parasite_blob), PAGE_SIZE))
+#include "pie/pie-relocs.h"
 
 static int can_run_syscall(unsigned long ip, unsigned long start, unsigned long end)
 {
@@ -57,7 +56,7 @@ static struct vma_area *get_vma_by_ip(struct list_head *vma_area_list, unsigned 
 	struct vma_area *vma_area;
 
 	list_for_each_entry(vma_area, vma_area_list, list) {
-		if (vma_area->e->start >= TASK_SIZE)
+		if (vma_area->e->start >= kdat.task_size)
 			continue;
 		if (!(vma_area->e->prot & PROT_EXEC))
 			continue;
@@ -1205,7 +1204,7 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 
 	ctl->args_size = round_up(parasite_args_size, PAGE_SIZE);
 	parasite_args_size = PARASITE_ARG_SIZE_MIN; /* reset for next task */
-	map_exchange_size = parasite_size + ctl->args_size;
+	map_exchange_size = pie_size(parasite_blob) + ctl->args_size;
 	map_exchange_size += RESTORE_STACK_SIGFRAME + PARASITE_STACK_SIZE;
 	if (item->nr_threads > 1)
 		map_exchange_size += PARASITE_STACK_SIZE;
@@ -1219,12 +1218,14 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	pr_info("Putting parasite blob into %p->%p\n", ctl->local_map, ctl->remote_map);
 	memcpy(ctl->local_map, parasite_blob, sizeof(parasite_blob));
 
+	ELF_RELOCS_APPLY_PARASITE(ctl->local_map, ctl->remote_map);
+
 	/* Setup the rest of a control block */
 	ctl->parasite_ip	= (unsigned long)parasite_sym(ctl->remote_map, __export_parasite_head_start);
 	ctl->addr_cmd		= parasite_sym(ctl->local_map, __export_parasite_cmd);
 	ctl->addr_args		= parasite_sym(ctl->local_map, __export_parasite_args);
 
-	p = parasite_size + ctl->args_size;
+	p = pie_size(parasite_blob) + ctl->args_size;
 
 	ctl->rsigframe	= ctl->remote_map + p;
 	ctl->sigframe	= ctl->local_map  + p;
