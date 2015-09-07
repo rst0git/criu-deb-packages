@@ -1,3 +1,12 @@
+criu (1.7-1) experimental; urgency=low
+
+  * Imported Upstream version 1.7
+  * Add copyright stanza for arch/ppc64/misc.S
+  * Drop 0001-Fix-spelling-errors-in-documentation.patch patch
+  * Drop 0002-Fix-spelling-error-in-usage-text.patch patch
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 07 Sep 2015 12:35:44 +0200
+
 criu (1.6.1-1) experimental; urgency=low
 
   * Imported Upstream version 1.6.1
