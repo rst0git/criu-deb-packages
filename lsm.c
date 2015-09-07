@@ -12,6 +12,8 @@
 #include "protobuf/inventory.pb-c.h"
 #include "protobuf/creds.pb-c.h"
 
+#undef CONFIG_HAS_SELINUX
+
 #ifdef CONFIG_HAS_SELINUX
 #include <selinux/selinux.h>
 #endif
@@ -102,7 +104,7 @@ static int selinux_get_label(pid_t pid, char **output)
 }
 #endif
 
-void kerndat_lsm()
+void kerndat_lsm(void)
 {
 	if (access("/sys/kernel/security/apparmor", F_OK) == 0) {
 		get_label = apparmor_get_label;
@@ -130,7 +132,7 @@ void kerndat_lsm()
 	name = "none";
 }
 
-Lsmtype host_lsm_type()
+Lsmtype host_lsm_type(void)
 {
 	return lsmtype;
 }

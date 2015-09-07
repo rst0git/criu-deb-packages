@@ -30,6 +30,7 @@
 #include "cgroup.h"
 #include "action-scripts.h"
 #include "security.h"
+#include "sockets.h"
 
 #include "setproctitle.h"
 
@@ -285,8 +286,13 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		req->pid = ids.pid;
 	}
 
-	if (req->has_ext_unix_sk)
+	if (req->has_ext_unix_sk) {
 		opts.ext_unix_sk = req->ext_unix_sk;
+		for (i = 0; i < req->n_unix_sk_ino; i++) {
+			if (unix_sk_id_add(req->unix_sk_ino[i]->inode) < 0)
+				goto err;
+		}
+	}
 
 	if (req->root)
 		opts.root = req->root;
@@ -385,8 +391,47 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_cpu_cap)
 		opts.cpu_cap = req->cpu_cap;
 
+	/*
+	 * FIXME: For backward compatibility we setup
+	 * soft mode here, need to enhance to support
+	 * other modes as well via separate option
+	 * probably.
+	 */
 	if (req->has_manage_cgroups)
-		opts.manage_cgroups = req->manage_cgroups;
+		opts.manage_cgroups = req->manage_cgroups ? CG_MODE_SOFT : CG_MODE_IGNORE;
+
+	/* Override the manage_cgroup if mode is set explicitly */
+	if (req->has_manage_cgroups_mode) {
+		unsigned int mode;
+
+		switch (req->manage_cgroups_mode) {
+		case CRIU_CG_MODE__IGNORE:
+			mode = CG_MODE_IGNORE;
+			break;
+		case CRIU_CG_MODE__NONE:
+			mode = CG_MODE_NONE;
+			break;
+		case CRIU_CG_MODE__PROPS:
+			mode = CG_MODE_PROPS;
+			break;
+		case CRIU_CG_MODE__SOFT:
+			mode = CG_MODE_SOFT;
+			break;
+		case CRIU_CG_MODE__FULL:
+			mode = CG_MODE_FULL;
+			break;
+		case CRIU_CG_MODE__STRICT:
+			mode = CG_MODE_STRICT;
+			break;
+		case CRIU_CG_MODE__DEFAULT:
+			mode = CG_MODE_DEFAULT;
+			break;
+		default:
+			goto err;
+		}
+
+		opts.manage_cgroups = mode;
+	}
 
 	if (req->has_auto_ext_mnt)
 		opts.autodetect_ext_mounts = req->auto_ext_mnt;
@@ -396,6 +441,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (req->has_ext_masters)
 		opts.enable_external_masters = req->ext_masters;
+
+	if (req->has_ghost_limit)
+		opts.ghost_limit = req->ghost_limit;
 
 	return 0;
 

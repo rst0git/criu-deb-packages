@@ -33,6 +33,9 @@ TST_NOFILE	=				\
 		socket6_udp			\
 		socket_udplite			\
 		socket_aio			\
+		socket_close_data		\
+		socket_snd_addr			\
+		socket_dgram_data		\
 		packet_sock			\
 		packet_sock_mmap		\
 		sock_filter			\
@@ -123,6 +126,8 @@ TST_NOFILE	=				\
 		aio00				\
 		fd				\
 		apparmor				\
+		seccomp_strict			\
+		different_creds			\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -134,6 +139,7 @@ TST_FILE	=				\
 		link10				\
 		file_attr			\
 		deleted_unix_sock		\
+		sk-unix-rel			\
 		deleted_dev			\
 		unlink_fstat00			\
 		unlink_fstat01			\
@@ -176,6 +182,7 @@ TST_DIR		=				\
 		overmount_fifo			\
 		overmount_sock			\
 		tempfs				\
+		mount_paths			\
 		bind-mount			\
 		inotify00			\
 		cgroup00			\
@@ -190,6 +197,7 @@ TST_DIR		=				\
 		mntns_root_bind			\
 		mnt_ext_auto			\
 		mnt_ext_master			\
+		mntns_deleted			\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -272,6 +280,18 @@ stop:	$(STATE_OUT)
 	-kill -TERM `cat *.pid`
 
 WAIT_TIME=240
+%.stop:	%.pid %
+	kill -TERM `cat $<`; \
+	i=0; \
+	while [ $$i -lt $(WAIT_TIME) ] ; do \
+		kill -0 `cat $< 2>/dev/null` 2>/dev/null || break; \
+		sleep 1; \
+		echo -n .; \
+		i=`expr $$i + 1`; \
+	done; \
+	echo; \
+	[ $$i -lt $(WAIT_TIME) ]
+
 wait_stop:
 		i=0; \
 		while [ $$i -lt $(WAIT_TIME) ] ; do \
@@ -283,6 +303,7 @@ wait_stop:
 $(TST):	$(LIB)
 
 aio00:			override LDLIBS += -laio
+different_creds:	override LDLIBS += -lcap
 futex.o:		override CFLAGS += -pthread
 futex:			override LDFLAGS += -pthread
 futex-rl.o:		override CFLAGS += -pthread

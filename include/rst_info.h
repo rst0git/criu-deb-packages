@@ -7,9 +7,9 @@
 
 struct task_entries {
 	int nr_threads, nr_tasks, nr_helpers;
+	atomic_t nr_zombies;
 	futex_t nr_in_progress;
 	futex_t start;
-	mutex_t	zombie_lock;
 	atomic_t cr_err;
 	mutex_t userns_sync_lock;
 };
@@ -57,6 +57,13 @@ struct rst_info {
 	struct file_desc	*root;
 	bool			has_umask;
 	u32			umask;
+
+	/*
+	 * We set this flag when process has seccomp filters
+	 * so that we know to suspend them before we unmap the
+	 * restorer blob.
+	 */
+	bool			has_seccomp;
 
 	void			*breakpoint;
 };

@@ -66,12 +66,6 @@ struct link_remap_rlb {
 };
 static LIST_HEAD(link_remaps);
 
-/*
- * This constant is selected without any calculations. Just do not
- * want to pick up too big files with us in the image.
- */
-#define MAX_GHOST_FILE_SIZE	(1 * 1024 * 1024)
-
 static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, char *root, struct cr_img *img)
 {
 	int gfd, ghost_flags, ret = -1;
@@ -423,8 +417,8 @@ static int dump_ghost_remap(char *path, const struct stat *st,
 
 	pr_info("Dumping ghost file for fd %d id %#x\n", lfd, id);
 
-	if (st->st_size > MAX_GHOST_FILE_SIZE) {
-		pr_err("Can't dump ghost file %s of %"PRIu64" size\n",
+	if (st->st_size > opts.ghost_limit) {
+		pr_err("Can't dump ghost file %s of %"PRIu64" size, increase limit\n",
 				path, st->st_size);
 		return -1;
 	}
@@ -645,20 +639,38 @@ static inline bool nfs_silly_rename(char *rpath, const struct fd_parms *parms)
 	return (parms->fs_type == NFS_SUPER_MAGIC) && is_sillyrename_name(rpath);
 }
 
-static void strip_deleted(struct fd_link *link)
+int strip_deleted(struct fd_link *link)
 {
-	const char postfix[] = " (deleted)";
-	const size_t plen = strlen(postfix);
+	struct dcache_prepends {
+		const char	*str;
+		size_t		len;
+	} static const prepends[] = {
+		{
+			.str	= " (deleted)",
+			.len	= 10,
+		}, {
+			.str	= "//deleted",
+			.len	= 9,
+		}
+	};
+	size_t i;
 
-	if (link->len > plen) {
-		size_t at = link->len - plen;
-		if (!strcmp(&link->name[at], postfix)) {
+	for (i = 0; i < ARRAY_SIZE(prepends); i++) {
+		size_t at;
+
+		if (link->len <= prepends[i].len)
+			continue;
+
+		at = link->len - prepends[i].len;
+		if (!strcmp(&link->name[at], prepends[i].str)) {
 			pr_debug("Stip %s' tag from '%s'\n",
-				 postfix, link->name);
+				 prepends[i].str, link->name);
 			link->name[at] = '\0';
-			link->len -= plen;
+			link->len -= prepends[i].len;
+			return 1;
 		}
 	}
+	return 0;
 }
 
 static int check_path_remap(struct fd_link *link, const struct fd_parms *parms,

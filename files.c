@@ -30,6 +30,7 @@
 #include "eventfd.h"
 #include "eventpoll.h"
 #include "fsnotify.h"
+#include "mount.h"
 #include "signalfd.h"
 #include "namespaces.h"
 #include "tun.h"
@@ -157,6 +158,56 @@ void show_saved_files(void)
 }
 
 /*
+ * Workaround for the OverlayFS bug present before Kernel 4.2
+ *
+ * This is here only to support the Linux Kernel between versions
+ * 3.18 and 4.2. After that, this workaround is not needed anymore,
+ * but it will work properly on both a kernel with and withouth the bug.
+ *
+ * When a process has a file open in an OverlayFS directory,
+ * the information in /proc/<pid>/fd/<fd> and /proc/<pid>/fdinfo/<fd>
+ * is wrong. We can't even rely on stat()-ing /proc/<pid>/fd/<fd> since
+ * this will show us the wrong filesystem type.
+ *
+ * So we grab that information from the mountinfo table instead. This is done
+ * every time fill_fdlink is called. See lookup_overlayfs for more details.
+ *
+ */
+static int fixup_overlayfs(struct fd_parms *p, struct fd_link *link)
+{
+	struct mount_info *m;
+
+	if (!link)
+		return 0;
+
+	m = lookup_overlayfs(link->name, p->stat.st_dev, p->stat.st_ino, p->mnt_id);
+	if (IS_ERR(m))
+		return -1;
+
+	if (!m)
+		return 0;
+
+	p->mnt_id = m->mnt_id;
+
+	/*
+	 * If the bug is present, the file path from /proc/<pid>/fd
+	 * does not include the mountpoint, so we prepend it ourselves.
+	 */
+	if (strcmp("./", m->mountpoint) != 0) {
+		char buf[PATH_MAX];
+		int n;
+
+		strncpy(buf, link->name, PATH_MAX - 1);
+		n = snprintf(link->name, PATH_MAX, "%s/%s", m->mountpoint, buf + 2);
+		if (n >= PATH_MAX) {
+			pr_err("Not enough space to replace %s\n", buf);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/*
  * The gen_id thing is used to optimize the comparison of shared files.
  * If two files have different gen_ids, then they are different for sure.
  * If it matches, we don't know it and have to call sys_kcmp().
@@ -206,6 +257,10 @@ int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
 	}
 
 	link->len = len + 1;
+
+	if (opts.overlayfs)
+		if (fixup_overlayfs((struct fd_parms *)p, link) < 0)
+			return -1;
 	return 0;
 }
 
@@ -271,6 +326,29 @@ static const struct fdtype_ops *get_misc_dev_ops(int minor)
 	return NULL;
 }
 
+static const struct fdtype_ops *get_mem_dev_ops(struct fd_parms *p, int minor)
+{
+	const struct fdtype_ops *ops = NULL;
+
+	switch (minor) {
+	case 11:
+		/*
+		 * If /dev/kmsg is opened in write-only mode the file position
+		 * should not be set up upon restore, kernel doesn't allow that.
+		 */
+		if ((p->flags & O_ACCMODE) == O_WRONLY && p->pos == 0)
+			p->pos = -1ULL;
+		/*
+		 * Fallthrough.
+		 */
+	default:
+		ops = &regfile_dump_ops;
+		break;
+	};
+
+	return ops;
+}
+
 static int dump_chrdev(struct fd_parms *p, int lfd, struct cr_img *img)
 {
 	int maj = major(p->stat.st_rdev);
@@ -278,7 +356,7 @@ static int dump_chrdev(struct fd_parms *p, int lfd, struct cr_img *img)
 
 	switch (maj) {
 	case MEM_MAJOR:
-		ops = &regfile_dump_ops;
+		ops = get_mem_dev_ops(p, minor(p->stat.st_rdev));
 		break;
 	case MISC_MAJOR:
 		ops = get_misc_dev_ops(minor(p->stat.st_rdev));
@@ -1394,11 +1472,14 @@ bool inherited_fd(struct file_desc *d, int *fd_p)
 	if (i_fd < 0)
 		return false;
 
+	if (fd_p == NULL)
+		return true;
+
 	*fd_p = dup(i_fd);
 	if (*fd_p < 0)
 		pr_perror("Inherit fd DUP failed");
 	else
-		pr_info("File %s will be restored from fd %d duped "
+		pr_info("File %s will be restored from fd %d dumped "
 				"from inherit fd %d\n", id_str, *fd_p, i_fd);
 	return true;
 }

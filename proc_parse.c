@@ -27,6 +27,10 @@
 #include "proc_parse.h"
 #include "cr_options.h"
 #include "sysfs_parse.h"
+#include "seccomp.h"
+#include "namespaces.h"
+#include "files-reg.h"
+
 #include "protobuf.h"
 #include "protobuf/fdinfo.pb-c.h"
 #include "protobuf/mnt.pb-c.h"
@@ -48,33 +52,6 @@ static char *buf = __buf.buf;
  */
 
 #define AIO_FNAME	"/[aio]"
-
-int parse_cpuinfo_features(int (*handler)(char *tok))
-{
-	FILE *cpuinfo;
-
-	cpuinfo = fopen_proc(PROC_GEN, "cpuinfo");
-	if (!cpuinfo) {
-		pr_perror("Can't open cpuinfo file");
-		return -1;
-	}
-
-	while (fgets(buf, BUF_SIZE, cpuinfo)) {
-		char *tok;
-
-		if (strncmp(buf, "flags\t\t:", 8))
-			continue;
-
-		for (tok = strtok(buf, " \t\n"); tok;
-		     tok = strtok(NULL, " \t\n")) {
-			if (handler(tok) < 0)
-				break;
-		}
-	}
-
-	fclose(cpuinfo);
-	return 0;
-}
 
 /* check the @line starts with "%lx-%lx" format */
 static bool is_vma_range_fmt(char *line)
@@ -149,13 +126,11 @@ static int parse_vmflags(char *buf, struct vma_area *vma_area)
 
 		/* vmsplice doesn't work for VM_IO and VM_PFNMAP mappings. */
 		if (_vmflag_match(tok, "io") || _vmflag_match(tok, "pf")) {
-#ifdef CONFIG_VDSO
 			/*
 			 * VVAR area mapped by the kernel as
 			 * VM_IO | VM_PFNMAP| VM_DONTEXPAND | VM_DONTDUMP
 			 */
 			if (!vma_area_is(vma_area, VMA_AREA_VVAR))
-#endif
 				vma_area->e->status |= VMA_UNSUPP;
 		}
 
@@ -336,6 +311,36 @@ int parse_self_maps_lite(struct vm_area_list *vms)
 	return 0;
 }
 
+#ifdef CONFIG_VDSO
+static inline int handle_vdso_vma(struct vma_area *vma)
+{
+	vma->e->status |= VMA_AREA_REGULAR;
+	if ((vma->e->prot & VDSO_PROT) == VDSO_PROT)
+		vma->e->status |= VMA_AREA_VDSO;
+	return 0;
+}
+
+static inline int handle_vvar_vma(struct vma_area *vma)
+{
+	vma->e->status |= VMA_AREA_REGULAR;
+	if ((vma->e->prot & VVAR_PROT) == VVAR_PROT)
+		vma->e->status |= VMA_AREA_VVAR;
+	return 0;
+}
+#else
+static inline int handle_vdso_vma(struct vma_area *vma)
+{
+	pr_warn_once("Found vDSO area without support\n");
+	return -1;
+}
+
+static inline int handle_vvar_vma(struct vma_area *vma)
+{
+	pr_warn_once("Found VVAR area without support\n");
+	return -1;
+}
+#endif
+
 static int handle_vma(pid_t pid, struct vma_area *vma_area,
 			char *file_path, DIR *map_files_dir,
 			struct vma_file_info *vfi,
@@ -353,23 +358,11 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area,
 		   !strcmp(file_path, "[vectors]")) {
 		vma_area->e->status |= VMA_AREA_VSYSCALL;
 	} else if (!strcmp(file_path, "[vdso]")) {
-#ifdef CONFIG_VDSO
-		vma_area->e->status |= VMA_AREA_REGULAR;
-		if ((vma_area->e->prot & VDSO_PROT) == VDSO_PROT)
-			vma_area->e->status |= VMA_AREA_VDSO;
-#else
-		pr_warn_once("Found vDSO area without support\n");
-		goto err;
-#endif
+		if (handle_vdso_vma(vma_area))
+			goto err;
 	} else if (!strcmp(file_path, "[vvar]")) {
-#ifdef CONFIG_VDSO
-		vma_area->e->status |= VMA_AREA_REGULAR;
-		if ((vma_area->e->prot & VVAR_PROT) == VVAR_PROT)
-			vma_area->e->status |= VMA_AREA_VVAR;
-#else
-		pr_warn_once("Found VVAR area without support\n");
-		goto err;
-#endif
+		if (handle_vvar_vma(vma_area))
+			goto err;
 	} else if (!strcmp(file_path, "[heap]")) {
 		vma_area->e->status |= VMA_AREA_REGULAR | VMA_AREA_HEAP;
 	} else {
@@ -483,7 +476,7 @@ static int vma_list_add(struct vma_area *vma_area,
 
 	list_add_tail(&vma_area->list, &vma_area_list->h);
 	vma_area_list->nr++;
-	if (vma_area_is_private(vma_area)) {
+	if (vma_area_is_private(vma_area, kdat.task_size)) {
 		unsigned long pages;
 
 		pages = vma_area_len(vma_area) / PAGE_SIZE;
@@ -763,7 +756,7 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 	if (bfdopenr(&f))
 		return -1;
 
-	while (done < 8) {
+	while (done < 9) {
 		str = breadline(&f);
 		if (str == NULL)
 			break;
@@ -824,9 +817,22 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 
 			done++;
 		}
+
+		if (!strncmp(str, "Seccomp:", 8)) {
+			if (sscanf(str + 9, "%d", &cr->seccomp_mode) != 1) {
+				goto err_parse;
+			}
+
+			if (cr->seccomp_mode == SECCOMP_MODE_FILTER) {
+				pr_err("SECCOMP_MODE_FILTER not currently supported\n");
+				goto err_parse;
+			}
+
+			done++;
+		}
 	}
 
-	if (done == 8)
+	if (done >= 8)
 		ret = 0;
 
 err_parse:
@@ -849,6 +855,8 @@ static int do_opt2flag(char *opt, unsigned *flags,
 	size_t uoff = 0;
 
 	while (1) {
+		unsigned int id;
+
 		end = strchr(opt, ',');
 		if (end)
 			*end = '\0';
@@ -859,7 +867,15 @@ static int do_opt2flag(char *opt, unsigned *flags,
 				break;
 			}
 
-		if (opts[i].opt == NULL) {
+		if (sscanf(opt, "gid=%d", &id) == 1) {
+			uoff += sprintf(unknown + uoff, "gid=%d", userns_gid(id));
+			unknown[uoff] = ',';
+			uoff++;
+		} else if (sscanf(opt, "uid=%d", &id) == 1) {
+			uoff += sprintf(unknown + uoff, "uid=%d", userns_uid(id));
+			unknown[uoff] = ',';
+			uoff++;
+		} else if (opts[i].opt == NULL) {
 			if (!unknown) {
 				pr_err("Unknown option [%s]\n", opt);
 				return -1;
@@ -887,14 +903,14 @@ static int do_opt2flag(char *opt, unsigned *flags,
 static int parse_mnt_flags(char *opt, unsigned *flags)
 {
 	static const struct opt2flag mnt_opt2flag[] = {
-		{ "rw", 0, },
-		{ "ro", MS_RDONLY, },
-		{ "nosuid", MS_NOSUID, },
-		{ "nodev", MS_NODEV, } ,
-		{ "noexec", MS_NOEXEC, },
-		{ "noatime", MS_NOATIME, },
-		{ "nodiratime", MS_NODIRATIME, },
-		{ "relatime", MS_RELATIME, },
+		{ "rw",		0,		},
+		{ "ro",		MS_RDONLY,	},
+		{ "nosuid",	MS_NOSUID,	},
+		{ "nodev",	MS_NODEV,	},
+		{ "noexec",	MS_NOEXEC,	},
+		{ "noatime",	MS_NOATIME,	},
+		{ "nodiratime",	MS_NODIRATIME,	},
+		{ "relatime",	MS_RELATIME,	},
 		{ },
 	};
 
@@ -911,11 +927,11 @@ static int parse_mnt_flags(char *opt, unsigned *flags)
 static int parse_sb_opt(char *opt, unsigned *flags, char *uopt)
 {
 	static const struct opt2flag sb_opt2flag[] = {
-		{ "rw", 0, },
-		{ "ro", MS_RDONLY, },
-		{ "sync", MS_SYNC, },
-		{ "dirsync", MS_DIRSYNC, },
-		{ "mad", MS_MANDLOCK, },
+		{ "rw",		0,		},
+		{ "ro",		MS_RDONLY,	},
+		{ "sync",	MS_SYNC,	},
+		{ "dirsync",	MS_DIRSYNC,	},
+		{ "mad",	MS_MANDLOCK,	},
 		{ },
 	};
 
@@ -958,8 +974,42 @@ static int parse_mnt_opt(char *str, struct mount_info *mi, int *off)
 	return 0;
 }
 
+/*
+ * mountinfo contains mangled paths. space, tab and back slash were replaced
+ * with usual octal escape. This function replaces these symbols back.
+ */
+static void cure_path(char *path)
+{
+	int i, len, off = 0;
+
+	if (strchr(path, '\\') == NULL) /* fast path */
+		return;
+
+	len = strlen(path);
+	for (i = 0; i < len; i++) {
+		if (!strncmp(path + i, "\\040", 4)) {
+			path[i - off] = ' ';
+			goto replace;
+		} else if (!strncmp(path + i, "\\011", 4)) {
+			path[i - off] = '\t';
+			goto replace;
+		} else if (!strncmp(path + i, "\\134", 4)) {
+			path[i - off] = '\\';
+			goto replace;
+		}
+		if (off)
+			path[i - off] = path[i];
+		continue;
+replace:
+		off += 3;
+		i += 3;
+	}
+	path[len - off] = 0;
+}
+
 static int parse_mountinfo_ent(char *str, struct mount_info *new, char **fsname)
 {
+	struct fd_link root_link;
 	unsigned int kmaj, kmin;
 	int ret, n;
 	char *sub, *opt = NULL;
@@ -975,6 +1025,16 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new, char **fsname)
 			&opt, &n);
 	if (ret != 7)
 		goto err;
+
+	cure_path(new->mountpoint);
+	cure_path(new->root);
+
+	root_link.len = strlen(new->root);
+	strcpy(root_link.name, new->root);
+	if (strip_deleted(&root_link)) {
+		strcpy(new->root, root_link.name);
+		new->deleted = true;
+	}
 
 	new->mountpoint = xrealloc(new->mountpoint, strlen(new->mountpoint) + 1);
 	if (!new->mountpoint)
@@ -994,8 +1054,17 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new, char **fsname)
 
 	str += n;
 	ret = sscanf(str, "%ms %ms %ms", fsname, &new->source, &opt);
-	if (ret != 3)
+	if (ret == 2) {
+		/* src may be empty */
+		opt = new->source;
+		new->source = xstrdup("");
+		if (new->source == NULL)
+			goto err;
+	} else if (ret != 3)
 		goto err;
+
+	cure_path(new->source);
+
 	/*
 	 * The kernel reports "subtypes" sometimes and the valid
 	 * type-vs-subtype delimiter is the dot symbol. We disregard
@@ -1079,7 +1148,7 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 
 		ret = parse_mountinfo_ent(str, new, &fsname);
 		if (ret < 0) {
-			pr_err("Bad format in %d mountinfo\n", pid);
+			pr_err("Bad format in %d mountinfo: '%s'\n", pid, str);
 			goto end;
 		}
 
@@ -2012,6 +2081,19 @@ out:
 }
 
 /*
+ * If an OverlayFS mountpoint is found in the mountinfo table,
+ * we enable opts.overlayfs, which is a workaround for the
+ * OverlayFS Kernel bug.
+ *
+ * See fixup_overlayfs for details.
+ */
+int overlayfs_parse(struct mount_info *new)
+{
+	opts.overlayfs = true;
+	return 0;
+}
+
+/*
  * AUFS callback function to "fix up" the root pathname.
  * See sysfs_parse.c for details.
  */
@@ -2026,3 +2108,69 @@ int aufs_parse(struct mount_info *new)
 
 	return ret;
 }
+
+bool proc_status_creds_eq(struct proc_status_creds *o1, struct proc_status_creds *o2)
+{
+	return memcmp(o1, o2, sizeof(struct proc_status_creds)) == 0;
+}
+
+int parse_children(pid_t pid, pid_t **_c, int *_n)
+{
+	pid_t *ch = NULL;
+	int nr = 0;
+	DIR *dir;
+	struct dirent *de;
+
+	dir = opendir_proc(pid, "task");
+	if (dir == NULL)
+		return -1;
+
+	while ((de = readdir(dir))) {
+		int fd, len;
+		char *pos;
+
+		if (dir_dots(de))
+			continue;
+
+		fd = open_proc(pid, "task/%s/children", de->d_name);
+		if (fd < 0)
+			goto err;
+
+		len = read(fd, buf, BUF_SIZE);
+		close(fd);
+		if (len < 0)
+			goto err;
+
+		buf[len] = '\0';
+		pos = buf;
+		while (1) {
+			pid_t val, *tmp;
+
+			val = strtol(pos, &pos, 0);
+			if (!val) {
+				BUG_ON(*pos != '\0');
+				break;
+			}
+
+			tmp = xrealloc(ch, (nr + 1) * sizeof(pid_t));
+			if (!tmp)
+				goto err;
+
+			ch = tmp;
+			ch[nr] = val;
+			nr++;
+			pos++; /* space goes after each pid */
+		}
+	}
+
+	*_c = ch;
+	*_n = nr;
+
+	closedir(dir);
+	return 0;
+err:
+	closedir(dir);
+	xfree(ch);
+	return -1;
+}
+

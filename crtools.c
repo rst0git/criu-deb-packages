@@ -50,6 +50,7 @@ void init_opts(void)
 
 	/* Default options */
 	opts.final_state = TASK_DEAD;
+	INIT_LIST_HEAD(&opts.ext_unixsk_ids);
 	INIT_LIST_HEAD(&opts.veth_pairs);
 	INIT_LIST_HEAD(&opts.scripts);
 	INIT_LIST_HEAD(&opts.ext_mounts);
@@ -57,8 +58,9 @@ void init_opts(void)
 	INIT_LIST_HEAD(&opts.new_cgroup_roots);
 
 	opts.cpu_cap = CPU_CAP_DEFAULT;
-	opts.manage_cgroups = false;
+	opts.manage_cgroups = CG_MODE_DEFAULT;
 	opts.ps_socket = -1;
+	opts.ghost_limit = DEFAULT_GHOST_LIMIT;
 }
 
 static int parse_ns_string(const char *ptr)
@@ -147,6 +149,44 @@ Esyntax:
 	return -1;
 }
 
+static int parse_manage_cgroups(struct cr_options *opts, const char *optarg)
+{
+	if (!optarg) {
+		opts->manage_cgroups = CG_MODE_SOFT;
+		return 0;
+	}
+
+	if (!strcmp(optarg, "none")) {
+		opts->manage_cgroups = CG_MODE_NONE;
+	} else if (!strcmp(optarg, "props")) {
+		opts->manage_cgroups = CG_MODE_PROPS;
+	} else if (!strcmp(optarg, "soft")) {
+		opts->manage_cgroups = CG_MODE_SOFT;
+	} else if (!strcmp(optarg, "full")) {
+		opts->manage_cgroups = CG_MODE_FULL;
+	} else if (!strcmp(optarg, "strict")) {
+		opts->manage_cgroups = CG_MODE_STRICT;
+	} else
+		goto Esyntax;
+
+	return 0;
+
+Esyntax:
+	pr_err("Unknown cgroups mode `%s' selected\n", optarg);
+	return -1;
+}
+
+static size_t parse_size(char *optarg)
+{
+	if (index(optarg, 'K'))
+		return (size_t)KILO(atol(optarg));
+	else if (index(optarg, 'M'))
+		return (size_t)MEGA(atol(optarg));
+	else if (index(optarg, 'G'))
+		return (size_t)GIGA(atol(optarg));
+	return (size_t)atol(optarg);
+}
+
 int main(int argc, char *argv[], char *envp[])
 {
 	pid_t pid = 0, tree_id = 0;
@@ -157,7 +197,7 @@ int main(int argc, char *argv[], char *envp[])
 	int log_level = LOG_UNSET;
 	char *imgs_dir = ".";
 	char *work_dir = NULL;
-	static const char short_opts[] = "dSsRf:F:t:p:hcD:o:n:v::xVr:jlW:L:M:";
+	static const char short_opts[] = "dSsRf:F:t:p:hcD:o:n:v::x::Vr:jlW:L:M:";
 	static struct option long_opts[] = {
 		{ "tree",			required_argument,	0, 't'	},
 		{ "pid",			required_argument,	0, 'p'	},
@@ -174,7 +214,7 @@ int main(int argc, char *argv[], char *envp[])
 		{ "log-file",			required_argument,	0, 'o'	},
 		{ "namespaces",			required_argument,	0, 'n'	},
 		{ "root",			required_argument,	0, 'r'	},
-		{ USK_EXT_PARAM,		no_argument,		0, 'x'	},
+		{ USK_EXT_PARAM,		optional_argument,	0, 'x'	},
 		{ "help",			no_argument,		0, 'h'	},
 		{ SK_EST_PARAM,			no_argument,		0, 1042	},
 		{ "close",			required_argument,	0, 1043	},
@@ -199,7 +239,7 @@ int main(int argc, char *argv[], char *envp[])
 		{ "force-irmap",		no_argument,		0, 1058	},
 		{ "ext-mount-map",		required_argument,	0, 'M'	},
 		{ "exec-cmd",			no_argument,		0, 1059	},
-		{ "manage-cgroups",		no_argument,		0, 1060	},
+		{ "manage-cgroups",		optional_argument,	0, 1060	},
 		{ "cgroup-root",		required_argument,	0, 1061	},
 		{ "inherit-fd",			required_argument,	0, 1062	},
 		{ "feature",			required_argument,	0, 1063	},
@@ -207,6 +247,8 @@ int main(int argc, char *argv[], char *envp[])
 		{ "enable-fs",			required_argument,	0, 1065 },
 		{ "enable-external-sharing", 	no_argument, 		0, 1066 },
 		{ "enable-external-masters", 	no_argument, 		0, 1067 },
+		{ "freeze-cgroup",		required_argument,	0, 1068 },
+		{ "ghost-limit",		required_argument,	0, 1069 },
 		{ },
 	};
 
@@ -251,6 +293,8 @@ int main(int argc, char *argv[], char *envp[])
 			opts.final_state = TASK_ALIVE;
 			break;
 		case 'x':
+			if (optarg && unix_sk_ids_parse(optarg) < 0)
+				return 1;
 			opts.ext_unix_sk = true;
 			break;
 		case 'p':
@@ -392,7 +436,8 @@ int main(int argc, char *argv[], char *envp[])
 			has_exec_cmd = true;
 			break;
 		case 1060:
-			opts.manage_cgroups = true;
+			if (parse_manage_cgroups(&opts, optarg))
+				goto usage;
 			break;
 		case 1061:
 			{
@@ -433,6 +478,12 @@ int main(int argc, char *argv[], char *envp[])
 			break;
 		case 1067:
 			opts.enable_external_masters = true;
+			break;
+		case 1068:
+			opts.freeze_cgroup = optarg;
+			break;
+		case 1069:
+			opts.ghost_limit = parse_size(optarg);
 			break;
 		case 'M':
 			{
@@ -645,9 +696,11 @@ usage:
 "                        'cpu','fpu','all','ins','none'. To disable capability, prefix it with '^'.\n"
 "     --exec-cmd         execute the command specified after '--' on successful\n"
 "                        restore making it the parent of the restored process\n"
+"  --freeze-cgroup\n"
+"                        use cgroup freezer to collect processes\n"
 "\n"
 "* Special resources support:\n"
-"  -x|--" USK_EXT_PARAM "      allow external unix connections\n"
+"  -x|--" USK_EXT_PARAM "inode,.." "      allow external unix connections (optionally can be assign socket's inode that allows one-sided dump)\n"
 "     --" SK_EST_PARAM "  checkpoint/restore established TCP connections\n"
 "  -r|--root PATH        change the root filesystem (when run in mount namespace)\n"
 "  --evasive-devices     use any path to a device file if the original one\n"
@@ -655,9 +708,10 @@ usage:
 "  --veth-pair IN=OUT    map inside veth device name to outside one\n"
 "                        can optionally append @<bridge-name> to OUT for moving\n"
 "                        the outside veth to the named bridge\n"
-"  --link-remap          allow to link unlinked files back when possible\n"
+"  --link-remap          allow one to link unlinked files back when possible\n"
+"  --ghost-limit size    specify maximum size of deleted file contents to be carried inside an image file\n"
 "  --action-script FILE  add an external action script\n"
-"  -j|--" OPT_SHELL_JOB "        allow to dump and restore shell jobs\n"
+"  -j|--" OPT_SHELL_JOB "        allow one to dump and restore shell jobs\n"
 "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
 "  -L|--libdir           path to a plugin directory (by default " CR_PLUGIN_DEFAULT ")\n"
 "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
@@ -669,7 +723,8 @@ usage:
 "                        allow autoresolving mounts with external sharing\n"
 "  --enable-external-masters\n"
 "                        allow autoresolving mounts with external masters\n"
-"  --manage-cgroups      dump or restore cgroups the process is in\n"
+"  --manage-cgroups [m]  dump or restore cgroups the process is in usig mode:\n"
+"                        'none', 'props', 'soft' (default), 'full' and 'strict'.\n"
 "  --cgroup-root [controller:]/newroot\n"
 "                        change the root cgroup the controller will be\n"
 "                        installed into. No controller means that root is the\n"

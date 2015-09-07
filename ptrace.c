@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <signal.h>
 
+#include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -20,22 +21,74 @@
 #include "proc_parse.h"
 #include "crtools.h"
 #include "security.h"
+#include "seccomp.h"
 
 int unseize_task(pid_t pid, int orig_st, int st)
 {
 	pr_debug("\tUnseizing %d into %d\n", pid, st);
 
-	if (st == TASK_DEAD)
+	if (st == TASK_DEAD) {
 		kill(pid, SIGKILL);
-	else if (st == TASK_STOPPED) {
+		return 0;
+	} else if (st == TASK_STOPPED) {
 		if (orig_st == TASK_ALIVE)
 			kill(pid, SIGSTOP);
-	} else if (st == TASK_ALIVE)
+		/* PTRACE_SEIZE will restore state of other tasks */
+	} else if (st == TASK_ALIVE) {
 		/* do nothing */ ;
-	else
+	} else
 		pr_err("Unknown final state %d\n", st);
 
-	return ptrace(PTRACE_DETACH, pid, NULL, NULL);
+	if (ptrace(PTRACE_DETACH, pid, NULL, NULL)) {
+		pr_perror("Unable to detach from %d", pid);
+		return -1;
+	}
+
+	return 0;
+}
+
+int suspend_seccomp(pid_t pid)
+{
+	if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_SUSPEND_SECCOMP) < 0) {
+		pr_perror("suspending seccomp failed");
+		return -1;
+	}
+
+	return 0;
+}
+
+int seize_catch_task(pid_t pid)
+{
+	int ret;
+
+	ret = ptrace(PTRACE_SEIZE, pid, NULL, 0);
+	if (ret) {
+		/*
+		 * ptrace API doesn't allow to distinguish
+		 * attaching to zombie from other errors.
+		 * All errors will be handled in seize_wait_task().
+		 */
+		pr_warn("Unable to interrupt task: %d (%s)\n", pid, strerror(errno));
+		return ret;
+	}
+
+	/*
+	 * If we SEIZE-d the task stop it before going
+	 * and reading its stat from proc. Otherwise task
+	 * may die _while_ we're doing it and we'll have
+	 * inconsistent seize/state pair.
+	 *
+	 * If task dies after we seize it but before we
+	 * do this interrupt, we'll notice it via proc.
+	 */
+	ret = ptrace(PTRACE_INTERRUPT, pid, NULL, NULL);
+	if (ret < 0) {
+		pr_warn("SEIZE %d: can't interrupt task: %s", pid, strerror(errno));
+		if (ptrace(PTRACE_DETACH, pid, NULL, NULL))
+			pr_perror("Unable to detach from %d", pid);
+	}
+
+	return ret;
 }
 
 /*
@@ -45,46 +98,29 @@ int unseize_task(pid_t pid, int orig_st, int st)
  * of it so the task would not know if it was saddled
  * up with someone else.
  */
-
-int seize_task(pid_t pid, pid_t ppid)
+int seize_wait_task(pid_t pid, pid_t ppid, struct proc_status_creds **creds)
 {
 	siginfo_t si;
 	int status;
-	int ret, ret2, ptrace_errno, wait_errno = 0;
+	int ret = 0, ret2, wait_errno = 0;
 	struct proc_status_creds cr;
 
-	ret = ptrace(PTRACE_SEIZE, pid, NULL, 0);
-	ptrace_errno = errno;
-	if (ret == 0) {
-		/*
-		 * If we SEIZE-d the task stop it before going
-		 * and reading its stat from proc. Otherwise task
-		 * may die _while_ we're doing it and we'll have
-		 * inconsistent seize/state pair.
-		 *
-		 * If task dies after we seize it but before we
-		 * do this interrupt, we'll notice it via proc.
-		 */
-		ret = ptrace(PTRACE_INTERRUPT, pid, NULL, NULL);
-		if (ret < 0) {
-			pr_perror("SEIZE %d: can't interrupt task", pid);
-			ptrace(PTRACE_DETACH, pid, NULL, NULL);
-			goto err;
-		}
-	}
+	/*
+	 * For the comparison below, let's zero out any padding.
+	 */
+	memzero(&cr, sizeof(struct proc_status_creds));
 
 	/*
 	 * It's ugly, but the ptrace API doesn't allow to distinguish
 	 * attaching to zombie from other errors. Thus we have to parse
 	 * the target's /proc/pid/stat. Sad, but parse whatever else
-	 * we might nead at that early point.
+	 * we might need at that early point.
 	 */
 
 try_again:
-	if (!ret) {
-		ret = wait4(pid, &status, __WALL, NULL);
-		wait_errno = errno;
-	}
+
+	ret = wait4(pid, &status, __WALL, NULL);
+	wait_errno = errno;
 
 	ret2 = parse_pid_status(pid, &cr);
 	if (ret2)
@@ -100,8 +136,8 @@ try_again:
 			if (pid == getpid())
 				pr_err("The criu itself is within dumped tree.\n");
 			else
-				pr_err("Unseizable non-zombie %d found, state %c, err %d/%d/%d\n",
-						pid, cr.state, ret, ptrace_errno, wait_errno);
+				pr_err("Unseizable non-zombie %d found, state %c, err %d/%d\n",
+						pid, cr.state, ret, wait_errno);
 			return -1;
 		}
 
@@ -141,6 +177,21 @@ try_again:
 		ret = 0;
 		goto try_again;
 	}
+
+	if (*creds == NULL) {
+		*creds = xzalloc(sizeof(struct proc_status_creds));
+		if (!*creds)
+			goto err_stop;
+
+		**creds = cr;
+
+	} else if (!proc_status_creds_eq(*creds, &cr)) {
+		pr_err("creds don't match %d %d\n", pid, ppid);
+		goto err_stop;
+	}
+
+	if (cr.seccomp_mode != SECCOMP_MODE_DISABLED && suspend_seccomp(pid) < 0)
+		goto err_stop;
 
 	if (si.si_signo == SIGTRAP)
 		return TASK_ALIVE;
@@ -182,7 +233,8 @@ try_again:
 err_stop:
 	kill(pid, SIGSTOP);
 err:
-	ptrace(PTRACE_DETACH, pid, NULL, NULL);
+	if (ptrace(PTRACE_DETACH, pid, NULL, NULL))
+		pr_perror("Unable to detach from %d", pid);
 	return -1;
 }
 

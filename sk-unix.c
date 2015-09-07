@@ -75,6 +75,11 @@ struct unix_sk_listen_icon {
 	struct unix_sk_listen_icon	*next;
 };
 
+struct  unix_sk_exception {
+	struct list_head unix_sk_list;
+	ino_t unix_sk_ino;
+};
+
 #define SK_HASH_SIZE		32
 
 static struct unix_sk_listen_icon *unix_listen_icons[SK_HASH_SIZE];
@@ -139,6 +144,22 @@ static int can_dump_unix_sk(const struct unix_sk_desc *sk)
 	return 1;
 }
 
+static bool unix_sk_exception_lookup_id(ino_t ino)
+{
+	bool ret = false;
+	struct unix_sk_exception *sk;
+
+	list_for_each_entry(sk, &opts.ext_unixsk_ids, unix_sk_list) {
+		if (sk->unix_sk_ino == ino) {
+			pr_debug("Found ino %u in exception unix sk list\n", (unsigned int)ino);
+			ret = true;
+			break;
+		}
+	}
+
+	return ret;
+}
+
 static int write_unix_entry(struct unix_sk_desc *sk)
 {
 	int ret;
@@ -167,16 +188,22 @@ static int resolve_rel_name(struct unix_sk_desc *sk, const struct fd_parms *p)
 		if (task->pid.real == p->pid)
 			break;
 	}
-	if (!task)
+	if (!task) {
+		pr_err("Can't find task with pid %d\n", p->pid);
 		return -ENOENT;
+	}
 
 	ns = lookup_ns_by_id(task->ids->mnt_ns_id, &mnt_ns_desc);
-	if (!ns)
+	if (!ns) {
+		pr_err("Can't resolve mount namespace for pid %d\n", p->pid);
 		return -ENOENT;
+	}
 
 	mntns_root = mntns_get_root_fd(ns);
-	if (mntns_root < 0)
+	if (mntns_root < 0) {
+		pr_err("Can't resolve fs root for pid %d\n", p->pid);
 		return -ENOENT;
+	}
 
 	pr_debug("Resolving relative name %s for socket %x\n",
 		 sk->name, sk->sd.ino);
@@ -202,7 +229,7 @@ static int resolve_rel_name(struct unix_sk_desc *sk, const struct fd_parms *p)
 		}
 
 		if ((st.st_ino == rel_name->udiag_vfs_ino) &&
-		    phys_stat_dev_match(st.st_dev, rel_name->udiag_vfs_dev, ns, path)) {
+		    phys_stat_dev_match(st.st_dev, rel_name->udiag_vfs_dev, ns, &path[1])) {
 			rel_name->dir = xstrdup(dir);
 			if (!rel_name->dir)
 				return -ENOMEM;
@@ -449,8 +476,8 @@ const struct fdtype_ops unix_dump_ops = {
  */
 static int unix_process_name(struct unix_sk_desc *d, const struct unix_diag_msg *m, struct rtattr **tb)
 {
+	int len, ret;
 	char *name;
-	int len;
 
 	len = RTA_PAYLOAD(tb[UNIX_DIAG_NAME]);
 	name = xmalloc(len + 1);
@@ -474,12 +501,16 @@ static int unix_process_name(struct unix_sk_desc *d, const struct unix_diag_msg 
 		}
 
 		ns = lookup_ns_by_id(root_item->ids->mnt_ns_id, &mnt_ns_desc);
-		if (!ns)
-			return -ENOENT;
+		if (!ns) {
+			ret = -ENOENT;
+			goto out;
+		}
 
 		mntns_root = mntns_get_root_fd(ns);
-		if (mntns_root < 0)
-			return -ENOENT;
+		if (mntns_root < 0) {
+			ret = -ENOENT;
+			goto out;
+		}
 
 		uv = RTA_DATA(tb[UNIX_DIAG_VFS]);
 		if (name[0] != '/') {
@@ -488,8 +519,10 @@ static int unix_process_name(struct unix_sk_desc *d, const struct unix_diag_msg 
 			 * dump attempt.
 			 */
 			rel_name_desc_t *rel_name = xzalloc(sizeof(*rel_name));
-			if (!rel_name)
-				return -ENOMEM;
+			if (!rel_name) {
+				ret = -ENOMEM;
+				goto out;
+			}
 			rel_name->udiag_vfs_dev = uv->udiag_vfs_dev;
 			rel_name->udiag_vfs_ino = uv->udiag_vfs_ino;
 
@@ -538,9 +571,12 @@ postprone:
 	d->name = name;
 	return 0;
 
-skip:
+out:
 	xfree(name);
-	return 1;
+	return ret;
+skip:
+	ret = 1;
+	goto out;
 }
 
 static int unix_collect_one(const struct unix_diag_msg *m,
@@ -611,8 +647,6 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 			e->peer_ino	= n;
 			e->sk_desc	= d;
 		}
-
-
 	}
 
 	if (tb[UNIX_DIAG_RQLEN]) {
@@ -664,16 +698,21 @@ static int dump_external_sockets(struct unix_sk_desc *peer)
 				return -1;
 			}
 
-			if (peer->type != SOCK_DGRAM) {
-				show_one_unix("Ext stream not supported", peer);
-				pr_err("Can't dump half of stream unix connection.\n");
-				return -1;
-			}
+			if (unix_sk_exception_lookup_id(sk->sd.ino)) {
+				pr_debug("found exception for unix name-less external socket.\n");
+			} else {
+				if (peer->type != SOCK_DGRAM) {
+					show_one_unix("Ext stream not supported", peer);
+					pr_err("Can't dump half of stream unix connection.\n");
+					return -1;
+				}
 
-			if (!peer->name) {
-				show_one_unix("Ext dgram w/o name", peer);
-				pr_err("Can't dump name-less external socket.\n");
-				return -1;
+				if (!peer->name) {
+					show_one_unix("Ext dgram w/o name", peer);
+					pr_err("Can't dump name-less external socket.\n");
+					pr_err("%d\n", sk->fd);
+					return -1;
+				}
 			}
 		} else if (ret < 0)
 			return -1;
@@ -817,15 +856,18 @@ static int post_open_unix_sk(struct file_desc *d, int fd)
 	if (ui->ue->uflags & USK_CALLBACK)
 		return 0;
 
-	pr_info("\tConnect %#x to %#x\n", ui->ue->ino, peer->ue->ino);
-
 	/* Skip external sockets */
 	if (!list_empty(&peer->d.fd_info_head))
 		futex_wait_while(&peer->prepared, 0);
 
+	if (ui->ue->uflags & USK_INHERIT)
+		return 0;
+
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	memcpy(&addr.sun_path, peer->name, peer->ue->name.len);
+
+	pr_info("\tConnect %#x to %#x\n", ui->ue->ino, peer->ue->ino);
 
 	if (prep_unix_sk_cwd(peer))
 		return -1;
@@ -1113,7 +1155,13 @@ static int open_unix_sk(struct file_desc *d)
 	struct unix_sk_info *ui;
 
 	ui = container_of(d, struct unix_sk_info, d);
-	if (ui->flags & USK_PAIR_MASTER)
+
+	int unixsk_fd = -1;
+
+	if (inherited_fd(d, &unixsk_fd)) {
+		ui->ue->uflags |= USK_INHERIT;
+		return unixsk_fd;
+	} else if (ui->flags & USK_PAIR_MASTER)
 		return open_unixsk_pair_master(ui);
 	else if (ui->flags & USK_PAIR_SLAVE)
 		return open_unixsk_pair_slave(ui);
@@ -1121,11 +1169,27 @@ static int open_unix_sk(struct file_desc *d)
 		return open_unixsk_standalone(ui);
 }
 
+static char *socket_d_name(struct file_desc *d, char *buf, size_t s)
+{
+	struct unix_sk_info *ui;
+
+	ui = container_of(d, struct unix_sk_info, d);
+
+	if (snprintf(buf, s, "socket:[%d]", ui->ue->ino) >= s) {
+		pr_err("Not enough room for unixsk %d identifier string\n",
+				ui->ue->ino);
+		return NULL;
+	}
+
+	return buf;
+}
+
 static struct file_desc_ops unix_desc_ops = {
 	.type = FD_TYPES__UNIXSK,
 	.open = open_unix_sk,
 	.post_open = post_open_unix_sk,
 	.want_transport = unixsk_should_open_transport,
+	.name = socket_d_name,
 };
 
 /*
@@ -1251,6 +1315,50 @@ int resolve_unix_peers(void)
 			pr_info("\t\tfd %d in pid %d\n",
 					fle->fe->fd, fle->pid);
 
+	}
+
+	return 0;
+}
+
+int unix_sk_id_add(ino_t ino)
+{
+	struct unix_sk_exception *unix_sk;
+
+	/* TODO: validate inode here? */
+
+	unix_sk = xmalloc(sizeof *unix_sk);
+	if (unix_sk == NULL)
+		return -1;
+	unix_sk->unix_sk_ino = ino;
+	list_add_tail(&unix_sk->unix_sk_list, &opts.ext_unixsk_ids);
+
+	return 0;
+}
+
+int unix_sk_ids_parse(char *optarg)
+{
+	/*
+	 * parsing option of the following form: --ext-unix-sk=<inode value>,<inode
+	 * value>... or short form -x<inode>,<inode>...
+	 */
+
+	char *iter = optarg;
+
+	while (*iter != '\0') {
+		if (*iter == ',')
+			iter++;
+		else {
+			ino_t ino = (ino_t)strtoul(iter, &iter, 10);
+
+			if (0 == ino) {
+				pr_err("Can't parse unix socket inode from optarg: %s\n", optarg);
+				return -1;
+			}
+			if (unix_sk_id_add(ino) < 0) {
+				pr_err("Can't add unix socket inode in list: %s\n", optarg);
+				return -1;
+			}
+		}
 	}
 
 	return 0;

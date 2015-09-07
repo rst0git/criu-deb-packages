@@ -71,9 +71,11 @@ generate_test_list()
 		static/sock_opts01
 		static/sockets_spair
 		static/sockets_dgram
+		static/socket_dgram_data
 		static/socket_queues
 		static/deleted_unix_sock
 		static/sk-unix-unconn
+		static/sk-unix-rel
 		static/pid00
 		static/pstree
 		static/caps00
@@ -182,6 +184,7 @@ generate_test_list()
 		ns/static/session00
 		ns/static/session01
 		ns/static/tempfs
+		ns/static/mount_paths
 		ns/static/bind-mount
 		static/utsname
 		static/ipc_namespace
@@ -200,6 +203,7 @@ generate_test_list()
 		static/poll
 		static/apparmor
 		ns/static/apparmor
+		static/different_creds
 	"
 
 	TEST_CR_KERNEL="
@@ -214,6 +218,7 @@ generate_test_list()
 		ns/static/mntns_shared_bind
 		ns/static/mntns_shared_bind02
 		ns/static/mntns_root_bind
+		ns/static/mntns_deleted
 	"
 
 	TEST_AIO="
@@ -229,6 +234,10 @@ generate_test_list()
 	TEST_TUN="
 		ns/static/tun
 	"
+	TEST_SECCOMP_SUSPEND="
+		static/seccomp_strict
+	"
+
 
 	$CRIU check -v0 --feature "mnt_id"
 	if [ $? -eq 0 ]; then
@@ -252,6 +261,13 @@ generate_test_list()
 		TEST_LIST="$TEST_LIST$TEST_TUN"
 	fi
 
+	$CRIU check -v0 --feature "seccomp_suspend"
+	if [ $? -eq 0 ]; then
+		TEST_LIST="$TEST_LIST$TEST_SECCOMP_SUSPEND"
+	fi
+
+	# ns/static/clean_mntns: proc can't be mounted in userns, if it isn't mounted yet
+
 	BLACKLIST_FOR_USERNS="
 		ns/static/maps01
 		ns/static/mlock_setuid
@@ -260,16 +276,12 @@ generate_test_list()
 		ns/static/fanotify00
 		ns/static/dumpable02
 		ns/static/deleted_dev
-		ns/static/tempfs
 		ns/static/clean_mntns
 		ns/static/mntns_link_remap
 		ns/static/mntns_link_ghost
 		ns/static/console
 		ns/static/vt
 		ns/static/rtc
-		ns/static/mntns_shared_bind
-		ns/static/mntns_shared_bind02
-		ns/static/mntns_root_bind
 		ns/static/cow01
 	"
 
@@ -329,10 +341,18 @@ mntns_shared_bind
 mntns_shared_bind02
 mntns_root_bind
 mntns_rw_ro_rw
+mntns_deleted
+mount_paths
 netns-dev
 sockets00
 cow01
 apparmor
+seccomp_strict
+different_creds
+"
+
+TEST_EXPECTED_FAILURE="
+static/different_creds
 "
 
 CRIU_CPT=$CRIU
@@ -355,6 +375,7 @@ BATCH_TEST=0
 SPECIFIED_NAME_USED=0
 START_FROM="."
 RESTORE_SIBLING=""
+FREEZE_CGROUP=""
 
 zdtm_sep()
 { (
@@ -452,6 +473,7 @@ construct_root()
 	local libs=$(ldd $test_path $ps_path | awk '
 		!/^[ \t]/ { next }
 		/linux-vdso\.so/ { next }
+		/linux-vdso64\.so/ { next }
 		/linux-gate\.so/ { next }
 		/not a dynamic executable$/ { next }
 		$2 ~ /^=>$/ { print $3; next }
@@ -547,6 +569,12 @@ start_test()
 	fi
 
 	(
+		if [ -n "$FREEZE_CGROUP" ]; then
+			mkdir -p $FREEZE_CGROUP
+			echo 0 > $FREEZE_CGROUP/tasks || exit 1
+		else
+			export ZDTM_THREAD_BOMB=100
+		fi
 		# Here is no way to set FD_CLOEXEC on 3
 		exec 3>&-
 		make -C $tdir $tname.pid
@@ -555,6 +583,10 @@ start_test()
 	if [ $? -ne 0 ]; then
 		echo ERROR: fail to start $test
 		return 1
+	fi
+
+	if [ -n "$FREEZE_CGROUP" ] && [ -n "$FREEZER_STATE" ]; then
+		echo $FREEZER_STATE > $FREEZE_CGROUP/freezer.state
 	fi
 
 	[ -z "$PIDNS" ] || cd -
@@ -635,10 +667,6 @@ run_test()
 			echo "Skip $test"
 			return 0
 		fi
-		expr $test : 'ns/user' > /dev/null && {
-			echo "Skip $test"
-			return 0
-		}
 	fi
 
 	expr "$test" : 'ns/' > /dev/null && PIDNS=1 || PIDNS=""
@@ -741,6 +769,10 @@ EOF
 			fi
 			[ -n "$snappdir" ] && cpt_args="$cpt_args --prev-images-dir=$snappdir"
 		fi
+		if [ -n "$FREEZE_CGROUP" ]; then
+			cpt_args="$cpt_args --freeze-cgroup $FREEZE_CGROUP --manage-cgroups"
+			rst_args="$rst_args --manage-cgroups"
+		fi
 
 		[ -n "$dump_only" ] && cpt_args="$cpt_args $POSTDUMP"
 
@@ -756,6 +788,11 @@ EOF
 		# with some error code, or checkpoint is complete but return
 		# code is non-zero because of post dump action.
 		if [ "$retcode" -ne 0 ] && [[ "$retcode" -ne 32 || -z "$dump_only" ]]; then
+			if echo $TEST_EXPECTED_FAILURE | grep -q $tname; then
+				echo "Got expected dump failure"
+				return 0
+			fi
+
 			if [ $BATCH_TEST -eq 0 ]; then
 				echo WARNING: $tname returned $retcode and left running for debug needs
 			else
@@ -786,6 +823,15 @@ EOF
 				save_maps $PID  $ddump/dump.maps.after
 				diff_maps $ddump/dump.maps $ddump/dump.maps.after || return 1
 			}
+
+			if [ -n "$FREEZE_CGROUP" ] && [ -n "$FREEZER_STATE" ]; then
+				while :; do
+					echo freezer.state=`cat $FREEZE_CGROUP/freezer.state`
+					cat $FREEZE_CGROUP/freezer.state | grep -q $FREEZER_STATE && break;
+					sleep 0.1
+				done
+			fi
+			echo THAWED > $FREEZE_CGROUP/freezer.state
 
 			rm -f ./$tdir/link_remap.*
 		else
@@ -844,7 +890,7 @@ EOF
 
 	if [ -x "${test}.hook" ]; then
 		echo "Executing cleanup hook"
-		"${test}.hook" --clean
+		"${test}.hook" --clean || return 2
 	fi
 
 	if [ -n "$AUTO_DEDUP" ]; then
@@ -1035,6 +1081,15 @@ while :; do
 		;;
 	  --auto-dedup)
 		AUTO_DEDUP=1
+		shift
+		;;
+	  --freeze-cgroup)
+		shift
+		FREEZE_CGROUP=$1
+		shift
+		;;
+	  --frozen)
+		FREEZER_STATE=FROZEN
 		shift
 		;;
 	  -g)

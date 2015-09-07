@@ -30,6 +30,7 @@
 #include "lock.h"
 #include "restorer.h"
 #include "aio.h"
+#include "seccomp.h"
 
 #include "protobuf/creds.pb-c.h"
 #include "protobuf/mm.pb-c.h"
@@ -50,10 +51,11 @@
 
 static struct task_entries *task_entries;
 static futex_t thread_inprogress;
-static futex_t zombies_inprogress;
 static int cap_last_cap;
 static pid_t *helpers;
 static int n_helpers;
+static pid_t *zombies;
+static int n_zombies;
 
 extern void cr_restore_rt (void) asm ("__cr_restore_rt")
 			__attribute__ ((visibility ("hidden")));
@@ -69,16 +71,9 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 		if (siginfo->si_pid == helpers[i])
 			return;
 
-	if (futex_get(&task_entries->start) == CR_STATE_RESTORE_SIGCHLD) {
-		pr_debug("%ld: Collect a zombie with (pid %d, %d)\n",
-			sys_getpid(), siginfo->si_pid, siginfo->si_pid);
-		futex_dec_and_wake(&task_entries->nr_in_progress);
-		futex_dec_and_wake(&zombies_inprogress);
-		task_entries->nr_threads--;
-		task_entries->nr_tasks--;
-		mutex_unlock(&task_entries->zombie_lock);
-		return;
-	}
+	for (i = 0; i < n_zombies; i++)
+		if (siginfo->si_pid == zombies[i])
+			return;
 
 	if (siginfo->si_code & CLD_EXITED)
 		r = " exited, status=";
@@ -95,7 +90,38 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 	sys_exit_group(1);
 }
 
-static int restore_creds(CredsEntry *ce)
+static int lsm_set_label(char *label, int procfd)
+{
+	int ret = -1, len, lsmfd;
+	char path[LOG_SIMPLE_CHUNK];
+
+	if (!label)
+		return 0;
+
+	pr_info("restoring lsm profile %s\n", label);
+
+	simple_sprintf(path, "self/task/%ld/attr/current", sys_gettid());
+
+	lsmfd = sys_openat(procfd, path, O_WRONLY, 0);
+	if (lsmfd < 0) {
+		pr_err("failed openat %d\n", lsmfd);
+		return -1;
+	}
+
+	for (len = 0; label[len]; len++)
+		;
+
+	ret = sys_write(lsmfd, label, len);
+	sys_close(lsmfd);
+	if (ret < 0) {
+		pr_err("can't write lsm profile %d\n", ret);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int restore_creds(CredsEntry *ce, int procfd)
 {
 	int b, i, ret;
 	struct cap_header hdr;
@@ -200,6 +226,9 @@ static int restore_creds(CredsEntry *ce)
 		return -1;
 	}
 
+	if (lsm_set_label(ce->lsm_profile, procfd) < 0)
+		return -1;
+
 	return 0;
 }
 
@@ -273,7 +302,7 @@ static void restore_rlims(struct task_restore_args *ta)
 {
 	int r;
 
-	for (r = 0; r < ta->nr_rlim; r++) {
+	for (r = 0; r < ta->rlims_n; r++) {
 		struct krlimit krlim;
 
 		krlim.rlim_cur = ta->rlims[r].rlim_cur;
@@ -303,6 +332,32 @@ static int restore_signals(siginfo_t *ptr, int nr, bool group)
 	}
 
 	return 0;
+}
+
+static void restore_seccomp(int seccomp_mode)
+{
+	switch (seccomp_mode) {
+	case SECCOMP_MODE_DISABLED:
+		return;
+	case SECCOMP_MODE_STRICT:
+		if (sys_prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0))
+			goto die;
+		return;
+	case SECCOMP_MODE_FILTER:
+		goto die;
+	default:
+		goto die;
+	}
+
+die:
+	/*
+	 * If preparing any seccomp state failed, we should make sure this
+	 * process doesn't continue so that it can't do things outside the
+	 * sandbox. Unfortunately, the rest of the restore has to continue
+	 * since we're too late in the process to stop it and have unlocked the
+	 * network.
+	 */
+	sys_exit_group(1);
 }
 
 static int restore_thread_common(struct rt_sigframe *sigframe,
@@ -366,7 +421,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 	if (restore_thread_common(rt_sigframe, args))
 		goto core_restore_end;
 
-	ret = restore_creds(&args->ta->creds);
+	ret = restore_creds(&args->ta->creds, args->ta->proc_fd);
 	if (ret)
 		goto core_restore_end;
 
@@ -378,13 +433,19 @@ long __export_restore_thread(struct thread_restore_args *args)
 
 	restore_finish_stage(CR_STATE_RESTORE);
 
-	if (restore_signals(args->siginfo, args->siginfo_nr, false))
+	if (restore_signals(args->siginfo, args->siginfo_n, false))
 		goto core_restore_end;
 
 	restore_finish_stage(CR_STATE_RESTORE_SIGCHLD);
 	restore_pdeath_sig(args);
+
+	if (args->ta->seccomp_mode != SECCOMP_MODE_DISABLED)
+		pr_info("Restoring seccomp mode %d for %ld\n", args->ta->seccomp_mode, sys_getpid());
+
 	restore_finish_stage(CR_STATE_RESTORE_CREDS);
 	futex_dec_and_wake(&thread_inprogress);
+
+	restore_seccomp(args->ta->seccomp_mode);
 
 	new_sp = (long)rt_sigframe + SIGFRAME_OFFSET;
 	rst_sigreturn(new_sp);
@@ -462,14 +523,14 @@ static void rst_tcp_repair_off(struct rst_tcp_sock *rts)
 
 	ret = sys_setsockopt(rts->sk, SOL_SOCKET, SO_REUSEADDR, &aux, sizeof(aux));
 	if (ret < 0)
-		pr_err("Failed to restore of SO_REUSEADDR on socket (%d)", ret);
+		pr_err("Failed to restore of SO_REUSEADDR on socket (%d)\n", ret);
 }
 
 static void rst_tcp_socks_all(struct task_restore_args *ta)
 {
 	int i;
 
-	for (i = 0; i < ta->tcp_socks_nr; i++)
+	for (i = 0; i < ta->tcp_socks_n; i++)
 		rst_tcp_repair_off(&ta->tcp_socks[i]);
 }
 
@@ -569,7 +630,7 @@ static int timerfd_arm(struct task_restore_args *args)
 			 * overflow the limit NSEC_PER_SEC FIXME
 			 */
 			if (sys_clock_gettime(t->clockid, &ts)) {
-				pr_err("Can't get current time");
+				pr_err("Can't get current time\n");
 				return -1;
 			}
 
@@ -599,7 +660,7 @@ static int create_posix_timers(struct task_restore_args *args)
 	timer_t next_id;
 	struct sigevent sev;
 
-	for (i = 0; i < args->timer_n; i++) {
+	for (i = 0; i < args->posix_timers_n; i++) {
 		sev.sigev_notify = args->posix_timers[i].spt.it_sigev_notify;
 		sev.sigev_signo = args->posix_timers[i].spt.si_signo;
 		sev.sigev_value.sival_ptr = args->posix_timers[i].spt.sival_ptr;
@@ -621,7 +682,7 @@ static int create_posix_timers(struct task_restore_args *args)
 			}
 
 			if ((long)next_id > args->posix_timers[i].spt.it_id) {
-				pr_err("Can't create timers, kernel don't give them consequently");
+				pr_err("Can't create timers, kernel don't give them consequently\n");
 				return -1;
 			}
 		}
@@ -635,7 +696,7 @@ static void restore_posix_timers(struct task_restore_args *args)
 	int i;
 	struct restore_posix_timer *rt;
 
-	for (i = 0; i < args->timer_n; i++) {
+	for (i = 0; i < args->posix_timers_n; i++) {
 		rt = &args->posix_timers[i];
 		sys_timer_settime((timer_t)rt->spt.it_id, 0, &rt->val, NULL);
 	}
@@ -649,16 +710,14 @@ static unsigned int bootstrap_len;
  */
 #ifdef CONFIG_VDSO
 static unsigned long vdso_rt_size;
+#else
+#define vdso_rt_size	(0)
+#endif
+
 void __export_unmap(void)
 {
 	sys_munmap(bootstrap_start, bootstrap_len - vdso_rt_size);
 }
-#else
-void __export_unmap(void)
-{
-	sys_munmap(bootstrap_start, bootstrap_len);
-}
-#endif
 
 /*
  * This function unmaps all VMAs, which don't belong to
@@ -668,22 +727,23 @@ void __export_unmap(void)
  * and arguments and the one with private vmas of the tasks we restore
  * (a.k.a. premmaped area):
  *
- * 0                       TASK_SIZE
+ * 0                       task_size
  * +----+====+----+====+---+
  *
  * Thus to unmap old memory we have to do 3 unmaps:
  * [ 0 -- 1st area start ]
  * [ 1st end -- 2nd start ]
- * [ 2nd start -- TASK_SIZE ]
+ * [ 2nd start -- task_size ]
  */
 static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len,
-		      void *bootstrap_start, unsigned long bootstrap_len)
+		      void *bootstrap_start, unsigned long bootstrap_len,
+		      unsigned long task_size)
 {
 	unsigned long s1, s2;
 	void *p1, *p2;
 	int ret;
 
-	if ((void *) premmapped_addr < bootstrap_start) {
+	if (premmapped_addr < bootstrap_start) {
 		p1 = premmapped_addr;
 		s1 = premmapped_len;
 		p2 = bootstrap_start;
@@ -707,10 +767,10 @@ static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len,
 		return -1;
 	}
 
-	ret = sys_munmap(p2 + s2, (void *) TASK_SIZE - (p2 + s2));
+	ret = sys_munmap(p2 + s2, task_size - (unsigned long)(p2 + s2));
 	if (ret) {
 		pr_err("Unable to unmap (%p-%p): %d\n",
-				p2 + s2, (void *)TASK_SIZE, ret);
+				p2 + s2, (void *)task_size, ret);
 		return -1;
 	}
 
@@ -721,7 +781,7 @@ static int wait_helpers(struct task_restore_args *task_args)
 {
 	int i;
 
-	for (i = 0; i < task_args->n_helpers; i++) {
+	for (i = 0; i < task_args->helpers_n; i++) {
 		int status;
 		pid_t pid = task_args->helpers[i];
 
@@ -740,23 +800,23 @@ static int wait_helpers(struct task_restore_args *task_args)
 	return 0;
 }
 
-static int lsm_set_label(struct task_restore_args *args)
+static int wait_zombies(struct task_restore_args *task_args)
 {
-	int ret = -1;
+	int i;
 
-	if (!args->lsm_profile)
-		return 0;
+	atomic_add(task_args->zombies_n, &task_entries->nr_zombies);
 
-	pr_info("restoring lsm profile %s\n", args->lsm_profile);
-
-	ret = sys_write(args->proc_attr_current, args->lsm_profile, args->lsm_profile_len);
-	sys_close(args->proc_attr_current);
-	if (ret < 0) {
-		pr_err("can't write lsm profile\n");
-		return -1;
+	for (i = 0; i < task_args->zombies_n; i++) {
+		if (sys_waitid(P_PID, task_args->zombies[i], NULL, WNOWAIT | WEXITED, NULL) < 0) {
+			pr_err("Wait on %d zombie failed\n", task_args->zombies[i]);
+			return -1;
+		}
+		pr_debug("%ld: Collect a zombie with pid %d\n",
+			sys_getpid(), task_args->zombies[i]);
+		futex_dec_and_wake(&task_entries->nr_in_progress);
 	}
 
-	return ret;
+	return 0;
 }
 
 /*
@@ -789,7 +849,9 @@ long __export_restore_task(struct task_restore_args *args)
 
 	task_entries = args->task_entries;
 	helpers = args->helpers;
-	n_helpers = args->n_helpers;
+	n_helpers = args->helpers_n;
+	zombies = args->zombies;
+	n_zombies = args->zombies_n;
 	*args->breakpoint = rst_sigreturn;
 
 	ksigfillset(&act.rt_sa_mask);
@@ -805,23 +867,21 @@ long __export_restore_task(struct task_restore_args *args)
 
 	pr_info("Switched to the restorer %d\n", my_pid);
 
-#ifdef CONFIG_VDSO
 	if (vdso_do_park(&args->vdso_sym_rt, args->vdso_rt_parked_at, vdso_rt_size))
 		goto core_restore_end;
-#endif
 
 	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len,
-				bootstrap_start, bootstrap_len))
+				bootstrap_start, bootstrap_len, args->task_size))
 		goto core_restore_end;
 
 	/* Shift private vma-s to the left */
-	for (i = 0; i < args->nr_vmas; i++) {
-		vma_entry = args->tgt_vmas + i;
+	for (i = 0; i < args->vmas_n; i++) {
+		vma_entry = args->vmas + i;
 
-		if (!vma_entry_is_private(vma_entry))
+		if (!vma_entry_is_private(vma_entry, args->task_size))
 			continue;
 
-		if (vma_entry->end >= TASK_SIZE)
+		if (vma_entry->end >= args->task_size)
 			continue;
 
 		if (vma_entry->start > vma_entry->shmid)
@@ -833,13 +893,13 @@ long __export_restore_task(struct task_restore_args *args)
 	}
 
 	/* Shift private vma-s to the right */
-	for (i = args->nr_vmas - 1; i >= 0; i--) {
-		vma_entry = args->tgt_vmas + i;
+	for (i = args->vmas_n - 1; i >= 0; i--) {
+		vma_entry = args->vmas + i;
 
-		if (!vma_entry_is_private(vma_entry))
+		if (!vma_entry_is_private(vma_entry, args->task_size))
 			continue;
 
-		if (vma_entry->start > TASK_SIZE)
+		if (vma_entry->start > args->task_size)
 			continue;
 
 		if (vma_entry->start < vma_entry->shmid)
@@ -853,13 +913,13 @@ long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * OK, lets try to map new one.
 	 */
-	for (i = 0; i < args->nr_vmas; i++) {
-		vma_entry = args->tgt_vmas + i;
+	for (i = 0; i < args->vmas_n; i++) {
+		vma_entry = args->vmas + i;
 
 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR))
 			continue;
 
-		if (vma_entry_is_private(vma_entry))
+		if (vma_entry_is_private(vma_entry, args->task_size))
 			continue;
 
 		va = restore_mapping(vma_entry);
@@ -874,12 +934,12 @@ long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * Proxify vDSO.
 	 */
-	for (i = 0; i < args->nr_vmas; i++) {
-		if (vma_entry_is(&args->tgt_vmas[i], VMA_AREA_VDSO) ||
-		    vma_entry_is(&args->tgt_vmas[i], VMA_AREA_VVAR)) {
+	for (i = 0; i < args->vmas_n; i++) {
+		if (vma_entry_is(&args->vmas[i], VMA_AREA_VDSO) ||
+		    vma_entry_is(&args->vmas[i], VMA_AREA_VVAR)) {
 			if (vdso_proxify("dumpee", &args->vdso_sym_rt,
 					 args->vdso_rt_parked_at,
-					 i, args->tgt_vmas, args->nr_vmas))
+					 i, args->vmas, args->vmas_n))
 				goto core_restore_end;
 			break;
 		}
@@ -890,8 +950,8 @@ long __export_restore_task(struct task_restore_args *args)
 	 * Walk though all VMAs again to drop PROT_WRITE
 	 * if it was not there.
 	 */
-	for (i = 0; i < args->nr_vmas; i++) {
-		vma_entry = args->tgt_vmas + i;
+	for (i = 0; i < args->vmas_n; i++) {
+		vma_entry = args->vmas + i;
 
 		if (!(vma_entry_is(vma_entry, VMA_AREA_REGULAR)))
 			continue;
@@ -907,10 +967,10 @@ long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * Finally restore madivse() bits
 	 */
-	for (i = 0; i < args->nr_vmas; i++) {
+	for (i = 0; i < args->vmas_n; i++) {
 		unsigned long m;
 
-		vma_entry = args->tgt_vmas + i;
+		vma_entry = args->vmas + i;
 		if (!vma_entry->has_madv || !vma_entry->madv)
 			continue;
 
@@ -936,7 +996,7 @@ long __export_restore_task(struct task_restore_args *args)
 	 * up AIO rings.
 	 */
 
-	for (i = 0; i < args->nr_rings; i++) {
+	for (i = 0; i < args->rings_n; i++) {
 		struct rst_aio_ring *raio = &args->rings[i];
 		unsigned long ctx = 0;
 		int ret;
@@ -1080,10 +1140,16 @@ long __export_restore_task(struct task_restore_args *args)
 		long parent_tid;
 		int i, fd;
 
-		fd = args->fd_last_pid;
+		fd = sys_openat(args->proc_fd, LAST_PID_PATH, O_RDWR, 0);
+		if (fd < 0) {
+			pr_err("can't open last pid fd %d\n", fd);
+			goto core_restore_end;
+		}
+
 		ret = sys_flock(fd, LOCK_EX);
 		if (ret) {
 			pr_err("Can't lock last_pid %d\n", fd);
+			sys_close(fd);
 			goto core_restore_end;
 		}
 
@@ -1100,6 +1166,7 @@ long __export_restore_task(struct task_restore_args *args)
 			ret = sys_write(fd, s, last_pid_len);
 			if (ret < 0) {
 				pr_err("Can't set last_pid %ld/%s\n", ret, last_pid_buf);
+				sys_close(fd);
 				goto core_restore_end;
 			}
 
@@ -1116,12 +1183,12 @@ long __export_restore_task(struct task_restore_args *args)
 		ret = sys_flock(fd, LOCK_UN);
 		if (ret) {
 			pr_err("Can't unlock last_pid %ld\n", ret);
+			sys_close(fd);
 			goto core_restore_end;
 		}
 
+		sys_close(fd);
 	}
-
-	sys_close(args->fd_last_pid);
 
 	restore_rlims(args);
 
@@ -1139,11 +1206,10 @@ long __export_restore_task(struct task_restore_args *args)
 
 	pr_info("%ld: Restored\n", sys_getpid());
 
-	futex_set(&zombies_inprogress, args->nr_zombies);
-
 	restore_finish_stage(CR_STATE_RESTORE);
 
-	futex_wait_while_gt(&zombies_inprogress, 0);
+	if (wait_zombies(args) < 0)
+		goto core_restore_end;
 
 	if (wait_helpers(args) < 0)
 		goto core_restore_end;
@@ -1157,11 +1223,11 @@ long __export_restore_task(struct task_restore_args *args)
 
 	sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(k_rtsigset_t));
 
-	ret = restore_signals(args->siginfo, args->siginfo_nr, true);
+	ret = restore_signals(args->siginfo, args->siginfo_n, true);
 	if (ret)
 		goto core_restore_end;
 
-	ret = restore_signals(args->t->siginfo, args->t->siginfo_nr, false);
+	ret = restore_signals(args->t->siginfo, args->t->siginfo_n, false);
 	if (ret)
 		goto core_restore_end;
 
@@ -1175,16 +1241,18 @@ long __export_restore_task(struct task_restore_args *args)
 	 * thus restore* creds _after_ all of the above.
 	 */
 
-	ret = restore_creds(&args->creds);
+	ret = restore_creds(&args->creds, args->proc_fd);
 	ret = ret || restore_dumpable_flag(&args->mm);
 	ret = ret || restore_pdeath_sig(args->t);
 
-	if (lsm_set_label(args) < 0) {
-		pr_err("lsm_set_label failed\n");
-		goto core_restore_end;
-	}
-
 	futex_set_and_wake(&thread_inprogress, args->nr_threads);
+
+	/*
+	 * We have to close the log before restoring seccomp, because
+	 * SECCOMP_MODE_STRICT blocks close().
+	 */
+	if (args->seccomp_mode != SECCOMP_MODE_DISABLED)
+		pr_info("restoring seccomp mode %d for %ld\n", args->seccomp_mode, sys_getpid());
 
 	restore_finish_stage(CR_STATE_RESTORE_CREDS);
 
@@ -1194,6 +1262,7 @@ long __export_restore_task(struct task_restore_args *args)
 	/* Wait until children stop to use args->task_entries */
 	futex_wait_while_gt(&thread_inprogress, 1);
 
+	sys_close(args->proc_fd);
 	log_set_fd(-1);
 
 	/*
@@ -1215,6 +1284,8 @@ long __export_restore_task(struct task_restore_args *args)
 	restore_posix_timers(args);
 
 	sys_munmap(args->rst_mem, args->rst_mem_size);
+
+	restore_seccomp(args->seccomp_mode);
 
 	/*
 	 * Sigframe stack.

@@ -18,15 +18,15 @@ struct rst_mem_type_s {
 	unsigned long size;
 };
 
-#define RST_MEM_BATCH	(2 * PAGE_SIZE)
-
 static inline unsigned long rst_mem_grow(unsigned long need_size)
 {
-	need_size = round_up(need_size, PAGE_SIZE);
-	if (likely(need_size < RST_MEM_BATCH))
-		need_size = RST_MEM_BATCH;
+	int rst_mem_batch = 2 * page_size();
+
+	need_size = round_up(need_size, page_size());
+	if (likely(need_size < rst_mem_batch))
+		need_size = rst_mem_batch;
 	else
-		pr_debug("Growing rst memory %lu pages\n", need_size / PAGE_SIZE);
+		pr_debug("Growing rst memory %lu pages\n", need_size / page_size());
 	return need_size;
 }
 
@@ -169,8 +169,15 @@ void rst_mem_free_last(int type)
 	t->last = 0; /* next free_last would be no-op */
 }
 
-unsigned long rst_mem_remap_size(void)
+unsigned long rst_mem_lock(void)
 {
+	/*
+	 * Don't allow further allocations from rst_mem since we're
+	 * going to get the bootstrap area and remap all the stuff
+	 * into it. The SHREMAP and SHARED should be already locked
+	 * in the rst_mem_switch_to_private().
+	 */
+	rst_mems[RM_PRIVATE].enabled = false;
 	return rst_mems[RM_PRIVATE].size + rst_mems[RM_SHREMAP].size;
 }
 
@@ -178,7 +185,7 @@ static int rst_mem_remap_one(struct rst_mem_type_s *t, void *to)
 {
 	void *aux;
 
-	BUG_ON(!t->remapable);
+	BUG_ON(!t->remapable || t->enabled);
 
 	if (!t->buf)
 		/*
@@ -196,7 +203,6 @@ static int rst_mem_remap_one(struct rst_mem_type_s *t, void *to)
 	}
 
 	t->buf = aux;
-	t->enabled = false;
 	return 0;
 }
 

@@ -2,6 +2,7 @@
 #define __CR_TIMERFD_H__
 
 #include <time.h>
+#include <sys/ioctl.h>
 
 #include "files.h"
 
@@ -18,13 +19,11 @@ struct restore_timerfd {
 
 extern const struct fdtype_ops timerfd_dump_ops;
 extern struct collect_image_info timerfd_cinfo;
-extern struct restore_timerfd *rst_timerfd;
+
+int rst_timerfd_prep(void);
+extern unsigned long rst_timerfd_cpos;
 extern unsigned int rst_timerfd_nr;
 
-static inline unsigned long rst_timerfd_len(void)
-{
-	return sizeof(*rst_timerfd) * rst_timerfd_nr;
-}
 
 extern int check_timerfd(void);
 extern int is_timerfd_link(char *link);
@@ -34,7 +33,7 @@ extern int is_timerfd_link(char *link);
 #endif
 
 #ifndef TFD_IOC_SET_TICKS
-# define TFD_IOC_SET_TICKS	0x40085400
+# define TFD_IOC_SET_TICKS	_IOW('T', 0, u64)
 #endif
 
 #endif /* __CR_TIMERFD_H__ */

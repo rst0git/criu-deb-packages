@@ -14,7 +14,6 @@
 
 #define MAP_SIZE (1UL << 20)
 #define MEM_SIZE (1UL << 29)
-#define PAGE_SIZE 4096
 
 const char *test_doc	= "create random mappings and touch memory";
 
@@ -131,8 +130,9 @@ int main(int argc, char **argv)
 			err("unexpected state");
 		futex_set_and_wake(&shm->stop, 2);
 		test_waitsig();
+		return 0;
 	} else {
-		int readable = 0;
+		int readable = 0, status = -1;
 
 		/* stop the child */
 		futex_set(&shm->stop, 1);
@@ -160,8 +160,12 @@ int main(int argc, char **argv)
 			}
 		}
 		test_msg("readable %d\n", readable);
-		kill(child, SIGTRAP);
-		wait(NULL);
+		kill(child, SIGTERM);
+		wait(&status);
+		if (status != 0) {
+			err("Non-zero exit code: %d", status);
+			goto err;
+		}
 		pass();
 	}
 

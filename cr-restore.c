@@ -75,6 +75,7 @@
 #include "aio.h"
 #include "security.h"
 #include "lsm.h"
+#include "seccomp.h"
 
 #include "parasite-syscall.h"
 
@@ -90,6 +91,8 @@
 #include "asm/atomic.h"
 
 #include "cr-errno.h"
+
+#include "pie/pie-relocs.h"
 
 #ifndef arch_export_restore_thread
 #define arch_export_restore_thread	__export_restore_thread
@@ -113,9 +116,10 @@ static int prepare_posix_timers(int pid, CoreEntry *core);
 static int prepare_signals(int pid, CoreEntry *core);
 
 static int root_as_sibling;
-static pid_t *helpers = NULL;
 static unsigned long helpers_pos = 0;
 static int n_helpers = 0;
+static unsigned long zombies_pos = 0;
+static int n_zombies = 0;
 
 static int crtools_prepare_shared(void)
 {
@@ -239,7 +243,7 @@ err:
 }
 
 /* Map a private vma, if it is not mapped by a parent yet */
-static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
+static int map_private_vma(struct vma_area *vma, void **tgt_addr,
 			struct vma_area **pvma, struct list_head *pvma_list)
 {
 	int ret;
@@ -265,7 +269,7 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
 		if (p->e->start > vma->e->start)
 			 break;
 
-		if (!vma_area_is_private(p))
+		if (!vma_area_is_private(p, kdat.task_size))
 			continue;
 
 		 if (p->e->end != vma->e->end ||
@@ -350,7 +354,7 @@ static int map_private_vma(pid_t pid, struct vma_area *vma, void **tgt_addr,
 	return 0;
 }
 
-static int premap_priv_vmas(pid_t pid, struct vm_area_list *vmas, void *at)
+static int premap_priv_vmas(struct vm_area_list *vmas, void *at)
 {
 	struct list_head *parent_vmas;
 	struct vma_area *pvma, *vma;
@@ -377,10 +381,10 @@ static int premap_priv_vmas(pid_t pid, struct vm_area_list *vmas, void *at)
 		}
 		pstart = vma->e->start;
 
-		if (!vma_area_is_private(vma))
+		if (!vma_area_is_private(vma, kdat.task_size))
 			continue;
 
-		ret = map_private_vma(pid, vma, &at, &pvma, parent_vmas);
+		ret = map_private_vma(vma, &at, &pvma, parent_vmas);
 		if (ret < 0)
 			break;
 	}
@@ -388,7 +392,7 @@ static int premap_priv_vmas(pid_t pid, struct vm_area_list *vmas, void *at)
 	return ret;
 }
 
-static int restore_priv_vma_content(pid_t pid)
+static int restore_priv_vma_content(void)
 {
 	struct vma_area *vma;
 	int ret = 0;
@@ -403,7 +407,7 @@ static int restore_priv_vma_content(pid_t pid)
 
 	vma = list_first_entry(vmas, struct vma_area, list);
 
-	ret = open_page_read(pid, &pr, PR_TASK);
+	ret = open_page_read(current->pid.virt, &pr, PR_TASK);
 	if (ret <= 0)
 		return -1;
 
@@ -443,7 +447,7 @@ static int restore_priv_vma_content(pid_t pid)
 			 */
 			if (va < vma->e->start)
 				goto err_addr;
-			else if (unlikely(!vma_area_is_private(vma))) {
+			else if (unlikely(!vma_area_is_private(vma, kdat.task_size))) {
 				pr_err("Trying to restore page for non-private VMA\n");
 				goto err_addr;
 			}
@@ -531,7 +535,7 @@ err_addr:
 	return -1;
 }
 
-static int prepare_mappings(int pid)
+static int prepare_mappings(void)
 {
 	int ret = 0;
 	void *addr;
@@ -557,11 +561,11 @@ static int prepare_mappings(int pid)
 	rsti(current)->premmapped_addr = addr;
 	rsti(current)->premmapped_len = vmas->priv_size;
 
-	ret = premap_priv_vmas(pid, vmas, addr);
+	ret = premap_priv_vmas(vmas, addr);
 	if (ret < 0)
 		goto out;
 
-	ret = restore_priv_vma_content(pid);
+	ret = restore_priv_vma_content();
 	if (ret < 0)
 		goto out;
 
@@ -586,7 +590,7 @@ static int unmap_guard_pages()
 	struct list_head *vmas = &rsti(current)->vmas.h;
 
 	list_for_each_entry(vma, vmas, list) {
-		if (!vma_area_is_private(vma))
+		if (!vma_area_is_private(vma, kdat.task_size))
 			continue;
 
 		if (vma->e->flags & MAP_GROWSDOWN) {
@@ -728,32 +732,38 @@ err:
 	return ret;
 }
 
-static int collect_helper_pids()
+static int collect_child_pids(int state, int *n)
 {
 	struct pstree_item *pi;
 
+	*n = 0;
 	list_for_each_entry(pi, &current->children, sibling) {
+		static pid_t *child;
 
-		if (pi->state != TASK_HELPER)
+		if (pi->state != state)
 			continue;
 
-		if (helpers) {
-			void *m;
-			m = rst_mem_alloc(sizeof(*helpers) * ++n_helpers, RM_PRIVATE);
-			if (!m)
-				return -1;
-		} else {
-			helpers_pos = rst_mem_cpos(RM_PRIVATE);
-			helpers = rst_mem_alloc(sizeof(*helpers), RM_PRIVATE);
-			if (!helpers)
-				return -1;
-			n_helpers = 1;
-		}
+		child = rst_mem_alloc(sizeof(*child), RM_PRIVATE);
+		if (!child)
+			return -1;
 
-		helpers[n_helpers - 1] = pi->pid.virt;
+		(*n)++;
+		*child = pi->pid.virt;
 	}
 
 	return 0;
+}
+
+static int collect_helper_pids()
+{
+	helpers_pos = rst_mem_cpos(RM_PRIVATE);
+	return collect_child_pids(TASK_HELPER, &n_helpers);
+}
+
+static int collect_zombie_pids()
+{
+	zombies_pos = rst_mem_cpos(RM_PRIVATE);
+	return collect_child_pids(TASK_DEAD, &n_zombies);
 }
 
 static int open_cores(int pid, CoreEntry *leader_core)
@@ -826,6 +836,9 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (collect_helper_pids() < 0)
 		return -1;
 
+	if (collect_zombie_pids() < 0)
+		return -1;
+
 	if (inherit_fd_fini() < 0)
 		return -1;
 
@@ -885,7 +898,7 @@ static inline int sig_fatal(int sig)
 struct task_entries *task_entries;
 static unsigned long task_entries_pos;
 
-static int restore_one_zombie(int pid, CoreEntry *core)
+static int restore_one_zombie(CoreEntry *core)
 {
 	int exit_code = core->tc->exit_code;
 
@@ -899,7 +912,6 @@ static int restore_one_zombie(int pid, CoreEntry *core)
 	if (task_entries != NULL) {
 		restore_finish_stage(CR_STATE_RESTORE);
 		zombie_prepare_signals();
-		mutex_lock(&task_entries->zombie_lock);
 	}
 
 	if (exit_code & 0x7f) {
@@ -915,7 +927,7 @@ static int restore_one_zombie(int pid, CoreEntry *core)
 			signr = SIGABRT;
 		}
 
-		if (kill(pid, signr) < 0)
+		if (kill(current->pid.virt, signr) < 0)
 			pr_perror("Can't kill myself, will just exit");
 
 		exit_code = 0;
@@ -968,7 +980,7 @@ static int restore_one_task(int pid, CoreEntry *core)
 	if (task_alive(current))
 		ret = restore_one_alive_task(pid, core);
 	else if (current->state == TASK_DEAD)
-		ret = restore_one_zombie(pid, core);
+		ret = restore_one_zombie(core);
 	else if (current->state == TASK_HELPER) {
 		restore_finish_stage(CR_STATE_RESTORE);
 		ret = 0;
@@ -1058,6 +1070,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 		item->state = ca.core->tc->task_state;
 		rsti(item)->cg_set = ca.core->tc->cg_set;
+		rsti(item)->has_seccomp = ca.core->tc->seccomp_mode != SECCOMP_MODE_DISABLED;
 
 		if (item->state == TASK_DEAD)
 			rsti(item->parent)->nr_zombies++;
@@ -1255,7 +1268,15 @@ static int criu_signals_setup(void)
 	 */
 	sigfillset(&blockmask);
 	sigdelset(&blockmask, SIGCHLD);
-	ret = sigprocmask(SIG_BLOCK, &blockmask, NULL);
+
+	/*
+	 * Here we use SIG_SETMASK instead of SIG_BLOCK to avoid the case where
+	 * we've been forked from a parent who had blocked SIGCHLD. If SIGCHLD
+	 * is blocked when a task dies (e.g. if the task fails to restore
+	 * somehow), we hang because our SIGCHLD handler is never run. Since we
+	 * depend on SIGCHLD being unblocked, let's set the mask explicitly.
+	 */
+	ret = sigprocmask(SIG_SETMASK, &blockmask, NULL);
 	if (ret < 0) {
 		pr_perror("Can't block signals");
 		return -1;
@@ -1354,7 +1375,7 @@ static int mount_proc(void)
 	}
 
 	pr_info("Mount procfs in %s\n", proc_mountpoint);
-	if (mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL)) {
+	if (mount("proc", proc_mountpoint, "proc", MS_MGC_VAL | MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL)) {
 		pr_perror("mount failed");
 		rmdir(proc_mountpoint);
 		return -1;
@@ -1490,7 +1511,7 @@ static int restore_task_with_children(void *_arg)
 			goto err_fini_mnt;
 	}
 
-	if (prepare_mappings(pid))
+	if (prepare_mappings())
 		goto err_fini_mnt;
 
 	if (!(ca->clone_flags & CLONE_FILES)) {
@@ -1672,6 +1693,17 @@ static void finalize_restore(int status)
 			goto detach;
 
 		/* Unmap the restorer blob */
+
+		/*
+		 * Suspend seccomp if necessary. We need to do this because
+		 * although seccomp is restored at the very end of the
+		 * restorer blob (and the final sigreturn is ok), here we're
+		 * doing an munmap in the process, which may be blocked by
+		 * seccomp and cause the task to be killed.
+		 */
+		if (rsti(item)->has_seccomp && suspend_seccomp(pid) < 0)
+			pr_err("failed to suspend seccomp, restore will probably fail...\n");
+
 		ctl = parasite_prep_ctl(pid, NULL);
 		if (ctl == NULL)
 			goto detach;
@@ -1806,6 +1838,12 @@ static int restore_root_task(struct pstree_item *init)
 	if (ret < 0)
 		goto out_kill;
 
+	/*
+	 * The task_entries->nr_zombies is updated in the
+	 * CR_STATE_RESTORE_SIGCHLD in pie code.
+	 */
+	task_entries->nr_threads -= atomic_read(&task_entries->nr_zombies);
+
 	ret = stop_usernsd();
 	if (ret < 0)
 		goto out_kill;
@@ -1908,8 +1946,8 @@ static int prepare_task_entries(void)
 	task_entries->nr_threads = 0;
 	task_entries->nr_tasks = 0;
 	task_entries->nr_helpers = 0;
+	atomic_set(&task_entries->nr_zombies, 0);
 	futex_set(&task_entries->start, CR_STATE_RESTORE_NS);
-	mutex_init(&task_entries->zombie_lock);
 	mutex_init(&task_entries->userns_sync_lock);
 
 	return 0;
@@ -1962,7 +2000,7 @@ err:
 	return ret;
 }
 
-static long restorer_get_vma_hint(pid_t pid, struct list_head *tgt_vma_list,
+static long restorer_get_vma_hint(struct list_head *tgt_vma_list,
 		struct list_head *self_vma_list, long vma_len)
 {
 	struct vma_area *t_vma, *s_vma;
@@ -1971,7 +2009,7 @@ static long restorer_get_vma_hint(pid_t pid, struct list_head *tgt_vma_list,
 	VmaEntry end_e;
 
 	end_vma.e = &end_e;
-	end_e.start = end_e.end = TASK_SIZE;
+	end_e.start = end_e.end = kdat.task_size;
 	prev_vma_end = PAGE_SIZE * 0x10; /* CONFIG_LSM_MMAP_MIN_ADDR=65536 */
 
 	s_vma = list_first_entry(self_vma_list, struct vma_area, list);
@@ -2249,31 +2287,42 @@ static inline int verify_cap_size(CredsEntry *ce)
 		(ce->n_cap_prm == CR_CAP_SIZE) && (ce->n_cap_bnd == CR_CAP_SIZE));
 }
 
-static int prepare_creds(int pid, struct task_restore_args *args, char **lsm_profile)
+static CredsEntry *read_creds(int pid)
 {
 	int ret;
 	struct cr_img *img;
-	CredsEntry *ce;
+	CredsEntry *ce = NULL;
 
 	img = open_image(CR_FD_CREDS, O_RSTR, pid);
 	if (!img)
-		return -1;
+		return NULL;
 
 	ret = pb_read_one(img, &ce, PB_CREDS);
 	close_image(img);
 
-	if (ret < 0)
-		return ret;
+	if (ret < 0) {
+		creds_entry__free_unpacked(ce, NULL);
+		return NULL;
+	}
+
 	if (!verify_cap_size(ce)) {
 		pr_err("Caps size mismatch %d %d %d %d\n",
 		       (int)ce->n_cap_inh, (int)ce->n_cap_eff,
 		       (int)ce->n_cap_prm, (int)ce->n_cap_bnd);
-		return -1;
+		creds_entry__free_unpacked(ce, NULL);
+		return NULL;
 	}
 
-	if (!may_restore(ce))
-		return -1;
+	if (!may_restore(ce)) {
+		creds_entry__free_unpacked(ce, NULL);
+		return NULL;
+	}
 
+	return ce;
+}
+
+static int prepare_creds(CredsEntry *ce, struct task_restore_args *args)
+{
 	args->creds = *ce;
 	args->creds.cap_inh = args->cap_inh;
 	memcpy(args->cap_inh, ce->cap_inh, sizeof(args->cap_inh));
@@ -2294,17 +2343,6 @@ static int prepare_creds(int pid, struct task_restore_args *args, char **lsm_pro
 	if (setgroups(ce->n_groups, ce->groups) < 0) {
 		pr_perror("Can't set supplementary groups");
 		return -1;
-	}
-
-	*lsm_profile = NULL;
-
-	if (ce->lsm_profile) {
-		if (validate_lsm(ce) < 0)
-			return -1;
-
-		*lsm_profile = xstrdup(ce->lsm_profile);
-		if (!*lsm_profile)
-			return -1;
 	}
 
 	creds_entry__free_unpacked(ce, NULL);
@@ -2356,7 +2394,7 @@ static int prepare_restorer_blob(void)
 	 * in turn will lead to set-exe-file prctl to fail with EBUSY.
 	 */
 
-	restorer_len = round_up(sizeof(restorer_blob), PAGE_SIZE);
+	restorer_len = pie_size(restorer_blob);
 	restorer = mmap(NULL, restorer_len,
 			PROT_READ | PROT_WRITE | PROT_EXEC,
 			MAP_PRIVATE | MAP_ANON, 0, 0);
@@ -2380,6 +2418,7 @@ static int remap_restorer_blob(void *addr)
 		return -1;
 	}
 
+	ELF_RELOCS_APPLY_RESTORER(addr, addr);
 	return 0;
 }
 
@@ -2541,7 +2580,7 @@ static int open_signal_image(int type, pid_t pid, unsigned int *nr)
 		if (ret <= 0)
 			break;
 		if (sie->siginfo.len != sizeof(siginfo_t)) {
-			pr_err("Unknown image format");
+			pr_err("Unknown image format\n");
 			ret = -1;
 			break;
 		}
@@ -2621,6 +2660,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	long ret;
 
 	long restore_bootstrap_len;
+	long rst_mem_size;
 
 	struct task_restore_args *task_args;
 	struct thread_restore_args *thread_args;
@@ -2628,12 +2668,6 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 	struct vma_area *vma;
 	unsigned long tgt_vmas;
-
-	void *tcp_socks_mem;
-	unsigned long tcp_socks;
-
-	void *timerfd_mem;
-	unsigned long timerfd_mem_cpos;
 
 #ifdef CONFIG_VDSO
 	unsigned long vdso_rt_size = 0;
@@ -2651,6 +2685,8 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	struct vm_area_list *vmas = &rsti(current)->vmas;
 	int i;
 
+	CredsEntry *creds;
+
 	pr_info("Restore via sigreturn\n");
 
 	/* pr_info_vma_list(&self_vma_list); */
@@ -2658,7 +2694,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	BUILD_BUG_ON(sizeof(struct task_restore_args) & 1);
 	BUILD_BUG_ON(sizeof(struct thread_restore_args) & 1);
 
-	args_len = round_up(sizeof(*task_args) + sizeof(*thread_args) * current->nr_threads, PAGE_SIZE);
+	args_len = round_up(sizeof(*task_args) + sizeof(*thread_args) * current->nr_threads, page_size());
 	pr_info("%d threads require %ldK of memory\n",
 			current->nr_threads, KBYTES(args_len));
 
@@ -2677,7 +2713,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 		*vme = *vma->e;
 
-		if (vma_area_is_private(vma))
+		if (vma_area_is_private(vma, kdat.task_size))
 			vma_premmaped_start(vme) = vma->premmaped_addr;
 	}
 
@@ -2699,26 +2735,18 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	}
 
 	/*
-	 * Copy tcp sockets fds to rst memory -- restorer will
-	 * turn repair off before going sigreturn
+	 * Get all the tcp sockets fds into rst memory -- restorer
+	 * will turn repair off before going sigreturn
 	 */
-
-	tcp_socks = rst_mem_cpos(RM_PRIVATE);
-	tcp_socks_mem = rst_mem_alloc(rst_tcp_socks_len(), RM_PRIVATE);
-	if (!tcp_socks_mem)
+	if (rst_tcp_socks_prep())
 		goto err_nv;
-
-	memcpy(tcp_socks_mem, rst_tcp_socks, rst_tcp_socks_len());
 
 	/*
 	 * Copy timerfd params for restorer args, we need to proceed
 	 * timer setting at the very late.
 	 */
-	timerfd_mem_cpos = rst_mem_cpos(RM_PRIVATE);
-	timerfd_mem = rst_mem_alloc(rst_timerfd_len(), RM_PRIVATE);
-	if (!timerfd_mem)
+	if (rst_timerfd_prep())
 		goto err_nv;
-	memcpy(timerfd_mem, rst_timerfd, rst_timerfd_len());
 
 	/*
 	 * We're about to search for free VM area and inject the restorer blob
@@ -2730,8 +2758,37 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	if (ret < 0)
 		goto err;
 
-	restore_bootstrap_len = restorer_len + args_len +
-				rst_mem_remap_size();
+	creds = read_creds(pid);
+	if (!creds)
+		goto err;
+
+	if (creds->lsm_profile) {
+		char *rendered;
+		int ret;
+
+		if (validate_lsm(creds) < 0)
+			return -1;
+
+		ret = render_lsm_profile(creds->lsm_profile, &rendered);
+		if (ret < 0) {
+			goto err_nv;
+		}
+
+		lsm_pos = rst_mem_cpos(RM_PRIVATE);
+		lsm_profile_len = strlen(rendered);
+		lsm = rst_mem_alloc(lsm_profile_len + 1, RM_PRIVATE);
+		if (!lsm) {
+			xfree(rendered);
+			goto err_nv;
+		}
+
+		strncpy(lsm, rendered, lsm_profile_len);
+		xfree(rendered);
+
+	}
+
+	rst_mem_size = rst_mem_lock();
+	restore_bootstrap_len = restorer_len + args_len + rst_mem_size;
 
 #ifdef CONFIG_VDSO
 	/*
@@ -2759,7 +2816,7 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	 * or inited from scratch).
 	 */
 
-	exec_mem_hint = restorer_get_vma_hint(pid, &vmas->h, &self_vmas.h,
+	exec_mem_hint = restorer_get_vma_hint(&vmas->h, &self_vmas.h,
 					      restore_bootstrap_len);
 	if (exec_mem_hint == -1) {
 		pr_err("No suitable area for task_restore bootstrap (%ldK)\n",
@@ -2799,31 +2856,15 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	task_args	= mem;
 	thread_args	= (struct thread_restore_args *)(task_args + 1);
 
-	ret = prepare_creds(pid, task_args, &lsm);
+	task_args->proc_fd = dup(get_service_fd(PROC_FD_OFF));
+	if (task_args->proc_fd < 0) {
+		pr_perror("can't dup proc fd");
+		goto err;
+	}
+
+	ret = prepare_creds(creds, task_args);
 	if (ret < 0)
 		goto err;
-
-	if (lsm) {
-		char *rendered;
-		int ret;
-
-		ret = render_lsm_profile(lsm, &rendered);
-		xfree(lsm);
-		if (ret < 0) {
-			goto err_nv;
-		}
-
-		lsm_pos = rst_mem_cpos(RM_PRIVATE);
-		lsm_profile_len = strlen(rendered);
-		lsm = rst_mem_alloc(lsm_profile_len + 1, RM_PRIVATE);
-		if (!lsm) {
-			xfree(rendered);
-			goto err_nv;
-		}
-
-		strncpy(lsm, rendered, lsm_profile_len);
-		xfree(rendered);
-	}
 
 	/*
 	 * Get a reference to shared memory area which is
@@ -2844,53 +2885,39 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	task_args->task_entries = rst_mem_remap_ptr(task_entries_pos, RM_SHREMAP);
 
 	task_args->rst_mem = mem;
-	task_args->rst_mem_size = rst_mem_remap_size();
+	task_args->rst_mem_size = rst_mem_size;
 
 	task_args->bootstrap_start = (void *)exec_mem_hint;
 	task_args->bootstrap_len = restore_bootstrap_len;
-#ifdef CONFIG_VDSO
-	task_args->vdso_rt_size = vdso_rt_size;
-#endif
 
 	task_args->premmapped_addr = (unsigned long)rsti(current)->premmapped_addr;
 	task_args->premmapped_len = rsti(current)->premmapped_len;
 
-	task_args->nr_vmas = vmas->nr;
-	task_args->tgt_vmas = rst_mem_remap_ptr(tgt_vmas, RM_PRIVATE);
+	task_args->task_size = kdat.task_size;
 
-	task_args->timer_n = posix_timers_nr;
-	task_args->posix_timers = rst_mem_remap_ptr(posix_timers_cpos, RM_PRIVATE);
+#define remap_array(name, nr, cpos)	do {				\
+		task_args->name##_n = nr;				\
+		task_args->name = rst_mem_remap_ptr(cpos, RM_PRIVATE);	\
+	} while (0)
 
-	task_args->timerfd_n = rst_timerfd_nr;
-	task_args->timerfd = rst_mem_remap_ptr(timerfd_mem_cpos, RM_PRIVATE);
+	remap_array(vmas,	  vmas->nr, tgt_vmas);
+	remap_array(posix_timers, posix_timers_nr, posix_timers_cpos);
+	remap_array(timerfd,	  rst_timerfd_nr, rst_timerfd_cpos);
+	remap_array(siginfo,	  siginfo_nr, siginfo_cpos);
+	remap_array(tcp_socks,	  rst_tcp_socks_nr, rst_tcp_socks_cpos);
+	remap_array(rings,	  mm->n_aios, aio_rings);
+	remap_array(rlims,	  rlims_nr, rlims_cpos);
+	remap_array(helpers,	  n_helpers, helpers_pos);
+	remap_array(zombies,	  n_zombies, zombies_pos);
 
-	task_args->siginfo_nr = siginfo_nr;
-	task_args->siginfo = rst_mem_remap_ptr(siginfo_cpos, RM_PRIVATE);
+#undef remap_array
 
-	task_args->tcp_socks_nr = rst_tcp_socks_nr;
-	task_args->tcp_socks = rst_mem_remap_ptr(tcp_socks, RM_PRIVATE);
+	task_args->seccomp_mode = core->tc->seccomp_mode;
 
-	task_args->nr_rings = mm->n_aios;
-	task_args->rings = rst_mem_remap_ptr(aio_rings, RM_PRIVATE);
-
-	task_args->n_helpers = n_helpers;
-	if (n_helpers > 0)
-		task_args->helpers = rst_mem_remap_ptr(helpers_pos, RM_PRIVATE);
+	if (lsm)
+		task_args->creds.lsm_profile = rst_mem_remap_ptr(lsm_pos, RM_PRIVATE);
 	else
-		task_args->helpers = NULL;
-
-	if (lsm) {
-		task_args->proc_attr_current = open_proc_rw(PROC_SELF, "attr/current");
-		if (task_args->proc_attr_current < 0) {
-			pr_perror("Can't open attr/current");
-			goto err;
-		}
-
-		task_args->lsm_profile = rst_mem_remap_ptr(lsm_pos, RM_PRIVATE);
-		task_args->lsm_profile_len = lsm_profile_len;
-	} else {
-		task_args->lsm_profile = NULL;
-	}
+		task_args->creds.lsm_profile = NULL;
 
 	/*
 	 * Arguments for task restoration.
@@ -2904,9 +2931,6 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 
 	strncpy(task_args->comm, core->tc->comm, sizeof(task_args->comm));
 
-	task_args->nr_rlim = rlims_nr;
-	if (rlims_nr)
-		task_args->rlims = rst_mem_remap_ptr(rlims_cpos, RM_PRIVATE);
 
 	/*
 	 * Fill up per-thread data.
@@ -2916,10 +2940,10 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 		struct rt_sigframe *sigframe;
 
 		thread_args[i].pid = current->threads[i].virt;
-		thread_args[i].siginfo_nr = siginfo_priv_nr[i];
+		thread_args[i].siginfo_n = siginfo_priv_nr[i];
 		thread_args[i].siginfo = rst_mem_remap_ptr(siginfo_cpos, RM_PRIVATE);
 		thread_args[i].siginfo += siginfo_nr;
-		siginfo_nr += thread_args[i].siginfo_nr;
+		siginfo_nr += thread_args[i].siginfo_n;
 
 		/* skip self */
 		if (thread_args[i].pid == pid) {
@@ -2981,9 +3005,10 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	 * since we need it being accessible even when own
 	 * self-vmas are unmaped.
 	 */
-	mem += rst_mem_remap_size();
+	mem += rst_mem_size;
 	task_args->vdso_rt_parked_at = (unsigned long)mem + vdso_rt_delta;
 	task_args->vdso_sym_rt = vdso_sym_rt;
+	task_args->vdso_rt_size = vdso_rt_size;
 #endif
 
 	new_sp = restorer_stack(task_args->t);
@@ -3001,20 +3026,9 @@ static int sigreturn_restore(pid_t pid, CoreEntry *core)
 	xfree(current->core);
 
 	/*
-	 * Open the last_pid syscl early, since restorer (maybe) lives
-	 * in chroot and has no access to "/proc/..." paths.
-	 */
-	task_args->fd_last_pid = open_proc_rw(PROC_GEN, LAST_PID_PATH);
-	if (task_args->fd_last_pid < 0) {
-		pr_perror("Can't open sys.ns_last_pid");
-		goto err;
-	}
-
-	/*
 	 * Now prepare run-time data for threads restore.
 	 */
 	task_args->nr_threads		= current->nr_threads;
-	task_args->nr_zombies		= rsti(current)->nr_zombies;
 	task_args->clone_restore_fn	= (void *)restore_thread_exec_start;
 	task_args->thread_args		= thread_args;
 

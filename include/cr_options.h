@@ -21,6 +21,23 @@ struct cg_root_opt {
 	char *newroot;
 };
 
+/*
+ * Cgroup management options.
+ */
+#define CG_MODE_IGNORE		(0u << 0)	/* Zero is important here */
+#define CG_MODE_NONE		(1u << 0)
+#define CG_MODE_PROPS		(1u << 1)
+#define CG_MODE_SOFT		(1u << 2)
+#define CG_MODE_FULL		(1u << 3)
+#define CG_MODE_STRICT		(1u << 4)
+
+#define CG_MODE_DEFAULT		(CG_MODE_SOFT)
+
+/*
+ * Ghost file size we allow to carry by default.
+ */
+#define DEFAULT_GHOST_LIMIT	(1 << 20)
+
 struct cr_options {
 	int			final_state;
 	char			*show_dump_file;
@@ -33,6 +50,7 @@ struct cr_options {
 	};
 	bool			restore_sibling;
 	bool			ext_unix_sk;
+	struct list_head        ext_unixsk_ids;
 	bool			shell_job;
 	bool			handle_file_locks;
 	bool			tcp_established_ok;
@@ -44,6 +62,7 @@ struct cr_options {
 	char			*output;
 	char			*root;
 	char			*pidfile;
+	char			*freeze_cgroup;
 	struct list_head	veth_pairs;
 	struct list_head	scripts;
 	struct list_head	ext_mounts;
@@ -59,13 +78,15 @@ struct cr_options {
 	unsigned int		cpu_cap;
 	bool			force_irmap;
 	char			**exec_cmd;
-	bool			manage_cgroups;
+	unsigned int		manage_cgroups;
 	char			*new_global_cg_root;
 	struct list_head	new_cgroup_roots;
 	bool			autodetect_ext_mounts;
 	bool			enable_external_sharing;
 	bool			enable_external_masters;
 	bool			aufs;		/* auto-deteced, not via cli */
+	bool			overlayfs;
+	size_t			ghost_limit;
 };
 
 extern struct cr_options opts;
