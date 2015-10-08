@@ -2,13 +2,21 @@
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=-all
 
+PACKAGE = $(firstword $(shell dh_listpackages))
+TMP     = $(CURDIR)/debian/$(PACKAGE)
+
 %:
 	dh ${@} --parallel --with python2
 
 override_dh_auto_install:
-	mkdir -p debian/criu/etc/logrotate.d
-
-	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr" LOGROTATEDIR="/etc/logrotate.d"
+	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr"
+	
+	# Cf. #792008; don't install criu systemd service anymore
+	rm --verbose $(TMP)/usr/etc/logrotate.d/criu-service
+	rmdir --ignore-fail-on-non-empty --parents --verbose $(TMP)/usr/etc/logrotate.d
+	rm --verbose $(TMP)/usr/lib/systemd/system/criu.service
+	rm --verbose $(TMP)/usr/lib/systemd/system/criu.socket
+	rmdir --ignore-fail-on-non-empty --parents --verbose $(TMP)/usr/lib/systemd/system
 
 override_dh_auto_test:
 	# disabled: doesn't work yet
