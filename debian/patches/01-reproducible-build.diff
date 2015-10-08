@@ -1,0 +1,19 @@
+Description: Make build reproducible
+Origin: vendor
+Bug-Debian: https://bugs.debian.org/801211
+Forwarded: https://lists.openvz.org/pipermail/criu/2015-October/022549.html
+Author: Chris Lamb <lamby at debian.org>
+Reviewed-by: Salvatore Bonaccorso <carnil@debian.org>
+Last-Update: 2015-10-08
+
+--- criu-1.7.orig/pycriu/images/Makefile
++++ criu-1.7/pycriu/images/Makefile
+@@ -2,7 +2,7 @@ all: pb.py protobuf magic.py
+ 
+ .PHONY: all protobuf clean pb.py
+ 
+-proto := $(filter-out $(SRC_DIR)/protobuf/rpc.proto, $(wildcard $(SRC_DIR)/protobuf/*.proto))
++proto := $(filter-out $(SRC_DIR)/protobuf/rpc.proto, $(sort $(wildcard $(SRC_DIR)/protobuf/*.proto)))
+ proto-py-modules := $(foreach m,$(proto),$(subst -,_,$(notdir $(m:.proto=_pb2))))
+ 
+ # We don't need rpc_pb2.py here, as it is not related to the
