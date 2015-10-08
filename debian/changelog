@@ -1,3 +1,14 @@
+criu (1.7-3) unstable; urgency=medium
+
+  * Add 01-reproducible-build.diff patch.
+    Make build reproducible.
+    Thanks to Chris Lamb <lamby@debian.org> (Closes: #801211)
+  * Don't install criu systemd service files and logrotate script.
+    Don't install criu.service, criu.socket and corresponding logrotate
+    script for criu.service. (Closes: #792008)
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 08 Oct 2015 12:30:33 +0200
+
 criu (1.7-2) unstable; urgency=medium
 
   * Upload to unstable
