@@ -982,7 +982,7 @@ static struct mount_info *mnt_build_tree(struct mount_info *list)
  * mnt_fd is a file descriptor on the mountpoint, which is closed in an error case.
  * If mnt_fd is -1, the mountpoint will be opened by this function.
  */
-static int __open_mountpoint(struct mount_info *pm, int mnt_fd)
+int __open_mountpoint(struct mount_info *pm, int mnt_fd)
 {
 	dev_t dev;
 	struct stat st;
@@ -995,23 +995,23 @@ static int __open_mountpoint(struct mount_info *pm, int mnt_fd)
 		if (mntns_root < 0)
 			return -1;
 
-		mnt_fd = openat(mntns_root, pm->mountpoint, O_RDONLY);
+		mnt_fd = openat(mntns_root, pm->ns_mountpoint, O_RDONLY);
 		if (mnt_fd < 0) {
-			pr_perror("Can't open %s", pm->mountpoint);
+			pr_perror("Can't open %s", pm->ns_mountpoint);
 			return -1;
 		}
 	}
 
 	ret = fstat(mnt_fd, &st);
 	if (ret < 0) {
-		pr_perror("fstat(%s) failed", pm->mountpoint);
+		pr_perror("fstat(%s) failed", pm->ns_mountpoint);
 		goto err;
 	}
 
-	dev = phys_stat_resolve_dev(pm->nsid, st.st_dev, pm->mountpoint + 1);
+	dev = phys_stat_resolve_dev(pm->nsid, st.st_dev, pm->ns_mountpoint + 1);
 	if (dev != pm->s_dev) {
 		pr_err("The file system %#x (%#x) %s %s is inaccessible\n",
-				pm->s_dev, (int)dev, pm->fstype->name, pm->mountpoint);
+		       pm->s_dev, (int)dev, pm->fstype->name, pm->ns_mountpoint);
 		goto err;
 	}
 
@@ -2068,14 +2068,27 @@ static bool can_mount_now(struct mount_info *mi)
 	/* The root mount */
 	if (!mi->parent)
 		return true;
-	if (mi->is_ns_root)
-		return true;
 
 	if (mi->external)
 		return true;
 
-	if (mi->master_id && mi->bind == NULL)
-		return false;
+	/*
+	 * We're the slave peer:
+	 *   - Make sure the master peer is already mounted
+	 *   - Make sure all children is mounted as well to
+	 *     eliminame mounts duplications
+	 */
+	if (mi->master_id) {
+		struct mount_info *c;
+
+		if (mi->bind == NULL)
+			return false;
+
+		list_for_each_entry(c, &mi->bind->children, siblings) {
+			if (!c->mounted)
+				return false;
+		}
+	}
 
 	if (!fsroot_mounted(mi) && (mi->bind == NULL && !mi->need_plugin && !mi->external))
 		return false;
@@ -2090,9 +2103,6 @@ static bool can_mount_now(struct mount_info *mi)
 					return false;
 		} else {
 			list_for_each_entry(n, &p->mnt_share, mnt_share)
-				if (!n->mounted)
-					return false;
-			list_for_each_entry(n, &p->mnt_slave_list, mnt_slave)
 				if (!n->mounted)
 					return false;
 		}
@@ -2527,7 +2537,8 @@ static int do_restore_task_mnt_ns(struct ns_id *nsid)
 		return -1;
 	}
 
-	print_ns_root(nsid, path, sizeof(path));
+	path[0] = '/';
+	print_ns_root(nsid, path + 1, sizeof(path) - 1);
 	if (cr_pivot_root(path))
 		return -1;
 
