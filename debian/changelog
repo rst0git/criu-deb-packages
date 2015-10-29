@@ -1,3 +1,9 @@
+criu (1.7.2-1) unstable; urgency=medium
+
+  * Imported Upstream version 1.7.2
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 29 Oct 2015 15:42:58 +0100
+
 criu (1.7-3) unstable; urgency=medium
 
   * Add 01-reproducible-build.diff patch.
