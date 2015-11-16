@@ -1,3 +1,9 @@
+criu (1.7.2-2) UNRELEASED; urgency=medium
+
+  * Add missing copyright stanza for included sd-daemon.[ch] files
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 16 Nov 2015 08:39:13 +0100
+
 criu (1.7.2-1) unstable; urgency=medium
 
   * Imported Upstream version 1.7.2
