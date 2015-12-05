@@ -18,7 +18,7 @@ Vcs-Browser: https://anonscm.debian.org/cgit/collab-maint/criu.git
 Vcs-Git: git://anonscm.debian.org/collab-maint/criu.git
 
 Package: criu
-Architecture: amd64 armhf
+Architecture: amd64 armhf ppc64el
 Depends: python-ipaddr, python-protobuf, ${misc:Depends}, ${python:Depends}, ${shlibs:Depends}
 Recommends: iproute2 | iproute
 Description: checkpoint and restore in userspace
@@ -28,7 +28,7 @@ Description: checkpoint and restore in userspace
 Package: criu-dbg
 Section: debug
 Priority: extra
-Architecture: amd64 armhf
+Architecture: amd64 armhf ppc64el
 Depends: criu (= ${binary:Version}), ${misc:Depends}
 Description: checkpoint and restore in userspace (debug)
  criu contains the utilities to checkpoint and restore processes in
