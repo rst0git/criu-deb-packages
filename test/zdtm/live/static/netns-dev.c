@@ -25,6 +25,7 @@ char *devconfs[] = {
 	"forwarding",
 	"igmpv2_unsolicited_report_interval",
 	"igmpv3_unsolicited_report_interval",
+	"ignore_routes_with_linkdown",
 	"log_martians",
 	"mc_forwarding",
 	"medium_id",
@@ -57,6 +58,7 @@ int rand_limit[] = {
 	2,	/* forwarding */
 	0,	/* igmpv2_unsolicited_report_interval */
 	0,	/* igmpv3_unsolicited_report_interval */
+	2,	/* ignore_routes_with_linkdown */
 	2,	/* log_martians */
 	2,	/* mc_forwarding */
 	0,	/* medium_id */
@@ -87,13 +89,13 @@ static int save_and_set(int opt, FILE *fp, struct test_conf *tc) {
 	 */
 	ret = fscanf(fp, "%d", &tc->ipv4_conf[opt]);
 	if (ret != 1) {
-		err("fscanf");
+		pr_perror("fscanf");
 		return -1;
 	}
 
 	ret = fseek(fp, 0, SEEK_SET);
 	if (ret) {
-		err("fseek");
+		pr_perror("fseek");
 		return -1;
 	}
 
@@ -109,7 +111,7 @@ static int save_and_set(int opt, FILE *fp, struct test_conf *tc) {
 
 	ret = fprintf(fp, "%d", tc->ipv4_conf_rand[opt]);
 	if (ret < 0) {
-		err("fprintf");
+		pr_perror("fprintf");
 		return -1;
 	}
 
@@ -125,7 +127,7 @@ static int check_and_restore(int opt, FILE *fp, struct test_conf *tc) {
 	 */
 	ret = fscanf(fp, "%d", &val);
 	if (ret != 1) {
-		err("fscanf");
+		pr_perror("fscanf");
 		return -1;
 	}
 
@@ -137,7 +139,7 @@ static int check_and_restore(int opt, FILE *fp, struct test_conf *tc) {
 
 	ret = fseek(fp, 0, SEEK_SET);
 	if (ret) {
-		err("fseek");
+		pr_perror("fseek");
 		return -1;
 	}
 
@@ -146,7 +148,7 @@ static int check_and_restore(int opt, FILE *fp, struct test_conf *tc) {
 	 */
 	ret = fprintf(fp, "%d", tc->ipv4_conf[opt]);
 	if (ret < 0) {
-		err("fprintf");
+		pr_perror("fprintf");
 		return -1;
 	}
 
@@ -163,7 +165,7 @@ static int for_each_option_do(int (*f)(int opt, FILE *fp, struct test_conf *tc),
 
 		ret = snprintf(path, sizeof(path), "%s/%s", tc->dir, devconfs[i]);
 		if (ret < 0) {
-			err("snprintf");
+			pr_perror("snprintf");
 			return -1;
 		}
 
@@ -173,7 +175,7 @@ static int for_each_option_do(int (*f)(int opt, FILE *fp, struct test_conf *tc),
 
 		fp = fopen(path, "r+");
 		if (fp == NULL) {
-			err("fopen");
+			pr_perror("fopen");
 			return -1;
 		}
 

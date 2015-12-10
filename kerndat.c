@@ -21,7 +21,23 @@
 #include "lsm.h"
 
 struct kerndat_s kdat = {
-	.tcp_max_rshare = 3U << 20,
+	/*
+	 * TCP send receive buffers are calculated
+	 * dynamically by the kernel taking into account
+	 * the size of memory present on the machine.
+	 *
+	 * On machines with huge amount of memory it grants
+	 * up to 4M for sendding buffer and 6M for receiving.
+	 * But in turn for low mem machines these limits
+	 * are quite small down to 16K for sending and
+	 * 87380 for receiving.
+	 *
+	 * We will find out precise limits in tcp_read_sysctl_limits
+	 * but by default lets stick for small data to not fail
+	 * on restore: better to slowdown restore procedure than
+	 * failing completely.
+	 */
+	.tcp_max_rshare = 87380,
 };
 
 /*
@@ -194,24 +210,24 @@ int kerndat_get_dirty_track(void)
 
 static int tcp_read_sysctl_limits(void)
 {
-	u32 vect[2][3] = { };
+	u32 vect[3] = { };
 	int ret;
 
 	struct sysctl_req req[] = {
-		{ "net/ipv4/tcp_rmem", &vect[1], CTL_U32A(ARRAY_SIZE(vect[1])) },
+		{ "net/ipv4/tcp_rmem", &vect, CTL_U32A(ARRAY_SIZE(vect)), CTL_FLAGS_OPTIONAL },
 	};
 
 	/*
 	 * Lets figure out which exactly amount of memory is
 	 * availabe for send/read queues on restore.
 	 */
-	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_READ);
-	if (ret) {
+	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0);
+	if (ret || vect[0] == 0) {
 		pr_warn("TCP mem sysctls are not available. Using defaults.\n");
 		goto out;
 	}
 
-	kdat.tcp_max_rshare = min(kdat.tcp_max_rshare, (int)vect[1][2]);
+	kdat.tcp_max_rshare = min(kdat.tcp_max_rshare, (int)vect[2]);
 
 	if (kdat.tcp_max_rshare < 128)
 		pr_warn("The memory limits for TCP queues are suspiciously small\n");
@@ -252,7 +268,7 @@ static int get_last_cap(void)
 		{ "kernel/cap_last_cap", &kdat.last_cap, CTL_U32 },
 	};
 
-	return sysctl_op(req, ARRAY_SIZE(req), CTL_READ);
+	return sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0);
 }
 
 static bool kerndat_has_memfd_create(void)
@@ -317,6 +333,21 @@ out:
 	return exit_code;
 }
 
+static int get_ipv6()
+{
+	if (access("/proc/sys/net/ipv6", F_OK) < 0) {
+		if (errno == ENOENT) {
+			pr_debug("ipv6 is disabled\n");
+			kdat.ipv6 = false;
+			return 0;
+		}
+		pr_perror("Unable to access /proc/sys/net/ipv6");
+		return -1;
+	}
+	kdat.ipv6 = true;
+	return 0;
+}
+
 int kerndat_init(void)
 {
 	int ret;
@@ -332,6 +363,8 @@ int kerndat_init(void)
 		ret = kerndat_fdinfo_has_lock();
 	if (!ret)
 		ret = get_task_size();
+	if (!ret)
+		ret = get_ipv6();
 
 	kerndat_lsm();
 
@@ -355,6 +388,8 @@ int kerndat_init_rst(void)
 		ret = kerndat_has_memfd_create();
 	if (!ret)
 		ret = get_task_size();
+	if (!ret)
+		ret = get_ipv6();
 
 	kerndat_lsm();
 

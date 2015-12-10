@@ -53,7 +53,7 @@ static void test_fini(void)
 	unlink(pidfile);
 }
 
-void setup_outfile()
+static void setup_outfile()
 {
 	if (!access(outfile, F_OK) || errno != ENOENT) {
 		fprintf(stderr, "Output file %s appears to exist, aborting\n",
@@ -75,7 +75,7 @@ static void redir_stdfds()
 
 	nullfd = open("/dev/null", O_RDWR);
 	if (nullfd < 0) {
-		err("Can't open /dev/null: %m\n");
+		pr_perror("Can't open /dev/null");
 		exit(1);
 	}
 
@@ -169,18 +169,15 @@ void test_init(int argc, char **argv)
 	setup_outfile();
 	redir_stdfds();
 
-	if (getenv("ZDTM_REEXEC"))
-		goto skip_pid;
-
 	pidf = fopen(pidfile, "wx");
 	if (!pidf) {
-		err("Can't create pid file %s: %m\n", pidfile);
+		pr_perror("Can't create pid file %s", pidfile);
 		exit(1);
 	}
 
 	pid = fork();
 	if (pid < 0) {
-		err("Daemonizing failed: %m\n");
+		pr_perror("Daemonizing failed");
 		exit(1);
 	}
 
@@ -189,15 +186,18 @@ void test_init(int argc, char **argv)
 
 		if (futex_get(&sig_received) == SIGCHLD) {
 			int ret;
-			waitpid(pid, &ret, 0);
+			if (waitpid(pid, &ret, 0) != pid) {
+				pr_perror("Unable to wait %d, pid");
+				exit(1);
+			}
 
 			if (WIFEXITED(ret)) {
-				err("Test exited with unexpectedly with code %d\n", WEXITSTATUS(ret));
-				exit(0);
+				pr_err("Test exited unexpectedly with code %d\n", WEXITSTATUS(ret));
+				exit(1);
 			}
 			if (WIFSIGNALED(ret)) {
-				err("Test exited on unexpected signal %d\n", WTERMSIG(ret));
-				exit(0);
+				pr_err("Test exited on unexpected signal %d\n", WTERMSIG(ret));
+				exit(1);
 			}
 		}
 
@@ -209,133 +209,20 @@ void test_init(int argc, char **argv)
 	fclose(pidf);
 
 	if (setsid() < 0) {
-		err("Can't become session group leader: %m\n");
+		pr_perror("Can't become session group leader");
 		exit(1);
 	}
 
-skip_pid:
 	/* record the test pid to remember the ownership of the pidfile */
 	master_pid = getpid();
 
 	sa.sa_handler = SIG_DFL;
 	if (sigaction(SIGCHLD, &sa, NULL)) {
-		err("Can't reset SIGCHLD handler: %m\n");
+		pr_perror("Can't reset SIGCHLD handler");
 		exit(1);
 	}
 
 	srand48(time(NULL));	/* just in case we need it */
-}
-
-#define STACK_SIZE	4096
-
-struct zdtm_clone_arg {
-	char stack[STACK_SIZE];
-	char stack_ptr[0];
-	FILE *pidf;
-	int argc;
-	char **argv;
-	int (*fn)(int argc, char **argv);
-};
-
-static int do_test_fn(void *_arg)
-{
-	struct zdtm_clone_arg *ca = _arg;
-	struct sigaction sa = {
-		.sa_handler	= SIG_DFL,
-		.sa_flags	= SA_RESTART,
-	};
-
-	/* record the test pid to remember the ownership of the pidfile */
-	master_pid = getpid();
-
-	fclose(ca->pidf);
-
-	sigemptyset(&sa.sa_mask);
-	if (sigaction(SIGCHLD, &sa, NULL)) {
-		err("Can't reset SIGCHLD handler: %m\n");
-		exit(1);
-	}
-
-	if (setsid() < 0) {
-		err("Can't become session group leader: %m\n");
-		exit(1);
-	}
-
-	srand48(time(NULL));	/* just in case we need it */
-
-	if (ca->fn(ca->argc, ca->argv))
-		exit(1);
-	exit(0);
-}
-
-void test_init_ns(int argc, char **argv, unsigned long clone_flags,
-		  int (*fn)(int , char **))
-{
-	extern void parseargs(int, char **);
-
-	pid_t pid;
-	static FILE *pidf;
-	struct sigaction sa = {
-		.sa_handler	= sig_hand,
-		.sa_flags	= SA_RESTART,
-	};
-	struct zdtm_clone_arg ca;
-
-	sigemptyset(&sa.sa_mask);
-
-	if (sigaction(SIGTERM, &sa, NULL)) {
-		fprintf(stderr, "Can't set SIGTERM handler: %m\n");
-		exit(1);
-	}
-
-	if (sigaction(SIGCHLD, &sa, NULL)) {
-		fprintf(stderr, "Can't set SIGCHLD handler: %m\n");
-		exit(1);
-	}
-
-	parseargs(argc, argv);
-
-	/* setup_outfile() should be called in a target mount namespace */
-	if (!(clone_flags & CLONE_NEWNS))
-		setup_outfile();
-	redir_stdfds();
-
-	pidf = fopen(pidfile, "wx");
-	if (!pidf) {
-		err("Can't create pid file %s: %m\n", pidfile);
-		exit(1);
-	}
-
-	ca.pidf = pidf;
-	ca.fn = fn;
-	ca.argc = argc;
-	ca.argv = argv;
-	pid = clone(do_test_fn, ca.stack_ptr, clone_flags | SIGCHLD, &ca);
-	if (pid < 0) {
-		err("Daemonizing failed: %m\n");
-		exit(1);
-	}
-
-	/* parent will exit when the child is ready */
-	test_waitsig();
-
-	if (futex_get(&sig_received) == SIGCHLD) {
-		int ret;
-		waitpid(pid, &ret, 0);
-
-		if (WIFEXITED(ret)) {
-			err("Test exited with unexpectedly with code %d\n", WEXITSTATUS(ret));
-			exit(0);
-		}
-		if (WIFSIGNALED(ret)) {
-			err("Test exited on unexpected signal %d\n", WTERMSIG(ret));
-			exit(0);
-		}
-	}
-
-	fprintf(pidf, "%d\n", pid);
-	fclose(pidf);
-	_exit(0);
 }
 
 void test_daemon()
@@ -344,7 +231,7 @@ void test_daemon()
 
 	ppid = getppid();
 	if (ppid <= 1) {
-		err("Test orphaned\n");
+		pr_perror("Test orphaned");
 		goto out;
 	}
 

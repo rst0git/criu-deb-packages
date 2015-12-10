@@ -31,6 +31,8 @@ TST_NOFILE	=				\
 		socket_listen6			\
 		socket_udp			\
 		socket6_udp			\
+		sk-freebind			\
+		sk-freebind-false		\
 		socket_udplite			\
 		socket_aio			\
 		socket_close_data		\
@@ -61,9 +63,13 @@ TST_NOFILE	=				\
 		socket_queues02			\
 		socket-tcp			\
 		socket-tcp6			\
+		socket-tcp-local		\
+		socket-tcp6-local		\
 		socket-tcpbuf			\
 		socket-tcpbuf-local		\
+		socket-tcpbuf6-local		\
 		socket-tcpbuf6			\
+		socket-closed-tcp		\
 		sock_opts00			\
 		sock_opts01			\
 		sk-unix-unconn			\
@@ -117,6 +123,9 @@ TST_NOFILE	=				\
 		grow_map03			\
 		tun				\
 		stopped				\
+		stopped01			\
+		stopped02			\
+		stopped12			\
 		rtc				\
 		clean_mntns			\
 		mntns_rw_ro_rw			\
@@ -127,7 +136,13 @@ TST_NOFILE	=				\
 		fd				\
 		apparmor				\
 		seccomp_strict			\
+		seccomp_filter			\
+		seccomp_filter_tsync			\
+		seccomp_filter_inheritance		\
 		different_creds			\
+		vsx				\
+		bridge				\
+		vfork00				\
 #		jobctl00			\
 
 TST_FILE	=				\
@@ -143,6 +158,7 @@ TST_FILE	=				\
 		deleted_dev			\
 		unlink_fstat00			\
 		unlink_fstat01			\
+		unlink_fstat01+			\
 		unlink_fstat02			\
 		unlink_fstat03			\
 		unlink_largefile		\
@@ -182,9 +198,13 @@ TST_DIR		=				\
 		overmount_fifo			\
 		overmount_sock			\
 		tempfs				\
+		tempfs_ro			\
+		tempfs_subns			\
+		mnt_ro_bind			\
 		mount_paths			\
 		bind-mount			\
 		inotify00			\
+		inotify01			\
 		cgroup00			\
 		rmdir_open			\
 		cgroup01			\
@@ -317,8 +337,10 @@ inotify_system_nodel:	override CFLAGS += -DNODEL
 pthread00:		override LDLIBS += -pthread
 pthread01:		override LDLIBS += -pthread
 pthread02:		override LDLIBS += -pthread
+different_creds:	override LDLIBS += -pthread
 sigpending:		override LDLIBS += -pthread
 sigaltstack:		override LDLIBS += -pthread
+seccomp_filter_tsync:		override LDLIBS += -pthread
 shm:			override CFLAGS += -DNEW_IPC_NS
 msgque:			override CFLAGS += -DNEW_IPC_NS
 sem:			override CFLAGS += -DNEW_IPC_NS
@@ -326,6 +348,9 @@ posix_timers:		override LDLIBS += -lrt -pthread
 socket-tcp6: override CFLAGS += -D ZDTM_IPV6
 socket-tcpbuf6: override CFLAGS += -D ZDTM_IPV6
 socket-tcpbuf-local: override CFLAGS += -D ZDTM_TCP_LOCAL
+socket-tcpbuf6-local: override CFLAGS += -D ZDTM_TCP_LOCAL -D ZDTM_IPV6
+socket-tcp6-local: override CFLAGS += -D ZDTM_TCP_LOCAL -D ZDTM_IPV6
+socket-tcp-local: override CFLAGS += -D ZDTM_TCP_LOCAL
 socket_listen6: override CFLAGS += -D ZDTM_IPV6
 sigpending:		override LDLIBS += -lrt
 vdso01:			override LDLIBS += -lrt
@@ -333,6 +358,12 @@ mntns_link_remap:	override CFLAGS += -DZDTM_LINK_REMAP
 mntns_shared_bind02:		override CFLAGS += -DSHARED_BIND02
 maps02:		get_smaps_bits.o
 mlock_setuid:		get_smaps_bits.o
+inotify01:		override CFLAGS += -DINOTIFY01
+unlink_fstat01+:	override CFLAGS += -DUNLINK_OVER
+sk-freebind-false:	override CFLAGS += -DZDTM_FREEBIND_FALSE
+stopped01:	override CFLAGS += -DZDTM_STOPPED_KILL
+stopped02:	override CFLAGS += -DZDTM_STOPPED_TKILL
+stopped12:	override CFLAGS += -DZDTM_STOPPED_KILL -DZDTM_STOPPED_TKILL
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)
@@ -344,10 +375,10 @@ cleandep:	clean
 	$(RM) -f $(DEP)
 
 cleanout:
-	$(RM) -f -r *.pid *.out* *.test* *.state ip.dump ip.rst
+	$(RM) -f -r *.pid *.out* *.test* *.state
 
 %.cleanout: %
-	$(Q) $(RM) -f -r $<.pid $<.out* *$<.test* $<.*.test $<.state
+	$(Q) $(RM) -f -r $<.pid $<.out* *$<.test* $<.*.test $<.state $<.init.pid
 
 realclean:	cleandep cleanout
 

@@ -24,6 +24,7 @@
 #include "image.h"
 #include "stats.h"
 #include "pstree.h"
+#include "cr_options.h"
 
 #include "protobuf.h"
 #include "protobuf/fsnotify.pb-c.h"
@@ -56,6 +57,10 @@ static struct irmap *cache[IRMAP_CACHE_SIZE];
 static struct irmap hints[] = {
 	{ .path = "/etc", .nr_kids = -1, },
 	{ .path = "/var/spool", .nr_kids = -1, },
+	{ .path = "/var/log", .nr_kids = -1, },
+	{ .path = "/usr/share/dbus-1/system-services", .nr_kids = -1 },
+	{ .path = "/var/lib/polkit-1/localauthority", .nr_kids = -1 },
+	{ .path = "/usr/share/polkit-1/actions", .nr_kids = -1 },
 	{ .path = "/lib/udev", .nr_kids = -1, },
 	{ .path = "/.", .nr_kids = 0, },
 	{ .path = "/no-such-path", .nr_kids = -1, },
@@ -225,6 +230,7 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 	struct irmap *c, *h, **p;
 	char *path = NULL;
 	int hv;
+	struct irmap_path_opt *o;
 
 	s_dev = kdev_to_odev(s_dev);
 
@@ -254,6 +260,18 @@ char *irmap_lookup(unsigned int s_dev, unsigned long i_ino)
 		pr_debug("\tFound %s in cache\n", c->path);
 		path = c->path;
 		goto out;
+	}
+
+	/* Let's scan any user provided paths first; since the user told us
+	 * about them, hopefully they're more interesting than our hints.
+	 */
+	list_for_each_entry(o, &opts.irmap_scan_paths, node) {
+		c = irmap_scan(o->ir, s_dev, i_ino);
+		if (c) {
+			pr_debug("\tScanned %s\n", c->path);
+			path = c->path;
+			goto out;
+		}
 	}
 
 	for (h = hints; h->path; h++) {
@@ -452,4 +470,24 @@ int irmap_load_cache(void)
 
 	close_image(img);
 	return ret;
+}
+
+int irmap_scan_path_add(char *path)
+{
+	struct irmap_path_opt *o;
+
+	o = xzalloc(sizeof(*o));
+	if (!o)
+		return -1;
+
+	o->ir = xzalloc(sizeof(*o->ir));
+	if (!o->ir) {
+		xfree(o);
+		return -1;
+	}
+
+	o->ir->path = path;
+	o->ir->nr_kids = -1;
+	list_add(&o->node, &opts.irmap_scan_paths);
+	return 0;
 }

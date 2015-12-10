@@ -94,6 +94,9 @@ extern int do_open_proc(pid_t pid, int flags, const char *fmt, ...);
 #define open_proc_rw(pid, fmt, ...)				\
 	__open_proc(pid, O_RDWR, fmt, ##__VA_ARGS__)
 
+#define open_proc_path(pid, fmt, ...)				\
+	__open_proc(pid, O_PATH, fmt, ##__VA_ARGS__)
+
 /* DIR *opendir_proc(pid_t pid, const char *fmt, ...); */
 #define opendir_proc(pid, fmt, ...)					\
 	({								\
@@ -169,9 +172,11 @@ extern int is_anon_link_type(char *link, char *type);
 extern void *shmalloc(size_t bytes);
 extern void shfree_last(void *ptr);
 
-extern int cr_system(int in, int out, int err, char *cmd, char *const argv[]);
+#define CRS_CAN_FAIL	0x1 /* cmd can validly exit with non zero code */
+
+extern int cr_system(int in, int out, int err, char *cmd, char *const argv[], unsigned flags);
 extern int cr_system_userns(int in, int out, int err, char *cmd,
-				char *const argv[], int userns_pid);
+				char *const argv[], unsigned flags, int userns_pid);
 extern int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd);
 extern int is_root_user(void);
 
@@ -179,6 +184,8 @@ static inline bool dir_dots(struct dirent *de)
 {
 	return !strcmp(de->d_name, ".") || !strcmp(de->d_name, "..");
 }
+
+extern int is_empty_dir(int dirfd);
 
 /*
  * Size of buffer to carry the worst case or /proc/self/fd/N
@@ -261,4 +268,10 @@ void split(char *str, char token, char ***out, int *n);
 
 int fd_has_data(int lfd);
 
+int make_yard(char *path);
+
+void tcp_nodelay(int sk, bool on);
+void tcp_cork(int sk, bool on);
+
+const char *ns_to_string(unsigned int ns);
 #endif /* __CR_UTIL_H__ */

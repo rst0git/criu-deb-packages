@@ -16,6 +16,7 @@
 #include "util.h"
 #include "imgset.h"
 #include "util-pie.h"
+#include "namespaces.h"
 #include "protobuf.h"
 #include "protobuf/core.pb-c.h"
 #include "protobuf/cgroup.pb-c.h"
@@ -188,7 +189,7 @@ static struct cg_set *get_cg_set(struct list_head *ctls, unsigned int n_ctls)
 	return cs;
 }
 
-struct cg_controller *new_controller(const char *name, int heirarchy)
+struct cg_controller *new_controller(const char *name)
 {
 	struct cg_controller *nc = xmalloc(sizeof(*nc));
 	if (!nc)
@@ -208,7 +209,6 @@ struct cg_controller *new_controller(const char *name, int heirarchy)
 	}
 
 	nc->n_controllers = 1;
-	nc->heirarchy = heirarchy;
 
 	nc->n_heads = 0;
 	INIT_LIST_HEAD(&nc->heads);
@@ -218,7 +218,7 @@ struct cg_controller *new_controller(const char *name, int heirarchy)
 
 int parse_cg_info(void)
 {
-	if (parse_cgroups(&cgroups, &n_cgroups) < 0)
+	if (collect_controllers(&cgroups, &n_cgroups) < 0)
 		return -1;
 
 	return 0;
@@ -403,7 +403,7 @@ static int add_cgroup_properties(const char *fpath, struct cgroup_dir *ncd,
 
 		for (j = 0; prop_arr != NULL && prop_arr[j] != NULL; ++j) {
 			if (snprintf(buf, PATH_MAX, "%s/%s", fpath, prop_arr[j]) >= PATH_MAX) {
-				pr_err("snprintf output was truncated");
+				pr_err("snprintf output was truncated\n");
 				return -1;
 			}
 
@@ -522,7 +522,7 @@ static int collect_cgroups(struct list_head *ctls)
 				pr_err("controller %s not found\n", cc->name);
 				return -1;
 			} else {
-				struct cg_controller *nc = new_controller(cc->name, -1);
+				struct cg_controller *nc = new_controller(cc->name);
 				list_add_tail(&nc->l, &cg->l);
 				n_cgroups++;
 				current_controller = nc;
@@ -858,15 +858,41 @@ static const char *special_cpuset_props[] = {
 	NULL,
 };
 
+static int userns_move(void *arg, int fd, pid_t pid)
+{
+	char pidbuf[32];
+	int cg, len, err;
+
+	len = snprintf(pidbuf, sizeof(pidbuf), "%d", pid);
+
+	if (len >= sizeof(pidbuf)) {
+		pr_err("pid printing failed: %d\n", pid);
+		return -1;
+	}
+
+	cg = get_service_fd(CGROUP_YARD);
+	err = fd = openat(cg, arg, O_WRONLY);
+	if (fd >= 0) {
+		err = write(fd, pidbuf, len);
+		close(fd);
+	}
+
+	if (err < 0) {
+		pr_perror("Can't move %s into %s (%d/%d)", pidbuf, (char *)arg, err, fd);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int move_in_cgroup(CgSetEntry *se)
 {
-	int cg, i;
+	int i;
 
 	pr_info("Move into %d\n", se->id);
-	cg = get_service_fd(CGROUP_YARD);
 	for (i = 0; i < se->n_ctls; i++) {
 		char aux[PATH_MAX];
-		int fd, err, j, aux_off;
+		int fd = -1, err, j, aux_off;
 		CgMemberEntry *ce = se->ctls[i];
 		CgControllerEntry *ctrl = NULL;
 
@@ -887,16 +913,7 @@ static int move_in_cgroup(CgSetEntry *se)
 
 		snprintf(aux + aux_off, sizeof(aux) - aux_off, "/%s/tasks", ce->path);
 		pr_debug("  `-> %s\n", aux);
-		err = fd = openat(cg, aux, O_WRONLY);
-		if (fd >= 0) {
-			/*
-			 * Writing zero into this file moves current
-			 * task w/o any permissions checks :)
-			 */
-			err = write(fd, "0", 1);
-			close(fd);
-		}
-
+		err = userns_call(userns_move, UNS_ASYNC, aux, strlen(aux) + 1, -1);
 		if (err < 0) {
 			pr_perror("Can't move into %s (%d/%d)", aux, err, fd);
 			return -1;
@@ -952,7 +969,7 @@ static int restore_cgroup_prop(const CgroupPropEntry * cg_prop_entry_p,
 	int cg;
 
 	if (!cg_prop_entry_p->value) {
-		pr_err("cg_prop_entry->value was empty when should have had a value");
+		pr_err("cg_prop_entry->value was empty when should have had a value\n");
 		return -1;
 	}
 
@@ -960,6 +977,8 @@ static int restore_cgroup_prop(const CgroupPropEntry * cg_prop_entry_p,
 		pr_err("snprintf output was truncated for %s\n", cg_prop_entry_p->name);
 		return -1;
 	}
+
+	pr_info("Restoring cgroup property value [%s] to [%s]\n", cg_prop_entry_p->value, path);
 
 	cg = get_service_fd(CGROUP_YARD);
 	f = fopenat(cg, path, "w+");
@@ -979,7 +998,6 @@ static int restore_cgroup_prop(const CgroupPropEntry * cg_prop_entry_p,
 		return -1;
 	}
 
-	pr_info("Restored cgroup property value %s to %s\n", cg_prop_entry_p->value, path);
 	return 0;
 }
 
@@ -1034,6 +1052,8 @@ int prepare_cgroup_properties(void)
 static int restore_special_cpuset_props(char *paux, size_t off, CgroupDirEntry *e)
 {
 	int i, j;
+
+	pr_info("Restore special cpuset props\n");
 
 	for (i = 0; special_cpuset_props[i]; i++) {
 		const char *name = special_cpuset_props[i];
@@ -1155,15 +1175,8 @@ static int prepare_cgroup_sfd(CgroupEntry *ce)
 		return -1;
 	}
 
-	if (mount("none", cg_yard, "tmpfs", 0, NULL)) {
-		pr_perror("Can't mount tmpfs in cgyard");
+	if (make_yard(cg_yard))
 		goto err;
-	}
-
-	if (mount("none", cg_yard, NULL, MS_PRIVATE, NULL)) {
-		pr_perror("Can't make cgyard private");
-		goto err;
-	}
 
 	pr_debug("Opening %s as cg yard\n", cg_yard);
 	i = open(cg_yard, O_DIRECTORY);
@@ -1185,7 +1198,7 @@ static int prepare_cgroup_sfd(CgroupEntry *ce)
 		CgControllerEntry *ctrl = ce->controllers[i];
 
 		if (ctrl->n_cnames < 1) {
-			pr_err("Each cg_controller_entry must have at least 1 controller");
+			pr_err("Each cg_controller_entry must have at least 1 controller\n");
 			goto err;
 		}
 

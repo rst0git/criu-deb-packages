@@ -39,6 +39,8 @@
 #include "cpu.h"
 #include "action-scripts.h"
 #include "security.h"
+#include "irmap.h"
+#include "fault-injection.h"
 
 #include "setproctitle.h"
 
@@ -56,6 +58,7 @@ void init_opts(void)
 	INIT_LIST_HEAD(&opts.ext_mounts);
 	INIT_LIST_HEAD(&opts.inherit_fds);
 	INIT_LIST_HEAD(&opts.new_cgroup_roots);
+	INIT_LIST_HEAD(&opts.irmap_scan_paths);
 
 	opts.cpu_cap = CPU_CAP_DEFAULT;
 	opts.manage_cgroups = CG_MODE_DEFAULT;
@@ -249,10 +252,14 @@ int main(int argc, char *argv[], char *envp[])
 		{ "enable-external-masters", 	no_argument, 		0, 1067 },
 		{ "freeze-cgroup",		required_argument,	0, 1068 },
 		{ "ghost-limit",		required_argument,	0, 1069 },
+		{ "irmap-scan-path",		required_argument,	0, 1070 },
 		{ },
 	};
 
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
+
+	if (fault_injection_init())
+		return 1;
 
 	cr_pb_init();
 	if (restrict_uid(getuid(), getgid()))
@@ -269,6 +276,8 @@ int main(int argc, char *argv[], char *envp[])
 		return 1;
 
 	if (!strcmp(argv[1], "swrk")) {
+		if (argc < 3)
+			goto usage;
 		/*
 		 * This is to start criu service worker from libcriu calls.
 		 * The usage is "criu swrk <fd>" and is not for CLI/scripts.
@@ -485,6 +494,10 @@ int main(int argc, char *argv[], char *envp[])
 		case 1069:
 			opts.ghost_limit = parse_size(optarg);
 			break;
+		case 1070:
+			if (irmap_scan_path_add(optarg))
+				return -1;
+			break;
 		case 'M':
 			{
 				char *aux;
@@ -551,11 +564,10 @@ int main(int argc, char *argv[], char *envp[])
 		}
 
 		opts.exec_cmd = xmalloc((argc - optind) * sizeof(char *));
+		if (!opts.exec_cmd)
+			return 1;
 		memcpy(opts.exec_cmd, &argv[optind + 1], (argc - optind - 1) * sizeof(char *));
 		opts.exec_cmd[argc - optind - 1] = NULL;
-	} else if (optind + 1 != argc) {
-		pr_err("Unable to handle more than one command\n");
-		goto usage;
 	}
 
 	/* We must not open imgs dir, if service is called */
@@ -715,6 +727,8 @@ usage:
 "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
 "  -L|--libdir           path to a plugin directory (by default " CR_PLUGIN_DEFAULT ")\n"
 "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
+"  --irmap-scan-path FILE\n"
+"                        add a path the irmap hints to scan\n"
 "  -M|--ext-mount-map KEY:VALUE\n"
 "                        add external mount mapping\n"
 "  -M|--ext-mount-map auto\n"

@@ -37,10 +37,10 @@
 
 static void pr_ipc_desc_entry(unsigned int loglevel, const IpcDescEntry *desc)
 {
-	print_on_level(loglevel, "id: %-10d key: 0x%08x ", desc->id, desc->key);
-	print_on_level(loglevel, "uid: %-10d gid: %-10d ", desc->uid, desc->gid);
-	print_on_level(loglevel, "cuid: %-10d cgid: %-10d ", desc->cuid, desc->cgid);
-	print_on_level(loglevel, "mode: %-10o ", desc->mode);
+	print_on_level(loglevel, "id: %-10d key: 0x%08x uid: %-10d gid: %-10d "
+		       "cuid: %-10d cgid: %-10d mode: %-10o ",
+		       desc->id, desc->key, desc->uid, desc->gid,
+		       desc->cuid, desc->cgid, desc->mode);
 }
 
 static void fill_ipc_desc(int id, IpcDescEntry *desc, const struct ipc_perm *ipcp)
@@ -181,7 +181,7 @@ static int dump_ipc_msg_queue_messages(struct cr_img *img, const IpcMsgEntry *ms
 		{ "kernel/msgmax", &msgmax, CTL_U32 },
 	};
 
-	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_READ);
+	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_READ, CLONE_NEWIPC);
 	if (ret < 0) {
 		pr_err("Failed to read max IPC message size\n");
 		goto err;
@@ -313,7 +313,7 @@ static int ipc_sysctl_req(IpcVarEntry *e, int op)
 
 	int ret;
 
-	ret = sysctl_op(req, ARRAY_SIZE(req), op);
+	ret = sysctl_op(req, ARRAY_SIZE(req), op, CLONE_NEWIPC);
 	if (ret)
 		return ret;
 
@@ -322,7 +322,7 @@ static int ipc_sysctl_req(IpcVarEntry *e, int op)
 		return 0;
 	}
 
-	return sysctl_op(req_mq, ARRAY_SIZE(req_mq), op);
+	return sysctl_op(req_mq, ARRAY_SIZE(req_mq), op, CLONE_NEWIPC);
 }
 
 /*
@@ -555,7 +555,7 @@ static int prepare_ipc_sem_desc(struct cr_img *img, const IpcSemEntry *sem)
 	};
 	struct semid_ds semid;
 
-	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE);
+	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE, CLONE_NEWIPC);
 	if (ret < 0) {
 		pr_err("Failed to set desired IPC sem ID\n");
 		return ret;
@@ -691,7 +691,7 @@ static int prepare_ipc_msg_queue(struct cr_img *img, const IpcMsgEntry *msq)
 	};
 	struct msqid_ds msqid;
 
-	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE);
+	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE, CLONE_NEWIPC);
 	if (ret < 0) {
 		pr_err("Failed to set desired IPC msg ID\n");
 		return ret;
@@ -802,7 +802,7 @@ static int prepare_ipc_shm_seg(struct cr_img *img, const IpcShmEntry *shm)
 	};
 	struct shmid_ds shmid;
 
-	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE);
+	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_WRITE, CLONE_NEWIPC);
 	if (ret < 0) {
 		pr_err("Failed to set desired IPC shm ID\n");
 		return ret;

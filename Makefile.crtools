@@ -48,6 +48,7 @@ obj-y	+= fsnotify.o
 obj-y	+= irmap.o
 obj-y	+= signalfd.o
 obj-y	+= pstree.o
+obj-y	+= bitmap.o
 obj-y	+= protobuf.o
 obj-y	+= protobuf-desc.o
 obj-y	+= tty.o
@@ -66,14 +67,18 @@ obj-y	+= string.o
 obj-y	+= sigframe.o
 obj-y	+= lsm.o
 ifeq ($(VDSO),y)
-obj-y	+= $(ARCH_DIR)/vdso.o
+obj-y	+= vdso.o
+obj-y	+= pie/util-vdso.o
 endif
 obj-y	+= cr-service.o
-obj-y	+= sd-daemon.o
 obj-y	+= plugin.o
 obj-y	+= cr-errno.o
 obj-y	+= pie/pie-relocs.o
 obj-y	+= seize.o
+obj-y	+= fault-injection.o
+obj-y	+= pie/util-fd.o
+obj-y	+= pie/util.o
+obj-y	+= seccomp.o
 
 ifneq ($(MAKECMDGOALS),clean)
 incdeps := y

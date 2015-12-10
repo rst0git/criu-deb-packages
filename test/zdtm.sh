@@ -10,7 +10,6 @@ ARCH=`uname -m | sed			\
 		-e s/sun4u/sparc64/	\
 		-e s/s390x/s390/	\
 		-e s/parisc64/parisc/	\
-		-e s/ppc.*/powerpc/	\
 		-e s/mips.*/mips/	\
 		-e s/sh[234].*/sh/`
 
@@ -125,11 +124,6 @@ generate_test_list()
 		static/vt
 		static/child_opened_proc
 		static/cow01
-		static/fpu00
-		static/fpu01
-		static/mmx00
-		static/sse00
-		static/sse20
 		static/pdeath_sig
 		static/fdt_shared
 		static/file_locks00
@@ -153,13 +147,28 @@ generate_test_list()
 		static/dumpable01
 		static/dumpable02
 		static/deleted_dev
+		static/socket-tcpbuf-local
+		static/socket-tcpbuf6-local
+		static/socket-tcp-local
+		static/socket-tcp6-local
 	"
 
 	#
 	# Arch specific tests
 	if [ $ARCH = "x86_64" ]; then
 		TEST_LIST_ARCH="
+			static/fpu00
+			static/fpu01
+			static/mmx00
+			static/sse00
+			static/sse20
 			static/vdso01
+		"
+	fi
+
+	if [ $ARCH = "ppc64le" ]; then
+		TEST_LIST_ARCH="
+			static/vsx
 		"
 	fi
 
@@ -177,23 +186,23 @@ generate_test_list()
 		streaming/socket-tcp
 		streaming/socket-tcp6
 		static/socket-tcpbuf
-		static/socket-tcpbuf-local
 		static/socket-tcpbuf6
 		static/pty03
-		static/mountpoints
+		ns/static/mountpoints
 		ns/static/session00
 		ns/static/session01
 		ns/static/tempfs
+		ns/static/tempfs_ro
+		ns/static/tempfs_subns
+		ns/static/mnt_ro_bind
 		ns/static/mount_paths
 		ns/static/bind-mount
-		static/utsname
-		static/ipc_namespace
-		static/shm
-		static/msgque
-		static/sem
-		transition/ipc
-		static/netns-nf
-		static/netns
+		ns/static/utsname
+		ns/static/ipc_namespace
+		ns/static/shm
+		ns/static/msgque
+		ns/static/sem
+		ns/transition/ipc
 		ns/static/netns-dev
 		static/cgroup00
 		static/cgroup01
@@ -219,6 +228,7 @@ generate_test_list()
 		ns/static/mntns_shared_bind02
 		ns/static/mntns_root_bind
 		ns/static/mntns_deleted
+		ns/static/inotify01
 	"
 
 	TEST_AIO="
@@ -238,6 +248,11 @@ generate_test_list()
 		static/seccomp_strict
 	"
 
+	TEST_SECCOMP_FILTERS="
+		static/seccomp_filter
+		static/seccomp_filter_tsync
+		static/seccomp_filter_inheritance
+	"
 
 	$CRIU check -v0 --feature "mnt_id"
 	if [ $? -eq 0 ]; then
@@ -266,6 +281,11 @@ generate_test_list()
 		TEST_LIST="$TEST_LIST$TEST_SECCOMP_SUSPEND"
 	fi
 
+	$CRIU check -v0 --feature "seccomp_filters"
+	if [ $? -eq 0 ]; then
+		TEST_LIST="$TEST_LIST$TEST_SECCOMP_FILTERS"
+	fi
+
 	# ns/static/clean_mntns: proc can't be mounted in userns, if it isn't mounted yet
 
 	BLACKLIST_FOR_USERNS="
@@ -283,6 +303,8 @@ generate_test_list()
 		ns/static/vt
 		ns/static/rtc
 		ns/static/cow01
+		ns/static/tempfs_ro
+		ns/static/ipc_namespace
 	"
 
 	# Add tests which can be executed in an user namespace
@@ -323,9 +345,11 @@ chroot-file
 console
 vt
 rtc
-tempfs
 maps007
 tempfs
+tempfs_ro
+tempfs_subns
+mnt_ro_bind
 bind-mount
 mountpoints
 inotify_irmap
@@ -348,7 +372,13 @@ sockets00
 cow01
 apparmor
 seccomp_strict
+seccomp_filter
+seccomp_filter_tsync
+seccomp_filter_inheritance
 different_creds
+inotify01
+ipc_namespace
+utsname
 "
 
 TEST_EXPECTED_FAILURE="
@@ -511,7 +541,18 @@ construct_root()
 	done
 
 	mkdir $root/dev
+	mkdir $root/dev/pts
 	mknod -m 0666 $root/dev/tty c 5 0
+	mknod -m 0666 $root/dev/null c 1 3
+	if [ -r "/dev/net/tun" ]; then
+		mkdir $root/dev/net/
+		mknod -m 0666 $root/dev/net/tun $(stat -c "0x%t" /dev/net/tun) $(stat -c "0x%T" /dev/net/tun)
+	fi
+	if [ -r "/dev/rtc" ]; then
+		mknod -m 0666 $root/dev/rtc $(stat -c "0x%t" /dev/rtc) $(stat -c "0x%T" /dev/rtc)
+	fi
+
+	mkdir $root/proc
 
 	# make 'tmp' dir under new root
 	mkdir -p $tmpdir
@@ -783,16 +824,21 @@ EOF
 		setsid $CRIU_CPT $dump_cmd -D $ddump -o dump.log -v4 -t $PID $gen_args $cpt_args
 		retcode=$?
 
+		cat $ddump/dump.log | grep Error
+
 		#
 		# Here we may have two cases: either checkpoint is failed
 		# with some error code, or checkpoint is complete but return
 		# code is non-zero because of post dump action.
-		if [ "$retcode" -ne 0 ] && [[ "$retcode" -ne 32 || -z "$dump_only" ]]; then
-			if echo $TEST_EXPECTED_FAILURE | grep -q $tname; then
-				echo "Got expected dump failure"
-				return 0
+		if echo $TEST_EXPECTED_FAILURE | grep -q $tname; then
+			echo "Expect dump falure: $retcode"
+			if [ "$retcode" -eq 0 ]; then
+				return 1
 			fi
-
+			dump_only=1
+			retcode=32
+		fi
+		if [ "$retcode" -ne 0 ] && [[ "$retcode" -ne 32 || -z "$dump_only" ]]; then
 			if [ $BATCH_TEST -eq 0 ]; then
 				echo WARNING: $tname returned $retcode and left running for debug needs
 			else
@@ -800,7 +846,6 @@ EOF
 			fi
 			return 1
 		fi
-		cat $ddump/dump.log* | grep Error
 
 		if [ -n "$SNAPSHOT" ]; then
 			snappdir=../`basename $ddump`
@@ -1168,7 +1213,11 @@ if [ $SPECIFIED_NAME_USED -eq 1 ]; then
 		exit 1
 	fi
 	$CRIU check -v0 --feature "mnt_id" || export ZDTM_NOSUBNS=1
-	run_test $1 || case_error $1
+	# don't run file_locks* tests simultaneously
+	(
+		expr $1 : ".*file_locks" > /dev/null && flock 10
+		run_test $1 10<&-
+	) 10<zdtm.sh || case_error $1
 else
 	if [ $# -eq 0 ]; then
 		pattern='.*'

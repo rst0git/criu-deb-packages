@@ -1,6 +1,6 @@
 VERSION_MAJOR		:= 1
-VERSION_MINOR		:= 7
-VERSION_SUBLEVEL	:= 2
+VERSION_MINOR		:= 8
+VERSION_SUBLEVEL	:=
 VERSION_EXTRA		:=
 VERSION_NAME		:=
 VERSION_SO_MAJOR	:= 1
@@ -32,8 +32,15 @@ NM		:= $(CROSS_COMPILE)nm
 SH		:= bash
 MAKE		:= make
 OBJCOPY		:= $(CROSS_COMPILE)objcopy
+HOSTCC		?= gcc
+HOSTLD		?= ld
 
 CFLAGS		+= $(USERCFLAGS)
+HOSTCFLAGS	?= $(CFLAGS)
+
+export HOSTCC
+export HOSTLD
+export HOSTCFLAGS
 
 #
 # Fetch ARCH from the uname if not yet set
@@ -209,17 +216,15 @@ $(ARCH_DIR): protobuf config
 
 ifeq ($(piegen-y),y)
 pie/piegen/%: config
-	$(Q) $(MAKE) $(build)=pie/piegen $@
+	$(Q) CC=$(HOSTCC) LD=$(HOSTLD) CFLAGS="$(HOSTCFLAGS)" $(MAKE) $(build)=pie/piegen $@
 pie/piegen: config
-	$(Q) $(MAKE) $(build)=pie/piegen all
+	$(Q) CC=$(HOSTCC) LD=$(HOSTLD) CFLAGS="$(HOSTCFLAGS)" $(MAKE) $(build)=pie/piegen all
 $(piegen): pie/piegen/built-in.o
 	$(E) "  LINK    " $@
-	$(Q) $(CC) $(CFLAGS) pie/piegen/built-in.o $(LDFLAGS) -o $@
+	$(Q) $(HOSTCC) $(HOSTCFLAGS) $^ $(LDFLAGS) -o $@
 .PHONY: pie/piegen
 endif
 
-pie/%:: $(ARCH_DIR) $(piegen)
-	$(Q) $(MAKE) $(build)=pie $@
 pie: $(ARCH_DIR) $(piegen)
 	$(Q) $(MAKE) $(build)=pie all
 
@@ -233,20 +238,6 @@ lib/%:: $(VERSION_HEADER) config built-in.o
 lib: $(VERSION_HEADER) config built-in.o
 	$(Q) $(MAKE) $(build)=lib all
 
-ifeq ($(VDSO),y)
-$(ARCH_DIR)/vdso-pie.o: pie
-	$(Q) $(MAKE) $(build)=pie $(ARCH_DIR)/vdso-pie.o
-PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-pie.o
-ifeq ($(SRCARCH),aarch64)
-PROGRAM-BUILTINS	+= $(ARCH_DIR)/intraprocedure.o
-endif
-ifeq ($(SRCARCH),ppc64)
-PROGRAM-BUILTINS	+= $(ARCH_DIR)/vdso-trampoline.o
-endif
-endif
-
-PROGRAM-BUILTINS	+= pie/util-fd.o
-PROGRAM-BUILTINS	+= pie/util.o
 PROGRAM-BUILTINS	+= protobuf/built-in.o
 PROGRAM-BUILTINS	+= built-in.o
 
@@ -293,6 +284,7 @@ clean: clean-built
 	$(Q) $(MAKE) -C pycriu $@
 	$(Q) $(RM) ./*.pyc
 	$(Q) $(RM) -r build
+	$(Q) $(RM) -r usr
 
 distclean: clean
 	$(E) "  DISTCLEAN"
@@ -335,10 +327,6 @@ install-criu: $(PROGRAM) $(CRIU-LIB) install-crit
 	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)
 	$(Q) install -m 644 $(CRIU-INC) $(DESTDIR)$(INCLUDEDIR)
 	$(Q) mkdir -p $(DESTDIR)$(SYSTEMDUNITDIR)
-	$(Q) install -m 644 scripts/sd/criu.socket $(DESTDIR)$(SYSTEMDUNITDIR)
-	$(Q) install -m 644 scripts/sd/criu.service $(DESTDIR)$(SYSTEMDUNITDIR)
-	$(Q) mkdir -p $(DESTDIR)$(LOGROTATEDIR)
-	$(Q) install -m 644 scripts/logrotate.d/criu-service $(DESTDIR)$(LOGROTATEDIR)
 	$(Q) sed -e 's,@version@,$(CRTOOLSVERSION),' \
 		-e 's,@libdir@,$(LIBDIR),' \
 		-e 's,@includedir@,$(dir $(INCLUDEDIR)),' \

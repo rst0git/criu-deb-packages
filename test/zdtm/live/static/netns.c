@@ -7,8 +7,10 @@
 const char *test_doc	= "Check that network environment (links, addresses and routes) are preserved";
 const char *test_author	= "Pavel Emelianov <xemul@parallels.com>";
 
-static int test_fn(int argc, char **argv)
+int main(int argc, char **argv)
 {
+	test_init(argc, argv);
+
 	if (system("ip link set lo up")) {
 		fail("Can't set lo up");
 		return -1;
@@ -29,7 +31,8 @@ static int test_fn(int argc, char **argv)
 		return -1;
 	}
 
-	if (system("ip link > ip.dump && ip addr >> ip.dump && ip route >> ip.dump")) {
+	if (system("ip link > netns.dump.test && ip addr >> netns.dump.test && ip route >> netns.dump.test")) {
+		sleep(1000);
 		fail("Can't save net config");
 		return -1;
 	}
@@ -37,12 +40,12 @@ static int test_fn(int argc, char **argv)
 	test_daemon();
 	test_waitsig();
 
-	if (system("ip link > ip.rst && ip addr >> ip.rst && ip route >> ip.rst")) {
+	if (system("ip link > netns.rst.test && ip addr >> netns.rst.test && ip route >> netns.rst.test")) {
 		fail("Can't get net config");
 		return -1;
 	}
 
-	if (system("diff ip.rst ip.dump")) {
+	if (system("diff netns.rst.test netns.dump.test")) {
 		fail("Net config differs after restore");
 		return -1;
 	}
@@ -50,12 +53,3 @@ static int test_fn(int argc, char **argv)
 	pass();
 	return 0;
 }
-
-#define CLONE_NEWNET     0x40000000
-
-int main(int argc, char **argv)
-{
-	test_init_ns(argc, argv, CLONE_NEWNET, test_fn);
-	return 0;
-}
-

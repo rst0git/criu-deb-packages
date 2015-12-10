@@ -28,6 +28,7 @@
 #include "cr_options.h"
 #include "sysfs_parse.h"
 #include "seccomp.h"
+#include "string.h"
 #include "namespaces.h"
 #include "files-reg.h"
 
@@ -176,6 +177,7 @@ static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 		struct vma_file_info *vfi, struct vma_file_info *prev_vfi)
 {
 	char path[32];
+	int flags;
 
 	if (prev_vfi->vma && vfi_equal(vfi, prev_vfi)) {
 		struct vma_area *prev = prev_vfi->vma;
@@ -213,7 +215,18 @@ static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 	 * so later we might refer to it via /proc/self/fd/vm_file_fd
 	 * if needed.
 	 */
-	vma->vm_file_fd = openat(dirfd(mfd), path, O_RDONLY);
+	flags = O_PATH;
+	if (vfi->dev_maj == 0)
+		/*
+		 * Opening with O_PATH omits calling kernel ->open
+		 * method, thus for some special files their type
+		 * detection might be broken. Thus we open those with
+		 * the O_RDONLY to potentially get ENXIO and check
+		 * it below.
+		 */
+		flags = O_RDONLY;
+
+	vma->vm_file_fd = openat(dirfd(mfd), path, flags);
 	if (vma->vm_file_fd < 0) {
 		if (errno == ENOENT)
 			/* Just mapping w/o map_files link */
@@ -621,12 +634,11 @@ int parse_pid_stat(pid_t pid, struct proc_pid_stat *s)
 		return -1;
 
 	n = read(fd, buf, BUF_SIZE);
+	close(fd);
 	if (n < 1) {
 		pr_err("stat for %d is corrupted\n", pid);
-		close(fd);
 		return -1;
 	}
-	close(fd);
 
 	memset(s, 0, sizeof(*s));
 
@@ -645,7 +657,7 @@ int parse_pid_stat(pid_t pid, struct proc_pid_stat *s)
 	*tok = '\0';
 	*p = '\0';
 
-	strncpy(s->comm, tok + 1, sizeof(s->comm));
+	strlcpy(s->comm, tok + 1, sizeof(s->comm));
 
 	n = sscanf(p + 1,
 	       " %c %d %d %d %d %d %u %lu %lu %lu %lu "
@@ -746,6 +758,7 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 	int done = 0;
 	int ret = -1;
 	char *str;
+	bool parsed_seccomp = false;
 
 	f.fd = open_proc(pid, "status");
 	if (f.fd < 0) {
@@ -753,10 +766,13 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 		return -1;
 	}
 
+	cr->sigpnd = 0;
+	cr->shdpnd = 0;
+
 	if (bfdopenr(&f))
 		return -1;
 
-	while (done < 9) {
+	while (done < 12) {
 		str = breadline(&f);
 		if (str == NULL)
 			break;
@@ -766,14 +782,16 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 		if (!strncmp(str, "State:", 6)) {
 			cr->state = str[7];
 			done++;
+			continue;
 		}
 
 		if (!strncmp(str, "PPid:", 5)) {
 			if (sscanf(str, "PPid:\t%d", &cr->ppid) != 1) {
-				pr_err("Unable to parse: %s", str);
+				pr_err("Unable to parse: %s\n", str);
 				goto err_parse;
 			}
 			done++;
+			continue;
 		}
 
 		if (!strncmp(str, "Uid:", 4)) {
@@ -781,6 +799,7 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 				goto err_parse;
 
 			done++;
+			continue;
 		}
 
 		if (!strncmp(str, "Gid:", 4)) {
@@ -788,6 +807,7 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 				goto err_parse;
 
 			done++;
+			continue;
 		}
 
 		if (!strncmp(str, "CapInh:", 7)) {
@@ -795,6 +815,7 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 				goto err_parse;
 
 			done++;
+			continue;
 		}
 
 		if (!strncmp(str, "CapEff:", 7)) {
@@ -802,6 +823,7 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 				goto err_parse;
 
 			done++;
+			continue;
 		}
 
 		if (!strncmp(str, "CapPrm:", 7)) {
@@ -809,6 +831,7 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 				goto err_parse;
 
 			done++;
+			continue;
 		}
 
 		if (!strncmp(str, "CapBnd:", 7)) {
@@ -816,6 +839,7 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 				goto err_parse;
 
 			done++;
+			continue;
 		}
 
 		if (!strncmp(str, "Seccomp:", 8)) {
@@ -823,16 +847,35 @@ int parse_pid_status(pid_t pid, struct proc_status_creds *cr)
 				goto err_parse;
 			}
 
-			if (cr->seccomp_mode == SECCOMP_MODE_FILTER) {
-				pr_err("SECCOMP_MODE_FILTER not currently supported\n");
+			parsed_seccomp = true;
+			done++;
+			continue;
+		}
+
+		if (!strncmp(str, "ShdPnd:", 7)) {
+			unsigned long long sigpnd;
+
+			if (sscanf(str + 7, "%llx", &sigpnd) != 1)
 				goto err_parse;
-			}
+			cr->shdpnd |= sigpnd;
 
 			done++;
+			continue;
+		}
+		if (!strncmp(str, "SigPnd:", 7)) {
+			unsigned long long sigpnd;
+
+			if (sscanf(str + 7, "%llx", &sigpnd) != 1)
+				goto err_parse;
+			cr->sigpnd |= sigpnd;
+
+			done++;
+			continue;
 		}
 	}
 
-	if (done >= 8)
+	/* seccomp is optional */
+	if (done >= 11 || (done == 10 && !parsed_seccomp))
 		ret = 0;
 
 err_parse:
@@ -847,16 +890,33 @@ struct opt2flag {
 	unsigned flag;
 };
 
+static bool sb_opt_cb(char *opt, char *unknown, size_t *uoff)
+{
+	unsigned int id;
+
+	if (sscanf(opt, "gid=%d", &id) == 1) {
+		*uoff += sprintf(unknown + *uoff, "gid=%d", userns_gid(id));
+		unknown[*uoff] = ',';
+		(*uoff)++;
+		return true;
+	} else if (sscanf(opt, "uid=%d", &id) == 1) {
+		*uoff += sprintf(unknown + *uoff, "uid=%d", userns_uid(id));
+		unknown[*uoff] = ',';
+		(*uoff)++;
+		return true;
+	}
+	return false;
+}
+
 static int do_opt2flag(char *opt, unsigned *flags,
-		const struct opt2flag *opts, char *unknown)
+		const struct opt2flag *opts, char *unknown,
+		bool (*cb)(char *opt, char *unknown, size_t *uoff))
 {
 	int i;
 	char *end;
 	size_t uoff = 0;
 
 	while (1) {
-		unsigned int id;
-
 		end = strchr(opt, ',');
 		if (end)
 			*end = '\0';
@@ -867,15 +927,7 @@ static int do_opt2flag(char *opt, unsigned *flags,
 				break;
 			}
 
-		if (sscanf(opt, "gid=%d", &id) == 1) {
-			uoff += sprintf(unknown + uoff, "gid=%d", userns_gid(id));
-			unknown[uoff] = ',';
-			uoff++;
-		} else if (sscanf(opt, "uid=%d", &id) == 1) {
-			uoff += sprintf(unknown + uoff, "uid=%d", userns_uid(id));
-			unknown[uoff] = ',';
-			uoff++;
-		} else if (opts[i].opt == NULL) {
+		if (opts[i].opt == NULL && cb && !cb(opt, unknown, &uoff)) {
 			if (!unknown) {
 				pr_err("Unknown option [%s]\n", opt);
 				return -1;
@@ -914,7 +966,7 @@ static int parse_mnt_flags(char *opt, unsigned *flags)
 		{ },
 	};
 
-	if (do_opt2flag(opt, flags, mnt_opt2flag, NULL))
+	if (do_opt2flag(opt, flags, mnt_opt2flag, NULL, NULL))
 		return -1;
 
 	/* Otherwise the kernel assumes RELATIME by default */
@@ -935,7 +987,7 @@ static int parse_sb_opt(char *opt, unsigned *flags, char *uopt)
 		{ },
 	};
 
-	return do_opt2flag(opt, flags, sb_opt2flag, uopt);
+	return do_opt2flag(opt, flags, sb_opt2flag, uopt, sb_opt_cb);
 }
 
 static int parse_mnt_opt(char *str, struct mount_info *mi, int *off)
@@ -1081,7 +1133,7 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new, char **fsname)
 	if (!new->options)
 		goto err;
 
-	if (parse_sb_opt(opt, &new->flags, new->options))
+	if (parse_sb_opt(opt, &new->sb_flags, new->options))
 		goto err;
 
 	ret = 0;
@@ -1675,7 +1727,7 @@ static int parse_file_lock_buf(char *buf, struct file_lock *fl,
 	}
 
 	if (num < 10) {
-		pr_err("Invalid file lock info (%d): %s", num, buf);
+		pr_err("Invalid file lock info (%d): %s\n", num, buf);
 		return -1;
 	}
 
@@ -2016,67 +2068,76 @@ void put_ctls(struct list_head *l)
 	}
 }
 
-
 /* Parse and create all the real controllers. This does not include things with
  * the "name=" prefix, e.g. systemd.
  */
-int parse_cgroups(struct list_head *cgroups, unsigned int *n_cgroups)
+int collect_controllers(struct list_head *cgroups, unsigned int *n_cgroups)
 {
+	int exit_code = -1;
 	FILE *f;
-	char buf[1024], name[1024];
-	int heirarchy, exit_code = -1;
-	struct cg_controller *cur = NULL;
 
-	f = fopen_proc(PROC_GEN, "cgroups");
-	if (!f) {
-		pr_perror("failed opening /proc/cgroups");
+	f = fopen_proc(PROC_SELF, "cgroup");
+	if (f == NULL)
 		return -1;
-	}
 
-	/* throw away the header */
-	if (!fgets(buf, 1024, f))
-		goto out;
+	while (fgets(buf, BUF_SIZE, f)) {
+		struct cg_controller *nc = NULL;
+		char *controllers, *off;
 
-	while (fgets(buf, 1024, f)) {
-		char *n;
-		char found = 0;
-
-		if (sscanf(buf, "%s %d", name, &heirarchy) != 2) {
-			pr_err("Unable to parse: %s\n", buf);
-			goto out;
+		controllers = strchr(buf, ':');
+		if (!controllers) {
+			pr_err("Unable to parse \"%s\"\n", buf);
+			goto err;
 		}
-		list_for_each_entry(cur, cgroups, l) {
-			if (cur->heirarchy == heirarchy) {
+		controllers++;
+
+		off = strchr(controllers, ':');
+		if (!off) {
+			pr_err("Unable to parse \"%s\"\n", buf);
+			goto err;
+		}
+		*off = '\0';
+		while (1) {
+			off = strchr(controllers, ',');
+			if (off)
+				*off = '\0';
+
+			if (!strncmp("name=", controllers, 5))
+				goto skip;
+
+			if (!nc) {
+				nc = new_controller(controllers);
+				if (!nc)
+					goto err;
+				list_add_tail(&nc->l, cgroups);
+				(*n_cgroups)++;
+			} else {
 				void *m;
+				char *n;
 
-				found = 1;
-				cur->n_controllers++;
-				m = xrealloc(cur->controllers, sizeof(char *) * cur->n_controllers);
+				nc->n_controllers++;
+				m = xrealloc(nc->controllers, sizeof(char *) * nc->n_controllers);
 				if (!m)
-					goto out;
+					goto err;
 
-				cur->controllers = m;
+				nc->controllers = m;
 
-				n = xstrdup(name);
+				n = xstrdup(controllers);
 				if (!n)
-					goto out;
+					goto err;
 
-				cur->controllers[cur->n_controllers-1] = n;
-				break;
+				nc->controllers[nc->n_controllers-1] = n;
 			}
-		}
-
-		if (!found) {
-			struct cg_controller *nc = new_controller(name, heirarchy);
-			if (!nc)
-				goto out;
-			list_add_tail(&nc->l, &cur->l);
-			(*n_cgroups)++;
+			
+skip:
+			if (!off)
+				break;
+			controllers = off + 1;
 		}
 	}
 
 	exit_code = 0;
-out:
+err:
 	fclose(f);
 	return exit_code;
 }
@@ -2112,6 +2173,10 @@ int aufs_parse(struct mount_info *new)
 
 bool proc_status_creds_eq(struct proc_status_creds *o1, struct proc_status_creds *o2)
 {
+	/* FIXME: this is a little too strict, we should do semantic comparison
+	 * of seccomp filters instead of forcing them to be exactly identical.
+	 * It's not unsafe, though, so let's be lazy for now.
+	 */
 	return memcmp(o1, o2, sizeof(struct proc_status_creds)) == 0;
 }
 
@@ -2121,47 +2186,50 @@ int parse_children(pid_t pid, pid_t **_c, int *_n)
 	int nr = 0;
 	DIR *dir;
 	struct dirent *de;
+	struct bfd f;
 
 	dir = opendir_proc(pid, "task");
 	if (dir == NULL)
 		return -1;
 
 	while ((de = readdir(dir))) {
-		int fd, len;
-		char *pos;
+		char *pos, *end;
 
 		if (dir_dots(de))
 			continue;
 
-		fd = open_proc(pid, "task/%s/children", de->d_name);
-		if (fd < 0)
+		f.fd = open_proc(pid, "task/%s/children", de->d_name);
+		if (f.fd < 0)
 			goto err;
 
-		len = read(fd, buf, BUF_SIZE);
-		close(fd);
-		if (len < 0)
+		if (bfdopenr(&f))
 			goto err;
 
-		buf[len] = '\0';
-		pos = buf;
 		while (1) {
 			pid_t val, *tmp;
 
-			val = strtol(pos, &pos, 0);
-			if (!val) {
-				BUG_ON(*pos != '\0');
+			pos = breadchr(&f, ' ');
+			if (IS_ERR(pos))
+				goto err_close;
+			if (pos == NULL)
 				break;
+
+			val = strtol(pos, &end, 0);
+
+			if (*end != 0 && *end != ' ') {
+				pr_err("Unable to parse %s\n", end);
+				goto err_close;
 			}
 
 			tmp = xrealloc(ch, (nr + 1) * sizeof(pid_t));
 			if (!tmp)
-				goto err;
+				goto err_close;
 
 			ch = tmp;
 			ch[nr] = val;
 			nr++;
-			pos++; /* space goes after each pid */
 		}
+		bclose(&f);
 	}
 
 	*_c = ch;
@@ -2169,6 +2237,8 @@ int parse_children(pid_t pid, pid_t **_c, int *_n)
 
 	closedir(dir);
 	return 0;
+err_close:
+	bclose(&f);
 err:
 	closedir(dir);
 	xfree(ch);

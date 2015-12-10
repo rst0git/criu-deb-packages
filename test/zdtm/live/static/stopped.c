@@ -1,6 +1,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
+#include <unistd.h>
+#include <syscall.h>
 #include <sys/wait.h>
 
 #include "zdtmtst.h"
@@ -16,7 +18,7 @@ int main(int argc, char **argv)
 	test_init(argc, argv);
 
 	if (pipe(p)) {
-		err("Unable to create pipe");
+		pr_perror("Unable to create pipe");
 		return 1;
 	}
 
@@ -29,7 +31,7 @@ int main(int argc, char **argv)
 		close(p[1]);
 		ret = read(p[0], &c, 1);
 		if (ret != 1) {
-			err("Unable to read: %d", ret);
+			pr_perror("Unable to read: %d", ret);
 			return 1;
 		}
 
@@ -38,6 +40,16 @@ int main(int argc, char **argv)
 	close(p[0]);
 
 	kill(pid, SIGSTOP);
+	if (waitid(P_PID, pid, NULL, WNOWAIT | WSTOPPED) < 0) {
+		pr_perror("waitid");
+		return 1;
+	}
+#ifdef ZDTM_STOPPED_TKILL
+	syscall(__NR_tkill, pid, SIGSTOP);
+#endif
+#ifdef ZDTM_STOPPED_KILL
+	kill(pid, SIGSTOP);
+#endif
 
 	write(p[1], "0", 1);
 	close(p[1]);
@@ -47,7 +59,7 @@ int main(int argc, char **argv)
 
 	// Return immediately if child run or stopped(by SIGSTOP)
 	if (waitpid(pid, &status, WUNTRACED | WCONTINUED) == -1) {
-		err("Unable to wait child");
+		pr_perror("Unable to wait child");
 		goto out;
 	}
 
@@ -61,7 +73,7 @@ int main(int argc, char **argv)
 	kill(pid, SIGCONT);
 
 	if (waitpid(pid, &status, 0) == -1) {
-		err("Unable to wait child");
+		pr_perror("Unable to wait child");
 		goto out;
 	}
 

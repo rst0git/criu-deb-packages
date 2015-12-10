@@ -243,6 +243,13 @@ void sbuf_printf(struct simple_buf *b, const char *format, va_list args)
 			else
 				print_hex(va_arg(args, unsigned int), b);
 			break;
+		case 'p':
+			print_hex_l((unsigned long)va_arg(args, void *), b);
+			break;
+		default:
+			print_string("UNKNOWN FORMAT ", b);
+			sbuf_putc(b, *s);
+			break;
 		}
 		s++;
 	}

@@ -334,17 +334,39 @@ static int restore_signals(siginfo_t *ptr, int nr, bool group)
 	return 0;
 }
 
-static void restore_seccomp(int seccomp_mode)
+static void restore_seccomp(struct task_restore_args *args)
 {
-	switch (seccomp_mode) {
+	switch (args->seccomp_mode) {
 	case SECCOMP_MODE_DISABLED:
 		return;
 	case SECCOMP_MODE_STRICT:
 		if (sys_prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0))
 			goto die;
 		return;
-	case SECCOMP_MODE_FILTER:
-		goto die;
+	case SECCOMP_MODE_FILTER: {
+		int i;
+		void *filter_data;
+
+		filter_data = &args->seccomp_filters[args->seccomp_filters_n];
+
+		for (i = 0; i < args->seccomp_filters_n; i++) {
+			struct sock_fprog *fprog = &args->seccomp_filters[i];
+
+			fprog->filter = filter_data;
+
+			/* We always TSYNC here, since we require that the
+			 * creds for all threads be the same; this means we
+			 * don't have to restore_seccomp() in threads, and that
+			 * future TSYNC behavior will be correct.
+			 */
+			if (sys_seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, (char *) fprog) < 0)
+				goto die;
+
+			filter_data += fprog->len * sizeof(struct sock_filter);
+		}
+
+		return;
+	}
 	default:
 		goto die;
 	}
@@ -412,7 +434,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 	ksigfillset(&to_block);
 	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
 	if (ret) {
-		pr_err("Unable to block signals %d", ret);
+		pr_err("Unable to block signals %d\n", ret);
 		goto core_restore_end;
 	}
 
@@ -443,9 +465,8 @@ long __export_restore_thread(struct thread_restore_args *args)
 		pr_info("Restoring seccomp mode %d for %ld\n", args->ta->seccomp_mode, sys_getpid());
 
 	restore_finish_stage(CR_STATE_RESTORE_CREDS);
-	futex_dec_and_wake(&thread_inprogress);
 
-	restore_seccomp(args->ta->seccomp_mode);
+	futex_dec_and_wake(&thread_inprogress);
 
 	new_sp = (long)rt_sigframe + SIGFRAME_OFFSET;
 	rst_sigreturn(new_sp);
@@ -1217,7 +1238,7 @@ long __export_restore_task(struct task_restore_args *args)
 	ksigfillset(&to_block);
 	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
 	if (ret) {
-		pr_err("Unable to block signals %ld", ret);
+		pr_err("Unable to block signals %ld\n", ret);
 		goto core_restore_end;
 	}
 
@@ -1283,9 +1304,9 @@ long __export_restore_task(struct task_restore_args *args)
 
 	restore_posix_timers(args);
 
-	sys_munmap(args->rst_mem, args->rst_mem_size);
+	restore_seccomp(args);
 
-	restore_seccomp(args->seccomp_mode);
+	sys_munmap(args->rst_mem, args->rst_mem_size);
 
 	/*
 	 * Sigframe stack.

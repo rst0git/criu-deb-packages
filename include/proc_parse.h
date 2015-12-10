@@ -13,6 +13,7 @@
 #include "protobuf/signalfd.pb-c.h"
 #include "protobuf/fsnotify.pb-c.h"
 #include "protobuf/timerfd.pb-c.h"
+#include "protobuf/seccomp.pb-c.h"
 
 #define PROC_TASK_COMM_LEN	32
 #define PROC_TASK_COMM_LEN_FMT	"(%31s"
@@ -72,6 +73,12 @@ struct proc_pid_stat {
 	int			exit_code;
 };
 
+struct seccomp_info {
+	SeccompFilter filter;
+	int id;
+	struct seccomp_info *prev;
+};
+
 #define PROC_CAP_SIZE	2
 
 struct proc_status_creds {
@@ -85,8 +92,11 @@ struct proc_status_creds {
 
 	char			state;
 	int			ppid;
+	unsigned long long	sigpnd;
+	unsigned long long	shdpnd;
 
 	int			seccomp_mode;
+	u32			last_filter;
 };
 
 bool proc_status_creds_eq(struct proc_status_creds *o1, struct proc_status_creds *o2);
@@ -180,7 +190,7 @@ struct cg_ctl {
 extern int parse_task_cgroup(int pid, struct list_head *l, unsigned int *n);
 extern void put_ctls(struct list_head *);
 
-int parse_cgroups(struct list_head *cgroups, unsigned int *n_cgroups);
+int collect_controllers(struct list_head *cgroups, unsigned int *n_cgroups);
 
 /* callback for AUFS support */
 extern int aufs_parse(struct mount_info *mi);

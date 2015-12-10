@@ -41,6 +41,7 @@
 #include "crtools.h"
 #include "cr_options.h"
 #include "servicefd.h"
+#include "string.h"
 #include "syscall.h"
 #include "ptrace.h"
 #include "util.h"
@@ -80,6 +81,7 @@
 #include "lsm.h"
 #include "seccomp.h"
 #include "seize.h"
+#include "fault-injection.h"
 
 #include "asm/dump.h"
 
@@ -238,7 +240,7 @@ static int dump_task_exe_link(pid_t pid, MmEntry *mm)
 	struct fd_parms params;
 	int fd, ret = 0;
 
-	fd = open_proc(pid, "exe");
+	fd = open_proc_path(pid, "exe");
 	if (fd < 0)
 		return -1;
 
@@ -261,7 +263,7 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_im
 	fe.has_umask = true;
 	fe.umask = misc->umask;
 
-	fd = open_proc(pid, "cwd");
+	fd = open_proc_path(pid, "cwd");
 	if (fd < 0)
 		return -1;
 
@@ -276,7 +278,7 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_im
 
 	close(fd);
 
-	fd = open_proc(pid, "root");
+	fd = open_proc_path(pid, "root");
 	if (fd < 0)
 		return -1;
 
@@ -344,7 +346,8 @@ static int dump_filemap(pid_t pid, struct vma_area *vma_area,
 	if (vma_area->aufs_rpath) {
 		struct fd_link aufs_link;
 
-		strcpy(aufs_link.name, vma_area->aufs_rpath);
+		strlcpy(aufs_link.name, vma_area->aufs_rpath,
+				sizeof(aufs_link.name));
 		aufs_link.len = strlen(aufs_link.name);
 		p.link = &aufs_link;
 	}
@@ -539,7 +542,7 @@ static int get_task_personality(pid_t pid, u32 *personality)
 {
 	int fd, ret = -1;
 
-	pr_info("Obtaining personality ... ");
+	pr_info("Obtaining personality ... \n");
 
 	fd = open_proc(pid, "personality");
 	if (fd < 0)
@@ -668,6 +671,7 @@ static int dump_task_core_all(struct pstree_item *item,
 	CoreEntry *core = item->core[0];
 	pid_t pid = item->pid.real;
 	int ret = -1;
+	struct proc_status_creds *creds;
 
 	pr_info("\n");
 	pr_info("Dumping core (pid: %d)\n", pid);
@@ -677,13 +681,19 @@ static int dump_task_core_all(struct pstree_item *item,
 	if (ret < 0)
 		goto err;
 
-	if (dmpi(item)->pi_creds->seccomp_mode != SECCOMP_MODE_DISABLED) {
-		pr_info("got seccomp mode %d for %d\n", dmpi(item)->pi_creds->seccomp_mode, item->pid.virt);
+	creds = dmpi(item)->pi_creds;
+	if (creds->seccomp_mode != SECCOMP_MODE_DISABLED) {
+		pr_info("got seccomp mode %d for %d\n", creds->seccomp_mode, item->pid.virt);
 		core->tc->has_seccomp_mode = true;
-		core->tc->seccomp_mode = dmpi(item)->pi_creds->seccomp_mode;
+		core->tc->seccomp_mode = creds->seccomp_mode;
+
+		if (creds->seccomp_mode == SECCOMP_MODE_FILTER) {
+			core->tc->has_seccomp_filter = true;
+			core->tc->seccomp_filter = creds->last_filter;
+		}
 	}
 
-	strncpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
+	strlcpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
 	core->tc->flags = stat->flags;
 	core->tc->task_state = item->state;
 	core->tc->exit_code = 0;
@@ -800,7 +810,7 @@ static int dump_one_zombie(const struct pstree_item *item,
 	if (!core)
 		return -1;
 
-	strncpy((char *)core->tc->comm, pps->comm, TASK_COMM_LEN);
+	strlcpy((char *)core->tc->comm, pps->comm, TASK_COMM_LEN);
 	core->tc->task_state = TASK_DEAD;
 	core->tc->exit_code = pps->exit_code;
 
@@ -1193,6 +1203,11 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
+	if (fault_injected(FI_DUMP_EARLY)) {
+		pr_info("fault: CRIU sudden detach\n");
+		BUG();
+	}
+
 	if (root_ns_mask & CLONE_NEWPID && root_item == item) {
 		int pfd;
 
@@ -1442,12 +1457,18 @@ int cr_dump_tasks(pid_t pid)
 {
 	struct pstree_item *item;
 	int post_dump_ret = 0;
+	int pre_dump_ret = 0;
 	int ret = -1;
 
 	pr_info("========================================\n");
 	pr_info("Dumping processes (pid: %d)\n", pid);
 	pr_info("========================================\n");
 
+	pre_dump_ret = run_scripts(ACT_PRE_DUMP);
+	if (pre_dump_ret != 0) {
+		pr_err("Pre dump script failed with %d!\n", post_dump_ret);
+		goto err;
+	}
 	if (init_stats(DUMP_STATS))
 		goto err;
 
@@ -1503,6 +1524,9 @@ int cr_dump_tasks(pid_t pid)
 
 	glob_imgset = cr_glob_imgset_open(O_DUMP);
 	if (!glob_imgset)
+		goto err;
+
+	if (collect_seccomp_filters() < 0)
 		goto err;
 
 	for_each_pstree_item(item) {
