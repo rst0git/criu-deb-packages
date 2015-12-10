@@ -92,6 +92,8 @@ struct tty_info {
 
 	bool				create;
 	bool				inherit;
+
+	struct tty_info			*ctl_tty;
 };
 
 struct tty_dump_info {
@@ -474,6 +476,11 @@ static void pty_free_fake_reg(struct reg_file_info **r)
 
 static int open_tty_reg(struct file_desc *reg_d, u32 flags)
 {
+	/*
+	 * Never set as a control terminal automatically, all
+	 * ctty magic happens only in tty_set_sid().
+	 */
+	flags |= O_NOCTTY;
 	return open_path(reg_d, do_open_reg_noseek_flags, &flags);
 }
 
@@ -684,7 +691,7 @@ struct tty_parms {
 	struct winsize w;
 };
 
-static int do_restore_tty_parms(void *arg, int fd)
+static int do_restore_tty_parms(void *arg, int fd, pid_t pid)
 {
 	struct tty_parms *p = arg;
 
@@ -770,7 +777,7 @@ static int pty_open_slaves(struct tty_info *info)
 	list_for_each_entry(slave, &info->sibling, sibling) {
 		BUG_ON(tty_is_master(slave));
 
-		fd = open_tty_reg(slave->reg_d, slave->tfe->flags | O_NOCTTY);
+		fd = open_tty_reg(slave->reg_d, slave->tfe->flags);
 		if (fd < 0) {
 			pr_perror("Can't open slave %s", path_from_reg(slave->reg_d));
 			goto err;
@@ -852,7 +859,7 @@ static int pty_open_unpaired_slave(struct file_desc *d, struct tty_info *slave)
 
 		unlock_pty(master);
 
-		fd = open_tty_reg(slave->reg_d, slave->tfe->flags | O_NOCTTY);
+		fd = open_tty_reg(slave->reg_d, slave->tfe->flags);
 		if (fd < 0) {
 			pr_perror("Can't open slave %s", path_from_reg(slave->reg_d));
 			goto err;
@@ -1080,6 +1087,14 @@ static int tty_find_restoring_task(struct tty_info *info)
 		}
 
 		/*
+		 * Restoring via leader only. All files
+		 * opened over same real tty get propagated
+		 * automatically by kernel itself.
+		 */
+		if (info->ctl_tty != info)
+			return 0;
+
+		/*
 		 * Find out the task which is session leader
 		 * and it can restore the controlling terminal
 		 * for us.
@@ -1158,6 +1173,31 @@ static int tty_setup_orphan_slavery(void)
 int tty_setup_slavery(void)
 {
 	struct tty_info *info, *peer, *m;
+
+	/*
+	 * The image may carry several terminals opened
+	 * belonging to the same session, so choose the
+	 * leader which gonna be setting up the controlling
+	 * terminal.
+	 */
+	list_for_each_entry(info, &all_ttys, list) {
+		if (!info->tie->sid || info->ctl_tty ||
+		    info->driver->type == TTY_TYPE__CTTY)
+			continue;
+
+		info->ctl_tty = info;
+		pr_debug("ctl tty leader %x\n", info->tfe->id);
+		peer = info;
+		list_for_each_entry_safe_continue(peer, m, &all_ttys, list) {
+			if (!peer->tie->sid || peer->ctl_tty ||
+			    peer->driver->type == TTY_TYPE__CTTY)
+				continue;
+			if (peer->tie->sid == info->tie->sid) {
+				pr_debug(" `- slave %x\n", peer->tfe->id);
+				peer->ctl_tty = info;
+			}
+		}
+	}
 
 	list_for_each_entry(info, &all_ttys, list) {
 		if (tty_find_restoring_task(info))
@@ -1316,6 +1356,7 @@ static int collect_one_tty(void *obj, ProtobufCMessage *msg)
 	info->driver = get_tty_driver(major(info->tie->rdev), minor(info->tie->rdev));
 	info->create = tty_is_master(info);
 	info->inherit = false;
+	info->ctl_tty = NULL;
 
 	if (verify_info(info))
 		return -1;

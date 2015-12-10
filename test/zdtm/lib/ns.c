@@ -77,11 +77,6 @@ static int prepare_mntns()
 			return -1;
 		}
 
-		if (mkdir("proc", 0777) && errno != EEXIST) {
-			fprintf(stderr, "mkdir(proc) failed: %m\n");
-			return -1;
-		}
-
 		/*
 		 * proc and sysfs can be mounted in an unprivileged namespace,
 		 * if they are already mounted when the user namespace is created.
@@ -97,14 +92,6 @@ static int prepare_mntns()
 			return -1;
 		}
 
-		if (mkdir("/dev", 0755) && errno != EEXIST) {
-			fprintf(stderr, "mkdir(/dev) failed: %m\n");
-			return -1;
-		}
-		if (mkdir("/dev/pts", 0755) && errno != EEXIST) {
-			fprintf(stderr, "mkdir(/dev/pts) failed: %m\n");
-			return -1;
-		}
 		if (mount("pts", "/dev/pts", "devpts", MS_MGC_VAL, "mode=666,ptmxmode=666,newinstance")) {
 			fprintf(stderr, "mount(/dev/pts) failed: %m\n");
 			return -1;
@@ -127,14 +114,7 @@ static int prepare_mntns()
 				return -1;
 			}
 		}
-		if (access("/dev/tty", F_OK)) {
-			if (mknod("/dev/tty", 0666 | S_IFCHR, makedev(5, 0)) == 0) {
-				chmod("/dev/tty", 0666);
-			} else if (errno != EEXIST) {
-				fprintf(stderr, "mknod(/dev/tty) failed: %m\n");
-				return -1;
-			}
-		}
+
 		if (fchdir(dfd)) {
 			fprintf(stderr, "fchdir() failed: %m\n");
 			return -1;
@@ -195,7 +175,7 @@ write_out:
 }
 
 #define STATUS_FD 255
-int ns_exec(void *_arg)
+static int ns_exec(void *_arg)
 {
 	struct ns_exec_args *args = (struct ns_exec_args *) _arg;
 	char buf[4096];
@@ -340,46 +320,6 @@ int ns_init(int argc, char **argv)
 	exit(1);
 }
 
-static int construct_root()
-{
-	char *root;
-	int dfd;
-
-	root = getenv("ZDTM_ROOT");
-	if (!root) {
-		fprintf(stderr, "ZDTM_ROOT isn't set\n");
-		return -1;
-	}
-
-	dfd = open(".", O_RDONLY);
-	if (dfd == -1) {
-		fprintf(stderr, "open(.) failed: %m\n");
-		return -1;
-	}
-	if (chdir(root)) {
-		fprintf(stderr, "chdir(%s): %m\n", root);
-		return -1;
-	}
-
-	mkdir("dev", 0777);
-	chmod("dev", 0777);
-	mknod("dev/null", 0777 | S_IFCHR, makedev(1, 3));
-	chmod("dev/null", 0777);
-	mkdir("dev/net", 0777);
-	mknod("dev/net/tun", 0777 | S_IFCHR, makedev(10, 200));
-	chmod("dev/net/tun", 0777);
-	mknod("dev/rtc", 0777 | S_IFCHR, makedev(254, 0));
-	chmod("dev/rtc", 0777);
-
-	if (fchdir(dfd)) {
-		fprintf(stderr, "fchdir() failed: %m\n");
-		return -1;
-	}
-	close(dfd);
-
-	return 0;
-}
-
 #define UID_MAP "0 100000 100000\n100000 200000 50000"
 #define GID_MAP "0 400000 50000\n50000 500000 100000"
 void ns_create(int argc, char **argv)
@@ -400,20 +340,12 @@ void ns_create(int argc, char **argv)
 		exit(1);
 	}
 
+	flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS |
+		CLONE_NEWNET | CLONE_NEWIPC | SIGCHLD;
+
 	val = getenv("ZDTM_USERNS");
 	if (val)
-		/*
-		 * CLONE_NEWIPC and CLONE_NEWUTS are excluded, because
-		 * their sysctl-s are protected by CAP_SYS_ADMIN
-		 */
-		flags = CLONE_NEWPID | CLONE_NEWNS  |
-			CLONE_NEWNET | CLONE_NEWUSER | SIGCHLD;
-	else
-		flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS |
-			CLONE_NEWNET | CLONE_NEWIPC | SIGCHLD;
-
-	if (construct_root())
-		exit(1);
+		flags |= CLONE_NEWUSER;
 
 	pid = clone(ns_exec, args.stack_ptr, flags, &args);
 	if (pid < 0) {
@@ -423,7 +355,7 @@ void ns_create(int argc, char **argv)
 
 	close(args.status_pipe[1]);
 
-	if (val) {
+	if (flags & CLONE_NEWUSER) {
 		snprintf(pname, sizeof(pname), "/proc/%d/uid_map", pid);
 		fd = open(pname, O_WRONLY);
 		if (fd < 0) {

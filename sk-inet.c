@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <net/if.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
@@ -91,7 +92,24 @@ static void show_one_inet_img(const char *act, const InetSkEntry *e)
 		e->state, src_addr);
 }
 
-static int can_dump_inet_sk(const struct inet_sk_desc *sk, int proto)
+static int can_dump_ipproto(int ino, int proto)
+{
+	/* Make sure it's a proto we support */
+	switch (proto) {
+	case IPPROTO_IP:
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+	case IPPROTO_UDPLITE:
+		break;
+	default:
+		pr_err("Unsupported proto %d for socket %x\n", proto, ino);
+		return 0;
+	}
+
+	return 1;
+}
+
+static int can_dump_inet_sk(const struct inet_sk_desc *sk)
 {
 	BUG_ON((sk->sd.family != AF_INET) && (sk->sd.family != AF_INET6));
 
@@ -137,7 +155,7 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk, int proto)
 		break;
 	case TCP_ESTABLISHED:
 		if (!opts.tcp_established_ok) {
-			pr_err("Connected TCP socket, consider using %s option.\n",
+			pr_err("Connected TCP socket, consider using --%s option.\n",
 					SK_EST_PARAM);
 			return 0;
 		}
@@ -147,18 +165,6 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk, int proto)
 		break;
 	default:
 		pr_err("Unknown inet socket %x state %d\n", sk->sd.ino, sk->state);
-		return 0;
-	}
-
-	/* Make sure it's a proto we support */
-	switch (proto) {
-	case IPPROTO_IP:
-	case IPPROTO_TCP:
-	case IPPROTO_UDP:
-	case IPPROTO_UDPLITE:
-		break;
-	default:
-		pr_err("Unsupported proto %d for socket %x\n", proto, sk->sd.ino);
 		return 0;
 	}
 
@@ -225,16 +231,49 @@ err:
 	return NULL;
 }
 
+static int dump_ip_opts(int sk, IpOptsEntry *ioe)
+{
+	int ret = 0;
+
+	ret |= dump_opt(sk, SOL_IP, IP_FREEBIND, &ioe->freebind);
+	ioe->has_freebind = ioe->freebind;
+
+	return ret;
+}
+
+/* Stolen from the kernel's __ipv6_addr_type/__ipv6_addr_needs_scopeid;
+ * link local and (multicast + loopback + linklocal) addrs require a
+ * scope id.
+ */
+#define IPV6_ADDR_SCOPE_NODELOCAL       0x01
+#define IPV6_ADDR_SCOPE_LINKLOCAL       0x02
+static bool needs_scope_id(uint32_t *src_addr)
+{
+	if ((src_addr[0] & htonl(0xFF00000)) == htonl(0xFF000000)) {
+		if (src_addr[1] & (IPV6_ADDR_SCOPE_LINKLOCAL|IPV6_ADDR_SCOPE_NODELOCAL))
+			return true;
+	}
+
+	if ((src_addr[0] & htonl(0xFFC00000)) == htonl(0xFE800000))
+		return true;
+
+	return false;
+}
+
 static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int family)
 {
 	struct inet_sk_desc *sk;
 	InetSkEntry ie = INET_SK_ENTRY__INIT;
+	IpOptsEntry ipopts = IP_OPTS_ENTRY__INIT;
 	SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
 	int ret = -1, err = -1, proto;
 
 	ret = do_dump_opt(lfd, SOL_SOCKET, SO_PROTOCOL,
 					&proto, sizeof(proto));
 	if (ret)
+		goto err;
+
+	if (!can_dump_ipproto(p->stat.st_ino, proto))
 		goto err;
 
 	sk = (struct inet_sk_desc *)lookup_socket(p->stat.st_ino, family, proto);
@@ -246,7 +285,7 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 			goto err;
 	}
 
-	if (!can_dump_inet_sk(sk, proto))
+	if (!can_dump_inet_sk(sk))
 		goto err;
 
 	BUG_ON(sk->sd.already_dumped);
@@ -264,11 +303,14 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 
 	ie.fown		= (FownEntry *)&p->fown;
 	ie.opts		= &skopts;
+	ie.ip_opts	= &ipopts;
 
 	ie.n_src_addr = PB_ALEN_INET;
 	ie.n_dst_addr = PB_ALEN_INET;
 	if (ie.family == AF_INET6) {
 		int val;
+		char device[IFNAMSIZ];
+		socklen_t len = sizeof(device);
 
 		ie.n_src_addr = PB_ALEN_INET6;
 		ie.n_dst_addr = PB_ALEN_INET6;
@@ -279,6 +321,24 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 
 		ie.v6only = val ? true : false;
 		ie.has_v6only = true;
+
+		/* ifindex only matters on source ports for bind, so let's
+		 * find only that ifindex. */
+		if (sk->src_port && needs_scope_id(sk->src_addr)) {
+			if (getsockopt(lfd, SOL_SOCKET, SO_BINDTODEVICE, device, &len) < 0) {
+				pr_perror("can't get ifname");
+				goto err;
+			}
+
+			if (len > 0) {
+				ie.ifname = xstrdup(device);
+				if (!ie.ifname)
+					goto err;
+			} else {
+				pr_err("couldn't find ifname for %d, can't bind\n", id);
+				goto err;
+			}
+		}
 	}
 
 	ie.src_addr = xmalloc(pb_repeated_size(&ie, src_addr));
@@ -289,6 +349,9 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 
 	memcpy(ie.src_addr, sk->src_addr, pb_repeated_size(&ie, src_addr));
 	memcpy(ie.dst_addr, sk->dst_addr, pb_repeated_size(&ie, dst_addr));
+
+	if (dump_ip_opts(lfd, &ipopts))
+		goto err;
 
 	if (dump_socket_opts(lfd, &skopts))
 		goto err;
@@ -469,6 +532,15 @@ static int post_open_inet_sk(struct file_desc *d, int sk)
 	return 0;
 }
 
+int restore_ip_opts(int sk, IpOptsEntry *ioe)
+{
+	int ret = 0;
+
+	if (ioe->has_freebind)
+		ret |= restore_opt(sk, SOL_IP, IP_FREEBIND, &ioe->freebind);
+
+	return ret;
+}
 static int open_inet_sk(struct file_desc *d)
 {
 	struct inet_sk_info *ii;
@@ -557,6 +629,9 @@ done:
 	if (rst_file_params(sk, ie->fown, ie->flags))
 		goto err;
 
+	if (ie->ip_opts && restore_ip_opts(sk, ie->ip_opts))
+		goto err;
+
 	if (restore_socket_opts(sk, ie->opts))
 		goto err;
 
@@ -573,7 +648,7 @@ union sockaddr_inet {
 };
 
 static int restore_sockaddr(union sockaddr_inet *sa,
-		int family, u32 pb_port, u32 *pb_addr)
+		int family, u32 pb_port, u32 *pb_addr, u32 ifindex)
 {
 	BUILD_BUG_ON(sizeof(sa->v4.sin_addr.s_addr) > PB_ALEN_INET * sizeof(u32));
 	BUILD_BUG_ON(sizeof(sa->v6.sin6_addr.s6_addr) > PB_ALEN_INET6 * sizeof(u32));
@@ -591,6 +666,12 @@ static int restore_sockaddr(union sockaddr_inet *sa,
 		sa->v6.sin6_family = AF_INET6;
 		sa->v6.sin6_port = htons(pb_port);
 		memcpy(sa->v6.sin6_addr.s6_addr, pb_addr, sizeof(sa->v6.sin6_addr.s6_addr));
+
+		/* Here although the struct member is called scope_id, the
+		 * kernel really wants ifindex. See
+		 * /net/ipv6/af_inet6.c:inet6_bind for details.
+		 */
+		sa->v6.sin6_scope_id = ifindex;
 		return sizeof(sa->v6);
 	}
 
@@ -600,15 +681,56 @@ static int restore_sockaddr(union sockaddr_inet *sa,
 
 int inet_bind(int sk, struct inet_sk_info *ii)
 {
+	bool rst_freebind = false;
 	union sockaddr_inet addr;
-	int addr_size;
+	int addr_size, ifindex = 0;
+
+	if (ii->ie->ifname) {
+		ifindex = if_nametoindex(ii->ie->ifname);
+		if (!ifindex) {
+			pr_err("couldn't find ifindex for %s\n", ii->ie->ifname);
+			return -1;
+		}
+	}
 
 	addr_size = restore_sockaddr(&addr, ii->ie->family,
-			ii->ie->src_port, ii->ie->src_addr);
+			ii->ie->src_port, ii->ie->src_addr, ifindex);
+
+	/*
+	 * ipv6 addresses go through a “tentative” phase and
+	 * sockets could not be bound to them in this moment
+	 * without setting IP_FREEBIND.
+	 */
+	if (ii->ie->family == AF_INET6) {
+		int yes = 1;
+
+		if (restore_opt(sk, SOL_IP, IP_FREEBIND, &yes))
+			return -1;
+
+		if (ii->ie->ip_opts && ii->ie->ip_opts->freebind)
+			/*
+			 * The right value is already set, so
+			 * don't need to restore it in restore_ip_opts()
+			 */
+			ii->ie->ip_opts->has_freebind = false;
+		else
+			rst_freebind = true;
+	}
 
 	if (bind(sk, (struct sockaddr *)&addr, addr_size) == -1) {
-		pr_perror("Can't bind inet socket");
+		pr_perror("Can't bind inet socket (id %d)", ii->ie->id);
 		return -1;
+	}
+
+	if (rst_freebind) {
+		int no = 0;
+
+		/*
+		 * The "no" value is default, so it will not be
+		 * restore in restore_ip_opts()
+		 */
+		if (restore_opt(sk, SOL_IP, IP_FREEBIND, &no))
+			return -1;
 	}
 
 	return 0;
@@ -620,7 +742,7 @@ int inet_connect(int sk, struct inet_sk_info *ii)
 	int addr_size;
 
 	addr_size = restore_sockaddr(&addr, ii->ie->family,
-			ii->ie->dst_port, ii->ie->dst_addr);
+			ii->ie->dst_port, ii->ie->dst_addr, 0);
 
 	if (connect(sk, (struct sockaddr *)&addr, addr_size) == -1) {
 		pr_perror("Can't connect inet socket back");

@@ -1,6 +1,7 @@
 #ifndef __CR_NS_H__
 #define __CR_NS_H__
 
+#include "compiler.h"
 #include "files.h"
 
 struct ns_desc {
@@ -9,12 +10,20 @@ struct ns_desc {
 	size_t		len;
 };
 
+enum ns_type {
+	NS_UNKNOWN = 0,
+	NS_CRIU,
+	NS_ROOT,
+	NS_OTHER,
+};
+
 struct ns_id {
 	unsigned int kid;
 	unsigned int id;
-	pid_t pid;
+	pid_t ns_pid;
 	struct ns_desc *nd;
 	struct ns_id *next;
+	enum ns_type type;
 
 	/*
 	 * For mount namespaces on restore -- indicates that
@@ -22,12 +31,13 @@ struct ns_id {
 	 * are mounted) and other tasks may do setns on it
 	 * and proceed.
 	 */
-	futex_t ns_created;
+	futex_t ns_populated;
 
 	union {
 		struct {
 			struct mount_info *mntinfo_list;
 			struct mount_info *mntinfo_tree;
+			int ns_fd;
 		} mnt;
 
 		struct {
@@ -59,6 +69,7 @@ extern int collect_namespaces(bool for_dump);
 extern int collect_mnt_namespaces(bool for_dump);
 extern int dump_mnt_namespaces(void);
 extern int dump_namespaces(struct pstree_item *item, unsigned int ns_flags);
+extern int prepare_namespace_before_tasks(void);
 extern int prepare_namespace(struct pstree_item *item, unsigned long clone_flags);
 extern int try_show_namespaces(int pid);
 
@@ -68,19 +79,18 @@ extern int restore_ns(int rst, struct ns_desc *nd);
 extern int dump_task_ns_ids(struct pstree_item *);
 extern int predump_task_ns_ids(struct pstree_item *);
 extern struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd);
-extern int rst_add_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd);
+extern int rst_add_ns_id(unsigned int id, struct pstree_item *, struct ns_desc *nd);
 extern struct ns_id *lookup_ns_by_id(unsigned int id, struct ns_desc *nd);
 
 extern int collect_user_namespaces(bool for_dump);
 extern int prepare_userns(struct pstree_item *item);
-extern int start_usernsd(void);
 extern int stop_usernsd(void);
 extern int userns_uid(int uid);
 extern int userns_gid(int gid);
 extern int dump_user_ns(pid_t pid, int ns_id);
 extern void free_userns_maps(void);
 
-typedef int (*uns_call_t)(void *arg, int fd);
+typedef int (*uns_call_t)(void *arg, int fd, pid_t pid);
 /*
  * Async call -- The call is guaranteed to be done till the
  * CR_STATE_COMPLETE happens. The function may return even
@@ -95,6 +105,8 @@ typedef int (*uns_call_t)(void *arg, int fd);
  */
 #define UNS_FDOUT	0x2
 
+#define MAX_UNSFD_MSG_SIZE 4096
+
 /*
  * When we're restoring inside user namespace, some things are
  * not allowed to be done there due to insufficient capabilities.
@@ -104,7 +116,11 @@ typedef int (*uns_call_t)(void *arg, int fd);
  * In case we're not in userns, just call the callback immediatelly
  * in the context of calling task.
  */
-int userns_call(uns_call_t call, int flags,
-		void *arg, size_t arg_size, int fd);
+extern int __userns_call(const char *func_name, uns_call_t call, int flags,
+			 void *arg, size_t arg_size, int fd);
+
+#define userns_call(__call, __flags, __arg, __arg_size, __fd)	\
+	__userns_call(__stringify(__call), __call, __flags,	\
+		      __arg, __arg_size, __fd)
 
 #endif /* __CR_NS_H__ */

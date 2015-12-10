@@ -339,7 +339,7 @@ struct socket_desc *lookup_socket(int ino, int family, int proto)
 		return ERR_PTR(-EINVAL);
 	}
 
-	pr_debug("\tSearching for socket %x (family %d)\n", ino, family);
+	pr_debug("\tSearching for socket %x (family %d.%d)\n", ino, family, proto);
 	for (sd = sockets[ino % SK_HASH_SIZE]; sd; sd = sd->next)
 		if (sd->ino == ino) {
 			BUG_ON(sd->family != family);
@@ -374,7 +374,7 @@ int do_restore_opt(int sk, int level, int name, void *val, int len)
 	return 0;
 }
 
-static int sk_setbufs(void *arg, int fd)
+static int sk_setbufs(void *arg, int fd, pid_t pid)
 {
 	u32 *buf = (u32 *)arg;
 
@@ -699,7 +699,7 @@ int collect_sockets(struct ns_id *ns)
 	tmp = do_collect_req(nl, &req, sizeof(req), packet_receive_one, NULL);
 	if (tmp) {
 		pr_warn("The current kernel doesn't support packet_diag\n");
-		if (ns->pid == 0 || tmp != -ENOENT) /* Fedora 19 */
+		if (ns->ns_pid == 0 || tmp != -ENOENT) /* Fedora 19 */
 			err = tmp;
 	}
 
@@ -709,7 +709,7 @@ int collect_sockets(struct ns_id *ns)
 	tmp = do_collect_req(nl, &req, sizeof(req), netlink_receive_one, NULL);
 	if (tmp) {
 		pr_warn("The current kernel doesn't support netlink_diag\n");
-		if (ns->pid == 0 || tmp != -ENOENT) /* Fedora 19 */
+		if (ns->ns_pid == 0 || tmp != -ENOENT) /* Fedora 19 */
 			err = tmp;
 	}
 
@@ -717,7 +717,7 @@ int collect_sockets(struct ns_id *ns)
 	close(nl);
 	ns->net.nlsk = -1;
 
-	if (err && (ns->pid == getpid())) {
+	if (err && (ns->type == NS_CRIU)) {
 		/*
 		 * If netns isn't dumped, criu will fail only
 		 * if an unsupported socket will be really dumped.

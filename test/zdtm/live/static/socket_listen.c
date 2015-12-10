@@ -44,7 +44,7 @@ int main(int argc, char **argv)
 	test_init(argc, argv);
 
 	if ((fd_s = tcp_init_server(ZDTM_FAMILY, &port)) < 0) {
-		err("initializing server failed");
+		pr_err("initializing server failed\n");
 		return 1;
 	}
 
@@ -53,11 +53,11 @@ int main(int argc, char **argv)
 
 	sigemptyset(&sa.sa_mask);
 	if (sigaction(SIGCHLD, &sa, NULL))
-		fprintf(stderr, "Can't set SIGTERM handler: %m\n");
+		pr_perror("Can't set SIGCHLD handler");
 
 	pid = test_fork();
 	if (pid < 0) {
-		err("fork failed. Return %d %m", pid);
+		pr_perror("fork failed");
 		return 1;
 	}
 
@@ -73,7 +73,7 @@ int main(int argc, char **argv)
 		res = read(fd, buf, BUF_SIZE);
 		close(fd);
 		if (res != BUF_SIZE) {
-			err("read less then have to: %d instead of %d", res, BUF_SIZE);
+			pr_perror("read less then have to: %d instead of %d", res, BUF_SIZE);
 			return -1;
 		}
 		if (datachk(buf, BUF_SIZE, &crc))
@@ -87,25 +87,25 @@ int main(int argc, char **argv)
 	fd = tcp_accept_server(fd_s);
 	close(fd_s);
 	if (fd < 0) {
-		err("can't accept client connection %m");
+		pr_err("can't accept client connection\n");
 		goto error;
 	}
 
 	datagen(buf, BUF_SIZE, &crc);
 	if (write(fd, buf, BUF_SIZE) < BUF_SIZE) {
-		err("can't write");
+		pr_perror("can't write");
 		goto error;
 	}
 	close(fd);
 
 
 	if (wait(&status) < 0) {
-		err("wait failed %m");
+		pr_perror("wait failed");
 		goto error;
 	}
 
 	if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
-		err("chiled failed. Return %d", WEXITSTATUS(status));
+		pr_err("child failed with exit code %d\n", WEXITSTATUS(status));
 		return 1;
 	}
 

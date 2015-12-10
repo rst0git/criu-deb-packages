@@ -14,7 +14,7 @@
 #include <sys/sendfile.h>
 #include <fcntl.h>
 #include <poll.h>
-
+#include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/ptrace.h>
@@ -28,6 +28,9 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include "compiler.h"
 #include "asm/types.h"
@@ -227,9 +230,9 @@ static int open_proc_sfd(char *path)
 	int fd, ret;
 
 	close_proc();
-	fd = open(path, O_DIRECTORY | O_RDONLY);
+	fd = open(path, O_DIRECTORY | O_PATH);
 	if (fd == -1) {
-		pr_err("Can't open %s\n", path);
+		pr_perror("Can't open %s", path);
 		return -1;
 	}
 
@@ -271,7 +274,7 @@ inline int open_pid_proc(pid_t pid)
 	else
 		snprintf(path, sizeof(path), "%d", pid);
 
-	fd = openat(dfd, path, O_RDONLY);
+	fd = openat(dfd, path, O_PATH);
 	if (fd < 0) {
 		pr_perror("Can't open %s", path);
 		set_cr_errno(ESRCH);
@@ -463,7 +466,7 @@ int read_fd_link(int lfd, char *buf, size_t size)
 	if (ret < 0) {
 		pr_perror("Can't read link of fd %d", lfd);
 		return -1;
-	} else if ((size_t)ret == size) {
+	} else if ((size_t)ret >= size) {
 		pr_err("Buffer for read link of fd %d is too small\n", lfd);
 		return -1;
 	}
@@ -506,13 +509,13 @@ void shfree_last(void *ptr)
  * If "in" is negative, stdin will be closed.
  * If "out" or "err" are negative, a log file descriptor will be used.
  */
-int cr_system(int in, int out, int err, char *cmd, char *const argv[])
+int cr_system(int in, int out, int err, char *cmd, char *const argv[], unsigned flags)
 {
-	return cr_system_userns(in, out, err, cmd, argv, -1);
+	return cr_system_userns(in, out, err, cmd, argv, flags, -1);
 }
 
 int cr_system_userns(int in, int out, int err, char *cmd,
-			char *const argv[], int userns_pid)
+			char *const argv[], unsigned flags, int userns_pid)
 {
 	sigset_t blockmask, oldmask;
 	int ret = -1, status;
@@ -589,7 +592,7 @@ out_chld:
 		}
 
 		if (WIFEXITED(status)) {
-			if (WEXITSTATUS(status))
+			if (!(flags & CRS_CAN_FAIL) && WEXITSTATUS(status))
 				pr_err("exited, status=%d\n", WEXITSTATUS(status));
 			break;
 		} else if (WIFSIGNALED(status)) {
@@ -662,6 +665,29 @@ int is_root_user()
 	return 1;
 }
 
+int is_empty_dir(int dirfd)
+{
+	int ret = 0;
+	DIR *fdir = NULL;
+	struct dirent *de;
+
+	fdir = fdopendir(dirfd);
+	if (!fdir)
+		return -1;
+
+	while ((de = readdir(fdir))) {
+		if (dir_dots(de))
+			continue;
+
+		goto out;
+	}
+
+	ret = 1;
+out:
+	closedir(fdir);
+	return ret;
+}
+
 int vaddr_to_pfn(unsigned long vaddr, u64 *pfn)
 {
 	int fd, ret = -1;
@@ -715,7 +741,7 @@ int mkdirpat(int fd, const char *path)
 	char made_path[PATH_MAX], *pos;
 
 	if (strlen(path) >= PATH_MAX) {
-		pr_err("path %s is longer than PATH_MAX", path);
+		pr_err("path %s is longer than PATH_MAX\n", path);
 		return -1;
 	}
 
@@ -844,4 +870,51 @@ int fd_has_data(int lfd)
 	}
 
 	return ret;
+}
+
+int make_yard(char *path)
+{
+	if (mount("none", path, "tmpfs", 0, NULL)) {
+		pr_perror("Unable to mount tmpfs in %s", path);
+		return -1;
+	}
+
+	if (mount("none", path, NULL, MS_PRIVATE, NULL)) {
+		pr_perror("Unable to mark yard as private");
+		return -1;
+	}
+
+	return 0;
+}
+
+const char *ns_to_string(unsigned int ns)
+{
+	switch (ns) {
+	case CLONE_NEWIPC:
+		return "ipc";
+	case CLONE_NEWNS:
+		return "mnt";
+	case CLONE_NEWNET:
+		return "net";
+	case CLONE_NEWPID:
+		return "pid";
+	case CLONE_NEWUSER:
+		return "user";
+	case CLONE_NEWUTS:
+		return "uts";
+	default:
+		return NULL;
+	}
+}
+
+void tcp_cork(int sk, bool on)
+{
+	int val = on ? 1 : 0;
+	setsockopt(sk, SOL_TCP, TCP_CORK, &val, sizeof(val));
+}
+
+void tcp_nodelay(int sk, bool on)
+{
+	int val = on ? 1 : 0;
+	setsockopt(sk, SOL_TCP, TCP_NODELAY, &val, sizeof(val));
 }

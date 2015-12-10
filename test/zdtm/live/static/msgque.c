@@ -28,22 +28,24 @@ struct msg1 {
 #define ANOTHER_TEST_STRING "Yet another test sysv5 msg"
 #define ANOTHER_MSG_TYPE 26538
 
-static int test_fn(int argc, char **argv)
+int main(int argc, char **argv)
 {
 	key_t key;
 	int msg, pid;
 	struct msg1 msgbuf;
 	int chret;
 
+	test_init(argc, argv);
+
 	key = ftok(argv[0], 822155650);
 	if (key == -1) {
-		err("Can't make key");
+		pr_perror("Can't make key");
 		exit(1);
 	}
 
 	pid = test_fork();
 	if (pid < 0) {
-		err("Can't fork");
+		pr_perror("Can't fork");
 		exit(1);
 	}
 
@@ -51,7 +53,7 @@ static int test_fn(int argc, char **argv)
 	if (msg == -1) {
 		msg = msgget(key, 0666);
 		if (msg == -1) {
-			err("Can't get queue");
+			pr_perror("Can't get queue");
 			goto err_kill;
 		}
 	}
@@ -133,15 +135,4 @@ err_kill:
 err:
 	chret = -errno;
 	goto out;
-}
-
-int main(int argc, char **argv)
-{
-#ifdef NEW_IPC_NS
-	test_init_ns(argc, argv, CLONE_NEWIPC, test_fn);
-#else
-	test_init(argc, argv);
-	test_fn(argc, argv);
-#endif
-	return 0;
 }

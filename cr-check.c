@@ -12,6 +12,8 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <linux/if.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <sys/mman.h>
@@ -54,12 +56,12 @@ static int check_tty(void)
 
 	master = open("/dev/ptmx", O_RDWR);
 	if (master < 0) {
-		pr_msg("Can't open master pty.\n");
+		pr_perror("Can't open /dev/ptmx");
 		goto out;
 	}
 
 	if (ioctl(master, TIOCSPTLCK, &lock)) {
-		pr_msg("Unable to lock pty device.\n");
+		pr_perror("Can't lock pty master");
 		goto out;
 	}
 
@@ -67,11 +69,11 @@ static int check_tty(void)
 	slave = open(slavename, O_RDWR);
 	if (slave < 0) {
 		if (errno != EIO) {
-			pr_msg("Unexpected error code on locked pty.\n");
+			pr_perror("Unexpected error on locked pty");
 			goto out;
 		}
 	} else {
-		pr_msg("Managed to open locked pty.\n");
+		pr_err("Managed to open locked pty.\n");
 		goto out;
 	}
 
@@ -90,7 +92,7 @@ static int check_map_files(void)
 	if (!ret)
 		return 0;
 
-	pr_msg("/proc/<pid>/map_files directory is missing.\n");
+	pr_perror("/proc/<pid>/map_files is inaccessible");
 	return -1;
 }
 
@@ -99,7 +101,8 @@ static int check_sock_diag(void)
 	int ret;
 	struct ns_id ns;
 
-	ns.pid = 0;
+	ns.ns_pid = 0;
+	ns.type = NS_CRIU;
 	ns.net.nlsk = socket(PF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
 	if (ns.net.nlsk < 0) {
 		pr_perror("Can't make diag socket for check");
@@ -125,7 +128,7 @@ static int check_ns_last_pid(void)
 	if (!ret)
 		return 0;
 
-	pr_msg("%s sysctl is missing.\n", LAST_PID_PATH);
+	pr_perror("%s sysctl is inaccessible", LAST_PID_PATH);
 	return -1;
 }
 
@@ -158,7 +161,8 @@ static int check_kcmp(void)
 	if (ret != -ENOSYS)
 		return 0;
 
-	pr_msg("System call kcmp is not supported\n");
+	errno = -ret;
+	pr_perror("System call kcmp is not supported");
 	return -1;
 }
 
@@ -171,7 +175,7 @@ static int check_prctl(void)
 
 	ret = sys_prctl(PR_GET_TID_ADDRESS, (unsigned long)&tid_addr, 0, 0, 0);
 	if (ret) {
-		pr_msg("prctl: PR_GET_TID_ADDRESS is not supported\n");
+		pr_msg("prctl: PR_GET_TID_ADDRESS is not supported");
 		return -1;
 	}
 
@@ -291,11 +295,6 @@ int check_mnt_id(void)
 {
 	struct fdinfo_common fdinfo = { .mnt_id = -1 };
 	int ret;
-
-	if (opts.check_ms_kernel) {
-		pr_warn("Skipping mnt_id support check\n");
-		return 0;
-	}
 
 	ret = parse_fdinfo(get_service_fd(LOG_FD_OFF), FD_TYPES__UND, NULL, &fdinfo);
 	if (ret < 0)
@@ -511,17 +510,20 @@ static int check_ipc(void)
 	if (!ret)
 		return 0;
 
-	pr_msg("/proc/sys/kernel/sem_next_id sysctl is missing.\n");
+	pr_perror("/proc/sys/kernel/sem_next_id is inaccessible");
 	return -1;
 }
 
 static int check_sigqueuinfo()
 {
+	int ret;
 	siginfo_t info = { .si_code = 1 };
 
 	signal(SIGUSR1, SIG_IGN);
 
-	if (sys_rt_sigqueueinfo(getpid(), SIGUSR1, &info)) {
+	ret = sys_rt_sigqueueinfo(getpid(), SIGUSR1, &info);
+	if (ret < 0) {
+		errno = -ret;
 		pr_perror("Unable to send siginfo with positive si_code to itself");
 		return -1;
 	}
@@ -529,19 +531,49 @@ static int check_sigqueuinfo()
 	return 0;
 }
 
-static pid_t fork_and_ptrace_attach(void)
+static pid_t fork_and_ptrace_attach(int (*child_setup)(void))
 {
 	pid_t pid;
+	int sk_pair[2], sk;
+	char c = 0;
+
+	if (socketpair(PF_LOCAL, SOCK_SEQPACKET, 0, sk_pair)) {
+		pr_perror("socketpair");
+		return -1;
+	}
 
 	pid = fork();
 	if (pid < 0) {
 		pr_perror("fork");
 		return -1;
 	} else if (pid == 0) {
+		sk = sk_pair[1];
+		close(sk_pair[0]);
+
+		if (child_setup && child_setup() != 0)
+			exit(1);
+
+		if (write(sk, &c, 1) != 1) {
+			pr_perror("write");
+			exit(1);
+		}
+
 		while (1)
 			sleep(1000);
 		exit(1);
 	}
+
+	sk = sk_pair[0];
+	close(sk_pair[1]);
+
+	if (read(sk, &c, 1) != 1) {
+		close(sk);
+		kill(pid, SIGKILL);
+		pr_perror("read");
+		return -1;
+	}
+
+	close(sk);
 
 	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
 		pr_perror("Unable to ptrace the child");
@@ -561,7 +593,7 @@ static int check_ptrace_peeksiginfo()
 	pid_t pid, ret = 0;
 	k_rtsigset_t mask;
 
-	pid = fork_and_ptrace_attach();
+	pid = fork_and_ptrace_attach(NULL);
 	if (pid < 0)
 		return -1;
 
@@ -593,7 +625,7 @@ static int check_ptrace_suspend_seccomp(void)
 		return 0;
 	}
 
-	pid = fork_and_ptrace_attach();
+	pid = fork_and_ptrace_attach(NULL);
 	if (pid < 0)
 		return -1;
 
@@ -604,6 +636,51 @@ static int check_ptrace_suspend_seccomp(void)
 			pr_perror("couldn't suspend seccomp");
 		}
 		ret = -1;
+	}
+
+	kill(pid, SIGKILL);
+	return ret;
+}
+
+static int setup_seccomp_filter(void)
+{
+	struct sock_filter filter[] = {
+		BPF_STMT(BPF_LD+BPF_W+BPF_ABS, offsetof(struct seccomp_data, nr)),
+		/* Allow all syscalls except ptrace */
+		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, __NR_ptrace, 0, 1),
+		BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),
+		BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ALLOW),
+	};
+
+	struct sock_fprog bpf_prog = {
+		.len = (unsigned short)(sizeof(filter)/sizeof(filter[0])),
+		.filter = filter,
+	};
+
+	if (sys_prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (long) &bpf_prog, 0, 0) < 0)
+		return -1;
+
+	return 0;
+}
+
+static int check_ptrace_dump_seccomp_filters(void)
+{
+	pid_t pid;
+	int ret = 0, len;
+
+	if (opts.check_ms_kernel) {
+		pr_warn("Skipping PTRACE_SECCOMP_GET_FILTER check");
+		return 0;
+	}
+
+	pid = fork_and_ptrace_attach(setup_seccomp_filter);
+	if (pid < 0)
+		return -1;
+
+	len = ptrace(PTRACE_SECCOMP_GET_FILTER, pid, 0, NULL);
+	if (len < 0) {
+		ret = -1;
+		pr_perror("Dumping seccomp filters not supported");
 	}
 
 	kill(pid, SIGKILL);
@@ -677,7 +754,7 @@ static int check_aio_remap(void)
 	int r;
 
 	if (sys_io_setup(16, &ctx) < 0) {
-		pr_err("No AIO syscall");
+		pr_err("No AIO syscall\n");
 		return -1;
 	}
 
@@ -757,7 +834,7 @@ static int (*chk_feature)(void);
 
 int cr_check(void)
 {
-	struct ns_id ns = { .pid = getpid(), .nd = &mnt_ns_desc };
+	struct ns_id ns = { .type = NS_CRIU, .ns_pid = PROC_SELF, .nd = &mnt_ns_desc };
 	int ret = 0;
 
 	if (!is_root_user())
@@ -800,6 +877,7 @@ int cr_check(void)
 	ret |= check_sigqueuinfo();
 	ret |= check_ptrace_peeksiginfo();
 	ret |= check_ptrace_suspend_seccomp();
+	ret |= check_ptrace_dump_seccomp_filters();
 	ret |= check_mem_dirty_track();
 	ret |= check_posix_timers();
 	ret |= check_tun_cr(0);
@@ -840,6 +918,7 @@ static int check_userns(void)
 
 	ret = sys_prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, (unsigned long)&size, 0, 0);
 	if (ret) {
+		errno = -ret;
 		pr_perror("No new prctl API");
 		return -1;
 	}
@@ -863,6 +942,8 @@ int check_add_feature(char *feat)
 		chk_feature = check_fdinfo_lock;
 	else if (!strcmp(feat, "seccomp_suspend"))
 		chk_feature = check_ptrace_suspend_seccomp;
+	else if (!strcmp(feat, "seccomp_filters"))
+		chk_feature = check_ptrace_dump_seccomp_filters;
 	else {
 		pr_err("Unknown feature %s\n", feat);
 		return -1;

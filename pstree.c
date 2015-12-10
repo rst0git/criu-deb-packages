@@ -218,6 +218,22 @@ struct pstree_item *pstree_item_next(struct pstree_item *item)
 	return NULL;
 }
 
+/* Preorder traversal of pstree item */
+int preorder_pstree_traversal(struct pstree_item *item, int (*f)(struct pstree_item *))
+{
+	struct pstree_item *cursor;
+
+	if (f(item) < 0)
+		return -1;
+
+	list_for_each_entry(cursor, &item->children, sibling) {
+		if (preorder_pstree_traversal(cursor, f) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
 int dump_pstree(struct pstree_item *root_item)
 {
 	struct pstree_item *item = root_item;
@@ -439,7 +455,7 @@ static int read_pstree_image(void)
 			goto err;
 
 		if (pi->ids->has_mnt_ns_id) {
-			if (rst_add_ns_id(pi->ids->mnt_ns_id, pi->pid.virt, &mnt_ns_desc))
+			if (rst_add_ns_id(pi->ids->mnt_ns_id, pi, &mnt_ns_desc))
 				goto err;
 		}
 	}
@@ -478,6 +494,7 @@ static int prepare_pstree_ids(void)
 		helper->pgid = item->sid;
 		helper->pid.virt = item->sid;
 		helper->parent = root_item;
+		helper->ids = root_item->ids;
 		list_add_tail(&helper->sibling, &helpers);
 
 		pr_info("Add a helper %d for restoring SID %d\n",
@@ -596,6 +613,7 @@ static int prepare_pstree_ids(void)
 		helper->pgid = item->pgid;
 		helper->pid.virt = item->pgid;
 		helper->parent = item;
+		helper->ids = item->ids;
 		list_add(&helper->sibling, &item->children);
 		rsti(item)->pgrp_leader = helper;
 

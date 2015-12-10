@@ -63,7 +63,6 @@ $(TST):	$(LIB)
 
 ptrace.o:	override CFLAGS += -pthread
 ptrace:		override LDFLAGS += -pthread
-ipc:		override CFLAGS += -DNEW_IPC_NS
 fork2:		override CFLAGS += -D FORK2
 thread-bomb.o:		override CFLAGS += -pthread
 thread-bomb:		override LDFLAGS += -pthread
@@ -82,7 +81,7 @@ cleandep:	clean
 	$(RM) -f $(DEP)
 
 %.cleanout: %
-	$(Q) $(RM) -f -r $<.pid $<.out* $<.test chew_$<.test*
+	$(Q) $(RM) -f -r $<.pid $<.init.pid $<.out* $<.test chew_$<.test*
 
 cleanout:
 	$(RM) -f *.pid *.out* *.test chew*

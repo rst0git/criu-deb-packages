@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
-#include <alloca.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -23,7 +22,6 @@
 #include "pstree.h"
 #include "cr-service.h"
 #include "cr-service-const.h"
-#include "sd-daemon.h"
 #include "page-xfer.h"
 #include "net.h"
 #include "mount.h"
@@ -31,6 +29,8 @@
 #include "action-scripts.h"
 #include "security.h"
 #include "sockets.h"
+#include "irmap.h"
+#include "kerndat.h"
 
 #include "setproctitle.h"
 
@@ -49,27 +49,33 @@ static int recv_criu_msg(int socket_fd, CriuReq **req)
 		return -1;
 	}
 
-	buf = alloca(len);
+	buf = xmalloc(len);
+	if (!buf)
+		return -ENOMEM;
 
 	len = recv(socket_fd, buf, len, MSG_TRUNC);
 	if (len == -1) {
 		pr_perror("Can't read request");
-		return -1;
+		goto err;
 	}
 
 	if (len == 0) {
 		pr_info("Client exited unexpectedly\n");
 		errno = ECONNRESET;
-		return -1;
+		goto err;
 	}
 
 	*req = criu_req__unpack(NULL, len, buf);
 	if (!*req) {
 		pr_perror("Failed unpacking request");
-		return -1;
+		goto err;
 	}
 
+	xfree(buf);
 	return 0;
+err:
+	xfree(buf);
+	return -1;
 }
 
 static int send_criu_msg(int socket_fd, CriuResp *msg)
@@ -79,19 +85,25 @@ static int send_criu_msg(int socket_fd, CriuResp *msg)
 
 	len = criu_resp__get_packed_size(msg);
 
-	buf = alloca(len);
+	buf = xmalloc(len);
+	if (!buf)
+		return -ENOMEM;
 
 	if (criu_resp__pack(msg, buf) != len) {
 		pr_perror("Failed packing response");
-		return -1;
+		goto err;
 	}
 
 	if (write(socket_fd, buf, len)  == -1) {
 		pr_perror("Can't send response");
-		return -1;
+		goto err;
 	}
 
+	xfree(buf);
 	return 0;
+err:
+	xfree(buf);
+	return -1;
 }
 
 static void send_criu_err(int sk, char *msg)
@@ -445,6 +457,13 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_ghost_limit)
 		opts.ghost_limit = req->ghost_limit;
 
+	if (req->n_irmap_scan_paths) {
+		for (i = 0; i < req->n_irmap_scan_paths; i++) {
+			if (irmap_scan_path_add(req->irmap_scan_paths[i]))
+				goto err;
+		}
+	}
+
 	return 0;
 
 err:
@@ -715,8 +734,85 @@ static int chk_keepopen_req(CriuReq *msg)
 	else if (msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ||
 		 msg->type == CRIU_REQ_TYPE__CPUINFO_CHECK)
 		return 0;
+	else if (msg->type == CRIU_REQ_TYPE__FEATURE_CHECK)
+		return 0;
 
 	return -1;
+}
+
+/*
+ * Generic function to handle CRIU_REQ_TYPE__FEATURE_CHECK.
+ *
+ * The function will have resp.sucess = true for most cases
+ * and the actual result will be in resp.features.
+ *
+ * For each feature which has been requested in msg->features
+ * the corresponding parameter will be set in resp.features.
+ */
+static int handle_feature_check(int sk, CriuReq * msg)
+{
+	CriuResp resp = CRIU_RESP__INIT;
+	CriuFeatures feat = CRIU_FEATURES__INIT;
+	bool success = false;
+	int pid, status;
+
+	/* enable setting of an optional message */
+	feat.has_mem_track = 1;
+	feat.mem_track = false;
+
+	/*
+	 * Check if the requested feature check can be answered.
+	 *
+	 * This function is right now hard-coded to memory
+	 * tracking detection and needs other/better logic to
+	 * handle multiple feature checks.
+	 */
+	if (msg->features->has_mem_track != 1) {
+		pr_warn("Feature checking for unknown feature.\n");
+		goto out;
+	}
+
+	/*
+	 * From this point on the function will always
+	 * 'succeed'. If the requested features are supported
+	 * can be seen if the requested optional parameters are
+	 * set in the message 'criu_features'.
+	 */
+	success = true;
+
+	pid = fork();
+	if (pid < 0) {
+		pr_perror("Can't fork");
+		goto out;
+	}
+
+	if (pid == 0) {
+		int ret = 1;
+
+		if (setup_opts_from_req(sk, msg->opts))
+			goto cout;
+
+		setproctitle("feature-check --rpc -D %s", images_dir);
+
+		kerndat_get_dirty_track();
+
+		if (kdat.has_dirty_track)
+			ret = 0;
+cout:
+		exit(ret);
+	}
+
+	wait(&status);
+	if (!WIFEXITED(status) || WEXITSTATUS(status))
+		goto out;
+
+	feat.mem_track = true;
+out:
+	resp.features = &feat;
+	resp.type = msg->type;
+	resp.success = success;
+
+	return send_criu_msg(sk, &resp);
 }
 
 static int handle_cpuinfo(int sk, CriuReq *msg)
@@ -751,10 +847,24 @@ cout:
 	}
 
 	wait(&status);
-	if (!WIFEXITED(status) || WEXITSTATUS(status))
+	if (!WIFEXITED(status))
 		goto out;
+	switch (WEXITSTATUS(status)) {
+	case (-ENOTSUP & 0xff):
+		resp.has_cr_errno = 1;
+		/*
+		 * Let's return the actual error code and
+		 * not just (-ENOTSUP & 0xff)
+		 */
+		resp.cr_errno = ENOTSUP;
+		break;
+	case 0:
+		success = true;
+		break;
+	default:
+		break;
+	}
 
-	success = true;
 out:
 	resp.type = msg->type;
 	resp.success = success;
@@ -795,6 +905,9 @@ more:
 	case CRIU_REQ_TYPE__CPUINFO_DUMP:
 	case CRIU_REQ_TYPE__CPUINFO_CHECK:
 		ret = handle_cpuinfo(sk, msg);
+		break;
+	case CRIU_REQ_TYPE__FEATURE_CHECK:
+		ret = handle_feature_check(sk, msg);
 		break;
 
 	default:
@@ -877,19 +990,13 @@ static int restore_sigchld_handler()
 
 int cr_service(bool daemon_mode)
 {
-	int server_fd = -1, n;
+	int server_fd = -1;
 	int child_pid;
 
 	struct sockaddr_un client_addr;
 	socklen_t client_addr_len;
 
-	n = sd_listen_fds(0);
-	if (n > 1) {
-		pr_err("Too many file descriptors (%d) recieved", n);
-		goto err;
-	} else if (n == 1)
-		server_fd = SD_LISTEN_FDS_START + 0;
-	else {
+	{
 		struct sockaddr_un server_addr;
 		socklen_t server_addr_len;
 
@@ -903,8 +1010,10 @@ int cr_service(bool daemon_mode)
 		memset(&client_addr, 0, sizeof(client_addr));
 		server_addr.sun_family = AF_LOCAL;
 
-		if (opts.addr == NULL)
+		if (opts.addr == NULL) {
+			pr_warn("Binding to local dir address!\n");
 			opts.addr = CR_DEFAULT_SERVICE_ADDRESS;
+		}
 
 		strcpy(server_addr.sun_path, opts.addr);
 

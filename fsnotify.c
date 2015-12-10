@@ -102,7 +102,7 @@ static void decode_handle(fh_t *handle, FhEntry *img)
 				sizeof(handle->__handle)));
 }
 
-static int open_by_handle(void *arg, int fd)
+static int open_by_handle(void *arg, int fd, int pid)
 {
 	return sys_open_by_handle_at(fd, arg, O_PATH);
 }
@@ -239,18 +239,25 @@ int check_open_handle(unsigned int s_dev, unsigned long i_ino,
 		}
 
 		/*
-		 * Inode numbers are not restored for tmpfs content, but we can
-		 * get file names, becasue tmpfs cache is not pruned.
+		 * Always try to fetch watchee path first. There are several reasons:
+		 *
+		 *  - tmpfs/devtmps do not save inode numbers between mounts,
+		 *    so it is critical to have the complete path under our
+		 *    hands for restore purpose;
+		 *
+		 *  - in case of migration the inodes might be changed as well
+		 *    so the only portable solution is to carry the whole path
+		 *    to the watchee inside image.
 		 */
-		if ((mi->fstype->code == FSTYPE__TMPFS) ||
-				(mi->fstype->code == FSTYPE__DEVTMPFS)) {
-			path = alloc_openable(s_dev, i_ino, f_handle);
-			if (IS_ERR_OR_NULL(path)) {
-				pr_err("Can't find suitable path for handle (%d)\n",
-				       (int)PTR_ERR(path));
-				goto err;
-			}
+		path = alloc_openable(s_dev, i_ino, f_handle);
+		if (!IS_ERR_OR_NULL(path))
 			goto out;
+
+		if ((mi->fstype->code == FSTYPE__TMPFS) ||
+		    (mi->fstype->code == FSTYPE__DEVTMPFS)) {
+			pr_err("Can't find suitable path for handle (dev %#x ino %#lx): %d\n",
+			       s_dev, i_ino, (int)PTR_ERR(path));
+			goto err;
 		}
 
 		if (!opts.force_irmap)
@@ -300,6 +307,10 @@ static int dump_inotify_entry(union fdinfo_entries *e, void *arg)
 	pr_info("\t[fhandle] bytes 0x%08x type 0x%08x __handle 0x%016"PRIx64":0x%016"PRIx64"\n",
 			we->f_handle->bytes, we->f_handle->type,
 			we->f_handle->handle[0], we->f_handle->handle[1]);
+
+	if (we->mask & KERNEL_FS_EVENT_ON_CHILD)
+		pr_warn_once("\t\tDetected FS_EVENT_ON_CHILD bit "
+			     "in mask (will be ignored on restore)\n");
 
 	if (check_open_handle(we->s_dev, we->i_ino, we->f_handle)) {
 		free_inotify_wd_entry(e);
@@ -500,11 +511,11 @@ static char *get_mark_path(const char *who, struct file_remap *remap,
 	if (remap) {
 		int mntns_root;
 
-		mntns_root = mntns_get_root_by_mnt_id(remap->mnt_id);
+		mntns_root = mntns_get_root_by_mnt_id(remap->rmnt_id);
 
 		pr_debug("\t\tRestore %s watch for 0x%08x:0x%016lx (via %s)\n",
-			 who, s_dev, i_ino, remap->path);
-		*target = openat(mntns_root, remap->path, O_PATH);
+			 who, s_dev, i_ino, remap->rpath);
+		*target = openat(mntns_root, remap->rpath, O_PATH);
 	} else if (f_handle->path) {
 		int  mntns_root;
 		char *path = ".";
@@ -523,8 +534,10 @@ static char *get_mark_path(const char *who, struct file_remap *remap,
 	} else
 		*target = open_handle(s_dev, i_ino, f_handle);
 
-	if (*target < 0)
+	if (*target < 0) {
+		pr_perror("Unable to open %s", f_handle->path);
 		goto err;
+	}
 
 	/*
 	 * fanotify/inotify open syscalls want path to attach
@@ -577,7 +590,7 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 			ret = 0;
 			break;
 		} else if (wd > iwe->wd) {
-			pr_err("Unsorted watch 0x%x found for 0x%x with 0x%x", wd, inotify_fd, iwe->wd);
+			pr_err("Unsorted watch 0x%x found for 0x%x with 0x%x\n", wd, inotify_fd, iwe->wd);
 			break;
 		}
 
@@ -888,6 +901,16 @@ static int collect_one_inotify_mark(void *o, ProtobufCMessage *msg)
 	mark->iwe = pb_msg(msg, InotifyWdEntry);
 	INIT_LIST_HEAD(&mark->list);
 	mark->remap = NULL;
+
+	/*
+	 * The kernel prior 4.3 might export internal event
+	 * mask bits which are not part of user-space API. It
+	 * is fixed in kernel but we have to keep backward
+	 * compatibility with old images. So mask out
+	 * inappropriate bits (in particular fdinfo might
+	 * have FS_EVENT_ON_CHILD bit set).
+	 */
+	mark->iwe->mask &= ~KERNEL_FS_EVENT_ON_CHILD;
 
 	return collect_inotify_mark(mark);
 }

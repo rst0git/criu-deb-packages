@@ -23,11 +23,13 @@
 #include "action-scripts.h"
 #include "sockets.h"
 #include "pstree.h"
+#include "string.h"
 #include "sysctl.h"
+#include "kerndat.h"
+
 #include "protobuf.h"
 #include "protobuf/netdev.pb-c.h"
 
-static int ns_fd = -1;
 static int ns_sysfs_fd = -1;
 
 int read_ns_sys_file(char *path, char *buf, int len)
@@ -45,8 +47,13 @@ int read_ns_sys_file(char *path, char *buf, int len)
 	rlen = read(fd, buf, len);
 	close(fd);
 
-	if (rlen >= 0)
-		buf[rlen] = '\0';
+	if (rlen == len) {
+		pr_err("Too small buffer to read ns sys file %s\n", path);
+		return -1;
+	}
+
+	if (rlen > 0)
+		buf[rlen - 1] = '\0';
 
 	return rlen;
 }
@@ -79,6 +86,7 @@ static char *devconfs[] = {
 	"shared_media",
 	"src_valid_mark",
 	"tag",
+	"ignore_routes_with_linkdown",
 };
 
 /*
@@ -91,14 +99,21 @@ static char *devconfs[] = {
 #define NET_CONF_PATH "net/ipv4/conf"
 #define MAX_CONF_OPT_PATH IFNAMSIZ+50
 
-static int ipv4_conf_op(char *tgt, int *conf, int op, NetnsEntry **netns)
+static int ipv4_conf_op(char *tgt, int *conf, int n, int op, NetnsEntry **netns)
 {
 	int i, ri;
 	int ret, flags = op == CTL_READ ? CTL_FLAGS_OPTIONAL : 0;
 	struct sysctl_req req[ARRAY_SIZE(devconfs)];
 	char path[ARRAY_SIZE(devconfs)][MAX_CONF_OPT_PATH];
 
+	if (n > ARRAY_SIZE(devconfs))
+		pr_warn("The image contains unknown sysctl-s\n");
+
 	for (i = 0, ri = 0; i < ARRAY_SIZE(devconfs); i++) {
+		if (i >= n) {
+			pr_warn("Skip %s/%s\n", tgt, devconfs[i]);
+			continue;
+		}
 		/*
 		 * If dev conf value is the same as default skip restoring it
 		 */
@@ -120,7 +135,7 @@ static int ipv4_conf_op(char *tgt, int *conf, int op, NetnsEntry **netns)
 		ri++;
 	}
 
-	ret = sysctl_op(req, ri, op);
+	ret = sysctl_op(req, ri, op, CLONE_NEWNET);
 	if (ret < 0) {
 		pr_err("Failed to %s %s/<confs>\n", (op == CTL_READ)?"read":"write", tgt);
 		return -1;
@@ -165,7 +180,7 @@ static int dump_one_netdev(int type, struct ifinfomsg *ifi,
 	if (!netdev.conf)
 		return -1;
 
-	ret = ipv4_conf_op(netdev.name, netdev.conf, CTL_READ, NULL);
+	ret = ipv4_conf_op(netdev.name, netdev.conf, netdev.n_conf, CTL_READ, NULL);
 	if (ret < 0)
 		goto err_free;
 
@@ -211,6 +226,41 @@ static int dump_unknown_device(struct ifinfomsg *ifi, char *kind,
 	return -1;
 }
 
+static int dump_bridge(NetDeviceEntry *nde, struct cr_imgset *imgset)
+{
+	char spath[IFNAMSIZ + 16]; /* len("class/net//brif") + 1 for null */
+	int ret, fd;
+
+	ret = snprintf(spath, sizeof(spath), "class/net/%s/brif", nde->name);
+	if (ret < 0 || ret >= sizeof(spath))
+		return -1;
+
+	/* Let's only allow dumping empty bridges for now. To do a full bridge
+	 * restore, we need to make sure the bridge and slaves are restored in
+	 * the right order and attached correctly. It looks like the veth code
+	 * supports this, but we need some way to do ordering.
+	 */
+	fd = openat(ns_sysfs_fd, spath, O_DIRECTORY, 0);
+	if (fd < 0) {
+		pr_perror("opening %s failed", spath);
+		return -1;
+	}
+
+	ret = is_empty_dir(fd);
+	close(fd);
+	if (ret < 0) {
+		pr_perror("problem testing %s for emptiness", spath);
+		return -1;
+	}
+
+	if (!ret) {
+		pr_err("dumping bridges with attached slaves not supported currently\n");
+		return -1;
+	}
+
+	return write_netdev_img(nde, imgset);
+}
+
 static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind,
 		struct rtattr **tb, struct cr_imgset *fds)
 {
@@ -226,6 +276,8 @@ static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind,
 		return dump_one_netdev(ND_TYPE__VETH, ifi, tb, fds, NULL);
 	if (!strcmp(kind, "tun"))
 		return dump_one_netdev(ND_TYPE__TUN, ifi, tb, fds, dump_tun_link);
+	if (!strcmp(kind, "bridge"))
+		return dump_one_netdev(ND_TYPE__BRIDGE, ifi, tb, fds, dump_bridge);
 
 	return dump_unknown_device(ifi, kind, tb, fds);
 }
@@ -410,6 +462,7 @@ enum {
 
 static int veth_link_info(NetDeviceEntry *nde, struct newlink_req *req)
 {
+	int ns_fd = get_service_fd(NS_FD_OFF);
 	struct rtattr *veth_data, *peer_data;
 	struct ifinfomsg ifm;
 	struct veth_pair *n;
@@ -438,6 +491,7 @@ static int veth_link_info(NetDeviceEntry *nde, struct newlink_req *req)
 
 static int venet_link_info(NetDeviceEntry *nde, struct newlink_req *req)
 {
+	int ns_fd = get_service_fd(NS_FD_OFF);
 	struct rtattr *venet_data;
 
 	BUG_ON(ns_fd < 0);
@@ -447,6 +501,17 @@ static int venet_link_info(NetDeviceEntry *nde, struct newlink_req *req)
 	addattr_l(&req->h, sizeof(*req), IFLA_INFO_DATA, NULL, 0);
 	addattr_l(&req->h, sizeof(*req), IFLA_NET_NS_FD, &ns_fd, sizeof(ns_fd));
 	venet_data->rta_len = (void *)NLMSG_TAIL(&req->h) - (void *)venet_data;
+
+	return 0;
+}
+
+static int bridge_link_info(NetDeviceEntry *nde, struct newlink_req *req)
+{
+	struct rtattr *bridge_data;
+
+	bridge_data = NLMSG_TAIL(&req->h);
+	addattr_l(&req->h, sizeof(*req), IFLA_INFO_KIND, "bridge", sizeof("bridge"));
+	bridge_data->rta_len = (void *)NLMSG_TAIL(&req->h) - (void *)bridge_data;
 
 	return 0;
 }
@@ -465,6 +530,9 @@ static int restore_link(NetDeviceEntry *nde, int nlsk)
 		return restore_one_link(nde, nlsk, veth_link_info);
 	case ND_TYPE__TUN:
 		return restore_one_tun(nde, nlsk);
+	case ND_TYPE__BRIDGE:
+		return restore_one_link(nde, nlsk, bridge_link_info);
+
 	default:
 		pr_err("Unsupported link type %d\n", nde->type);
 		break;
@@ -497,17 +565,21 @@ static int restore_links(int pid, NetnsEntry **netns)
 
 		ret = restore_link(nde, nlsk);
 		if (ret) {
-			pr_err("can not restore link");
+			pr_err("Can't restore link\n");
 			goto exit;
 		}
 
-		if (nde->conf)
+		if (nde->conf) {
+			NetnsEntry **def_netns = netns;
 			/*
 			 * optimize restore of devices configuration except lo
 			 * lo is created with namespace and before default is set
 			 * so we cant optimize its restore
 			 */
-			ret = ipv4_conf_op(nde->name, nde->conf, CTL_WRITE, nde->type == ND_TYPE__LOOPBACK ? NULL : netns);
+			if (nde->type == ND_TYPE__LOOPBACK)
+				def_netns = NULL;
+			ret = ipv4_conf_op(nde->name, nde->conf, nde->n_conf, CTL_WRITE, def_netns);
+		}
 exit:
 		net_device_entry__free_unpacked(nde, NULL);
 		if (ret)
@@ -519,7 +591,7 @@ exit:
 	return ret;
 }
 
-static int run_ip_tool(char *arg1, char *arg2, int fdin, int fdout)
+static int run_ip_tool(char *arg1, char *arg2, char *arg3, int fdin, int fdout, unsigned flags)
 {
 	char *ip_tool_cmd;
 	int ret;
@@ -531,9 +603,10 @@ static int run_ip_tool(char *arg1, char *arg2, int fdin, int fdout)
 		ip_tool_cmd = "ip";
 
 	ret = cr_system(fdin, fdout, -1, ip_tool_cmd,
-				(char *[]) { "ip", arg1, arg2, NULL });
+				(char *[]) { "ip", arg1, arg2, arg3, NULL }, flags);
 	if (ret) {
-		pr_err("IP tool failed on %s %s\n", arg1, arg2);
+		if (!(flags & CRS_CAN_FAIL))
+			pr_err("IP tool failed on %s %s\n", arg1, arg2);
 		return -1;
 	}
 
@@ -549,7 +622,7 @@ static int run_iptables_tool(char *def_cmd, int fdin, int fdout)
 	if (!cmd)
 		cmd = def_cmd;
 	pr_debug("\tRunning %s for %s\n", cmd, def_cmd);
-	ret = cr_system(fdin, fdout, -1, "sh", (char *[]) { "sh", "-c", cmd, NULL });
+	ret = cr_system(fdin, fdout, -1, "sh", (char *[]) { "sh", "-c", cmd, NULL }, 0);
 	if (ret)
 		pr_err("%s failed\n", def_cmd);
 
@@ -559,24 +632,69 @@ static int run_iptables_tool(char *def_cmd, int fdin, int fdout)
 static inline int dump_ifaddr(struct cr_imgset *fds)
 {
 	struct cr_img *img = img_from_set(fds, CR_FD_IFADDR);
-	return run_ip_tool("addr", "save", -1, img_raw_fd(img));
+	return run_ip_tool("addr", "save", NULL, -1, img_raw_fd(img), 0);
 }
 
 static inline int dump_route(struct cr_imgset *fds)
 {
-	struct cr_img *img = img_from_set(fds, CR_FD_ROUTE);
-	return run_ip_tool("route", "save", -1, img_raw_fd(img));
+	struct cr_img *img;
+
+	img = img_from_set(fds, CR_FD_ROUTE);
+	if (run_ip_tool("route", "save", NULL, -1, img_raw_fd(img), 0))
+		return -1;
+
+	/* If ipv6 is disabled, "ip -6 route dump" dumps all routes */
+	if (!kdat.ipv6)
+		return 0;
+
+	img = img_from_set(fds, CR_FD_ROUTE6);
+	if (run_ip_tool("-6", "route", "save", -1, img_raw_fd(img), 0))
+		return -1;
+
+	return 0;
+}
+
+static inline int dump_rule(struct cr_imgset *fds)
+{
+	struct cr_img *img;
+	char *path;
+
+	img = img_from_set(fds, CR_FD_RULE);
+	path = xstrdup(img->path);
+
+	if (!path)
+		return -1;
+
+	if (run_ip_tool("rule", "save", NULL, -1, img_raw_fd(img), CRS_CAN_FAIL)) {
+		pr_warn("Check if \"ip rule save\" is supported!\n");
+		unlinkat(get_service_fd(IMG_FD_OFF), path, 0);
+	}
+
+	free(path);
+
+	return 0;
 }
 
 static inline int dump_iptables(struct cr_imgset *fds)
 {
-	struct cr_img *img = img_from_set(fds, CR_FD_IPTABLES);
-	return run_iptables_tool("iptables-save", -1, img_raw_fd(img));
+	struct cr_img *img;
+
+	img = img_from_set(fds, CR_FD_IPTABLES);
+	if (run_iptables_tool("iptables-save", -1, img_raw_fd(img)))
+		return -1;
+
+	if (kdat.ipv6) {
+		img = img_from_set(fds, CR_FD_IP6TABLES);
+		if (run_iptables_tool("ip6tables-save", -1, img_raw_fd(img)))
+			return -1;
+	}
+
+	return 0;
 }
 
 static int dump_netns_conf(struct cr_imgset *fds)
 {
-	int ret;
+	int ret, n;
 	NetnsEntry netns = NETNS_ENTRY__INIT;
 
 	netns.n_def_conf = ARRAY_SIZE(devconfs);
@@ -590,10 +708,11 @@ static int dump_netns_conf(struct cr_imgset *fds)
 		return -1;
 	}
 
-	ret = ipv4_conf_op("default", netns.def_conf, CTL_READ, NULL);
+	n = netns.n_def_conf;
+	ret = ipv4_conf_op("default", netns.def_conf, n, CTL_READ, NULL);
 	if (ret < 0)
 		goto err_free;
-	ret = ipv4_conf_op("all", netns.all_conf, CTL_READ, NULL);
+	ret = ipv4_conf_op("all", netns.all_conf, n, CTL_READ, NULL);
 	if (ret < 0)
 		goto err_free;
 
@@ -610,8 +729,12 @@ static int restore_ip_dump(int type, int pid, char *cmd)
 	struct cr_img *img;
 
 	img = open_image(type, O_RSTR, pid);
+	if (empty_image(img)) {
+		close_image(img);
+		return 0;
+	}
 	if (img) {
-		ret = run_ip_tool(cmd, "restore", img_raw_fd(img), -1);
+		ret = run_ip_tool(cmd, "restore", NULL, img_raw_fd(img), -1, 0);
 		close_image(img);
 	}
 
@@ -625,7 +748,43 @@ static inline int restore_ifaddr(int pid)
 
 static inline int restore_route(int pid)
 {
-	return restore_ip_dump(CR_FD_ROUTE, pid, "route");
+	if (restore_ip_dump(CR_FD_ROUTE, pid, "route"))
+		return -1;
+
+	if (restore_ip_dump(CR_FD_ROUTE6, pid, "route"))
+		return -1;
+
+	return 0;
+}
+
+static inline int restore_rule(int pid)
+{
+	struct cr_img *img;
+	int ret = 0;
+
+	img = open_image(CR_FD_RULE, O_RSTR, pid);
+	if (!img) {
+		ret = -1;
+		goto out;
+	}
+
+	if (empty_image(img))
+		goto close;
+
+	/*
+	 * Delete 3 default rules to prevent duplicates. See kernel's
+	 * function fib_default_rules_init() for the details.
+	 */
+	run_ip_tool("rule", "delete", NULL, -1, -1, 0);
+	run_ip_tool("rule", "delete", NULL, -1, -1, 0);
+	run_ip_tool("rule", "delete", NULL, -1, -1, 0);
+
+	if (restore_ip_dump(CR_FD_RULE, pid, "rule"))
+		ret = -1;
+close:
+	close_image(img);
+out:
+	return ret;
 }
 
 static inline int restore_iptables(int pid)
@@ -638,13 +797,25 @@ static inline int restore_iptables(int pid)
 		ret = run_iptables_tool("iptables-restore", img_raw_fd(img), -1);
 		close_image(img);
 	}
+	if (ret)
+		return ret;
+
+	img = open_image(CR_FD_IP6TABLES, O_RSTR, pid);
+	if (img == NULL)
+		return -1;
+	if (empty_image(img))
+		goto out;
+
+	ret = run_iptables_tool("ip6tables-restore", img_raw_fd(img), -1);
+out:
+	close_image(img);
 
 	return ret;
 }
 
 static int restore_netns_conf(int pid, NetnsEntry **netns)
 {
-	int ret = 0;
+	int ret = 0, n;
 	struct cr_img *img;
 
 	img = open_image(CR_FD_NETNS, O_RSTR, pid);
@@ -661,9 +832,11 @@ static int restore_netns_conf(int pid, NetnsEntry **netns)
 		return -1;
 	}
 
-	ret = ipv4_conf_op("default", (*netns)->def_conf, CTL_WRITE, NULL);
-	if (!ret)
-		ret = ipv4_conf_op("all", (*netns)->all_conf, CTL_WRITE, NULL);
+	n = (*netns)->n_def_conf;
+	ret = ipv4_conf_op("default", (*netns)->def_conf, n, CTL_WRITE, NULL);
+	if (ret)
+		goto out;
+	ret = ipv4_conf_op("all", (*netns)->all_conf, n, CTL_WRITE, NULL);
 out:
 	close_image(img);
 	return ret;
@@ -728,6 +901,8 @@ int dump_net_ns(int ns_id)
 	if (!ret)
 		ret = dump_route(fds);
 	if (!ret)
+		ret = dump_rule(fds);
+	if (!ret)
 		ret = dump_iptables(fds);
 
 	close(ns_sysfs_fd);
@@ -753,23 +928,122 @@ int prepare_net_ns(int pid)
 	if (!ret)
 		ret = restore_route(pid);
 	if (!ret)
+		ret = restore_rule(pid);
+	if (!ret)
 		ret = restore_iptables(pid);
 
-	close(ns_fd);
+	close_service_fd(NS_FD_OFF);
 
 	return ret;
 }
 
-int netns_pre_create(void)
+int netns_keep_nsfd(void)
 {
+	int ns_fd, ret;
+
+	if (!(root_ns_mask & CLONE_NEWNET))
+		return 0;
+
+	/*
+	 * When restoring a net namespace we need to communicate
+	 * with the original (i.e. -- init) one. Thus, prepare for
+	 * that before we leave the existing namespaces.
+	 */
+
 	ns_fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
 	if (ns_fd < 0) {
 		pr_perror("Can't cache net fd");
 		return -1;
 	}
 
-	pr_info("Saved netns fd for links restore\n");
-	return 0;
+	ret = install_service_fd(NS_FD_OFF, ns_fd);
+	if (ret < 0)
+		pr_err("Can't install ns net reference\n");
+	else
+		pr_info("Saved netns fd for links restore\n");
+	close(ns_fd);
+
+	return ret >= 0 ? 0 : -1;
+}
+
+/*
+ * If we want to modify iptables, we need to recevied the current
+ * configuration, change it and load a new one into the kernel.
+ * iptables can change or add only one rule.
+ * iptables-restore allows to make a few changes for one iteration,
+ * so it works faster.
+ */
+static int iptables_restore(bool ipv6, char *buf, int size)
+{
+	int pfd[2], ret = -1;
+	char *cmd4[] = {"iptables-restore",  "--noflush", NULL};
+	char *cmd6[] = {"ip6tables-restore", "--noflush", NULL};
+	char **cmd = ipv6 ? cmd6 : cmd4;;
+
+	if (pipe(pfd) < 0) {
+		pr_perror("Unable to create pipe");
+		return -1;
+	}
+
+	if (write(pfd[1], buf, size) < size) {
+		pr_perror("Unable to write iptables configugration");
+		goto err;
+	}
+	close_safe(&pfd[1]);
+
+	ret = cr_system(pfd[0], -1, -1, cmd[0], cmd, 0);
+err:
+	close_safe(&pfd[1]);
+	close_safe(&pfd[0]);
+	return ret;
+}
+
+static int network_lock_internal()
+{
+	char conf[] =	"*filter\n"
+				":CRIU - [0:0]\n"
+				"-I INPUT -j CRIU\n"
+				"-I OUTPUT -j CRIU\n"
+				"-A CRIU -j DROP\n"
+				"COMMIT\n";
+	int ret = 0, nsret;
+
+	if (switch_ns(root_item->pid.real, &net_ns_desc, &nsret))
+		return -1;
+
+
+	ret |= iptables_restore(false, conf, sizeof(conf) - 1);
+	if (kdat.ipv6)
+		ret |= iptables_restore(true, conf, sizeof(conf) - 1);
+
+	if (restore_ns(nsret, &net_ns_desc))
+		ret = -1;
+
+	return ret;
+}
+
+static int network_unlock_internal()
+{
+	char conf[] =	"*filter\n"
+			":CRIU - [0:0]\n"
+			"-D INPUT -j CRIU\n"
+			"-D OUTPUT -j CRIU\n"
+			"-X CRIU\n"
+			"COMMIT\n";
+	int ret = 0, nsret;
+
+	if (switch_ns(root_item->pid.real, &net_ns_desc, &nsret))
+		return -1;
+
+
+	ret |= iptables_restore(false, conf, sizeof(conf) - 1);
+	if (kdat.ipv6)
+		ret |= iptables_restore(true, conf, sizeof(conf) - 1);
+
+	if (restore_ns(nsret, &net_ns_desc))
+		ret = -1;
+
+	return ret;
 }
 
 int network_lock(void)
@@ -780,7 +1054,10 @@ int network_lock(void)
 	if  (!(root_ns_mask & CLONE_NEWNET))
 		return 0;
 
-	return run_scripts(ACT_NET_LOCK);
+	if (run_scripts(ACT_NET_LOCK))
+		return -1;
+
+	return network_lock_internal();
 }
 
 void network_unlock(void)
@@ -790,8 +1067,10 @@ void network_unlock(void)
 	cpt_unlock_tcp_connections();
 	rst_unlock_tcp_connections();
 
-	if (root_ns_mask & CLONE_NEWNET)
+	if (root_ns_mask & CLONE_NEWNET) {
 		run_scripts(ACT_NET_UNLOCK);
+		network_unlock_internal();
+	}
 }
 
 int veth_pair_add(char *in, char *out)
@@ -839,9 +1118,9 @@ static int prep_ns_sockets(struct ns_id *ns, bool for_dump)
 {
 	int nsret = -1, ret;
 
-	if (ns->pid != getpid()) {
-		pr_info("Switching to %d's net for collecting sockets\n", ns->pid);
-		if (switch_ns(ns->pid, &net_ns_desc, &nsret))
+	if (ns->type != NS_CRIU) {
+		pr_info("Switching to %d's net for collecting sockets\n", ns->ns_pid);
+		if (switch_ns(ns->ns_pid, &net_ns_desc, &nsret))
 			return -1;
 	}
 
@@ -884,7 +1163,7 @@ static int collect_net_ns(struct ns_id *ns, void *oarg)
 	bool for_dump = (oarg == (void *)1);
 	int ret;
 
-	pr_info("Collecting netns %d/%d\n", ns->id, ns->pid);
+	pr_info("Collecting netns %d/%d\n", ns->id, ns->ns_pid);
 	ret = prep_ns_sockets(ns, for_dump);
 	if (ret)
 		return ret;
@@ -936,7 +1215,7 @@ int move_veth_to_bridge(void)
 			ret = -1;
 			break;
 		}
-		strncpy(ifr.ifr_name, n->bridge, IFNAMSIZ);
+		strlcpy(ifr.ifr_name, n->bridge, IFNAMSIZ);
 		ret = ioctl(s, SIOCBRADDIF, &ifr);
 		if (ret < 0) {
 			pr_perror("Can't add interface %s to bridge %s",
@@ -949,7 +1228,7 @@ int move_veth_to_bridge(void)
 		 * $ ip link set dev <device> up
 		 */
 		ifr.ifr_ifindex = 0;
-		strncpy(ifr.ifr_name, n->outside, IFNAMSIZ);
+		strlcpy(ifr.ifr_name, n->outside, IFNAMSIZ);
 		ret = ioctl(s, SIOCGIFFLAGS, &ifr);
 		if (ret < 0) {
 			pr_perror("Can't get flags of interface %s", n->outside);

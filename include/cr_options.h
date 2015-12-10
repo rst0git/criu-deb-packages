@@ -38,6 +38,13 @@ struct cg_root_opt {
  */
 #define DEFAULT_GHOST_LIMIT	(1 << 20)
 
+struct irmap;
+
+struct irmap_path_opt {
+	struct list_head node;
+	struct irmap *ir;
+};
+
 struct cr_options {
 	int			final_state;
 	char			*show_dump_file;
@@ -87,6 +94,7 @@ struct cr_options {
 	bool			aufs;		/* auto-deteced, not via cli */
 	bool			overlayfs;
 	size_t			ghost_limit;
+	struct list_head	irmap_scan_paths;
 };
 
 extern struct cr_options opts;

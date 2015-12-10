@@ -6,83 +6,97 @@
 #include <sched.h>
 #include <sys/capability.h>
 #include <linux/limits.h>
+#include <pthread.h>
+#include <syscall.h>
+#include <sys/socket.h>
 
 #include "zdtmtst.h"
 
 const char *test_doc	= "Check that threads with different creds aren't checkpointed";
 const char *test_author	= "Tycho Andersen <tycho.andersen@canonical.com>";
 
-int drop_caps_and_wait(void *arg)
+void *drop_caps_and_wait(void *arg)
 {
+	int fd = *((int *) arg);
+	void *retcode = (void *)0xdeadbeaf;
 	cap_t caps;
-	int *pipe = arg;
+	char c;
 
         caps = cap_get_proc();
         if (!caps) {
-                err("cap_get_proc");
-                return 1;
+                pr_perror("cap_get_proc");
+                return NULL;
         }
 
         if (cap_clear_flag(caps, CAP_EFFECTIVE) < 0) {
-                err("cap_clear_flag");
+                pr_perror("cap_clear_flag");
                 goto die;
         }
 
         if (cap_set_proc(caps) < 0) {
-                err("cap_set_proc");
+                pr_perror("cap_set_proc");
                 goto die;
         }
 
-	close(*pipe);
+	if (write(fd, "a", 1) != 1) {
+		pr_perror("Unable to send a status");
+		goto die;
+	}
 
-	while(1)
-		sleep(1000);
+	if (read(fd, &c, 1) != 1) {
+		pr_perror("Unable to read a status");
+		goto die;
+	}
+
+	retcode = NULL;
 die:
         cap_free(caps);
-        return 1;
+	return retcode;
 }
 
 int main(int argc, char ** argv)
 {
-	pid_t pid;
-	int ret, pipefd[2];
-	long clone_flags = CLONE_VM | CLONE_FILES | CLONE_SIGHAND |
-			   CLONE_THREAD | CLONE_SYSVSEM;
-
-        size_t stack_size = sysconf(_SC_PAGESIZE);
-        void *stack = alloca(stack_size);
-	char buf;
+	int pipefd[2];
+	pthread_t thr;
+	char c;
+	void *retcode;
 
 	test_init(argc, argv);
 
-	if (pipe(pipefd) < 0) {
-		err("pipe");
+	if (socketpair(AF_FILE, SOCK_SEQPACKET, 0, pipefd)) {
+		pr_perror("pipe");
 		return -1;
 	}
 
-	pid = clone(drop_caps_and_wait, stack + stack_size, clone_flags, pipefd);
-	if (pid < 0) {
-		err("fork");
+	if (pthread_create(&thr, NULL, drop_caps_and_wait, &pipefd[0])) {
+		pr_perror("Unable to create thread");
 		return -1;
 	}
-
-	close(pipefd[1]);
 
 	/*
 	 * Wait for child to signal us that it has droped caps.
 	 */
-	ret = read(pipefd[0], &buf, 1);
-	close(pipefd[0]);
-	if (ret < 0) {
-		err("read");
+	if (read(pipefd[1], &c, 1) != 1) {
+		pr_perror("read");
 		return 1;
 	}
 
 	test_daemon();
 	test_waitsig();
 
-	fail("shouldn't dump successfully");
+	if (write(pipefd[1], &c, 1) != 1) {
+		pr_perror("write");
+		return 1;
+	}
 
-	kill(pid, SIGKILL);
-	return ret;
+	if (pthread_join(thr, &retcode)) {
+		pr_perror("Unable to jount a thread");
+		return 1;
+	}
+	if (retcode != NULL)
+		return 1;
+
+	pass();
+
+	return 0;
 }

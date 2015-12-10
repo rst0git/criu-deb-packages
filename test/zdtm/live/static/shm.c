@@ -30,14 +30,14 @@ static int fill_shm_seg(int id, size_t size)
 
 	mem = shmat(id, NULL, 0);
 	if (mem == (void *)-1) {
-		err("Can't attach shm: %d\n", -errno);
+		pr_perror("Can't attach shm: %d", -errno);
 		return -1;
 	}
 
 	datagen(mem, size, &crc);
 
 	if (shmdt(mem) < 0) {
-		err("Can't detach shm: %d\n", -errno);
+		pr_perror("Can't detach shm: %d", -errno);
 		return -1;
 	}
 	return 0;
@@ -49,7 +49,7 @@ static int get_shm_seg(int key, size_t size, unsigned int flags)
 
 	id = shmget(key, size, 0777 | flags);
 	if (id == -1) {
-		err("Can't get shm: %d\n", -errno);
+		pr_perror("Can't get shm: %d", -errno);
 		return -1;
 	}
 	return id;
@@ -75,7 +75,7 @@ static int check_shm_id(int id, size_t size)
 
 	mem = shmat(id, NULL, 0);
 	if (mem == (void *)-1) {
-		err("Can't attach shm: %d\n", -errno);
+		pr_perror("Can't attach shm: %d", -errno);
 		return -1;
 	}
 	crc = INIT_CRC;
@@ -84,7 +84,7 @@ static int check_shm_id(int id, size_t size)
 		return -1;
 	}
 	if (shmdt(mem) < 0) {
-		err("Can't detach shm: %d\n", -errno);
+		pr_perror("Can't detach shm: %d", -errno);
 		return -1;
 	}
 	return 0;
@@ -100,7 +100,7 @@ static int check_shm_key(int key, size_t size)
 	return check_shm_id(id, size);
 }
 
-static int test_fn(int argc, char **argv)
+int main(int argc, char **argv)
 {
 	key_t key;
 	int shm;
@@ -110,21 +110,23 @@ static int test_fn(int argc, char **argv)
 	void *mem;
 	uint32_t crc = INIT_CRC;
 
+	test_init(argc, argv);
+
 	key = ftok(argv[0], 822155666);
 	if (key == -1) {
-		err("Can't make key");
+		pr_perror("Can't make key");
 		goto out;
 	}
 
 	shm = prepare_shm(key, shmem_size);
 	if (shm == -1) {
-		err("Can't prepare shm (1)");
+		pr_perror("Can't prepare shm (1)");
 		goto out;
 	}
 
 	mem = shmat(shm, NULL, 0);
 	if (mem == (void *)-1) {
-		err("Can't shmat");
+		pr_perror("Can't shmat");
 		goto out;
 	}
 
@@ -151,7 +153,7 @@ static int test_fn(int argc, char **argv)
 	}
 
 	if (shmdt(mem) < 0) {
-		err("Can't detach shm");
+		pr_perror("Can't detach shm");
 		return -1;
 	}
 
@@ -189,16 +191,4 @@ out_shm:
 		pass();
 out:
 	return ret;
-}
-
-
-int main(int argc, char **argv)
-{
-#ifdef NEW_IPC_NS
-	test_init_ns(argc, argv, CLONE_NEWIPC, test_fn);
-#else
-	test_init(argc, argv);
-	test_fn(argc, argv);
-#endif
-	return 0;
 }

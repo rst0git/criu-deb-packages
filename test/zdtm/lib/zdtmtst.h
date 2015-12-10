@@ -15,7 +15,6 @@
 /* set up test */
 extern void test_ext_init(int argc, char **argv);
 extern void test_init(int argc, char **argv);
-extern void test_init_ns(int argc, char **argv, unsigned long clone_flags, int (*fn)(int , char **));
 
 #ifndef CLONE_NEWUTS
 #define CLONE_NEWUTS 0x04000000
@@ -99,10 +98,11 @@ extern int parse_opt_string(char *param, void *arg);
 #define __stringify(x)          __stringify_1(x)
 
 /* message helpers */
-extern void setup_outfile(void);
 extern int test_log_init(const char *outfile, const char *suffix);
 extern int zdtm_seccomp;
-#define err(format, arg...)	\
+#define pr_err(format, arg...) \
+	test_msg("ERR: %s:%d: " format, __FILE__, __LINE__, ## arg)
+#define pr_perror(format, arg...)	\
 	test_msg("ERR: %s:%d: " format " (errno = %d (%s))\n", \
 		__FILE__, __LINE__, ## arg, errno, strerror(errno))
 #define fail(format, arg...)	\

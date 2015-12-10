@@ -846,7 +846,7 @@ static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd)
 			return -1;
 		}
 		if (chdir(ui->name_dir)) {
-			pr_perror("Can't change working dir %s\n",
+			pr_perror("Can't change working dir %s",
 				  ui->name_dir);
 			close(*prev_cwd_fd);
 			*prev_cwd_fd = -1;
@@ -1051,7 +1051,7 @@ static int open_unixsk_pair_slave(struct unix_sk_info *ui)
 
 	sk = recv_fd(fle->fe->fd);
 	if (sk < 0) {
-		pr_err("Can't recv pair slave");
+		pr_err("Can't recv pair slave\n");
 		return -1;
 	}
 	close(fle->fe->fd);
@@ -1227,20 +1227,24 @@ static struct file_desc_ops unix_desc_ops = {
  * Make FS clean from sockets we're about to
  * restore. See for how we bind them for details
  */
-static int unlink_stale(struct unix_sk_info *ui)
+static void unlink_stale(struct unix_sk_info *ui)
 {
 	int ret, cwd_fd;
 
 	if (ui->name[0] == '\0' || (ui->ue->uflags & USK_EXTERN))
-		return 0;
+		return;
 
 	if (prep_unix_sk_cwd(ui, &cwd_fd))
-		return -1;
+		return;
 
 	ret = unlinkat(AT_FDCWD, ui->name, 0) ? -1 : 0;
+	if (ret < 0) {
+		pr_warn("Can't unlink stale socket %#x peer %#x (name %s dir %s)\n",
+			ui->ue->ino, ui->ue->peer,
+			ui->name ? (ui->name[0] ? ui->name : &ui->name[1]) : "-",
+			ui->name_dir ? ui->name_dir : "-");
+	}
 	revert_unix_sk_cwd(&cwd_fd);
-
-	return ret;
 }
 
 static int collect_one_unixsk(void *o, ProtobufCMessage *base)
@@ -1258,12 +1262,7 @@ static int collect_one_unixsk(void *o, ProtobufCMessage *base)
 
 		ui->name = (void *)ui->ue->name.data;
 
-		if (unlink_stale(ui)) {
-			pr_warn("Can't unlink stale socket %#x peer %#x (name %s dir %s)\n",
-				ui->ue->ino, ui->ue->peer,
-				ui->name ? (ui->name[0] ? ui->name : &ui->name[1]) : "-",
-				ui->name_dir ? ui->name_dir : "-");
-		}
+		unlink_stale(ui);
 	} else
 		ui->name = NULL;
 

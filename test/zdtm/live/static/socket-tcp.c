@@ -61,21 +61,27 @@ int main(int argc, char **argv)
 	int val;
 	socklen_t optlen;
 
+#ifdef ZDTM_TCP_LOCAL
+	test_init(argc, argv);
+#endif
+
 	if (pipe(pfd)) {
-		err("pipe() failed");
+		pr_perror("pipe() failed");
 		return 1;
 	}
 
 	extpid = fork();
 	if (extpid < 0) {
-		err("fork() failed");
+		pr_perror("fork() failed");
 		return 1;
 	} else if (extpid == 0) {
+#ifndef ZDTM_TCP_LOCAL
 		test_ext_init(argc, argv);
+#endif
 
 		close(pfd[1]);
 		if (read(pfd[0], &port, sizeof(port)) != sizeof(port)) {
-			err("Can't read port\n");
+			pr_perror("Can't read port");
 			return 1;
 		}
 
@@ -86,7 +92,7 @@ int main(int argc, char **argv)
 #ifdef STREAM
 		while (1) {
 			if (read_data(fd, buf, BUF_SIZE)) {
-				err("read less then have to");
+				pr_perror("read less then have to");
 				return 1;
 			}
 			if (datachk(buf, BUF_SIZE, &crc))
@@ -94,13 +100,13 @@ int main(int argc, char **argv)
 
 			datagen(buf, BUF_SIZE, &crc);
 			if (write_data(fd, buf, BUF_SIZE)) {
-				err("can't write");
+				pr_perror("can't write");
 				return 1;
 			}
 		}
 #else
 		if (read_data(fd, buf, BUF_SIZE)) {
-			err("read less then have to");
+			pr_perror("read less then have to");
 			return 1;
 		}
 		if (datachk(buf, BUF_SIZE, &crc))
@@ -108,23 +114,25 @@ int main(int argc, char **argv)
 
 		datagen(buf, BUF_SIZE, &crc);
 		if (write_data(fd, buf, BUF_SIZE)) {
-			err("can't write");
+			pr_perror("can't write");
 			return 1;
 		}
 #endif
 		return 0;
 	}
 
+#ifndef ZDTM_TCP_LOCAL
 	test_init(argc, argv);
+#endif
 
 	if ((fd_s = tcp_init_server(ZDTM_FAMILY, &port)) < 0) {
-		err("initializing server failed");
+		pr_err("initializing server failed\n");
 		return 1;
 	}
 
 	close(pfd[0]);
 	if (write(pfd[1], &port, sizeof(port)) != sizeof(port)) {
-		err("Can't send port");
+		pr_perror("Can't send port");
 		return 1;
 	}
 	close(pfd[1]);
@@ -134,13 +142,13 @@ int main(int argc, char **argv)
 	 */
 	fd = tcp_accept_server(fd_s);
 	if (fd < 0) {
-		err("can't accept client connection %m");
+		pr_err("can't accept client connection\n");
 		return 1;
 	}
 
 	val = 1;
 	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val))) {
-		err("setsockopt");
+		pr_perror("setsockopt");
 		return 1;
 	}
 
@@ -149,12 +157,12 @@ int main(int argc, char **argv)
 	while (test_go()) {
 		datagen(buf, BUF_SIZE, &crc);
 		if (write_data(fd, buf, BUF_SIZE)) {
-			err("can't write");
+			pr_perror("can't write");
 			return 1;
 		}
 
 		if (read_data(fd, buf, BUF_SIZE)) {
-			err("read less then have to");
+			pr_perror("read less then have to");
 			return 1;
 		}
 		if (datachk(buf, BUF_SIZE, &crc))
@@ -166,12 +174,12 @@ int main(int argc, char **argv)
 
 	datagen(buf, BUF_SIZE, &crc);
 	if (write_data(fd, buf, BUF_SIZE)) {
-		err("can't write");
+		pr_perror("can't write");
 		return 1;
 	}
 
 	if (read_data(fd, buf, BUF_SIZE)) {
-		err("read less then have to");
+		pr_perror("read less then have to");
 		return 1;
 	}
 	if (datachk(buf, BUF_SIZE, &crc))
@@ -179,7 +187,7 @@ int main(int argc, char **argv)
 #endif
 	optlen = sizeof(val);
 	if (getsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, &optlen)) {
-		err("getsockopt");
+		pr_perror("getsockopt");
 		return 1;
 	}
 	if (val != 1) {

@@ -31,11 +31,22 @@ int unseize_task(pid_t pid, int orig_st, int st)
 		kill(pid, SIGKILL);
 		return 0;
 	} else if (st == TASK_STOPPED) {
-		if (orig_st == TASK_ALIVE)
-			kill(pid, SIGSTOP);
-		/* PTRACE_SEIZE will restore state of other tasks */
+		/*
+		 * Task might have had STOP in queue. We detected such
+		 * guy as TASK_STOPPED, but cleared signal to run the
+		 * parasite code. hus after detach the task will become
+		 * running. That said -- STOP everyone regardless of
+		 * the initial state.
+		 */
+		kill(pid, SIGSTOP);
 	} else if (st == TASK_ALIVE) {
-		/* do nothing */ ;
+		/*
+		 * Same as in the comment above -- there might be a
+		 * task with STOP in queue that would get lost after
+		 * detach, so stop it again.
+		 */
+		if (orig_st == TASK_STOPPED)
+			kill(pid, SIGSTOP);
 	} else
 		pr_err("Unknown final state %d\n", st);
 
@@ -91,6 +102,45 @@ int seize_catch_task(pid_t pid)
 	return ret;
 }
 
+static int skip_sigstop(int pid, int nr_signals)
+{
+	int i, status, ret;
+
+	/*
+	 * 1) SIGSTOP is queued, but isn't handled yet:
+	 * SGISTOP can't be blocked, so we need to wait when the kernel
+	 * handles this signal.
+	 *
+	 * Otherwise the process will be stopped immediatly after
+	 * starting it.
+	 *
+	 * 2) A seized task was stopped:
+	 * PTRACE_SEIZE doesn't affect signal or group stop state.
+	 * Currently ptrace reported that task is in stopped state.
+	 * We need to start task again, and it will be trapped
+	 * immediately, because we sent PTRACE_INTERRUPT to it.
+	 */
+	for (i = 0; i < nr_signals; i++) {
+		ret = ptrace(PTRACE_CONT, pid, 0, 0);
+		if (ret) {
+			pr_perror("Unable to start process");
+			return -1;
+		}
+
+		ret = wait4(pid, &status, __WALL, NULL);
+		if (ret < 0) {
+			pr_perror("SEIZE %d: can't wait task", pid);
+			return -1;
+		}
+
+		if (!WIFSTOPPED(status)) {
+			pr_err("SEIZE %d: task not stopped after seize\n", pid);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 /*
  * This routine seizes task putting it into a special
  * state where we can manipulate the task via ptrace
@@ -101,7 +151,7 @@ int seize_catch_task(pid_t pid)
 int seize_wait_task(pid_t pid, pid_t ppid, struct proc_status_creds **creds)
 {
 	siginfo_t si;
-	int status;
+	int status, nr_sigstop;
 	int ret = 0, ret2, wait_errno = 0;
 	struct proc_status_creds cr;
 
@@ -131,7 +181,7 @@ try_again:
 		goto err;
 	}
 
-	if (ret < 0) {
+	if (ret < 0 || WIFEXITED(status) || WIFSIGNALED(status)) {
 		if (cr.state != 'Z') {
 			if (pid == getpid())
 				pr_err("The criu itself is within dumped tree.\n");
@@ -181,51 +231,36 @@ try_again:
 	if (*creds == NULL) {
 		*creds = xzalloc(sizeof(struct proc_status_creds));
 		if (!*creds)
-			goto err_stop;
+			goto err;
 
 		**creds = cr;
 
 	} else if (!proc_status_creds_eq(*creds, &cr)) {
 		pr_err("creds don't match %d %d\n", pid, ppid);
-		goto err_stop;
+		goto err;
 	}
 
 	if (cr.seccomp_mode != SECCOMP_MODE_DISABLED && suspend_seccomp(pid) < 0)
-		goto err_stop;
+		goto err;
+
+	nr_sigstop = 0;
+	if (cr.sigpnd & (1 << (SIGSTOP - 1)))
+		nr_sigstop++;
+	if (cr.shdpnd & (1 << (SIGSTOP - 1)))
+		nr_sigstop++;
+	if (si.si_signo == SIGSTOP)
+		nr_sigstop++;
+
+	if (nr_sigstop) {
+		if (skip_sigstop(pid, nr_sigstop))
+			goto err_stop;
+
+		return TASK_STOPPED;
+	}
 
 	if (si.si_signo == SIGTRAP)
 		return TASK_ALIVE;
-	else if (si.si_signo == SIGSTOP) {
-		/*
-		 * PTRACE_SEIZE doesn't affect signal or group stop state.
-		 * Currently ptrace reported that task is in stopped state.
-		 * We need to start task again, and it will be trapped
-		 * immediately, because we sent PTRACE_INTERRUPT to it.
-		 */
-		ret = ptrace(PTRACE_CONT, pid, 0, 0);
-		if (ret) {
-			pr_perror("Unable to start process");
-			goto err_stop;
-		}
-
-		ret = wait4(pid, &status, __WALL, NULL);
-		if (ret < 0) {
-			pr_perror("SEIZE %d: can't wait task", pid);
-			goto err_stop;
-		}
-
-		if (ret != pid) {
-			pr_err("SEIZE %d: wrong task attached (%d)\n", pid, ret);
-			goto err_stop;
-		}
-
-		if (!WIFSTOPPED(status)) {
-			pr_err("SEIZE %d: task not stopped after seize\n", pid);
-			goto err_stop;
-		}
-
-		return TASK_STOPPED;
-	} else {
+	else {
 		pr_err("SEIZE %d: unsupported stop signal %d\n", pid, si.si_signo);
 		goto err;
 	}

@@ -128,38 +128,47 @@ static void nsid_add(struct ns_id *ns, struct ns_desc *nd, unsigned int id, pid_
 {
 	ns->nd = nd;
 	ns->id = id;
-	ns->pid = pid;
+	ns->ns_pid = pid;
 	ns->next = ns_ids;
 	ns_ids = ns;
 
-	pr_info("Add %s ns %d pid %d\n", nd->str, ns->id, ns->pid);
+	pr_info("Add %s ns %d pid %d\n", nd->str, ns->id, ns->ns_pid);
 }
 
-struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd)
+static struct ns_id *__rst_new_ns_id(unsigned int id, pid_t pid,
+		struct ns_desc *nd, enum ns_type type)
 {
 	struct ns_id *nsid;
 
 	nsid = shmalloc(sizeof(*nsid));
 	if (nsid) {
+		nsid->type = type;
 		nsid_add(nsid, nd, id, pid);
-		futex_set(&nsid->ns_created, 0);
+		futex_set(&nsid->ns_populated, 0);
 	}
 
 	return nsid;
 }
 
-int rst_add_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd)
+struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid, struct ns_desc *nd)
 {
+	return __rst_new_ns_id(id, pid, nd, NS_CRIU);
+}
+
+int rst_add_ns_id(unsigned int id, struct pstree_item *i, struct ns_desc *nd)
+{
+	pid_t pid = i->pid.virt;
 	struct ns_id *nsid;
 
 	nsid = lookup_ns_by_id(id, nd);
 	if (nsid) {
-		if (pid_rst_prio(pid, nsid->pid))
-			nsid->pid = pid;
+		if (pid_rst_prio(pid, nsid->ns_pid))
+			nsid->ns_pid = pid;
 		return 0;
 	}
 
-	nsid = rst_new_ns_id(id, pid, nd);
+	nsid = __rst_new_ns_id(id, pid, nd,
+			i == root_item ? NS_ROOT : NS_OTHER);
 	if (nsid == NULL)
 		return -1;
 
@@ -212,7 +221,7 @@ int walk_namespaces(struct ns_desc *nd, int (*cb)(struct ns_id *, void *), void 
 		if (ns->nd != nd)
 			continue;
 
-		if (ns->pid == getpid()) {
+		if (ns->type == NS_CRIU) {
 			if (root_ns_mask & nd->cflag)
 				continue;
 
@@ -232,28 +241,34 @@ static unsigned int generate_ns_id(int pid, unsigned int kid, struct ns_desc *nd
 		struct ns_id **ns_ret)
 {
 	struct ns_id *nsid;
+	enum ns_type type;
 
 	nsid = lookup_ns_by_kid(kid, nd);
 	if (nsid)
 		goto found;
 
 	if (pid != getpid()) {
+		type = NS_OTHER;
 		if (pid == root_item->pid.real) {
 			BUG_ON(root_ns_mask & nd->cflag);
 			pr_info("Will take %s namespace in the image\n", nd->str);
 			root_ns_mask |= nd->cflag;
+			type = NS_ROOT;
 		} else if (nd->cflag & ~CLONE_SUBNS) {
 			pr_err("Can't dump nested %s namespace for %d\n",
 					nd->str, pid);
 			return 0;
 		}
-	}
+	} else
+		type = NS_CRIU;
 
 	nsid = xmalloc(sizeof(*nsid));
 	if (!nsid)
 		return 0;
 
+	nsid->type = type;
 	nsid->kid = kid;
+	futex_set(&nsid->ns_populated, 1);
 	nsid_add(nsid, nd, ns_next_id++, pid);
 
 found:
@@ -705,28 +720,28 @@ static int do_dump_namespaces(struct ns_id *ns)
 {
 	int ret;
 
-	ret = switch_ns(ns->pid, ns->nd, NULL);
+	ret = switch_ns(ns->ns_pid, ns->nd, NULL);
 	if (ret)
 		return ret;
 
 	switch (ns->nd->cflag) {
 	case CLONE_NEWUTS:
 		pr_info("Dump UTS namespace %d via %d\n",
-				ns->id, ns->pid);
+				ns->id, ns->ns_pid);
 		ret = dump_uts_ns(ns->id);
 		break;
 	case CLONE_NEWIPC:
 		pr_info("Dump IPC namespace %d via %d\n",
-				ns->id, ns->pid);
+				ns->id, ns->ns_pid);
 		ret = dump_ipc_ns(ns->id);
 		break;
 	case CLONE_NEWNET:
 		pr_info("Dump NET namespace info %d via %d\n",
-				ns->id, ns->pid);
+				ns->id, ns->ns_pid);
 		ret = dump_net_ns(ns->id);
 		break;
 	default:
-		pr_err("Unknown namespace flag %x", ns->nd->cflag);
+		pr_err("Unknown namespace flag %x\n", ns->nd->cflag);
 		break;
 	}
 
@@ -761,7 +776,7 @@ int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 
 	for (ns = ns_ids; ns; ns = ns->next) {
 		/* Skip current namespaces, which are in the list too  */
-		if (ns->pid == getpid())
+		if (ns->type == NS_CRIU)
 			continue;
 
 		switch (ns->nd->cflag) {
@@ -846,16 +861,17 @@ struct unsc_msg {
 	 * 2nd is the optional (NULL in responce) arguments
 	 */
 	struct iovec iov[3];
-	char c[CMSG_SPACE(sizeof(int))];
+	char c[CMSG_SPACE(sizeof(struct ucred)) + CMSG_SPACE(sizeof(int))];
 };
-
-#define MAX_MSG_SIZE	256
 
 static int usernsd_pid;
 
 static inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c,
 		int *x, void *arg, size_t asize, int fd)
 {
+	struct cmsghdr *ch;
+	struct ucred *ucred;
+
 	m->h.msg_iov = m->iov;
 	m->h.msg_iovlen = 2;
 
@@ -874,15 +890,29 @@ static inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c,
 	m->h.msg_namelen = 0;
 	m->h.msg_flags = 0;
 
-	if (fd < 0) {
-		m->h.msg_control = NULL;
-		m->h.msg_controllen = 0;
-	} else {
-		struct cmsghdr *ch;
+	m->h.msg_control = &m->c;
 
-		m->h.msg_control = &m->c;
-		m->h.msg_controllen = sizeof(m->c);
-		ch = CMSG_FIRSTHDR(&m->h);
+	/* Need to memzero because of:
+	 * https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=514917
+	 */
+	memzero(&m->c, sizeof(m->c));
+
+	m->h.msg_controllen = CMSG_SPACE(sizeof(struct ucred));
+
+	ch = CMSG_FIRSTHDR(&m->h);
+	ch->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+	ch->cmsg_level = SOL_SOCKET;
+	ch->cmsg_type = SCM_CREDENTIALS;
+
+	ucred = (struct ucred *) CMSG_DATA(ch);
+	ucred->pid = getpid();
+	ucred->uid = getuid();
+	ucred->gid = getgid();
+
+	if (fd >= 0) {
+		m->h.msg_controllen += CMSG_SPACE(sizeof(int));
+		ch = CMSG_NXTHDR(&m->h, ch);
+		BUG_ON(!ch);
 		ch->cmsg_len = CMSG_LEN(sizeof(int));
 		ch->cmsg_level = SOL_SOCKET;
 		ch->cmsg_type = SCM_RIGHTS;
@@ -890,38 +920,54 @@ static inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c,
 	}
 }
 
-static int unsc_msg_fd(struct unsc_msg *um)
+static void unsc_msg_pid_fd(struct unsc_msg *um, pid_t *pid, int *fd)
 {
 	struct cmsghdr *ch;
+	struct ucred *ucred;
 
 	ch = CMSG_FIRSTHDR(&um->h);
+	BUG_ON(!ch);
+	BUG_ON(ch->cmsg_len != CMSG_LEN(sizeof(struct ucred)));
+	BUG_ON(ch->cmsg_level != SOL_SOCKET);
+	BUG_ON(ch->cmsg_type != SCM_CREDENTIALS);
+
+	if (pid) {
+		ucred = (struct ucred *) CMSG_DATA(ch);
+		*pid = ucred->pid;
+	}
+
+	ch = CMSG_NXTHDR(&um->h, ch);
+
 	if (ch && ch->cmsg_len == CMSG_LEN(sizeof(int))) {
 		BUG_ON(ch->cmsg_level != SOL_SOCKET);
 		BUG_ON(ch->cmsg_type != SCM_RIGHTS);
-		return *((int *)CMSG_DATA(ch));
+		*fd = *((int *)CMSG_DATA(ch));
+	} else {
+		*fd = -1;
 	}
-
-	return -1;
 }
 
 static int usernsd(int sk)
 {
-	pr_info("UNS: Daemon started\n");
+	pr_info("uns: Daemon started\n");
 
 	while (1) {
 		struct unsc_msg um;
-		static char msg[MAX_MSG_SIZE];
+		static char msg[MAX_UNSFD_MSG_SIZE];
 		uns_call_t call;
 		int flags, fd, ret;
+		pid_t pid;
 
 		unsc_msg_init(&um, &call, &flags, msg, sizeof(msg), 0);
 		if (recvmsg(sk, &um.h, 0) <= 0) {
-			pr_perror("UNS: recv req error");
+			pr_perror("uns: recv req error");
 			return -1;
 		}
 
-		fd = unsc_msg_fd(&um);
-		pr_debug("UNS: daemon calls %p (%d, %x)\n", call, fd, flags);
+		unsc_msg_pid_fd(&um, &pid, &fd);
+		pr_debug("uns: daemon calls %p (%d, %d, %x)\n", call, pid, fd, flags);
+
+		BUG_ON(fd < 0 && flags & UNS_FDOUT);
 
 		/*
 		 * Caller has sent us bare address of the routine it
@@ -931,7 +977,7 @@ static int usernsd(int sk)
 		 * former guy has. So go ahead and just call one!
 		 */
 
-		ret = call(msg, fd);
+		ret = call(msg, fd, pid);
 
 		if (fd >= 0)
 			close(fd);
@@ -947,7 +993,7 @@ static int usernsd(int sk)
 			 * sendmsg() in there.
 			 */
 			if (ret < 0) {
-				pr_err("UNS: Async call failed. Exiting\n");
+				pr_err("uns: Async call failed. Exiting\n");
 				return -1;
 			}
 
@@ -961,7 +1007,7 @@ static int usernsd(int sk)
 
 		unsc_msg_init(&um, &call, &ret, NULL, 0, fd);
 		if (sendmsg(sk, &um.h, 0) <= 0) {
-			pr_perror("UNS: send resp error");
+			pr_perror("uns: send resp error");
 			return -1;
 		}
 
@@ -970,23 +1016,23 @@ static int usernsd(int sk)
 	}
 }
 
-int userns_call(uns_call_t call, int flags,
-		void *arg, size_t arg_size, int fd)
+int __userns_call(const char *func_name, uns_call_t call, int flags,
+		  void *arg, size_t arg_size, int fd)
 {
 	int ret, res, sk;
 	bool async = flags & UNS_ASYNC;
 	struct unsc_msg um;
 
-	if (unlikely(arg_size > MAX_MSG_SIZE)) {
-		pr_err("UNS: message size exceeded\n");
+	if (unlikely(arg_size > MAX_UNSFD_MSG_SIZE)) {
+		pr_err("uns: message size exceeded\n");
 		return -1;
 	}
 
 	if (!usernsd_pid)
-		return call(arg, fd);
+		return call(arg, fd, getpid());
 
 	sk = get_service_fd(USERNSD_SK);
-	pr_debug("UNS: calling %p (%d, %x)\n", call, fd, flags);
+	pr_debug("uns: calling %s (%d, %x)\n", func_name, fd, flags);
 
 	if (!async)
 		/*
@@ -1010,7 +1056,7 @@ int userns_call(uns_call_t call, int flags,
 	unsc_msg_init(&um, &call, &flags, arg, arg_size, fd);
 	ret = sendmsg(sk, &um.h, 0);
 	if (ret <= 0) {
-		pr_perror("UNS: send req error");
+		pr_perror("uns: send req error");
 		ret = -1;
 		goto out;
 	}
@@ -1025,7 +1071,7 @@ int userns_call(uns_call_t call, int flags,
 	unsc_msg_init(&um, &call, &res, NULL, 0, 0);
 	ret = recvmsg(sk, &um.h, 0);
 	if (ret <= 0) {
-		pr_perror("UNS: recv resp error");
+		pr_perror("uns: recv resp error");
 		ret = -1;
 		goto out;
 	}
@@ -1033,7 +1079,7 @@ int userns_call(uns_call_t call, int flags,
 	/* Decode the result and return */
 
 	if (flags & UNS_FDOUT)
-		ret = unsc_msg_fd(&um);
+		unsc_msg_pid_fd(&um, NULL, &ret);
 	else
 		ret = res;
 out:
@@ -1043,9 +1089,10 @@ out:
 	return ret;
 }
 
-int start_usernsd(void)
+static int start_usernsd(void)
 {
 	int sk[2];
+	int one = 1;
 
 	if (!(root_ns_mask & CLONE_NEWUSER))
 		return 0;
@@ -1065,6 +1112,16 @@ int start_usernsd(void)
 
 	if (socketpair(PF_UNIX, SOCK_SEQPACKET, 0, sk)) {
 		pr_perror("Can't make usernsd socket");
+		return -1;
+	}
+
+	if (setsockopt(sk[0], SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) < 0) {
+		pr_perror("failed to setsockopt");
+		return -1;
+	}
+
+	if (setsockopt(sk[1], SOL_SOCKET, SO_PASSCRED, &one, sizeof(1)) < 0) {
+		pr_perror("failed to setsockopt");
 		return -1;
 	}
 
@@ -1096,10 +1153,10 @@ int start_usernsd(void)
 	return 0;
 }
 
-static int exit_usernsd(void *arg, int fd)
+static int exit_usernsd(void *arg, int fd, pid_t pid)
 {
 	int code = *(int *)arg;
-	pr_info("UNS: `- daemon exits w/ %d\n", code);
+	pr_info("uns: `- daemon exits w/ %d\n", code);
 	exit(code);
 }
 
@@ -1145,12 +1202,12 @@ int stop_usernsd(void)
 			ret = -1;
 
 		usernsd_pid = 0;
-		sigprocmask(SIG_BLOCK, &oldmask, NULL);
+		sigprocmask(SIG_SETMASK, &oldmask, NULL);
 
 		if (ret != 0)
-			pr_err("UNS: daemon exited abnormally\n");
+			pr_err("uns: daemon exited abnormally\n");
 		else
-			pr_info("UNS: daemon stopped\n");
+			pr_info("uns: daemon stopped\n");
 	}
 
 	return ret;
@@ -1255,6 +1312,35 @@ int prepare_namespace(struct pstree_item *item, unsigned long clone_flags)
 		return -1;
 
 	return 0;
+}
+
+int prepare_namespace_before_tasks(void)
+{
+	if (start_usernsd())
+		goto err_unds;
+
+	if (netns_keep_nsfd())
+		goto err_netns;
+
+	if (mntns_maybe_create_roots())
+		goto err_mnt;
+
+	if (read_mnt_ns_img())
+		goto err_img;
+
+	return 0;
+
+err_img:
+	cleanup_mnt_ns();
+err_mnt:
+	/*
+	 * Nothing, netns' descriptor will be closed
+	 * on criu exit
+	 */
+err_netns:
+	stop_usernsd();
+err_unds:
+	return -1;
 }
 
 int try_show_namespaces(int ns_pid)
