@@ -7,11 +7,6 @@ Files: *
 Copyright: 2011-2015, Parallels Inc.
 License: GPL-2
 
-Files: sd-daemon.c
- sd-daemon.h
-Copyright: 2010, Lennart Poettering
-License: Expat
-
 Files: arch/ppc64/misc.S
 Copyright: 1995, 1996, 1998, 2000, 2001 Free Software Foundation, Inc.
  2008 Freescale Semiconductor, Inc.
