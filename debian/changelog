@@ -1,9 +1,13 @@
-criu (1.8-1) UNRELEASED; urgency=medium
+criu (1.8-1) experimental; urgency=low
 
   * Imported Upstream version 1.8
   * Drop 01-reproducible-build.diff (applied upstream)
+  * Drop copyright stanza for sd-daemon.[ch]
+    Files dropped upstream from source.
+  * Drop override rules to remove systemd service and logrotate files.
+    Upstream does not provide anymore a criu systemd service.
 
- -- Salvatore Bonaccorso <carnil@debian.org>  Sun, 13 Dec 2015 17:40:14 +0100
+ -- Salvatore Bonaccorso <carnil@debian.org>  Tue, 15 Dec 2015 20:42:01 +0100
 
 criu (1.7.2-2) unstable; urgency=medium
 
