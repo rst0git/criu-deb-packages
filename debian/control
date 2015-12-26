@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Salvatore Bonaccorso <carnil@debian.org>
 Build-Depends:
  asciidoc,
- debhelper (>= 9),
+ debhelper (>= 9.20151219),
  dh-python,
  libprotobuf-c-dev,
  libprotobuf-dev,
@@ -24,14 +24,3 @@ Recommends: iproute2 | iproute
 Description: checkpoint and restore in userspace
  criu contains the utilities to checkpoint and restore processes in
  userspace.
-
-Package: criu-dbg
-Section: debug
-Priority: extra
-Architecture: amd64 armhf ppc64el
-Depends: criu (= ${binary:Version}), ${misc:Depends}
-Description: checkpoint and restore in userspace (debug)
- criu contains the utilities to checkpoint and restore processes in
- userspace.
- .
- This package contains the debugging symbols.
