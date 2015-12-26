@@ -1,3 +1,17 @@
+criu (1.8-2) unstable; urgency=low
+
+  * Upload to unstable
+  * Migrate from criu-dbg to ddebs.
+    Update versioned Build-Depends on debhelper to 9.20151219 to ensure
+    generation of dbgsym packages.
+    Drop criu-dbg binary package stanza from debian/control file.
+    debian/rules: Use --ddeb-migration argument to dh_strip to migrate from
+    criu-dbg to ddebs.
+  * debian/copyright: Drop unused Expat license stanza
+  * Remove empty /usr/lib/systemd/system directory
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Sat, 26 Dec 2015 20:35:50 +0100
+
 criu (1.8-1) experimental; urgency=low
 
   * Imported Upstream version 1.8
