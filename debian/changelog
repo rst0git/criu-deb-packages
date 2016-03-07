@@ -1,3 +1,16 @@
+criu (2.0-1) experimental; urgency=medium
+
+  * Imported Upstream version 2.0
+  * Add Build-Depends on libnl-3-dev
+  * Add Build-Depends on libcap-dev
+  * Use HTTPS transport protocol for Vcs-Git URI
+  * Update copyright years for debian/* packaging files
+  * Declare compliance with Debian policy 3.9.7
+  * debian/copyright: Update file paths after upstream file reorganisation
+  * Sync manpage for crit to include short explanation for new subcommands
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 07 Mar 2016 20:19:11 +0100
+
 criu (1.8-2) unstable; urgency=low
 
   * Upload to unstable
