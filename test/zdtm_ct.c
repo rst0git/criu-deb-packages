@@ -20,11 +20,6 @@ int main(int argc, char **argv)
 		return 1;
 	pid = fork();
 	if (pid == 0) {
-		if (setsid() == -1) {
-			fprintf(stderr, "setsid: %m\n");
-			return 1;
-		}
-
 		if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
 			fprintf(stderr, "mount(/, S_REC | MS_PRIVATE)): %m");
 			return 1;
@@ -38,6 +33,11 @@ int main(int argc, char **argv)
 		if (mount("zdtm_devpts", "/dev/pts", "devpts", 0,
 					"newinstance,ptmxmode=0666")) {
 			fprintf(stderr, "mount(pts): %m");
+			return 1;
+		}
+		if (mount("zdtm_binfmt", "/proc/sys/fs/binfmt_misc", "binfmt_misc", 0,
+					NULL)) {
+			fprintf(stderr, "mount(binfmt_misc): %m");
 			return 1;
 		}
 		if (mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL)) {

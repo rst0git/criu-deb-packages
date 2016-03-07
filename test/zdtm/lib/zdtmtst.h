@@ -76,6 +76,8 @@ extern void __push_opt(struct long_opt *opt);
 #define __param_check(name, p, type) \
 	static inline type *__check_##name(void) { return(p); }
 
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+
 extern void parseargs(int, char **);
 extern int parse_opt_bool(char *param, void *arg);
 #define param_check_bool(name, p) __param_check(name, p, int)
@@ -96,6 +98,12 @@ extern int parse_opt_string(char *param, void *arg);
 
 #define __stringify_1(x)        #x
 #define __stringify(x)          __stringify_1(x)
+
+/*
+ * Macro to define stack alignment. 
+ * aarch64 requires stack to be aligned to 16 bytes.
+ */
+#define __stack_aligned__	__attribute__((aligned(16)))
 
 /* message helpers */
 extern int test_log_init(const char *outfile, const char *suffix);
