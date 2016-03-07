@@ -3,61 +3,54 @@ RM := rm -f --one-file-system
 ZDTM_ARGS ?= -C
 export ZDTM_ARGS
 
-.FORCE:
-
 all:
 	$(MAKE) zdtm
 	$(MAKE) zdtm-pre-dump
 	$(MAKE) zdtm-snapshot
 	$(MAKE) zdtm-iter
 	$(MAKE) zdtm-freezer
-
 .PHONY: all
 
 TESTS = unix-callback mem-snap rpc libcriu mounts/ext security pipes crit socketpairs overlayfs
 
-other: .FORCE
+other:
 	for t in $(TESTS); do				\
-		setsid $(MAKE) -C $$t run || exit 1;	\
-	done						\
+		setsid $(MAKE) -C others/$$t run || exit 1;	\
+	done
+.PHONY: other
 
-zdtm-tst-list: zdtm.sh
-	./zdtm.sh -l > zdtm-tst-list
+zdtm_ct: zdtm_ct.c
 
-zdtm: zdtm-tst-list .FORCE 
-	$(MAKE) -f Makefile.zdtm zdtm_nons
-	$(MAKE) -f Makefile.zdtm zdtm_ns
-	$(MAKE) clean_root
-	$(MAKE) -f Makefile.zdtm zdtm_ns_user
-
-zdtm-pre-dump: zdtm-tst-list
-	ZDTM_ARGS="-P -p -i 3 -C" $(MAKE) -f Makefile.zdtm ns/static/pipe00
-
-zdtm-snapshot: zdtm-tst-list
-	ZDTM_ARGS="-s -i 3 -C" $(MAKE) -f Makefile.zdtm ns/static/pipe00
-
-zdtm-iter: zdtm-tst-list
-	ZDTM_ARGS="-i 3 -C" $(MAKE) -f Makefile.zdtm ns/static/pipe00
-
-zdtm-freezer:
-	ZDTM_ARGS="--freeze-cgroup /sys/fs/cgroup/freezer/test -i 3" $(MAKE) -f Makefile.zdtm transition/thread-bomb
-	ZDTM_ARGS="--freeze-cgroup /sys/fs/cgroup/freezer/test -d --frozen" $(MAKE) -f Makefile.zdtm transition/thread-bomb
-
+zdtm:
+	./zdtm.py run -a --parallel 2
 .PHONY: zdtm
 
-fault-injection: .FORCE
+zdtm-pre-dump:
+	./zdtm.py run --pre 2:1 -t zdtm/transition/fork -f uns
+.PHONY: zdtm
+
+zdtm-snapshot:
+	./zdtm.py run --pre 2:1 --snap -t zdtm/transition/fork -f uns
+.PHONY: zdtm-snapshot
+
+zdtm-iter:
+	./zdtm.py run --iters 3:1 -t zdtm/transition/fork -f uns
+.PHONY: zdtm-iter
+
+zdtm-freezer:
+	./zdtm.py run --test zdtm/transition/thread-bomb --pre 3 --freezecg zdtm:t
+	./zdtm.py run --test zdtm/transition/thread-bomb --pre 3 --freezecg zdtm:f
+.PHONY: zdtm-freezer
+
+fault-injection:
 	$(MAKE) -C fault-injection
 .PHONY: fault-injection
 
 override CFLAGS += -D_GNU_SOURCE
 
 clean_root:
-	$(Q) $(RM) -r ./lib/
-	$(Q) $(RM) -r ./lib64/
-	$(Q) $(RM) -r ./tmp
-	$(Q) $(RM) -r ./etc
-	$(Q) $(RM) -r ./dev
-	$(Q) $(RM) -r ./bin
+	$(Q) ./zdtm.py clean nsroot
+.PHONY: clean_root
 
 clean: clean_root
 	$(RM) zdtm_ct zdtm-tst-list
@@ -67,5 +60,4 @@ clean: clean_root
 	$(Q) $(MAKE) -C libcriu clean
 	$(Q) $(MAKE) -C rpc clean
 	$(Q) $(MAKE) -C crit clean
-
-.PHONY: zdtm_ns
+.PHONY: clean
