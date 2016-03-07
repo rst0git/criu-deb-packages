@@ -6,6 +6,7 @@ Build-Depends:
  asciidoc,
  debhelper (>= 9.20151219),
  dh-python,
+ libcap-dev,
  libnl-3-dev,
  libprotobuf-c-dev,
  libprotobuf-dev,
