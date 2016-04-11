@@ -12,24 +12,6 @@ int main(void)
 }
 endef
 
-define FEATURE_TEST_PRLIMIT
-
-#include <stdlib.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <sys/resource.h>
-
-int main(void)
-{
-	struct rlimit limit = {
-		.rlim_cur = RLIM_INFINITY,
-		.rlim_max = RLIM_INFINITY,
-	};
-
-	return prlimit(getpid(), RLIMIT_CPU, &limit, NULL);
-}
-endef
-
 define FEATURE_TEST_LIBBSD_DEV
 #include <bsd/string.h>
 
@@ -100,10 +82,10 @@ define FEATURE_TEST_MEMFD
 
 int main(void)
 {
-#ifdef SYS_memfd_create
+#ifdef __NR_memfd_create
 	return 0;
 #else
-#error No memfd support
+# error No memfd support
 #endif
 }
 

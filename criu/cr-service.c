@@ -567,9 +567,6 @@ static int check(int sk)
 
 	setproctitle("check --rpc");
 
-	/* Check only minimal kernel support */
-	opts.check_ms_kernel = true;
-
 	if (!cr_check())
 		resp.success = true;
 
@@ -958,8 +955,8 @@ static void reap_worker(int signo)
 			pr_info("Worker(pid %d) exited with %d\n",
 				pid, WEXITSTATUS(status));
 		else if (WIFSIGNALED(status))
-			pr_info("Worker(pid %d) was killed by %d\n",
-				pid, WTERMSIG(status));
+			pr_info("Worker(pid %d) was killed by %d: %s\n", pid,
+				WTERMSIG(status), strsignal(WTERMSIG(status)));
 	}
 }
 
