@@ -389,7 +389,7 @@ struct remap_info {
 	struct reg_file_info *rfi;
 };
 
-static int collect_one_remap(void *obj, ProtobufCMessage *msg)
+static int collect_one_remap(void *obj, ProtobufCMessage *msg, struct cr_img *i)
 {
 	struct remap_info *ri = obj;
 	RemapFilePathEntry *rfe;
@@ -804,11 +804,47 @@ static int dump_linked_remap(char *path, int len, const struct stat *ost,
 			&rpe, PB_REMAP_FPATH);
 }
 
+static pid_t *dead_pids;
+static int n_dead_pids;
+
+static int dead_pid_check_threads(struct pstree_item *item, pid_t pid)
+{
+	int i;
+
+	for (i = 0; i < item->nr_threads; i++) {
+		/*
+		 * If the dead PID was given to a main thread of another
+		 * process, this is handled during restore.
+		 */
+		if (item->pid.real == item->threads[i].real ||
+		    item->threads[i].virt != pid)
+			continue;
+
+		pr_err("Conflict with a dead task with the same PID as of this thread (virt %d, real %d).\n",
+			item->threads[i].virt, item->threads[i].real);
+		return 1;
+	}
+
+	return 0;
+}
+
+int dead_pid_conflict(void)
+{
+	struct pstree_item *item;
+	int i;
+
+	for (i = 0; i < n_dead_pids; i++) {
+		for_each_pstree_item(item)
+			if (dead_pid_check_threads(item, dead_pids[i]))
+				return 1;
+	}
+
+	return 0;
+}
+
 static int have_seen_dead_pid(pid_t pid)
 {
-	static pid_t *dead_pids = NULL;
-	static int n_dead_pids = 0;
-	size_t i;
+	int i;
 
 	for (i = 0; i < n_dead_pids; i++) {
 		if (dead_pids[i] == pid)
@@ -1621,7 +1657,7 @@ struct file_desc *try_collect_special_file(u32 id, int optional)
 	return fdesc;
 }
 
-static int collect_one_regfile(void *o, ProtobufCMessage *base)
+static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i)
 {
 	struct reg_file_info *rfi = o;
 	static char dot[] = ".";

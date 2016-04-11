@@ -191,7 +191,7 @@ struct mount_info *lookup_overlayfs(char *rpath, unsigned int st_dev,
 
 	/* If the mnt_id and device number match for some entry, no fixup is needed */
 	for (m = mntinfo; m != NULL; m = m->next)
-		if (st_dev == m->s_dev && mnt_id == m->mnt_id)
+		if (st_dev == kdev_to_odev(m->s_dev) && mnt_id == m->mnt_id)
 			return NULL;
 
 	return __lookup_overlayfs(mntinfo, rpath, st_dev, st_ino, mnt_id);
@@ -281,8 +281,43 @@ bool phys_stat_dev_match(dev_t st_dev, dev_t phys_dev,
  */
 static bool mounts_sb_equal(struct mount_info *a, struct mount_info *b)
 {
-	return a->s_dev == b->s_dev && a->fstype == b->fstype &&
-		!strcmp(a->source, b->source) && !strcmp(a->options, b->options);
+	if (a->fstype != b->fstype)
+		return false;
+
+	/* There is a btrfs bug where it doesn't emit subvol= correctly when
+	 * files are bind mounted, so let's ignore it for now.
+	 * https://marc.info/?l=linux-btrfs&m=145857372803614&w=2
+	 */
+	if (!strcmp(a->fstype->name, "btrfs")) {
+		char *posa = strstr(a->options, "subvol="), *posb = strstr(b->options, "subvol=");
+		bool equal;
+
+		if (!posa || !posb) {
+			pr_err("invalid btrfs options, no subvol argument");
+			return false;
+		}
+
+		*posa = *posb = 0;
+		equal = !strcmp(a->options, b->options);
+		*posa = *posb = 's';
+
+		if (!equal)
+			return false;
+
+		posa = strchr(posa, ',');
+		posb = strchr(posb, ',');
+
+		if ((posa && !posb) || (!posa && posb))
+			return false;
+
+		if (posa && strcmp(posa, posb))
+			return false;
+	} else {
+		if (strcmp(a->options, b->options))
+			return false;
+	}
+
+	return a->s_dev == b->s_dev && !strcmp(a->source, b->source);
 }
 
 /*
@@ -1583,7 +1618,8 @@ static int fusectl_dump(struct mount_info *pm)
 		}
 
 		for (it = mntinfo; it; it = it->next) {
-			if (it->fstype->code == FSTYPE__FUSE && id == minor(it->s_dev) && !it->external) {
+			if (it->fstype->code == FSTYPE__FUSE &&
+					id == kdev_minor(it->s_dev) && !it->external) {
 				pr_err("%s is a fuse mount but not external\n", it->mountpoint);
 				goto out;
 			}
@@ -1594,6 +1630,22 @@ static int fusectl_dump(struct mount_info *pm)
 out:
 	closedir(fdir);
 	return ret;
+}
+
+static int cgroup_parse(struct mount_info *pm)
+{
+	if (!(root_ns_mask & CLONE_NEWCGROUP))
+		return 0;
+
+	/* cgroup namespaced mounts don't look rooted to CRIU, so let's fake it
+	 * here.
+	 */
+	xfree(pm->root);
+	pm->root = xstrdup("/");
+	if (!pm->root)
+		return -1;
+
+	return 0;
 }
 
 static int dump_empty_fs(struct mount_info *pm)
@@ -1681,6 +1733,7 @@ static struct fstype fstypes[32] = {
 	}, {
 		.name = "cgroup",
 		.code = FSTYPE__CGROUP,
+		.parse = cgroup_parse,
 	}, {
 		.name = "aufs",
 		.code = FSTYPE__AUFS,
@@ -2155,6 +2208,14 @@ static int propagate_mount(struct mount_info *mi)
 		list_for_each_entry(c, &t->children, siblings) {
 			if (mounts_equal(mi, c)) {
 				pr_debug("\t\tPropagate %s\n", c->mountpoint);
+
+				/*
+				 * When a mount is propagated, the result mount
+				 * is always shared. If we want to get a private
+				 * mount, we need to convert it.
+				 */
+				restore_shared_options(c, !c->shared_id, 0, 0);
+
 				c->mounted = true;
 				propagate_siblings(c);
 				umount_from_slaves(c);
@@ -2251,9 +2312,12 @@ static int do_new_mount(struct mount_info *mi)
 		return -1;
 	}
 
-	if (restore_shared_options(mi, !mi->shared_id && !mi->master_id,
-					mi->shared_id,
-					mi->master_id))
+	/*
+	 * A slave should be mounted from do_bind_mount().
+	 * Look at can_mount_now() for details.
+	 */
+	BUG_ON(mi->master_id);
+	if (restore_shared_options(mi, !mi->shared_id, mi->shared_id, 0))
 		return -1;
 
 	mi->mounted = true;
@@ -2272,10 +2336,51 @@ static int restore_ext_mount(struct mount_info *mi)
 	return ret;
 }
 
+static char mnt_clean_path[] = "/tmp/cr-tmpfs.XXXXXX";
+
+static int mount_clean_path()
+{
+	/*
+	 * To make a bind mount, we need to have access to a source directory,
+	 * which can be over-mounted. The idea is to mount a source mount in
+	 * an intermediate place without MS_REC and then create a target mounts.
+	 * This intermediate place should be a private mount to not affect
+	 * properties of the source mount.
+	 */
+	if (mkdtemp(mnt_clean_path) == NULL) {
+		pr_perror("Unable to create a temporary directory");
+		return -1;
+	}
+
+	if (mount(mnt_clean_path, mnt_clean_path, NULL, MS_BIND, NULL)) {
+		pr_perror("Unable to mount tmpfs into %s", mnt_clean_path);
+		return -1;
+	}
+
+	if (mount(NULL, mnt_clean_path, NULL, MS_PRIVATE, NULL)) {
+		pr_perror("Unable to mark %s as private", mnt_clean_path);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int umount_clean_path()
+{
+	if (umount2(mnt_clean_path, MNT_DETACH)) {
+		pr_perror("Unable to umount %s\n", mnt_clean_path);
+		return -1;
+	}
+
+	if (rmdir(mnt_clean_path)) {
+		pr_perror("Unable to remove %s", mnt_clean_path);
+	}
+
+	return 0;
+}
+
 static int do_bind_mount(struct mount_info *mi)
 {
-	char mnt_path_tmp[] = "/tmp/cr-tmpfs.XXXXXX";
-	char mnt_path_root[] = "/cr-tmpfs.XXXXXX";
 	char *root, *cut_root, rpath[PATH_MAX];
 	unsigned long mflags;
 	int exit_code = -1;
@@ -2312,7 +2417,12 @@ static int do_bind_mount(struct mount_info *mi)
 	if (list_empty(&mi->bind->children))
 		mnt_path = mi->bind->mountpoint;
 	else {
-		mnt_path = get_clean_mnt(mi->bind, mnt_path_tmp, mnt_path_root);
+		/* mi->bind->mountpoint may be overmounted */
+		if (mount(mi->bind->mountpoint, mnt_clean_path, NULL, MS_BIND, NULL)) {
+			pr_perror("Unable to bind-mount %s to %s",
+					mi->bind->mountpoint, mnt_clean_path);
+		}
+		mnt_path = mnt_clean_path;
 		umount_mnt_path = true;
 	}
 	if (mnt_path == NULL)
@@ -2399,10 +2509,6 @@ err:
 		}
 		if (umount2(mnt_path, MNT_DETACH)) {
 			pr_perror("Unable to umount %s", mnt_path);
-			return -1;
-		}
-		if (rmdir(mnt_path)) {
-			pr_perror("Unable to remove %s", mnt_path);
 			return -1;
 		}
 	}
@@ -3017,6 +3123,7 @@ static int populate_mnt_ns(void)
 	struct mount_info *pms;
 	struct ns_id *nsid;
 	struct mount_info *roots_mp = NULL;
+	int ret;
 
 	if (mnt_roots) {
 		/* mnt_roots is a tmpfs mount and it's private */
@@ -3061,7 +3168,14 @@ static int populate_mnt_ns(void)
 	if (populate_roots_yard())
 		return -1;
 
-	return mnt_tree_for_each(pms, do_mount_one);
+	if (mount_clean_path())
+		return -1;
+
+	ret = mnt_tree_for_each(pms, do_mount_one);
+
+	if (umount_clean_path())
+		return -1;
+	return ret;
 }
 
 int depopulate_roots_yard(void)

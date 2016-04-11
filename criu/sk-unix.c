@@ -1,6 +1,7 @@
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <libnl3/netlink/msg.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
 #include <sys/stat.h>
@@ -27,6 +28,7 @@
 #include "plugin.h"
 #include "namespaces.h"
 #include "pstree.h"
+#include "crtools.h"
 
 #include "protobuf.h"
 #include "images/sk-unix.pb-c.h"
@@ -474,17 +476,17 @@ const struct fdtype_ops unix_dump_ops = {
 /*
  * Returns: < 0 on error, 0 if OK, 1 to skip the socket
  */
-static int unix_process_name(struct unix_sk_desc *d, const struct unix_diag_msg *m, struct rtattr **tb)
+static int unix_process_name(struct unix_sk_desc *d, const struct unix_diag_msg *m, struct nlattr **tb)
 {
 	int len, ret;
 	char *name;
 
-	len = RTA_PAYLOAD(tb[UNIX_DIAG_NAME]);
+	len = nla_len(tb[UNIX_DIAG_NAME]);
 	name = xmalloc(len + 1);
 	if (!name)
 		return -ENOMEM;
 
-	memcpy(name, RTA_DATA(tb[UNIX_DIAG_NAME]), len);
+	memcpy(name, nla_data(tb[UNIX_DIAG_NAME]), len);
 	name[len] = '\0';
 
 	if (name[0] != '\0') {
@@ -580,7 +582,7 @@ skip:
 }
 
 static int unix_collect_one(const struct unix_diag_msg *m,
-			    struct rtattr **tb)
+			    struct nlattr **tb)
 {
 	struct unix_sk_desc *d;
 	int ret = 0;
@@ -598,12 +600,12 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 	d->fd = -1;
 
 	if (tb[UNIX_DIAG_SHUTDOWN])
-		d->shutdown = *(u8 *)RTA_DATA(tb[UNIX_DIAG_SHUTDOWN]);
+		d->shutdown = nla_get_u8(tb[UNIX_DIAG_SHUTDOWN]);
 	else
 		pr_err_once("No socket shutdown info\n");
 
 	if (tb[UNIX_DIAG_PEER])
-		d->peer_ino = *(int *)RTA_DATA(tb[UNIX_DIAG_PEER]);
+		d->peer_ino = nla_get_u32(tb[UNIX_DIAG_PEER]);
 
 	if (tb[UNIX_DIAG_NAME]) {
 		ret = unix_process_name(d, m, tb);
@@ -615,14 +617,14 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 	}
 
 	if (tb[UNIX_DIAG_ICONS]) {
-		int len = RTA_PAYLOAD(tb[UNIX_DIAG_ICONS]);
+		int len = nla_len(tb[UNIX_DIAG_ICONS]);
 		int i;
 
 		d->icons = xmalloc(len);
 		if (!d->icons)
 			goto err;
 
-		memcpy(d->icons, RTA_DATA(tb[UNIX_DIAG_ICONS]), len);
+		memcpy(d->icons, nla_data(tb[UNIX_DIAG_ICONS]), len);
 		d->nr_icons = len / sizeof(u32);
 
 		/*
@@ -673,10 +675,9 @@ skip:
 int unix_receive_one(struct nlmsghdr *h, void *arg)
 {
 	struct unix_diag_msg *m = NLMSG_DATA(h);
-	struct rtattr *tb[UNIX_DIAG_MAX+1];
+	struct nlattr *tb[UNIX_DIAG_MAX+1];
 
-	parse_rtattr(tb, UNIX_DIAG_MAX, (struct rtattr *)(m + 1),
-		     h->nlmsg_len - NLMSG_LENGTH(sizeof(*m)));
+	nlmsg_parse(h, sizeof(struct unix_diag_msg), tb, UNIX_DIAG_MAX, NULL);
 
 	return unix_collect_one(m, tb);
 }
@@ -1281,12 +1282,21 @@ static void unlink_stale(struct unix_sk_info *ui)
 	revert_unix_sk_cwd(&cwd_fd);
 }
 
-static int collect_one_unixsk(void *o, ProtobufCMessage *base)
+static int resolve_unix_peers(void *unused);
+
+static int collect_one_unixsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 {
 	struct unix_sk_info *ui = o;
+	static bool post_queued = false;
 
 	ui->ue = pb_msg(base, UnixSkEntry);
 	ui->name_dir = (void *)ui->ue->name_dir;
+
+	if (ui->ue->peer && !post_queued) {
+		post_queued = true;
+		if (add_post_prepare_cb(resolve_unix_peers, NULL))
+			return -1;
+	}
 
 	if (ui->ue->name.len) {
 		if (ui->ue->name.len > UNIX_PATH_MAX) {
@@ -1320,12 +1330,7 @@ struct collect_image_info unix_sk_cinfo = {
 	.flags = COLLECT_SHARED,
 };
 
-int collect_unix_sockets(void)
-{
-	return read_sk_queues();
-}
-
-int resolve_unix_peers(void)
+static int resolve_unix_peers(void *unused)
 {
 	struct unix_sk_info *ui, *peer;
 	struct fdinfo_list_entry *fle, *fle_peer;

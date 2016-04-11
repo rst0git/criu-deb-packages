@@ -124,12 +124,22 @@ void rst_mem_switch_to_private(void)
 	rst_mems[RM_PRIVATE].enabled = true;
 }
 
+void rst_mem_align(int type)
+{
+	struct rst_mem_type_s *t = &rst_mems[type];
+	void *ptr;
+
+	ptr = (void *) round_up((unsigned long)t->free_mem, sizeof(void *));
+	t->free_bytes -= (ptr - t->free_mem);
+	t->free_mem = ptr;
+}
+
 unsigned long rst_mem_align_cpos(int type)
 {
 	struct rst_mem_type_s *t = &rst_mems[type];
 	BUG_ON(!t->remapable || !t->enabled);
 
-	t->free_mem = (void *) round_up((unsigned long)t->free_mem, sizeof(void *));
+	rst_mem_align(type);
 
 	return t->free_mem - t->buf;
 }

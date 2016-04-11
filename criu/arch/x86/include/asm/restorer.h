@@ -5,32 +5,6 @@
 #include "asm/fpu.h"
 #include "images/core.pb-c.h"
 
-struct pt_regs {
-	unsigned long	r15;
-	unsigned long	r14;
-	unsigned long	r13;
-	unsigned long	r12;
-	unsigned long	bp;
-	unsigned long	bx;
-
-	unsigned long	r11;
-	unsigned long	r10;
-	unsigned long	r9;
-	unsigned long	r8;
-	unsigned long	ax;
-	unsigned long	cx;
-	unsigned long	dx;
-	unsigned long	si;
-	unsigned long	di;
-	unsigned long	orig_ax;
-
-	unsigned long	ip;
-	unsigned long	cs;
-	unsigned long	flags;
-	unsigned long	sp;
-	unsigned long	ss;
-};
-
 struct rt_sigcontext {
 	unsigned long			r8;
 	unsigned long			r9;
@@ -159,7 +133,7 @@ struct rt_sigframe {
 		     : "memory")
 #endif /* CONFIG_X86_64 */
 
-#define RT_SIGFRAME_UC(rt_sigframe) rt_sigframe->uc
+#define RT_SIGFRAME_UC(rt_sigframe) (&rt_sigframe->uc)
 #define RT_SIGFRAME_REGIP(rt_sigframe) (rt_sigframe)->uc.uc_mcontext.rip
 #define RT_SIGFRAME_HAS_FPU(rt_sigframe) (rt_sigframe)->fpu_state.has_fpu
 #define RT_SIGFRAME_FPU(rt_sigframe) (rt_sigframe)->fpu_state
