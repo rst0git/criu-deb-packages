@@ -1,0 +1,33 @@
+From 8c9e6f3413448a249c9a243b0f25de62f6f7ac04 Mon Sep 17 00:00:00 2001
+From: Cyrill Gorcunov <gorcunov@openvz.org>
+Date: Thu, 5 May 2016 14:44:46 +0300
+Subject: [PATCH] build: Don't pass --wrap on every linking file only for CRIU
+ target only
+
+https://github.com/xemul/criu/issues/155
+
+Signed-off-by: Cyrill Gorcunov <gorcunov@openvz.org>
+---
+ criu/Makefile | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/criu/Makefile
++++ b/criu/Makefile
+@@ -8,7 +8,7 @@ CFLAGS			+= $(USERCFLAGS)
+ 
+ # here is a workaround for a bug in libnl-3:
+ # 6a8d90f5fec4 "attr: Allow attribute type 0" 
+-LDFLAGS			+= -Wl,--wrap=nla_parse,--wrap=nlmsg_parse
++WRAPFLAGS		+= -Wl,--wrap=nla_parse,--wrap=nlmsg_parse
+ 
+ export HOSTCC HOSTLD HOSTCFLAGS
+ 
+@@ -177,7 +177,7 @@ built-in.o: pie
+ 
+ criu: $(PROGRAM-BUILTINS)
+ 	$(call msg-link, $@)
+-	$(Q) $(CC) $(CFLAGS) $^ $(ARCH-LIB) $(LIBS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@
++	$(Q) $(CC) $(CFLAGS) $^ $(ARCH-LIB) $(LIBS) $(WRAPFLAGS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@
+ 
+ 
+ subclean:
