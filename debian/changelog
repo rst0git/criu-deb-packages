@@ -1,3 +1,11 @@
+criu (2.1-1) experimental; urgency=medium
+
+  * Imported Upstream version 2.1
+  * Declare compliance with Debian policy 3.9.8
+  * Don't pass --wrap on every linking file only for CRIU target only
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 05 May 2016 14:28:03 +0200
+
 criu (2.0-2) unstable; urgency=medium
 
   * Upload to unstable
