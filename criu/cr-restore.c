@@ -1024,7 +1024,7 @@ static int wait_on_helpers_zombies(void)
 		switch (pi->state) {
 		case TASK_DEAD:
 			if (waitid(P_PID, pid, NULL, WNOWAIT | WEXITED) < 0) {
-				pr_perror("Wait on %d zombie failed\n", pid);
+				pr_perror("Wait on %d zombie failed", pid);
 				return -1;
 			}
 			break;
@@ -1291,7 +1291,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 	 * move_in_cgroup(), so drop this flag here as well.
 	 */
 	ret = clone(restore_task_with_children, ca.stack_ptr,
-		    (ca.clone_flags & (~CLONE_NEWNET | ~CLONE_NEWCGROUP)) | SIGCHLD, &ca);
+		    (ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP)) | SIGCHLD, &ca);
 
 	if (ret < 0) {
 		pr_perror("Can't fork for %d", pid);
@@ -1643,6 +1643,11 @@ static int restore_task_with_children(void *_arg)
 			goto err;
 	}
 
+	/* Wait prepare_userns */
+	if (current->parent == NULL &&
+            restore_finish_stage(CR_STATE_RESTORE_NS) < 0)
+			goto err;
+
 	/*
 	 * Call this _before_ forking to optimize cgroups
 	 * restore -- if all tasks live in one set of cgroups
@@ -1654,9 +1659,6 @@ static int restore_task_with_children(void *_arg)
 
 	/* Restore root task */
 	if (current->parent == NULL) {
-		if (restore_finish_stage(CR_STATE_RESTORE_NS) < 0)
-			goto err;
-
 		pr_info("Calling restore_sid() for init\n");
 		restore_sid();
 
@@ -1866,6 +1868,9 @@ static int clear_breakpoints()
 {
 	struct pstree_item *item;
 	int ret = 0, i;
+
+	if (fault_injected(FI_NO_BREAKPOINTS))
+		return 0;
 
 	for_each_pstree_item(item) {
 		if (!task_alive(item))
@@ -2174,6 +2179,10 @@ static int restore_root_task(struct pstree_item *init)
 	finalize_restore_detach(ret);
 
 	write_stats(RESTORE_STATS);
+
+	ret = run_scripts(ACT_POST_RESUME);
+	if (ret != 0)
+		pr_err("Post-resume script ret code %d\n", ret);
 
 	if (!opts.restore_detach && !opts.exec_cmd)
 		wait(NULL);

@@ -619,9 +619,9 @@ int cr_system_userns(int in, int out, int err, char *cmd,
 		}
 
 		if (out < 0)
-			out = log_get_fd();
+			out = DUP_SAFE(log_get_fd(), out_chld);
 		if (err < 0)
-			err = log_get_fd();
+			err = DUP_SAFE(log_get_fd(), out_chld);
 
 		/*
 		 * out, err, in should be a separate fds,
