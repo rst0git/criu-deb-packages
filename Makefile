@@ -101,6 +101,12 @@ else
         CFLAGS		+= -O2 -g
 endif
 
+ifeq ($(GMON),1)
+        CFLAGS		+= -pg
+        GMONLDOPT	+= -pg
+export GMON GMONLDOPT
+endif
+
 CFLAGS			+= $(WARNINGS) $(DEFINES)
 
 #
@@ -228,7 +234,8 @@ help:
 	@echo '    * criu            - Build criu'
 	@echo '      zdtm            - Build zdtm test-suite'
 	@echo '      docs            - Build documentation'
-	@echo '      install         - Install binary and man page'
+	@echo '      install         - Install CRIU (see INSTALL.md)'
+	@echo '      uninstall       - Uninstall CRIU'
 	@echo '      dist            - Create a source tarball'
 	@echo '      clean           - Clean most, but leave enough to navigate'
 	@echo '      mrproper        - Delete all compiled/generated files'
