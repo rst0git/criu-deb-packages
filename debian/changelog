@@ -1,3 +1,10 @@
+criu (2.2-1) unstable; urgency=medium
+
+  * Imported Upstream version 2.2
+  * Drop build-Don-t-pass-wrap-on-every-linking-file-only-for.patch
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Fri, 20 May 2016 14:18:04 +0200
+
 criu (2.1-2) unstable; urgency=medium
 
   * Upload to unstable
