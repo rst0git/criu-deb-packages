@@ -1,3 +1,10 @@
+criu (2.3-1) experimental; urgency=medium
+
+  * Imported Upstream version 2.3
+  * debian/copyright: Use HTTPS transport protocol for Format URL
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Fri, 17 Jun 2016 07:09:17 +0200
+
 criu (2.2-1) unstable; urgency=medium
 
   * Imported Upstream version 2.2
