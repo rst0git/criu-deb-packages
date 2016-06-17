@@ -19,7 +19,7 @@
 #include "file-lock.h"
 #include "image.h"
 #include "list.h"
-#include "util.h"
+#include "rst-malloc.h"
 #include "util-pie.h"
 #include "lock.h"
 #include "sockets.h"
@@ -887,7 +887,7 @@ static int send_fd_to_self(int fd, struct fdinfo_list_entry *fle, int *sock)
 		return -1;
 
 	pr_info("\t\t\tGoing to dup %d into %d\n", fd, dfd);
-	if (move_img_fd(sock, dfd))
+	if (move_fd_from(sock, dfd))
 		return -1;
 
 	if (dup2(fd, dfd) != dfd) {
@@ -1591,4 +1591,18 @@ bool external_lookup_id(char *id)
 		if (!strcmp(ext->id, id))
 			return true;
 	return false;
+}
+
+char *external_lookup_by_key(char *key)
+{
+	struct external *ext;
+	int len = strlen(key);
+
+	list_for_each_entry(ext, &opts.external, node) {
+		if (strncmp(ext->id, key, len))
+			continue;
+		if (ext->id[len] == ':')
+			return ext->id + len + 1;
+	}
+	return NULL;
 }

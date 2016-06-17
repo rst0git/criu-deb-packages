@@ -176,7 +176,9 @@ static inline int vfi_equal(struct vma_file_info *a, struct vma_file_info *b)
 }
 
 static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
-		struct vma_file_info *vfi, struct vma_file_info *prev_vfi)
+			   struct vma_file_info *vfi,
+			   struct vma_file_info *prev_vfi,
+			   int *vm_file_fd)
 {
 	char path[32];
 	int flags;
@@ -188,12 +190,11 @@ static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 		 * If vfi is equal (!) and negative @vm_file_fd --
 		 * we have nothing to borrow for sure.
 		 */
-		if (prev->vm_file_fd < 0)
+		if (*vm_file_fd < 0)
 			return 0;
 
 		pr_debug("vma %"PRIx64" borrows vfi from previous %"PRIx64"\n",
 				vma->e->start, prev->e->start);
-		vma->vm_file_fd = prev->vm_file_fd;
 		if (prev->e->status & VMA_AREA_SOCKET)
 			vma->e->status |= VMA_AREA_SOCKET | VMA_AREA_REGULAR;
 
@@ -208,6 +209,7 @@ static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 
 		return 0;
 	}
+	close_safe(vm_file_fd);
 
 	/* Figure out if it's file mapping */
 	snprintf(path, sizeof(path), "%"PRIx64"-%"PRIx64, vma->e->start, vma->e->end);
@@ -228,8 +230,8 @@ static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 		 */
 		flags = O_RDONLY;
 
-	vma->vm_file_fd = openat(dirfd(mfd), path, flags);
-	if (vma->vm_file_fd < 0) {
+	*vm_file_fd = openat(dirfd(mfd), path, flags);
+	if (*vm_file_fd < 0) {
 		if (errno == ENOENT)
 			/* Just mapping w/o map_files link */
 			return 0;
@@ -249,8 +251,7 @@ static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 
 			if ((buf.st_mode & S_IFMT) == 0 && !strncmp(fname, AIO_FNAME, sizeof(AIO_FNAME) - 1)) {
 				/* AIO ring, let's try */
-				close(vma->vm_file_fd);
-				vma->aio_nr_req = -1;
+				close_safe(vm_file_fd);
 				vma->e->status = VMA_AREA_AIORING;
 				return 0;
 			}
@@ -340,7 +341,7 @@ static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 				return -1;
 			}
 
-			vma->vm_file_fd = fd;
+			*vm_file_fd = fd;
 			return 0;
 		}
 
@@ -364,14 +365,14 @@ static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 	if (opts.aufs) {
 		int ret;
 
-		ret = fixup_aufs_vma_fd(vma);
+		ret = fixup_aufs_vma_fd(vma, *vm_file_fd);
 		if (ret < 0)
 			return -1;
 		if (ret > 0)
 			return 0;
 	}
 
-	if (fstat(vma->vm_file_fd, vma->vmst) < 0) {
+	if (fstat(*vm_file_fd, vma->vmst) < 0) {
 		pr_perror("Failed fstat on map %"PRIx64"", vma->e->start);
 		return -1;
 	}
@@ -382,6 +383,7 @@ static int vma_get_mapfile(char *fname, struct vma_area *vma, DIR *mfd,
 int parse_self_maps_lite(struct vm_area_list *vms)
 {
 	FILE *maps;
+	struct vma_area *prev = NULL;
 
 	vm_area_list_init(vms);
 
@@ -394,17 +396,31 @@ int parse_self_maps_lite(struct vm_area_list *vms)
 	while (fgets(buf, BUF_SIZE, maps) != NULL) {
 		struct vma_area *vma;
 		char *end;
+		unsigned long s, e;
 
-		vma = alloc_vma_area();
-		if (!vma) {
-			fclose(maps);
-			return -1;
+		s = strtoul(buf, &end, 16);
+		e = strtoul(end + 1, NULL, 16);
+
+		if (prev && prev->e->end == s)
+			/*
+			 * This list is needed for one thing only -- to
+			 * get the idea of what parts of current address
+			 * space are busy. So merge them alltogether.
+			 */
+			prev->e->end = e;
+		else {
+			vma = alloc_vma_area();
+			if (!vma) {
+				fclose(maps);
+				return -1;
+			}
+
+			vma->e->start = s;
+			vma->e->end = e;
+			list_add_tail(&vma->list, &vms->h);
+			vms->nr++;
+			prev = vma;
 		}
-
-		vma->e->start = strtoul(buf, &end, 16);
-		vma->e->end = strtoul(end + 1, NULL, 16);
-		list_add_tail(&vma->list, &vms->h);
-		vms->nr++;
 
 		pr_debug("Parsed %"PRIx64"-%"PRIx64" vma\n", vma->e->start, vma->e->end);
 	}
@@ -447,9 +463,11 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area,
 			char *file_path, DIR *map_files_dir,
 			struct vma_file_info *vfi,
 			struct vma_file_info *prev_vfi,
-			struct vm_area_list *vma_area_list)
+			struct vm_area_list *vma_area_list,
+			int *vm_file_fd)
 {
-	if (vma_get_mapfile(file_path, vma_area, map_files_dir, vfi, prev_vfi))
+	if (vma_get_mapfile(file_path, vma_area, map_files_dir,
+					vfi, prev_vfi, vm_file_fd))
 		goto err_bogus_mapfile;
 
 	if (vma_area->e->status != 0) {
@@ -488,7 +506,7 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area,
 		vma_area->e->shmid = prev->e->shmid;
 		vma_area->vmst = prev->vmst;
 		vma_area->mnt_id = prev->mnt_id;
-	} else if (vma_area->vm_file_fd >= 0) {
+	} else if (*vm_file_fd >= 0) {
 		struct stat *st_buf = vma_area->vmst;
 
 		if (S_ISREG(st_buf->st_mode))
@@ -530,7 +548,7 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area,
 		 * have mnt_id.
 		 */
 		if (vma_area->mnt_id != -1 &&
-		    get_fd_mntid(vma_area->vm_file_fd, &vma_area->mnt_id))
+		    get_fd_mntid(*vm_file_fd, &vma_area->mnt_id))
 			return -1;
 	} else {
 		/*
@@ -551,7 +569,7 @@ err:
 err_bogus_mapping:
 	pr_err("Bogus mapping 0x%"PRIx64"-0x%"PRIx64" (flags: %#x vm_file_fd: %d)\n",
 	       vma_area->e->start, vma_area->e->end,
-	       vma_area->e->flags, vma_area->vm_file_fd);
+	       vma_area->e->flags, *vm_file_fd);
 	goto err;
 
 err_bogus_mapfile:
@@ -592,12 +610,13 @@ static int vma_list_add(struct vma_area *vma_area,
 	return 0;
 }
 
-int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list)
+int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list,
+					dump_filemap_t dump_filemap)
 {
 	struct vma_area *vma_area = NULL;
 	unsigned long start, end, pgoff, prev_end = 0;
 	char r, w, x, s;
-	int ret = -1;
+	int ret = -1, vm_file_fd = -1;
 	struct vma_file_info vfi;
 	struct vma_file_info prev_vfi = {};
 
@@ -692,8 +711,14 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list)
 		}
 
 		if (handle_vma(pid, vma_area, str + path_off, map_files_dir,
-					&vfi, &prev_vfi, vma_area_list))
+				&vfi, &prev_vfi, vma_area_list, &vm_file_fd))
 			goto err;
+
+		if (vma_entry_is(vma_area->e, VMA_FILE_PRIVATE) ||
+				vma_entry_is(vma_area->e, VMA_FILE_SHARED)) {
+			if (dump_filemap && dump_filemap(vma_area, vm_file_fd))
+				goto err;
+		}
 	}
 
 	vma_area = NULL;
@@ -702,6 +727,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list)
 err:
 	bclose(&f);
 err_n:
+	close_safe(&vm_file_fd);
 	if (map_files_dir)
 		closedir(map_files_dir);
 
@@ -1387,10 +1413,21 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 
 		if (new->fstype->parse) {
 			ret = new->fstype->parse(new);
-			if (ret) {
+			if (ret < 0) {
 				pr_err("Failed to parse FS specific data on %s\n",
 						new->mountpoint);
+				mnt_entry_free(new);
+				new = NULL;
 				goto end;
+			}
+
+			if (ret > 0) {
+				pr_info("\tskipping fs mounted at %s\n", new->mountpoint + 1);
+				mnt_entry_free(new);
+				new = NULL;
+				ret = 0;
+				goto end;
+
 			}
 		}
 end:
@@ -1930,6 +1967,11 @@ static int parse_file_lock_buf(char *buf, struct file_lock *fl,
 	return 0;
 }
 
+static bool pid_in_pstree(pid_t pid)
+{
+	return pstree_item_by_real(pid) != NULL;
+}
+
 int parse_file_locks(void)
 {
 	struct file_lock *fl;
@@ -2145,6 +2187,7 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 			t[nr - 1].virt = -1;
 		}
 		t[nr - 1].real = atoi(de->d_name);
+		t[nr - 1].state = TASK_THREAD;
 		nr++;
 	}
 

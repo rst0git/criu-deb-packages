@@ -218,7 +218,7 @@ int reopen_fd_as_safe(char *file, int line, int new_fd, int old_fd, bool allow_r
 	return 0;
 }
 
-int move_img_fd(int *img_fd, int want_fd)
+int move_fd_from(int *img_fd, int want_fd)
 {
 	if (*img_fd == want_fd) {
 		int tmp;
@@ -558,18 +558,6 @@ int is_anon_link_type(char *link, char *type)
 	return !strcmp(link, aux);
 }
 
-void *shmalloc(size_t bytes)
-{
-	rst_mem_align(RM_SHARED);
-	return rst_mem_alloc(bytes, RM_SHARED);
-}
-
-/* Only last chunk can be released */
-void shfree_last(void *ptr)
-{
-	rst_mem_free_last(RM_SHARED);
-}
-
 #define DUP_SAFE(fd, out)						\
 	({							\
 		int ret__;					\
@@ -633,8 +621,8 @@ int cr_system_userns(int in, int out, int err, char *cmd,
 		if (out == in)
 			out = DUP_SAFE(out, out_chld);
 
-		if (move_img_fd(&out, STDIN_FILENO) ||
-		    move_img_fd(&err, STDIN_FILENO))
+		if (move_fd_from(&out, STDIN_FILENO) ||
+		    move_fd_from(&err, STDIN_FILENO))
 			goto out_chld;
 
 		if (in < 0) {
@@ -644,7 +632,7 @@ int cr_system_userns(int in, int out, int err, char *cmd,
 				goto out_chld;
 		}
 
-		if (move_img_fd(&err, STDOUT_FILENO))
+		if (move_fd_from(&err, STDOUT_FILENO))
 			goto out_chld;
 
 		if (reopen_fd_as_nocheck(STDOUT_FILENO, out))
@@ -800,7 +788,6 @@ struct vma_area *alloc_vma_area(void)
 	if (p) {
 		p->e = (VmaEntry *)(p + 1);
 		vma_entry__init(p->e);
-		p->vm_file_fd = -1;
 		p->e->fd = -1;
 	}
 
@@ -942,21 +929,6 @@ int fd_has_data(int lfd)
 	}
 
 	return ret;
-}
-
-size_t read_into_buffer(int fd, char *buff, size_t size)
-{
-	size_t n = 0;
-	size_t curr = 0;
-
-	while (1) {
-		n  = read(fd, buff + curr, size - curr);
-		if (n < 1)
-			return n;
-		curr += n;
-		if (curr == size)
-			return size;
-	}
 }
 
 int make_yard(char *path)
@@ -1189,17 +1161,18 @@ int setup_tcp_client(char *addr)
 
 	pr_info("Connecting to server %s:%u\n", addr, (int)ntohs(opts.port));
 
+	if (get_sockaddr_in(&saddr, addr))
+		return -1;
+
 	sk = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sk < 0) {
 		pr_perror("Can't create socket");
 		return -1;
 	}
 
-	if (get_sockaddr_in(&saddr, addr))
-		return -1;
-
 	if (connect(sk, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
 		pr_perror("Can't connect to server");
+		close(sk);
 		return -1;
 	}
 

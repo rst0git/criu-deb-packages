@@ -38,6 +38,8 @@
 #undef	LOG_PREFIX
 #define LOG_PREFIX "mnt: "
 
+static struct fstype fstypes[];
+
 int ext_mount_add(char *key, char *val)
 {
 	struct ext_mount *em;
@@ -483,15 +485,42 @@ static void mnt_tree_show(struct mount_info *tree, int off)
 static int try_resolve_ext_mount(struct mount_info *info)
 {
 	struct ext_mount *em;
+	char devstr[64];
 
 	em = ext_mount_lookup(info->mountpoint + 1 /* trim the . */);
-	if (em == NULL)
-		return -ENOTSUP;
+	if (em) {
+		pr_info("Found %s mapping for %s mountpoint\n",
+				em->val, info->mountpoint);
+		info->external = em;
+		return 0;
+	}
 
-	pr_info("Found %s mapping for %s mountpoint\n",
-			em->val, info->mountpoint);
-	info->external = em;
-	return 0;
+	snprintf(devstr, sizeof(devstr), "dev[%d/%d]",
+			kdev_major(info->s_dev),  kdev_minor(info->s_dev));
+
+	if (info->fstype->code == FSTYPE__UNSUPPORTED) {
+		char *val;
+
+		val = external_lookup_by_key(devstr);
+		if (val) {
+			char *source;
+			int len;
+
+			len = strlen(val) + sizeof("dev[]");
+			source = xmalloc(len);
+			if (source == NULL)
+				return -1;
+
+			snprintf(source, len, "dev[%s]", val);
+			info->fstype = &fstypes[1];
+			BUG_ON(info->fstype->code != FSTYPE__AUTO);
+			xfree(info->source);
+			info->source = source;
+			return 0;
+		}
+	}
+
+	return -ENOTSUP;
 }
 
 static struct mount_info *find_widest_shared(struct mount_info *m)
@@ -777,6 +806,8 @@ static char *cut_root_for_bind(char *target_root, char *source_root)
 			break;
 		BUG_ON(target_root[tok] == '\0');
 	}
+	if (target_root[tok] == '/')
+		tok++;
 
 	return target_root + tok;
 
@@ -1122,8 +1153,10 @@ static char *get_clean_mnt(struct mount_info *mi, char *mnt_path_tmp, char *mnt_
 	return mnt_path;
 }
 
+#define MNT_UNREACHABLE INT_MIN
 static int open_mountpoint(struct mount_info *pm)
 {
+	struct mount_info *c;
 	int fd = -1, ns_old = -1;
 	char mnt_path_tmp[] = "/tmp/cr-tmpfs.XXXXXX";
 	char mnt_path_root[] = "/cr-tmpfs.XXXXXX";
@@ -1138,6 +1171,13 @@ static int open_mountpoint(struct mount_info *pm)
 		return __open_mountpoint(pm, -1);
 
 	pr_info("Something is mounted on top of %s\n", pm->mountpoint);
+
+	list_for_each_entry(c, &pm->children, siblings) {
+		if (!strcmp(c->mountpoint, pm->mountpoint)) {
+			pr_debug("%d:%s is overmounted\n", pm->mnt_id, pm->mountpoint);
+			return MNT_UNREACHABLE;
+		}
+	}
 
 	/*
 	 * To create a "private" copy, the target mount is bind-mounted
@@ -1221,13 +1261,13 @@ static int tmpfs_dump(struct mount_info *pm)
 
 	fd = open_mountpoint(pm);
 	if (fd < 0)
-		return -1;
+		return fd;
 
 	/* if fd happens to be 0 here, we need to move it to something
 	 * non-zero, because cr_system_userns closes STDIN_FILENO as we are not
 	 * interested in passing stdin to tar.
 	 */
-	if (move_img_fd(&fd, STDIN_FILENO) < 0)
+	if (move_fd_from(&fd, STDIN_FILENO) < 0)
 		goto out;
 
 	if (fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) & ~FD_CLOEXEC) == -1) {
@@ -1432,7 +1472,7 @@ static int binfmt_misc_dump(struct mount_info *pm)
 
 	fd = open_mountpoint(pm);
 	if (fd < 0)
-		return -1;
+		return fd;
 
 	fdir = fdopendir(fd);
 	if (fdir == NULL) {
@@ -1603,7 +1643,7 @@ static int fusectl_dump(struct mount_info *pm)
 
 	fd = open_mountpoint(pm);
 	if (fd < 0)
-		return -1;
+		return fd;
 
 	fdir = fdopendir(fd);
 	if (fdir == NULL) {
@@ -1638,6 +1678,22 @@ out:
 	return ret;
 }
 
+static int debugfs_parse(struct mount_info *pm)
+{
+	/* tracefs is automounted underneath debugfs sometimes, and the
+	 * kernel's overmounting protection prevents us from mounting debugfs
+	 * first without tracefs, so let's always mount debugfs MS_REC.
+	 */
+	pm->flags |= MS_REC;
+
+	return 0;
+}
+
+static int tracefs_parse(struct mount_info *pm)
+{
+	return 1;
+}
+
 static int cgroup_parse(struct mount_info *pm)
 {
 	if (!(root_ns_mask & CLONE_NEWCGROUP))
@@ -1657,10 +1713,10 @@ static int cgroup_parse(struct mount_info *pm)
 static int dump_empty_fs(struct mount_info *pm)
 {
 	int fd, ret = -1;
-	fd = open_mountpoint(pm);
 
+	fd = open_mountpoint(pm);
 	if (fd < 0)
-		return -1;
+		return fd;
 
 	ret = is_empty_dir(fd);
 	close(fd);
@@ -1739,6 +1795,11 @@ static struct fstype fstypes[] = {
 	}, {
 		.name = "debugfs",
 		.code = FSTYPE__DEBUGFS,
+		.parse = debugfs_parse,
+	}, {
+		.name = "tracefs",
+		.code = FSTYPE__TRACEFS,
+		.parse = tracefs_parse,
 	}, {
 		.name = "cgroup",
 		.code = FSTYPE__CGROUP,
@@ -1856,6 +1917,41 @@ uns:
 	return &fstypes[0];
 }
 
+static int dump_one_fs(struct mount_info *mi)
+{
+	struct mount_info *pm = mi;
+	struct mount_info *t;
+	bool first = true;
+
+	if (mi->is_ns_root || mi->need_plugin || mi->external || !mi->fstype->dump)
+		return 0;
+
+	/* mnt_bind is a cycled list, so list_for_each can't be used here. */
+	for (; &pm->mnt_bind != &mi->mnt_bind || first;
+	     pm = list_entry(pm->mnt_bind.next, typeof(*pm), mnt_bind)) {
+		int ret;
+
+		first = false;
+
+		if (!fsroot_mounted(pm))
+			continue;
+
+		ret = pm->fstype->dump(pm);
+		if (ret == MNT_UNREACHABLE)
+			continue;
+		if (ret < 0)
+			return ret;
+
+		list_for_each_entry(t, &pm->mnt_bind, mnt_bind)
+			t->dumped = true;
+		return 0;
+	}
+
+	pr_err("Unable to dump a file system for %d:%s\n",
+				mi->mnt_id, mi->mountpoint);
+	return -1;
+}
+
 static int dump_one_mountpoint(struct mount_info *pm, struct cr_img *img)
 {
 	MntEntry me = MNT_ENTRY__INIT;
@@ -1868,16 +1964,9 @@ static int dump_one_mountpoint(struct mount_info *pm, struct cr_img *img)
 	if (me.fstype == FSTYPE__AUTO)
 		me.fsname = pm->fsname;
 
-	if (pm->parent && !pm->dumped && !pm->need_plugin && !pm->external &&
-	    pm->fstype->dump && fsroot_mounted(pm)) {
-		struct mount_info *t;
 
-		if (pm->fstype->dump(pm))
-			return -1;
-
-		list_for_each_entry(t, &pm->mnt_bind, mnt_bind)
-			t->dumped = true;
-	}
+	if (!pm->dumped && dump_one_fs(pm))
+		return -1;
 
 	me.mnt_id		= pm->mnt_id;
 	me.root_dev		= pm->s_dev;
@@ -2084,6 +2173,11 @@ static char *resolve_source(struct mount_info *mi)
 
 	if (mi->fstype->code == FSTYPE__AUTO) {
 		struct stat st;
+		char *val;
+
+		val = external_lookup_by_key(mi->source);
+		if (val)
+			return val;
 
 		if (!stat(mi->source, &st) && S_ISBLK(st.st_mode) &&
 		    major(st.st_rdev) == kdev_major(mi->s_dev) &&
@@ -2284,7 +2378,7 @@ static int do_new_mount(struct mount_info *mi)
 	if (!src)
 		return -1;
 
-	/* Merge superblock and mount flags if it's posiable */
+	/* Merge superblock and mount flags if it's possible */
 	if (!(mflags & ~MS_MNT_KNOWN_FLAGS) && !((sflags ^ mflags) & MS_RDONLY)) {
 		sflags |= mflags;
 		mflags = 0;
@@ -2301,9 +2395,11 @@ static int do_new_mount(struct mount_info *mi)
 	if (tp->restore && tp->restore(mi))
 		return -1;
 
-	if (remount_ro)
-		return mount(NULL, mi->mountpoint, tp->name,
-			     MS_REMOUNT | MS_RDONLY, NULL);
+	if (remount_ro && mount(NULL, mi->mountpoint, tp->name,
+				     MS_REMOUNT | MS_RDONLY, NULL)) {
+		pr_perror("Unable to apply mount options");
+		return -1;
+	}
 
 	if (mflags && mount(NULL, mi->mountpoint, NULL,
 				MS_REMOUNT | MS_BIND | mflags, NULL)) {
@@ -2380,15 +2476,17 @@ static int umount_clean_path()
 
 static int do_bind_mount(struct mount_info *mi)
 {
+	char mnt_fd_path[PSFDS];
 	char *root, *cut_root, rpath[PATH_MAX];
 	unsigned long mflags;
-	int exit_code = -1;
+	int exit_code = -1, mp_len;
 	bool shared = false;
 	bool master = false;
 	bool private = false;
 	char *mnt_path = NULL;
 	struct stat st;
 	bool umount_mnt_path = false;
+	struct mount_info *c;
 
 	if (mi->need_plugin) {
 		if (restore_ext_mount(mi))
@@ -2413,20 +2511,55 @@ static int do_bind_mount(struct mount_info *mi)
 	private = !mi->master_id && !shared;
 	cut_root = cut_root_for_bind(mi->root, mi->bind->root);
 
-	if (list_empty(&mi->bind->children))
-		mnt_path = mi->bind->mountpoint;
-	else {
-		/* mi->bind->mountpoint may be overmounted */
-		if (mount(mi->bind->mountpoint, mnt_clean_path, NULL, MS_BIND, NULL)) {
+	/* Mount private can be initialized on mount() callback, which is
+	 * called only once.
+	 * It have to be copied to all it's sibling structures to provide users
+	 * of it with actual data.
+	 */
+	mi->private = mi->bind->private;
+
+	mnt_path = mi->bind->mountpoint;
+
+	/* Access a mount by fd if mi->bind->mountpoint is overmounted */
+	if (mi->bind->fd >= 0) {
+		snprintf(mnt_fd_path, sizeof(mnt_fd_path),
+					"/proc/self/fd/%d", mi->bind->fd);
+		mnt_path = mnt_fd_path;
+	}
+
+	if (cut_root[0] == 0) /* This case is handled by mi->bind->fd */
+		goto skip_overmount_check;
+
+	/*
+	 * The target path may be over-mounted by one of child mounts
+	 * and we need to create a new bind-mount to get access to the path.
+	 */
+	mp_len = strlen(mi->bind->mountpoint);
+	if (mp_len > 1) /* skip a joining / if mi->bind->mountpoint isn't "/" */
+		mp_len++;
+
+	list_for_each_entry(c, &mi->bind->children, siblings) {
+		if (!c->mounted)
+			continue;
+		if (issubpath(cut_root, c->mountpoint + mp_len))
+			break; /* a source path is overmounted */
+	}
+
+	if (&c->siblings != &mi->bind->children) {
+		/* Get a copy of mi->bind without child mounts */
+		if (mount(mnt_path, mnt_clean_path, NULL, MS_BIND, NULL)) {
 			pr_perror("Unable to bind-mount %s to %s",
 					mi->bind->mountpoint, mnt_clean_path);
+			return -1;
 		}
 		mnt_path = mnt_clean_path;
 		umount_mnt_path = true;
 	}
+
 	if (mnt_path == NULL)
 		return -1;
 
+skip_overmount_check:
 	snprintf(rpath, sizeof(rpath), "%s/%s",
 			mnt_path, cut_root);
 	root = rpath;
@@ -2459,7 +2592,7 @@ do_bind:
 		}
 	}
 
-	if (mount(root, mi->mountpoint, NULL, MS_BIND, NULL) < 0) {
+	if (mount(root, mi->mountpoint, NULL, MS_BIND | (mi->flags & MS_REC), NULL) < 0) {
 		pr_perror("Can't mount at %s", mi->mountpoint);
 		goto err;
 	}
@@ -2572,6 +2705,12 @@ static int do_mount_root(struct mount_info *mi)
 	return fetch_rt_stat(mi, mi->mountpoint);
 }
 
+static int do_close_one(struct mount_info *mi)
+{
+	close_safe(&mi->fd);
+	return 0;
+}
+
 static int do_mount_one(struct mount_info *mi)
 {
 	int ret;
@@ -2582,6 +2721,14 @@ static int do_mount_one(struct mount_info *mi)
 	if (!can_mount_now(mi)) {
 		pr_debug("Postpone slave %s\n", mi->mountpoint);
 		return 1;
+	}
+
+	if (mi->parent && !strcmp(mi->parent->mountpoint, mi->mountpoint)) {
+		mi->parent->fd = open(mi->parent->mountpoint, O_PATH);
+		if (mi->parent->fd < 0) {
+			pr_perror("Unable to open %s", mi->mountpoint);
+			return -1;
+		}
 	}
 
 	pr_debug("\tMounting %s @%s (%d)\n", mi->fstype->name, mi->mountpoint, mi->need_plugin);
@@ -2706,6 +2853,7 @@ struct mount_info *mnt_entry_alloc()
 
 	new = xzalloc(sizeof(struct mount_info));
 	if (new) {
+		new->fd = -1;
 		INIT_LIST_HEAD(&new->children);
 		INIT_LIST_HEAD(&new->siblings);
 		INIT_LIST_HEAD(&new->mnt_slave_list);
@@ -3183,6 +3331,7 @@ static int populate_mnt_ns(void)
 		return -1;
 
 	ret = mnt_tree_for_each(pms, do_mount_one);
+	mnt_tree_for_each(pms, do_close_one);
 
 	if (umount_clean_path())
 		return -1;

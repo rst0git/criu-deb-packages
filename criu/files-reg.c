@@ -20,9 +20,8 @@
 #include "file-ids.h"
 #include "mount.h"
 #include "files.h"
-#include "image.h"
 #include "list.h"
-#include "util.h"
+#include "rst-malloc.h"
 #include "fs-magic.h"
 #include "asm/atomic.h"
 #include "namespaces.h"
@@ -202,7 +201,7 @@ again:
 		}
 	} else {
 		if ((ret = mkreg_ghost(path, gfe->mode, gf, img)) < 0)
-			msg = "Can't create ghost regfile\n";
+			msg = "Can't create ghost regfile";
 	}
 
 	if (ret < 0) {
@@ -360,17 +359,16 @@ static int open_remap_dead_process(struct reg_file_info *rfi,
 {
 	struct pstree_item *helper;
 
-	for_each_pstree_item(helper) {
-		/* don't need to add multiple tasks */
-		if (helper->pid.virt == rfe->remap_id) {
-			pr_info("Skipping helper for restoring /proc/%d; pid exists\n", rfe->remap_id);
-			return 0;
-		}
-	}
-
-	helper = alloc_pstree_helper();
+	helper = lookup_create_item(rfe->remap_id);
 	if (!helper)
 		return -1;
+
+	if (helper->pid.state != TASK_UNDEF) {
+		pr_info("Skipping helper for restoring /proc/%d; pid exists\n", rfe->remap_id);
+		return 0;
+	}
+
+	init_pstree_helper(helper);
 
 	helper->sid = root_item->sid;
 	helper->pgid = root_item->pgid;
@@ -496,17 +494,25 @@ static void try_clean_ghost(struct remap_info *ri)
 	ret = rst_get_mnt_root(mnt_id, path, sizeof(path));
 	if (ret < 0)
 		return;
+	if (ret >= sizeof(path) - 1) {
+		pr_err("The path buffer is too small\n");
+		return;
+	}
+	if (path[ret] != '/') {
+		path[ret++] = '/';
+		path[ret] = 0;
+	}
 
 	if (ri->rfi->remap == NULL)
 		return;
 	if (!ri->rfi->is_dir) {
-		ghost_path(path + ret, sizeof(path) - 1, ri->rfi, ri->rfe);
+		ghost_path(path + ret, sizeof(path) - ret, ri->rfi, ri->rfe);
 		if (!unlink(path)) {
 			pr_info(" `- X [%s] ghost\n", path);
 			return;
 		}
 	} else {
-		strncpy(path + ret, ri->rfi->path, sizeof(path) - 1);
+		strncpy(path + ret, ri->rfi->path, sizeof(path) - ret);
 		if (!rmdir(path)) {
 			pr_info(" `- Xd [%s] ghost\n", path);
 			return;
@@ -807,36 +813,34 @@ static int dump_linked_remap(char *path, int len, const struct stat *ost,
 static pid_t *dead_pids;
 static int n_dead_pids;
 
-static int dead_pid_check_threads(struct pstree_item *item, pid_t pid)
-{
-	int i;
-
-	for (i = 0; i < item->nr_threads; i++) {
-		/*
-		 * If the dead PID was given to a main thread of another
-		 * process, this is handled during restore.
-		 */
-		if (item->pid.real == item->threads[i].real ||
-		    item->threads[i].virt != pid)
-			continue;
-
-		pr_err("Conflict with a dead task with the same PID as of this thread (virt %d, real %d).\n",
-			item->threads[i].virt, item->threads[i].real);
-		return 1;
-	}
-
-	return 0;
-}
-
 int dead_pid_conflict(void)
 {
-	struct pstree_item *item;
 	int i;
 
 	for (i = 0; i < n_dead_pids; i++) {
-		for_each_pstree_item(item)
-			if (dead_pid_check_threads(item, dead_pids[i]))
-				return 1;
+		struct pid *node;
+		pid_t pid = dead_pids[i];
+
+		node = pstree_pid_by_virt(pid);
+		if (!node)
+			continue;
+
+		if (node->state != TASK_THREAD) {
+			struct pstree_item *item;
+
+			/*
+			 * If the dead PID was given to a main thread of another
+			 * process, this is handled during restore.
+			 */
+			item = container_of(node, struct pstree_item, pid);
+			if (item->pid.real == item->threads[i].real ||
+			    item->threads[i].virt != pid)
+				continue;
+		}
+
+		pr_err("Conflict with a dead task with the same PID as of this thread (virt %d, real %d).\n",
+			node->virt, node->real);
+		return -1;
 	}
 
 	return 0;
@@ -1575,9 +1579,10 @@ int open_reg_by_id(u32 id)
 	return open_reg_fd(fd);
 }
 
-int get_filemap_fd(struct vma_area *vma)
+static int open_filemap(int pid, struct vma_area *vma)
 {
 	u32 flags;
+	int ret;
 
 	/*
 	 * Thevma->fd should have been assigned in collect_filemap
@@ -1594,7 +1599,25 @@ int get_filemap_fd(struct vma_area *vma)
 	else
 		flags = O_RDONLY;
 
-	return open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
+	ret = open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
+	if (ret < 0)
+		return ret;
+
+	vma->e->fd = ret;
+	return 0;
+}
+
+int collect_filemap(struct vma_area *vma)
+{
+	struct file_desc *fd;
+
+	fd = collect_special_file(vma->e->shmid);
+	if (!fd)
+		return -1;
+
+	vma->vmfd = fd;
+	vma->vm_open = open_filemap;
+	return 0;
 }
 
 static void remap_get(struct file_desc *fdesc, char typ)

@@ -1,50 +1,9 @@
-#
-# HOST part is needed to build helper
-# tools such as piegen.
-HOSTCC			?= gcc
-HOSTLD			?= ld
-HOSTCFLAGS		?= $(CFLAGS)
-CFLAGS			+= $(USERCFLAGS)
-
 # here is a workaround for a bug in libnl-3:
 # 6a8d90f5fec4 "attr: Allow attribute type 0" 
 WRAPFLAGS		+= -Wl,--wrap=nla_parse,--wrap=nlmsg_parse
 
-export HOSTCC HOSTLD HOSTCFLAGS
-
-ifeq ($(ARCH),x86)
-        SRCARCH		:= x86
-        LDARCH		:= i386:x86-64
-        VDSO		:= y
-endif
-
-ifeq ($(ARCH),arm)
-        SRCARCH		:= arm
-endif
-
-ifeq ($(ARCH),arm64)
-        ARCH		:= aarch64
-        SRCARCH		:= aarch64
-        VDSO		:= y
-endif
-
-ifeq ($(ARCH),ppc64)
-        SRCARCH		:= ppc64
-        LDARCH		:= powerpc:common64
-        VDSO		:= y
-endif
-
-LDARCH ?= $(SRCARCH)
-
-export SRCARCH LDARCH VDSO
-
-SRCARCH			?= $(ARCH)
-LDARCH			?= $(SRCARCH)
 ARCH_DIR		:= arch/$(SRCARCH)
-
-export SRCARCH LDARCH ARCH_DIR VDSO
-
-$(if $(wildcard $(ARCH_DIR)),,$(error "The architecture $(ARCH) isn't supported"))
+export ARCH_DIR
 
 #
 # General flags.
@@ -119,10 +78,6 @@ endif
 
 # msg-* printing
 include $(__nmk_dir)/msg.mk
-
-#
-# Version header file.
-include Makefile.version
 
 #
 # Configure variables.

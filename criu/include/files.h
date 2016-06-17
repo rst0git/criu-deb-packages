@@ -6,7 +6,6 @@
 #include "fcntl.h"
 #include "lock.h"
 #include "list.h"
-#include "image.h"
 #include "pid.h"
 #include "rst_info.h"
 
@@ -151,7 +150,6 @@ extern int prepare_fds(struct pstree_item *me);
 extern int prepare_fd_pid(struct pstree_item *me);
 extern int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id);
 extern int prepare_shared_fdinfo(void);
-extern int get_filemap_fd(struct vma_area *);
 extern int restore_fs(struct pstree_item *);
 extern int prepare_fs_pid(struct pstree_item *);
 extern int set_fd_flags(int fd, int flags);
@@ -177,6 +175,7 @@ extern int inherit_fd_fini(void);
 
 extern bool external_lookup_id(char *id);
 extern int inherit_fd_lookup_id(char *id);
+extern char *external_lookup_by_key(char *id);
 
 extern bool inherited_fd(struct file_desc *, int *fdp);
 

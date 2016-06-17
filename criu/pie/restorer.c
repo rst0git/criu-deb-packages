@@ -28,7 +28,6 @@
 #include "sk-inet.h"
 #include "vma.h"
 
-#include "crtools.h"
 #include "lock.h"
 #include "restorer.h"
 #include "aio.h"
@@ -37,6 +36,7 @@
 #include "images/creds.pb-c.h"
 #include "images/mm.pb-c.h"
 
+#include "shmem.h"
 #include "asm/restorer.h"
 
 #ifndef PR_SET_PDEATHSIG
@@ -451,7 +451,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 		goto core_restore_end;
 	}
 
-	rt_sigframe = (void *)args->mem_zone.rt_sigframe;
+	rt_sigframe = (void *)&args->mz->rt_sigframe;
 
 	if (restore_thread_common(args))
 		goto core_restore_end;
@@ -510,9 +510,18 @@ static unsigned long restore_mapping(const VmaEntry *vma_entry)
 	int flags	= vma_entry->flags | MAP_FIXED;
 	unsigned long addr;
 
-	if (vma_entry_is(vma_entry, VMA_AREA_SYSVIPC))
+	if (vma_entry_is(vma_entry, VMA_AREA_SYSVIPC)) {
+		/*
+		 * See comment in open_shmem_sysv() for what SYSV_SHMEM_SKIP_FD
+		 * means and why we check for PROT_EXEC few lines below.
+		 */
+		if (vma_entry->fd == SYSV_SHMEM_SKIP_FD)
+			return vma_entry->start;
+
+		pr_info("Attach SYSV shmem %d at %"PRIx64"\n", (int)vma_entry->fd, vma_entry->start);
 		return sys_shmat(vma_entry->fd, decode_pointer(vma_entry->start),
-				 (vma_entry->prot & PROT_WRITE) ? 0 : SHM_RDONLY);
+				vma_entry->prot & PROT_EXEC ? 0 : SHM_RDONLY);
+	}
 
 	/*
 	 * Restore or shared mappings are tricky, since
@@ -575,8 +584,9 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 	i = (raio->len - sizeof(struct aio_ring)) / sizeof(struct io_event);
 	if (tail >= ring->nr || head >= ring->nr || ring->nr != i ||
 	    new->nr != ring->nr) {
-		pr_err("wrong aio parametrs: tail=%x head=%x nr=%x len=%lx\n",
-			tail, head, raio->nr_req, raio->len);
+		pr_err("wrong aio: tail=%x head=%x req=%x old_nr=%x new_nr=%x expect=%x\n",
+			tail, head, raio->nr_req, ring->nr, new->nr, i);
+
 		return -1;
 	}
 
@@ -613,8 +623,8 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 				MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	iocbp = (void *)iocb + sizeof(struct iocb);
 
-	if (iocb == MAP_FAILED) {
-		pr_err("Can't mmap aio tmp buffer\n");
+	if (IS_ERR(iocb)) {
+		pr_err("Can't mmap aio tmp buffer: %ld\n", PTR_ERR(iocb));
 		return -1;
 	}
 
@@ -1226,7 +1236,7 @@ long __export_restore_task(struct task_restore_args *args)
 	 * registers from the frame, set them up and
 	 * finally pass execution to the new IP.
 	 */
-	rt_sigframe = (void *)args->t->mem_zone.rt_sigframe;
+	rt_sigframe = (void *)&args->t->mz->rt_sigframe;
 
 	if (restore_thread_common(args->t))
 		goto core_restore_end;
@@ -1277,7 +1287,7 @@ long __export_restore_task(struct task_restore_args *args)
 			if (thread_args[i].pid == args->t->pid)
 				continue;
 
-			new_sp = restorer_stack(thread_args + i);
+			new_sp = restorer_stack(thread_args[i].mz);
 			last_pid_len = vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
 			sys_lseek(fd, 0, SEEK_SET);
 			ret = sys_write(fd, s, last_pid_len);

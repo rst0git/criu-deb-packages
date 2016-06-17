@@ -18,8 +18,8 @@
 #include "asm/types.h"
 #include "util.h"
 #include "ptrace.h"
+#include "pid.h"
 #include "proc_parse.h"
-#include "crtools.h"
 #include "seccomp.h"
 #include "cr_options.h"
 
