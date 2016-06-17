@@ -42,9 +42,7 @@ struct vma_area {
 				 *
 				 * The aio_nr_req is only for aio rings.
 				 */
-				int	vm_file_fd;
 				int	vm_socket_id;
-				unsigned int aio_nr_req;
 			};
 
 			char		*aufs_rpath;	/* path from aufs root */
@@ -61,6 +59,7 @@ struct vma_area {
 		};
 
 		struct /* for restore */ {
+			int (*vm_open)(int pid, struct vma_area *vma);
 			struct file_desc *vmfd;
 			unsigned long	*page_bitmap;	/* existent pages */
 			unsigned long	*ppage_bitmap;	/* parent's existent pages */
@@ -69,8 +68,11 @@ struct vma_area {
 	};
 };
 
+typedef int (*dump_filemap_t)(struct vma_area *vma_area, int fd);
+
 extern struct vma_area *alloc_vma_area(void);
-extern int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list);
+extern int collect_mappings(pid_t pid,
+		struct vm_area_list *vma_area_list, dump_filemap_t cb);
 extern void free_mappings(struct vm_area_list *vma_area_list);
 
 #define vma_area_is(vma_area, s)	vma_entry_is((vma_area)->e, s)

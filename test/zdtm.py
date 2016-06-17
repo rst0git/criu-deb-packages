@@ -82,6 +82,19 @@ def add_to_report(path, tgt_name):
 				os.mkdir(os.path.dirname(tgt_path))
 			shutil.copy2(path, tgt_path)
 
+def add_to_output(path):
+	global report_dir
+	if not report_dir:
+		return
+
+	fdi = open(path, "r")
+	fdo = open(os.path.join(report_dir, "output"), "a")
+	while True:
+		buf = fdi.read(1<<20)
+		if not buf:
+			break
+		fdo.write(buf)
+
 
 # Arch we run on
 arch = os.uname()[4]
@@ -245,7 +258,10 @@ def encode_flav(f):
 	return (flavors.keys().index(f) + 128)
 
 def decode_flav(i):
-	return flavors.keys()[i - 128]
+        i = i - 128
+        if flavors.has_key(i):
+                return flavors.keys()[i - 128]
+        return "unknown"
 
 def tail(path):
 	p = subprocess.Popen(['tail', '-n1', path],
@@ -413,10 +429,10 @@ class zdtm_test:
 		return opts
 
 	def getdopts(self):
-		return self.__getcropts() + self.__freezer.getdopts()
+		return self.__getcropts() + self.__freezer.getdopts() + self.__desc.get('dopts', '').split()
 
 	def getropts(self):
-		return self.__getcropts() + self.__freezer.getropts()
+		return self.__getcropts() + self.__freezer.getropts() + self.__desc.get('ropts', '').split()
 
 	def gone(self, force = True):
 		if not self.auto_reap:
@@ -601,6 +617,7 @@ test_classes = { 'zdtm': zdtm_test, 'inhfd': inhfd_test, 'groups': groups_test }
 #
 
 criu_bin = "../criu/criu"
+join_ns_file = '/run/netns/zdtm_netns'
 class criu_cli:
 	def __init__(self, opts):
 		self.__test = None
@@ -609,6 +626,7 @@ class criu_cli:
 		self.__prev_dump_iter = None
 		self.__page_server = (opts['page_server'] and True or False)
 		self.__restore_sibling = (opts['sibling'] and True or False)
+		self.__join_ns = (opts['join_ns'] and True or False)
 		self.__fault = (opts['fault'])
 		self.__script = opts['script']
 		self.__sat = (opts['sat'] and True or False)
@@ -694,7 +712,9 @@ class criu_cli:
 					# on restore we move only a log file, because we need images
 					os.rename(os.path.join(__ddir, log), os.path.join(__ddir, log + ".fail"))
 				# try again without faults
+		                print "Run criu " + action
 				ret = self.__criu(action, s_args, False, strace, preexec)
+		                grep_errors(os.path.join(__ddir, log))
 				if ret == 0:
 					return
 			if self.__test.blocking() or (self.__sat and action == 'restore'):
@@ -745,6 +765,9 @@ class criu_cli:
 			r_opts = ["--restore-sibling"]
 			self.__test.auto_reap = False
 		r_opts += self.__test.getropts()
+		if self.__join_ns:
+			r_opts.append("--join-ns")
+			r_opts.append("net:%s" % join_ns_file)
 
 		self.__prev_dump_iter = None
 		criu_dir = os.path.dirname(os.getcwd())
@@ -864,7 +887,7 @@ def get_visible_state(test):
 		except IOError, e:
 			if e.errno != errno.EINVAL:
 				raise e
-		mounts[pid] = set(cmounts)
+		mounts[pid] = cmounts
 	return files, maps, mounts
 
 def check_visible_state(test, state, opts):
@@ -888,9 +911,15 @@ def check_visible_state(test, state, opts):
 
 		old_mounts = state[2][pid]
 		new_mounts = new[2][pid]
-		if old_mounts != new_mounts:
-			print "%s: Old mounts lost: %s" % (pid, old_mounts - new_mounts)
-			print "%s: New mounts appeared: %s" % (pid, new_mounts - old_mounts)
+		for i in xrange(len(old_mounts)):
+			m = old_mounts.pop(0)
+			if m in new_mounts:
+				new_mounts.remove(m)
+			else:
+				old_mounts.append(m)
+		if old_mounts or new_mounts:
+			print "%s: Old mounts lost: %s" % (pid, old_mounts)
+			print "%s: New mounts appeared: %s" % (pid, new_mounts)
 			raise test_fail_exc("mounts compare")
 
 
@@ -953,6 +982,17 @@ def get_freezer(desc):
 	fr = cg_freezer(path = fd[0], state = fd[1])
 	return fr
 
+def cmp_ns(ns1, match, ns2, msg):
+	ns1_ino = os.stat(ns1).st_ino
+	ns2_ino = os.stat(ns2).st_ino
+	if eval("%r %s %r" % (ns1_ino, match, ns2_ino)):
+		print "%s match (%r %s %r) fail" % (msg, ns1_ino, match, ns2_ino)
+		raise test_fail_exc("%s compare" % msg)
+
+
+def check_joinns_state(t):
+	cmp_ns("/proc/%s/ns/net" % t.getpid(), "!=", join_ns_file, "join-ns")
+
 
 def do_run_test(tname, tdesc, flavs, opts):
 	tcname = tname.split('/')[0]
@@ -987,6 +1027,8 @@ def do_run_test(tname, tdesc, flavs, opts):
 					t.stop()
 			else:
 				check_visible_state(t, s, opts)
+				if opts['join_ns']:
+					check_joinns_state(t)
 				t.stop()
 				try_run_hook(t, ["--clean"])
 		except test_fail_exc as e:
@@ -1063,7 +1105,7 @@ class launcher:
 
 		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', \
 				'fault', 'keep_img', 'report', 'snaps', 'sat', 'script', \
-				'dedup', 'sbs', 'freezecg', 'user', 'dry_run')
+				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run')
 		arg = repr((name, desc, flavor, { d: self.__opts[d] for d in nd }))
 
 		if self.__use_log:
@@ -1095,7 +1137,7 @@ class launcher:
 					print >> self.__file_report, testline
 					print >> self.__file_report, yaml.dump(details, explicit_start=True, explicit_end=True, default_style='|')
 				if sub['log']:
-					add_to_report(sub['log'], sub['name'].replace('/', '_') + "_" + failed_flavor + "/output")
+					add_to_output(sub['log'])
 			else:
 				if self.__file_report:
 					testline = "ok %d - %s" % (self.__runtest, sub['name'])
@@ -1235,6 +1277,12 @@ def run_tests(opts):
 		print "Parallel launch with freezer not supported"
 		opts['parallel'] = None
 
+	if opts['join_ns']:
+		if subprocess.Popen(["ip", "netns", "add", "zdtm_netns"]).wait():
+                    raise Exception("Unable to create a network namespace")
+		if subprocess.Popen(["ip", "netns", "exec", "zdtm_netns", "ip", "link", "set", "up", "dev", "lo"]).wait():
+                    raise Exception("ip link set up dev lo")
+
 	l = launcher(opts, len(torun))
 	try:
 		for t in torun:
@@ -1275,6 +1323,11 @@ def run_tests(opts):
 					l.skip(t, "criu root prio needed")
 					continue
 
+			if opts['join_ns']:
+				if test_flag(tdesc, 'samens'):
+					l.skip(t, "samens test in the same namespace")
+					continue
+
 			test_flavs = tdesc.get('flavor', 'h ns uns').split()
 			opts_flavs = (opts['flavor'] or 'h,ns,uns').split(',')
 			if opts_flavs != ['best']:
@@ -1287,13 +1340,18 @@ def run_tests(opts):
 				# FIXME -- probably uns will make sense
 				run_flavs -= set(['ns', 'uns'])
 
+			#remove ns and uns flavor in join_ns
+			if opts['join_ns']:
+				run_flavs -= set(['ns', 'uns'])
+
 			if run_flavs:
 				l.run_test(t, tdesc, run_flavs)
 			else:
 				l.skip(t, "no flavors")
 	finally:
 		l.finish()
-
+		if opts['join_ns']:
+			subprocess.Popen(["ip", "netns", "delete", "zdtm_netns"])
 
 sti_fmt = "%-40s%-10s%s"
 
@@ -1473,6 +1531,7 @@ rp.add_argument("-f", "--flavor", help = "Flavor to run")
 rp.add_argument("-x", "--exclude", help = "Exclude tests from --all run", action = 'append')
 
 rp.add_argument("--sibling", help = "Restore tests as siblings", action = 'store_true')
+rp.add_argument("--join-ns", help = "Restore tests and join existing namespace", action = 'store_true')
 rp.add_argument("--pre", help = "Do some pre-dumps before dump (n[:pause])")
 rp.add_argument("--snaps", help = "Instead of pre-dumps do full dumps", action = 'store_true')
 rp.add_argument("--dedup", help = "Auto-deduplicate images on iterations", action = 'store_true')

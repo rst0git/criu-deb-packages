@@ -85,26 +85,11 @@
 
 static char loc_buf[PAGE_SIZE];
 
-static void close_vma_file(struct vma_area *vma)
-{
-	if (vma->vm_file_fd < 0)
-		return;
-	if (vma->e->status & VMA_AREA_SOCKET)
-		return;
-	if (vma->file_borrowed)
-		return;
-	if (vma_area_is(vma, VMA_AREA_AIORING))
-		return;
-
-	close(vma->vm_file_fd);
-}
-
 void free_mappings(struct vm_area_list *vma_area_list)
 {
 	struct vma_area *vma_area, *p;
 
 	list_for_each_entry_safe(vma_area, p, &vma_area_list->h, list) {
-		close_vma_file(vma_area);
 		if (!vma_area->file_borrowed)
 			free(vma_area->vmst);
 		free(vma_area);
@@ -114,7 +99,8 @@ void free_mappings(struct vm_area_list *vma_area_list)
 	vma_area_list->nr = 0;
 }
 
-int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list)
+int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list,
+						dump_filemap_t dump_file)
 {
 	int ret = -1;
 
@@ -122,7 +108,7 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list)
 	pr_info("Collecting mappings (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
 
-	ret = parse_smaps(pid, vma_area_list);
+	ret = parse_smaps(pid, vma_area_list, dump_file);
 	if (ret < 0)
 		goto err;
 
@@ -364,8 +350,7 @@ static int dump_pid_misc(pid_t pid, TaskCoreEntry *tc)
 	return 0;
 }
 
-static int dump_filemap(pid_t pid, struct vma_area *vma_area,
-		const struct cr_imgset *imgset)
+static int dump_filemap(struct vma_area *vma_area, int fd)
 {
 	struct fd_parms p = FD_PARMS_INIT;
 	VmaEntry *vma = vma_area->e;
@@ -393,10 +378,10 @@ static int dump_filemap(pid_t pid, struct vma_area *vma_area,
 		p.link = &aufs_link;
 	}
 
-	/* Flags will be set during restore in get_filemap_fd() */
+	/* Flags will be set during restore in open_filmap() */
 
 	if (fd_id_generate_special(&p, &id))
-		ret = dump_one_reg_file(vma_area->vm_file_fd, id, &p);
+		ret = dump_one_reg_file(fd, id, &p);
 
 	vma->shmid = id;
 	return ret;
@@ -469,9 +454,6 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
 			ret = check_sysvipc_map_dump(pid, vma);
 		else if (vma_entry_is(vma, VMA_ANON_SHARED))
 			ret = add_shmem_area(pid, vma);
-		else if (vma_entry_is(vma, VMA_FILE_PRIVATE) ||
-				vma_entry_is(vma, VMA_FILE_SHARED))
-			ret = dump_filemap(pid, vma_area, imgset);
 		else if (vma_entry_is(vma, VMA_AREA_SOCKET))
 			ret = dump_socket_map(vma_area);
 		else
@@ -640,7 +622,7 @@ int get_task_ids(struct pstree_item *item)
 
 	task_kobj_ids_entry__init(item->ids);
 
-	if (item->state != TASK_DEAD) {
+	if (item->pid.state != TASK_DEAD) {
 		ret = dump_task_kobj_ids(item);
 		if (ret)
 			goto err_free;
@@ -722,7 +704,7 @@ static int dump_task_core_all(struct parasite_ctl *ctl,
 
 	strlcpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
 	core->tc->flags = stat->flags;
-	core->tc->task_state = item->state;
+	core->tc->task_state = item->pid.state;
 	core->tc->exit_code = 0;
 
 	ret = parasite_dump_thread_leader_seized(ctl, pid, core);
@@ -777,14 +759,14 @@ static int collect_pstree_ids_predump(void)
 	 * write_img_inventory().
 	 */
 
-	crt.i.state = TASK_ALIVE;
+	crt.i.pid.state = TASK_ALIVE;
 	crt.i.pid.real = getpid();
 
 	if (predump_task_ns_ids(&crt.i))
 		return -1;
 
 	for_each_pstree_item(item) {
-		if (item->state == TASK_DEAD)
+		if (item->pid.state == TASK_DEAD)
 			continue;
 
 		if (predump_task_ns_ids(item))
@@ -828,6 +810,7 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl,
 		pr_err("Can't dump thread for pid %d\n", pid);
 		goto err;
 	}
+	pstree_insert_pid(tid->virt, tid);
 
 	img = open_image(CR_FD_CORE, O_DUMP, tid->virt);
 	if (!img)
@@ -1069,7 +1052,7 @@ static int dump_zombies(void)
 	 */
 
 	for_each_pstree_item(item) {
-		if (item->state != TASK_DEAD)
+		if (item->pid.state != TASK_DEAD)
 			continue;
 
 		if (item->pid.virt < 0) {
@@ -1117,15 +1100,15 @@ static int pre_dump_one_task(struct pstree_item *item, struct list_head *ctls)
 	pr_info("Pre-dumping task (pid: %d)\n", pid);
 	pr_info("========================================\n");
 
-	if (item->state == TASK_STOPPED) {
+	if (item->pid.state == TASK_STOPPED) {
 		pr_warn("Stopped tasks are not supported\n");
 		return 0;
 	}
 
-	if (item->state == TASK_DEAD)
+	if (item->pid.state == TASK_DEAD)
 		return 0;
 
-	ret = collect_mappings(pid, &vmas);
+	ret = collect_mappings(pid, &vmas, NULL);
 	if (ret) {
 		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1194,7 +1177,7 @@ static int dump_one_task(struct pstree_item *item)
 	pr_info("Dumping task (pid: %d)\n", pid);
 	pr_info("========================================\n");
 
-	if (item->state == TASK_DEAD)
+	if (item->pid.state == TASK_DEAD)
 		/*
 		 * zombies are dumped separately in dump_zombies()
 		 */
@@ -1205,7 +1188,7 @@ static int dump_one_task(struct pstree_item *item)
 	if (ret < 0)
 		goto err;
 
-	ret = collect_mappings(pid, &vmas);
+	ret = collect_mappings(pid, &vmas, dump_filemap);
 	if (ret) {
 		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1284,6 +1267,7 @@ static int dump_one_task(struct pstree_item *item)
 	}
 
 	parasite_ctl->pid.virt = item->pid.virt = misc.pid;
+	pstree_insert_pid(item->pid.virt, &item->pid);
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;
 
@@ -1744,7 +1728,7 @@ int cr_dump_tasks(pid_t pid)
 	if (ret)
 		goto err;
 
-	ret = tty_verify_active_pairs();
+	ret = tty_post_actions();
 	if (ret)
 		goto err;
 

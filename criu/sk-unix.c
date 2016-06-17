@@ -17,7 +17,6 @@
 #include "unix_diag.h"
 #include "files.h"
 #include "file-ids.h"
-#include "image.h"
 #include "log.h"
 #include "util.h"
 #include "util-pie.h"
@@ -35,6 +34,24 @@
 
 #undef	LOG_PREFIX
 #define LOG_PREFIX "sk unix: "
+
+/*
+ * By-default, when dumping a unix socket, we should dump its peer
+ * as well. Which in turn means, we should dump the task(s) that have
+ * this peer opened.
+ *
+ * Sometimes, we can break this rule and dump only one end of the
+ * unix sockets pair, and on restore time connect() this end back to
+ * its peer.
+ *
+ * So, to resolve this situation we mark the peers we don't dump
+ * as "external" and require the --ext-unix-sk option.
+ */
+
+#define USK_EXTERN	(1 << 0)
+#define USK_SERVICE	(1 << 1)
+#define USK_CALLBACK	(1 << 2)
+#define USK_INHERIT	(1 << 3)
 
 typedef struct {
 	char			*dir;
@@ -186,10 +203,7 @@ static int resolve_rel_name(struct unix_sk_desc *sk, const struct fd_parms *p)
 	int mntns_root, i;
 	struct ns_id *ns;
 
-	for_each_pstree_item(task) {
-		if (task->pid.real == p->pid)
-			break;
-	}
+	task = pstree_item_by_real(p->pid);
 	if (!task) {
 		pr_err("Can't find task with pid %d\n", p->pid);
 		return -ENOENT;
@@ -371,12 +385,15 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 				((ue->shutdown == SK_SHUTDOWN__BOTH)  &&
 				 (peer->shutdown != SK_SHUTDOWN__BOTH)) )) {
 			/*
-			 * On restore we assume, that stream pairs must
-			 * be shut down from one end only
+			 * Usually this doesn't happen, however it's possible if
+			 * socket was shut down before connect() (see sockets03.c test).
+			 * On restore we will shutdown both end (iow socktes will be in
+			 * matched state). This shoudn't be a problem, since kernel seems
+			 * to check both ends on read()/write(). Thus mismatched sockets behave
+			 * the same way as matched.
 			 */
-			pr_err("Shutdown mismatch %u:%d -> %u:%d\n",
+			pr_warn("Shutdown mismatch %u:%d -> %u:%d\n",
 					ue->ino, ue->shutdown, peer->sd.ino, peer->shutdown);
-			goto err;
 		}
 	} else if (ue->state == TCP_ESTABLISHED) {
 		const struct unix_sk_listen_icon *e;
@@ -1066,13 +1083,8 @@ static int open_unixsk_pair_slave(struct unix_sk_info *ui)
 	if (restore_socket_opts(sk, ui->ue->opts))
 		return -1;
 
-	if (ui->ue->type == SOCK_DGRAM)
-		/*
-		 * Stream socket's "slave" end will be shut down
-		 * together with master
-		 */
-		if (shutdown_unix_sk(sk, ui))
-			return -1;
+	if (shutdown_unix_sk(sk, ui))
+		return -1;
 
 	return sk;
 }

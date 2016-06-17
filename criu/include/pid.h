@@ -2,6 +2,7 @@
 #define __CR_PID_H__
 
 #include "stdbool.h"
+#include "rbtree.h"
 
 struct pid {
 	/*
@@ -17,7 +18,18 @@ struct pid {
 	 * dumpee context, because the dumpee might have own pid namespace.
 	 */
 	pid_t virt;
+
+	int state;	/* TASK_XXX constants */
+
+	struct rb_node node;
 };
+
+#define TASK_UNDEF		0x0
+#define TASK_ALIVE		0x1
+#define TASK_DEAD		0x2
+#define TASK_STOPPED		0x3
+#define TASK_HELPER		0x4
+#define TASK_THREAD		0x5
 
 /*
  * When we have to restore a shared resource, we mush select which

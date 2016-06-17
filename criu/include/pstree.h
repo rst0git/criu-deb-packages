@@ -3,7 +3,6 @@
 
 #include "list.h"
 #include "pid.h"
-#include "image.h"
 #include "images/core.pb-c.h"
 
 /*
@@ -20,8 +19,6 @@ struct pstree_item {
 	pid_t			pgid;
 	pid_t			sid;
 	pid_t			born_sid;
-
-	int			state;		/* TASK_XXX constants */
 
 	int			nr_threads;	/* number of threads */
 	struct pid		*threads;	/* array of threads */
@@ -60,14 +57,17 @@ static inline int shared_fdtable(struct pstree_item *item)
 
 static inline bool task_alive(struct pstree_item *i)
 {
-	return (i->state == TASK_ALIVE) || (i->state == TASK_STOPPED);
+	return (i->pid.state == TASK_ALIVE) || (i->pid.state == TASK_STOPPED);
 }
 
 extern void free_pstree(struct pstree_item *root_item);
 extern struct pstree_item *__alloc_pstree_item(bool rst);
 #define alloc_pstree_item() __alloc_pstree_item(false)
-#define alloc_pstree_item_with_rst() __alloc_pstree_item(true)
-extern struct pstree_item *alloc_pstree_helper(void);
+extern void init_pstree_helper(struct pstree_item *ret);
+
+extern struct pstree_item *lookup_create_item(pid_t pid);
+extern void pstree_insert_pid(pid_t pid, struct pid *pid_node);
+extern struct pid *pstree_pid_by_virt(pid_t pid);
 
 extern struct pstree_item *root_item;
 extern struct pstree_item *pstree_item_next(struct pstree_item *item);
@@ -83,7 +83,6 @@ struct pstree_item *pstree_item_by_real(pid_t virt);
 struct pstree_item *pstree_item_by_virt(pid_t virt);
 
 extern int pid_to_virt(pid_t pid);
-extern bool pid_in_pstree(pid_t pid);
 
 struct task_entries;
 extern struct task_entries *task_entries;
