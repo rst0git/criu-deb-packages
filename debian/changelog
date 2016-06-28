@@ -1,3 +1,9 @@
+criu (2.3-2) unstable; urgency=medium
+
+  * Upload to unstable
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Tue, 28 Jun 2016 15:51:45 +0200
+
 criu (2.3-1) experimental; urgency=medium
 
   * Imported Upstream version 2.3
