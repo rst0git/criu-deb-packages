@@ -1,0 +1,52 @@
+From 58077359a7fc1a7509a1e2fb7ce35490f48bb7aa Mon Sep 17 00:00:00 2001
+From: Cyrill Gorcunov <gorcunov@openvz.org>
+Date: Thu, 30 Jun 2016 18:46:01 +0300
+Subject: [PATCH] build: nmk -- Filter out -Wl flags from linking builtin
+ targets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Tycho reported that Debian uses custom LDFLAGS to
+build criu, this flag get propagated into built-in
+targets where we use $(LD) instead causing build
+procedure to interrupt
+
+|  LINK     arch/x86/syscalls.built-in.o
+| ld: unrecognized option '-Wl,-Bsymbolic-functions'
+| ld: use the --help option for usage information
+| /«PKGBUILDDIR»/scripts/nmk/scripts/build.mk:141: recipe for target 'arch/x86/syscalls.built-in.o' failed
+
+Lets make maintainers life easier and filter
+out the flags we know never accepted by $(LD).
+
+Reported-by: Tycho Andersen <tycho.andersen@canonical.com>
+Tested-by: Tycho Andersen <tycho.andersen@canonical.com>
+Signed-off-by: Cyrill Gorcunov <gorcunov@openvz.org>
+---
+ scripts/nmk/scripts/build.mk | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/scripts/nmk/scripts/build.mk b/scripts/nmk/scripts/build.mk
+index bd40944..87da2d9 100644
+--- a/scripts/nmk/scripts/build.mk
++++ b/scripts/nmk/scripts/build.mk
+@@ -25,6 +25,15 @@ ifndef obj
+ endif
+ 
+ #
++# Filter out any -Wl,XXX option: some of build farms
++# assumes that we're using $(CC) for building built-in
++# targets (and they have all rights to). But we're
++# using $(LD) directly instead so filter out -Wl
++# flags to make maintainer's life easier.
++LDFLAGS-MASK	:= -Wl,%
++LDFLAGS		:= $(filter-out $(LDFLAGS-MASK),$(LDFLAGS))
++
++#
+ # Accumulate common flags.
+ define nmk-ccflags
+         $(CFLAGS) $(ccflags-y) $(CFLAGS_$(@F))
+-- 
+2.8.1
+
