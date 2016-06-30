@@ -1,3 +1,9 @@
+criu (2.3-3) unstable; urgency=medium
+
+  * build: nmk -- Filter out -Wl flags from linking builtin targets
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 30 Jun 2016 18:03:48 +0200
+
 criu (2.3-2) unstable; urgency=medium
 
   * Upload to unstable
