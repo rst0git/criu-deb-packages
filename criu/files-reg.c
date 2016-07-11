@@ -522,6 +522,25 @@ static void try_clean_ghost(struct remap_info *ri)
 	pr_perror(" `- XFail [%s] ghost", path);
 }
 
+static int clean_one_remap(struct file_remap *remap)
+{
+	int rmntns_root, ret = 0;
+
+	rmntns_root = mntns_get_root_by_mnt_id(remap->rmnt_id);
+	if (rmntns_root < 0)
+		return -1;
+
+	pr_info("Unlink remap %s\n", remap->rpath);
+
+	ret = unlinkat(rmntns_root, remap->rpath, remap->is_dir ? AT_REMOVEDIR : 0);
+	if (ret < 0) {
+		pr_perror("Couldn't unlink remap %s", remap->rpath);
+		return -1;
+	}
+
+	return 0;
+}
+
 void try_clean_remaps(int ns_fd)
 {
 	struct remap_info *ri;
@@ -647,14 +666,8 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st, dev_t phys_de
 void remap_put(struct file_remap *remap)
 {
 	mutex_lock(ghost_file_mutex);
-	if (--remap->users == 0) {
-		int mntns_root;
-
-		pr_info("Unlink the ghost %s\n", remap->rpath);
-
-		mntns_root = mntns_get_root_by_mnt_id(remap->rmnt_id);
-		unlinkat(mntns_root, remap->rpath, 0);
-	}
+	if (--remap->users == 0)
+		clean_one_remap(remap);
 	mutex_unlock(ghost_file_mutex);
 }
 
@@ -975,8 +988,8 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms,
 		if (!start)
 			return -1;
 		start = strstr(start + 1, "/");
-		if (!start)
-			return -1;
+		if (!start) /* it's /proc */
+			return 0;
 		pid = strtol(start + 1, &end, 10);
 
 		/* If strtol didn't convert anything, then we are looking at
@@ -1166,6 +1179,8 @@ ext:
 	rfe.flags	= p->flags;
 	rfe.pos		= p->pos;
 	rfe.fown	= (FownEntry *)&p->fown;
+	rfe.has_mode	= true;
+	rfe.mode	= p->stat.st_mode;
 
 	if (S_ISREG(p->stat.st_mode) && should_check_size(rfe.flags)) {
 		rfe.has_size = true;
@@ -1471,7 +1486,8 @@ ext:
 		return -1;
 	}
 
-	if (rfi->rfe->has_size && !rfi->size_checked) {
+	if ((rfi->rfe->has_size || rfi->rfe->has_mode) &&
+	    !rfi->size_mode_checked) {
 		struct stat st;
 
 		if (fstat(tmp, &st) < 0) {
@@ -1479,11 +1495,20 @@ ext:
 			return -1;
 		}
 
-		if (st.st_size != rfi->rfe->size) {
+		if (rfi->rfe->has_size && (st.st_size != rfi->rfe->size)) {
 			pr_err("File %s has bad size %"PRIu64" (expect %"PRIu64")\n",
 					rfi->path, st.st_size,
 					rfi->rfe->size);
 			return -1;
+		}
+
+		if (rfi->rfe->has_mode && (st.st_mode != rfi->rfe->mode)) {
+			if (st.st_mode != rfi->rfe->mode) {
+				pr_err("File %s has bad mode 0%o (expect 0%o)\n",
+				       rfi->path, (int)st.st_mode,
+				       rfi->rfe->mode);
+				return -1;
+			}
 		}
 
 		/*
@@ -1491,7 +1516,7 @@ ext:
 		 * change w/o locks. Other tasks sharing the same
 		 * file will get one via unix sockets.
 		 */
-		rfi->size_checked = true;
+		rfi->size_mode_checked = true;
 	}
 
 	if (rfi->remap) {
@@ -1501,11 +1526,8 @@ ext:
 		}
 
 		BUG_ON(!rfi->remap->users);
-		if (--rfi->remap->users == 0) {
-			pr_info("Unlink the ghost %s\n", rfi->remap->rpath);
-			mntns_root = mntns_get_root_by_mnt_id(rfi->remap->rmnt_id);
-			unlinkat(mntns_root, rfi->remap->rpath, rfi->remap->is_dir ? AT_REMOVEDIR : 0);
-		}
+		if (--rfi->remap->users == 0)
+			clean_one_remap(rfi->remap);
 
 		mutex_unlock(ghost_file_mutex);
 	}
@@ -1696,7 +1718,7 @@ static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i
 	else
 		rfi->path = rfi->rfe->name + 1;
 	rfi->remap = NULL;
-	rfi->size_checked = false;
+	rfi->size_mode_checked = false;
 
 	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
 	return file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);

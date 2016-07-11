@@ -1,6 +1,8 @@
 #ifndef __CR_FILES_H__
 #define __CR_FILES_H__
 
+#include <sys/stat.h>
+
 #include "compiler.h"
 #include "asm/types.h"
 #include "fcntl.h"
@@ -66,6 +68,7 @@ struct fdinfo_list_entry {
 	struct list_head	desc_list;	/* To chain on  @fd_info_head */
 	struct file_desc	*desc;		/* Associated file descriptor */
 	struct list_head	ps_list;	/* To chain  per-task files */
+	struct list_head	used_list;	/* To chain per-task used fds */
 	int			pid;
 	futex_t			real_pid;
 	FdinfoEntry		*fe;
@@ -107,10 +110,25 @@ struct file_desc_ops {
 	char *			(*name)(struct file_desc *, char *b, size_t s);
 };
 
+static inline void collect_used_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri)
+{
+	struct fdinfo_list_entry *fle;
+
+	list_for_each_entry(fle, &ri->used, used_list) {
+		if (new_fle->fe->fd < fle->fe->fd)
+			break;
+	}
+
+	list_add_tail(&new_fle->used_list, &fle->used_list);
+}
+
 static inline void collect_gen_fd(struct fdinfo_list_entry *fle, struct rst_info *ri)
 {
 	list_add_tail(&fle->ps_list, &ri->fds);
 }
+
+unsigned int find_unused_fd(struct list_head *head, int hint_fd);
+struct fdinfo_list_entry *find_used_fd(struct list_head *head, int fd);
 
 struct file_desc {
 	u32			id;		/* File id, unique */
@@ -178,5 +196,9 @@ extern int inherit_fd_lookup_id(char *id);
 extern char *external_lookup_by_key(char *id);
 
 extern bool inherited_fd(struct file_desc *, int *fdp);
+
+extern FdinfoEntry *dup_fdinfo(FdinfoEntry *old, int fd, unsigned flags);
+int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
+	    int fd, unsigned flags);
 
 #endif /* __CR_FILES_H__ */

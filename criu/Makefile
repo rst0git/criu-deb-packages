@@ -27,6 +27,7 @@ REQ-RPM-PKG-NAMES	+= protobuf-compiler
 REQ-RPM-PKG-NAMES	+= protobuf-devel
 REQ-RPM-PKG-NAMES	+= protobuf-python
 REQ-RPM-PKG-NAMES	+= libnl3-devel
+REQ-RPM-PKG-NAMES	+= libcap-devel
 
 REQ-DEB-PKG-NAMES	+= libprotobuf-dev
 REQ-DEB-PKG-NAMES	+= libprotobuf-c0-dev
@@ -34,12 +35,11 @@ REQ-DEB-PKG-NAMES	+= protobuf-c-compiler
 REQ-DEB-PKG-NAMES	+= protobuf-compiler
 REQ-DEB-PKG-NAMES	+= python-protobuf
 REQ-DEB-PKG-NAMES	+= libnl-3-dev
+REQ-DEB-PKG-NAMES	+= libcap-dev
 
 REQ-RPM-PKG-TEST-NAMES  += libaio-devel
-REQ-RPM-PKG-TEST-NAMES  += libcap-devel
 
 REQ-DEB-PKG-TEST-NAMES  += libaio-dev
-REQ-DEV-PKG-TEST-NAMES  += libcap-dev
 
 #
 # Make sure all required libs are installed
@@ -175,12 +175,15 @@ install: criu
 	$(Q) install -m 755 criu $(DESTDIR)$(SBINDIR)
 	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)
 	$(Q) install -m 644 $(UAPI_HEADERS) $(DESTDIR)$(INCLUDEDIR)
+	$(Q) mkdir -p $(DESTDIR)$(LIBEXECDIR)/criu/scripts
+	$(Q) install -m 755 $(SRC_DIR)/scripts/systemd-autofs-restart.sh $(DESTDIR)$(LIBEXECDIR)/criu/scripts
 .PHONY: install
 
 uninstall:
 	$(E) " UNINSTALL" criu
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(SBINDIR)/,criu)
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(INCLUDEDIR)/,$(notdir $(UAPI_HEADERS)))
+	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBEXECDIR)/criu/scripts/,systemd-autofs-restart.sh)
 .PHONY: uninstall
 
 #

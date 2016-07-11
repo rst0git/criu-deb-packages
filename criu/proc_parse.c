@@ -33,12 +33,26 @@
 #include "namespaces.h"
 #include "files-reg.h"
 #include "cgroup.h"
+#include "cgroup-props.h"
 
 #include "protobuf.h"
 #include "images/fdinfo.pb-c.h"
 #include "images/mnt.pb-c.h"
 
 #include <stdlib.h>
+
+#ifndef SIGEV_SIGNAL
+#define SIGEV_SIGNAL    0       /* notify via signal */
+#endif
+#ifndef SIGEV_NONE
+#define SIGEV_NONE      1       /* other notification: meaningless */
+#endif
+#ifndef SIGEV_THREAD
+#define SIGEV_THREAD    2       /* deliver via thread creation */
+#endif
+#ifndef SIGEV_THREAD_ID
+#define SIGEV_THREAD_ID 4       /* deliver to thread */
+#endif
 
 struct buffer {
 	char buf[PAGE_SIZE];
@@ -422,7 +436,7 @@ int parse_self_maps_lite(struct vm_area_list *vms)
 			prev = vma;
 		}
 
-		pr_debug("Parsed %"PRIx64"-%"PRIx64" vma\n", vma->e->start, vma->e->end);
+		pr_debug("Parsed %"PRIx64"-%"PRIx64" vma\n", prev->e->start, prev->e->end);
 	}
 
 	fclose(maps);
@@ -2231,6 +2245,18 @@ int parse_cgroup_file(FILE *f, struct list_head *retl, unsigned int *n)
 		*path++ = '\0';
 		if (e)
 			*e = '\0';
+
+		/*
+		 * Controllers and their props might be
+		 * configured the way some of them are
+		 * not taken into the image for migration
+		 * sake or container specifics.
+		 */
+		if (cgp_should_skip_controller(name)) {
+			pr_debug("cg-prop: Skipping controller %s\n", name);
+			xfree(ncc);
+			continue;
+		}
 
 		ncc->name = xstrdup(name);
 		ncc->path = xstrdup(path);

@@ -364,11 +364,7 @@ static int dump_one_unix_fd(int lfd, u32 id, const struct fd_parms *p)
 		 * until all sockets the program owns are processed.
 		 */
 		if (!peer->sd.already_dumped) {
-			if (list_empty(&peer->list)) {
-				show_one_unix("Add a peer", peer);
-				list_add_tail(&peer->list, &unix_sockets);
-			}
-
+			show_one_unix("Add a peer", peer);
 			list_add(&sk->peer_node, &peer->peer_list);
 			sk->fd = dup(lfd);
 			if (sk->fd < 0) {
@@ -464,7 +460,6 @@ dump:
 	if (list_empty(&sk->peer_node) && write_unix_entry(sk))
 		return -1;
 
-	list_del_init(&sk->list);
 	sk->sd.already_dumped = 1;
 
 	while (!list_empty(&sk->peer_list)) {
@@ -677,6 +672,7 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 	}
 
 	sk_collect_one(m->udiag_ino, AF_UNIX, &d->sd);
+	list_add_tail(&d->list, &unix_sockets);
 	show_one_unix("Collected", d);
 
 	return 0;
@@ -757,9 +753,10 @@ int fix_external_unix_sockets(void)
 		FownEntry fown = FOWN_ENTRY__INIT;
 		SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
 
-		show_one_unix("Dumping extern", sk);
+		if (sk->sd.already_dumped)
+			continue;
 
-		BUG_ON(sk->sd.already_dumped);
+		show_one_unix("Dumping extern", sk);
 
 		fd_id_generate_special(NULL, &e.id);
 		e.ino		= sk->sd.ino;
@@ -961,32 +958,35 @@ static int bind_unix_sk(int sk, struct unix_sk_info *ui)
 	if (prep_unix_sk_cwd(ui, &cwd_fd))
 		return -1;
 
-	if (bind(sk, (struct sockaddr *)&addr,
-				sizeof(addr.sun_family) + ui->ue->name.len)) {
-		pr_perror("Can't bind socket");
-		goto done;
-	}
-
-	if (ui->ue->name.len && *ui->name && ui->ue->file_perms) {
-		FilePermsEntry *perms = ui->ue->file_perms;
-		char fname[PATH_MAX];
-
-		if (ui->ue->name.len >= sizeof(fname)) {
-			pr_err("The file name is too long\n");
+	if (ui->ue->name.len) {
+		ret = bind(sk, (struct sockaddr *)&addr,
+				sizeof(addr.sun_family) + ui->ue->name.len);
+		if (ret < 0) {
+			pr_perror("Can't bind socket");
 			goto done;
 		}
 
-		memcpy(fname, ui->name, ui->ue->name.len);
-		fname[ui->ue->name.len] = '\0';
+		if (*ui->name && ui->ue->file_perms) {
+			FilePermsEntry *perms = ui->ue->file_perms;
+			char fname[PATH_MAX];
 
-		if (fchownat(AT_FDCWD, fname, perms->uid, perms->gid, 0) == -1) {
-			pr_perror("Unable to change file owner and group");
-			goto done;
-		}
+			if (ui->ue->name.len >= sizeof(fname)) {
+				pr_err("The file name is too long\n");
+				goto done;
+			}
 
-		if (fchmodat(AT_FDCWD, fname, perms->mode, 0) == -1) {
-			pr_perror("Unable to change file mode bits");
-			goto done;
+			memcpy(fname, ui->name, ui->ue->name.len);
+			fname[ui->ue->name.len] = '\0';
+
+			if (fchownat(AT_FDCWD, fname, perms->uid, perms->gid, 0) == -1) {
+				pr_perror("Unable to change file owner and group");
+				goto done;
+			}
+
+			if (fchmodat(AT_FDCWD, fname, perms->mode, 0) == -1) {
+				pr_perror("Unable to change file mode bits");
+				goto done;
+			}
 		}
 	}
 
@@ -1166,7 +1166,7 @@ static int open_unixsk_standalone(struct unix_sk_info *ui)
 		 * The below is hack: we use that connect with AF_UNSPEC
 		 * clears socket's peer.
 		 */
-		if (connect(sk, &addr, sizeof(addr.sun_family))) {
+		if (connect(sk, (struct sockaddr *)&addr, sizeof(addr.sun_family))) {
 			pr_perror("Can't clear socket's peer");
 			return -1;
 		}
@@ -1342,10 +1342,29 @@ struct collect_image_info unix_sk_cinfo = {
 	.flags = COLLECT_SHARED,
 };
 
+static void interconnected_pair(struct unix_sk_info *ui, struct unix_sk_info *peer)
+{
+	struct fdinfo_list_entry *fle, *fle_peer;
+	/*
+	 * Select who will restore the pair. Check is identical to
+	 * the one in pipes.c and makes sure tasks wait for each other
+	 * in pids sorting order (ascending).
+	 */
+	fle = file_master(&ui->d);
+	fle_peer = file_master(&peer->d);
+
+	if (fdinfo_rst_prio(fle, fle_peer)) {
+		ui->flags |= USK_PAIR_MASTER;
+		peer->flags |= USK_PAIR_SLAVE;
+	} else {
+		peer->flags |= USK_PAIR_MASTER;
+		ui->flags |= USK_PAIR_SLAVE;
+	}
+}
+
 static int resolve_unix_peers(void *unused)
 {
 	struct unix_sk_info *ui, *peer;
-	struct fdinfo_list_entry *fle, *fle_peer;
 
 	list_for_each_entry(ui, &unix_sockets, list) {
 		if (ui->peer)
@@ -1370,25 +1389,10 @@ static int resolve_unix_peers(void *unused)
 		if (peer->ue->peer != ui->ue->ino)
 			continue;
 
-		/* socketpair or interconnected sockets */
 		peer->peer = ui;
 
-		/*
-		 * Select who will restore the pair. Check is identical to
-		 * the one in pipes.c and makes sure tasks wait for each other
-		 * in pids sorting order (ascending).
-		 */
-
-		fle = file_master(&ui->d);
-		fle_peer = file_master(&peer->d);
-
-		if (fdinfo_rst_prio(fle, fle_peer)) {
-			ui->flags |= USK_PAIR_MASTER;
-			peer->flags |= USK_PAIR_SLAVE;
-		} else {
-			peer->flags |= USK_PAIR_MASTER;
-			ui->flags |= USK_PAIR_SLAVE;
-		}
+		/* socketpair or interconnected sockets */
+		interconnected_pair(ui, peer);
 	}
 
 	pr_info("Unix sockets:\n");

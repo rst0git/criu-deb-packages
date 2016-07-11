@@ -39,6 +39,7 @@
 #include "fs-magic.h"
 #include "proc_parse.h"
 #include "cr_options.h"
+#include "autofs.h"
 
 #include "parasite.h"
 #include "parasite-syscall.h"
@@ -94,6 +95,45 @@ struct file_desc *find_file_desc_raw(int type, u32 id)
 static inline struct file_desc *find_file_desc(FdinfoEntry *fe)
 {
 	return find_file_desc_raw(fe->type, fe->id);
+}
+
+struct fdinfo_list_entry *find_used_fd(struct list_head *head, int fd)
+{
+	struct fdinfo_list_entry *fle;
+
+	list_for_each_entry_reverse(fle, head, used_list) {
+		if (fle->fe->fd == fd)
+			return fle;
+		/* List is ordered, so let's stop */
+		if (fle->fe->fd < fd)
+			break;
+	}
+	return NULL;
+}
+
+unsigned int find_unused_fd(struct list_head *head, int hint_fd)
+{
+	struct fdinfo_list_entry *fle;
+	int fd = 0, prev_fd;
+
+	if ((hint_fd >= 0) && (!find_used_fd(head, hint_fd))) {
+		fd = hint_fd;
+		goto out;
+	}
+
+	prev_fd = service_fd_min_fd() - 1;
+
+	list_for_each_entry_reverse(fle, head, used_list) {
+		fd = fle->fe->fd;
+		if (prev_fd > fd) {
+			fd++;
+			goto out;
+		}
+		prev_fd = fd - 1;
+	}
+	BUG();
+out:
+	return fd;
 }
 
 /*
@@ -238,7 +278,7 @@ int do_dump_gen_file(struct fd_parms *p, int lfd,
 	if (ret < 0)
 		return ret;
 
-	pr_info("fdinfo: type: 0x%2x flags: %#o/%#o pos: 0x%8"PRIx64" fd: %d\n",
+	pr_info("fdinfo: type: %#2x flags: %#o/%#o pos: %#8"PRIx64" fd: %d\n",
 		ops->type, p->flags, (int)p->fd_flags, p->pos, p->fd);
 
 	return pb_write_one(img, &e, PB_FDINFO);
@@ -295,7 +335,7 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 
 	fown_entry__init(&p->fown);
 
-	pr_info("%d fdinfo %d: pos: 0x%16"PRIx64" flags: %16o/%#x\n",
+	pr_info("%d fdinfo %d: pos: %#16"PRIx64" flags: %16o/%#x\n",
 		ctl->pid.real, fd, p->pos, p->flags, (int)p->fd_flags);
 
 	ret = fcntl(lfd, F_GETSIG, 0);
@@ -321,6 +361,8 @@ static const struct fdtype_ops *get_misc_dev_ops(int minor)
 	switch (minor) {
 	case TUN_MINOR:
 		return &tunfile_dump_ops;
+	case AUTOFS_MINOR:
+		return &regfile_dump_ops;
 	};
 
 	return NULL;
@@ -391,7 +433,7 @@ static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_op
 	const struct fdtype_ops *ops;
 
 	if (fill_fd_params(ctl, fd, lfd, opts, &p) < 0) {
-		pr_perror("Can't get stat on %d", fd);
+		pr_err("Can't get stat on %d\n", fd);
 		return -1;
 	}
 
@@ -650,10 +692,41 @@ static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 	else
 		collect_gen_fd(new_le, rst_info);
 
+	collect_used_fd(new_le, rst_info);
+
 	list_add_tail(&new_le->desc_list, &le->desc_list);
 	new_le->desc = fdesc;
 
 	return 0;
+}
+
+FdinfoEntry *dup_fdinfo(FdinfoEntry *old, int fd, unsigned flags)
+{
+	FdinfoEntry *e;
+
+	e = shmalloc(sizeof(*e));
+	if (!e)
+		return NULL;
+
+	fdinfo_entry__init(e);
+
+	e->id		= old->id;
+	e->type		= old->type;
+	e->fd		= fd;
+	e->flags	= flags;
+	return e;
+}
+
+int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
+		   int fd, unsigned flags)
+{
+	FdinfoEntry *e;
+
+	e = dup_fdinfo(ple->fe, fd, flags);
+	if (!e)
+		return -1;
+
+	return collect_fd(task->pid.virt, e, rsti(task));
 }
 
 int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
@@ -690,26 +763,21 @@ int prepare_fd_pid(struct pstree_item *item)
 	pid_t pid = item->pid.virt;
 	struct rst_info *rst_info = rsti(item);
 
+	INIT_LIST_HEAD(&rst_info->used);
 	INIT_LIST_HEAD(&rst_info->fds);
 	INIT_LIST_HEAD(&rst_info->eventpoll);
 	INIT_LIST_HEAD(&rst_info->tty_slaves);
 	INIT_LIST_HEAD(&rst_info->tty_ctty);
 
-	if (!fdinfo_per_id) {
-		img = open_image(CR_FD_FDINFO, O_RSTR, pid);
-		if (!img)
-			return -1;
-	} else {
-		if (item->ids == NULL) /* zombie */
-			return 0;
+	if (item->ids == NULL) /* zombie */
+		return 0;
 
-		if (rsti(item)->fdt && rsti(item)->fdt->pid != item->pid.virt)
-			return 0;
+	if (rsti(item)->fdt && rsti(item)->fdt->pid != item->pid.virt)
+		return 0;
 
-		img = open_image(CR_FD_FDINFO, O_RSTR, item->ids->files_id);
-		if (!img)
-			return -1;
-	}
+	img = open_image(CR_FD_FDINFO, O_RSTR, item->ids->files_id);
+	if (!img)
+		return -1;
 
 	while (1) {
 		FdinfoEntry *e;
@@ -842,7 +910,7 @@ static int open_transport_fd(int pid, struct fdinfo_list_entry *fle)
 		pr_perror("Can't create socket");
 		return -1;
 	}
-	ret = bind(sock, &saddr, sun_len);
+	ret = bind(sock, (struct sockaddr *)&saddr, sun_len);
 	if (ret < 0) {
 		pr_perror("Can't bind unix socket %s", saddr.sun_path + 1);
 		goto err;
@@ -1150,26 +1218,18 @@ out:
 
 static int fchroot(int fd)
 {
-	char fd_path[PSFDS];
-	int proc;
-
 	/*
 	 * There's no such thing in syscalls. We can emulate
-	 * it using the /proc/self/fd/ :)
-	 *
-	 * But since there might be no /proc mount in our mount
-	 * namespace, we will have to ... workaround it.
+	 * it using fchdir()
 	 */
 
-	proc = get_service_fd(PROC_FD_OFF);
-	if (fchdir(proc) < 0) {
+	if (fchdir(fd) < 0) {
 		pr_perror("Can't chdir to proc");
 		return -1;
 	}
 
-	sprintf(fd_path, "./self/fd/%d", fd);
-	pr_debug("Going to chroot into %s\n", fd_path);
-	return chroot(fd_path);
+	pr_debug("Going to chroot into /proc/self/fd/%d\n", fd);
+	return chroot(".");
 }
 
 int restore_fs(struct pstree_item *me)
@@ -1195,9 +1255,8 @@ int restore_fs(struct pstree_item *me)
 	}
 
 	/*
-	 * Now do chroot/chdir. Chroot goes first as it
-	 * calls chdir into proc service descriptor so
-	 * we'd need to fix chdir after it anyway.
+	 * Now do chroot/chdir. Chroot goes first as it calls chdir into
+	 * dd_root so we'd need to fix chdir after it anyway.
 	 */
 
 	ret = fchroot(dd_root);

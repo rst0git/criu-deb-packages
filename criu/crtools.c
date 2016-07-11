@@ -38,6 +38,7 @@
 #include "mount.h"
 #include "namespaces.h"
 #include "cgroup.h"
+#include "cgroup-props.h"
 #include "cpu.h"
 #include "action-scripts.h"
 #include "irmap.h"
@@ -214,7 +215,6 @@ int main(int argc, char *argv[], char *envp[])
 	int opt, idx;
 	int log_level = LOG_UNSET;
 	char *imgs_dir = ".";
-	char *work_dir = NULL;
 	static const char short_opts[] = "dSsRf:F:t:p:hcD:o:v::x::Vr:jJ:lW:L:M:";
 	static struct option long_opts[] = {
 		{ "tree",			required_argument,	0, 't'	},
@@ -275,6 +275,10 @@ int main(int argc, char *argv[], char *envp[])
 		{ "extra",			no_argument,		0, 1077	},
 		{ "experimental",		no_argument,		0, 1078	},
 		{ "all",			no_argument,		0, 1079	},
+		{ "cgroup-props",		required_argument,	0, 1080	},
+		{ "cgroup-props-file",		required_argument,	0, 1081	},
+		{ "cgroup-dump-controller",	required_argument,	0, 1082	},
+		{ SK_INFLIGHT_PARAM,		no_argument,		0, 1083	},
 		{ },
 	};
 
@@ -359,7 +363,7 @@ int main(int argc, char *argv[], char *envp[])
 			imgs_dir = optarg;
 			break;
 		case 'W':
-			work_dir = optarg;
+			opts.work_dir = optarg;
 			break;
 		case 'o':
 			opts.output = optarg;
@@ -569,6 +573,20 @@ int main(int argc, char *argv[], char *envp[])
 			opts.check_extra_features = true;
 			opts.check_experimental_features = true;
 			break;
+		case 1080:
+			opts.cgroup_props = optarg;
+			break;
+		case 1081:
+			opts.cgroup_props_file = optarg;
+			break;
+		case 1082:
+			if (!cgp_add_dump_controller(optarg))
+				return 1;
+			break;
+		case 1083:
+			pr_msg("Will skip in-flight TCP connections\n");
+			opts.tcp_skip_in_flight = true;
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -597,8 +615,8 @@ int main(int argc, char *argv[], char *envp[])
 		return 1;
 	}
 
-	if (work_dir == NULL)
-		work_dir = imgs_dir;
+	if (opts.work_dir == NULL)
+		opts.work_dir = imgs_dir;
 
 	if (optind >= argc) {
 		pr_msg("Error: command is required\n");
@@ -635,8 +653,8 @@ int main(int argc, char *argv[], char *envp[])
 			return 1;
 	}
 
-	if (chdir(work_dir)) {
-		pr_perror("Can't change directory to %s", work_dir);
+	if (chdir(opts.work_dir)) {
+		pr_perror("Can't change directory to %s", opts.work_dir);
 		return 1;
 	}
 
@@ -777,6 +795,10 @@ usage:
 "* Special resources support:\n"
 "  -x|--" USK_EXT_PARAM "inode,.." "      allow external unix connections (optionally can be assign socket's inode that allows one-sided dump)\n"
 "     --" SK_EST_PARAM "  checkpoint/restore established TCP connections\n"
+"     --" SK_INFLIGHT_PARAM "   this option skips in-flight TCP connections.\n"
+"                        if TCP connections are found which are not yet completely\n"
+"                        established, criu will ignore these connections in favor\n"
+"                        of erroring out.\n"
 "  -r|--root PATH        change the root filesystem (when run in mount namespace)\n"
 "  --evasive-devices     use any path to a device file if the original one\n"
 "                        is inaccessible\n"
@@ -806,6 +828,16 @@ usage:
 "                        change the root cgroup the controller will be\n"
 "                        installed into. No controller means that root is the\n"
 "                        default for all controllers not specified.\n"
+"  --cgroup-props STRING\n"
+"                        define cgroup controllers and properties\n"
+"                        to be checkpointed, which are described\n"
+"                        via STRING using simplified YAML format.\n"
+"  --cgroup-props-file FILE\n"
+"                        same as --cgroup-props but taking descrition\n"
+"                        from the path specified.\n"
+"  --cgroup-dump-controller NAME\n"
+"                        define cgroup controller to be dumped\n"
+"                        and skip anything else present in system.\n"
 "  --skip-mnt PATH       ignore this mountpoint when dumping the mount namespace.\n"
 "  --enable-fs FSNAMES   a comma separated list of filesystem names or \"all\".\n"
 "                        force criu to (try to) dump/restore these filesystem's\n"

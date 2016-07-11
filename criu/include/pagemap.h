@@ -51,6 +51,7 @@ struct page_read {
 	/* stop working on current pagemap */
 	void (*put_pagemap)(struct page_read *);
 	void (*close)(struct page_read *);
+	int (*seek_page)(struct page_read *pr, unsigned long vaddr, bool warn);
 
 	/* Private data of reader */
 	struct cr_img *pmi;
@@ -62,10 +63,15 @@ struct page_read {
 					   go to this guy for page, see
 					   read_pagemap_page */
 	unsigned long cvaddr;		/* vaddr we are on */
+	off_t pi_off;			/* current offset in pages file */
 
 	struct iovec bunch;		/* record consequent neighbour
 					   iovecs to punch together */
 	unsigned id; /* for logging */
+
+	PagemapEntry **pmes;
+	int nr_pmes;
+	int curr_pme;
 };
 
 #define PR_SHMEM	0x1
@@ -83,8 +89,6 @@ extern int open_page_read(int pid, struct page_read *, int pr_flags);
 extern int open_page_read_at(int dfd, int pid, struct page_read *pr, int pr_flags);
 extern void pagemap2iovec(PagemapEntry *pe, struct iovec *iov);
 extern void iovec2pagemap(struct iovec *iov, PagemapEntry *pe);
-extern int seek_pagemap_page(struct page_read *pr, unsigned long vaddr, bool warn);
 
 extern int dedup_one_iovec(struct page_read *pr, struct iovec *iov);
-extern int punch_hole(struct page_read *pr, unsigned long off, unsigned long len, bool cleanup);
 #endif /* __CR_PAGE_READ_H__ */

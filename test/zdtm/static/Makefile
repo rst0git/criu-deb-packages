@@ -45,7 +45,6 @@ TST_NOFILE	=				\
 		inotify_system			\
 		inotify_system_nodel		\
 		shm				\
-		shm-unaligned			\
 		shm-mp				\
 		ptrace_sig			\
 		pipe00				\
@@ -224,6 +223,7 @@ TST_DIR		=				\
 		cgroup01			\
 		cgroup02			\
 		cgroup03			\
+		cgroup04			\
 		cgroup_stray		\
 		unlink_fstat04			\
 		mntns_open			\
@@ -243,6 +243,7 @@ TST_DIR		=				\
 		mntns_deleted			\
 		unlink_regular00		\
 		mnt_enablefs			\
+		autofs				\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -258,6 +259,7 @@ TST		=				\
 		fifo-rowo-pair			\
 		umask00				\
 		cmdlinenv00			\
+		shm-unaligned			\
 
 TST_STATE	=				\
 		conntracks			\
