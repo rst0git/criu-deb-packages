@@ -96,7 +96,6 @@
 
 #define CR_PARENT_LINK "parent"
 
-extern bool fdinfo_per_id;
 extern bool ns_per_id;
 extern bool img_common_magic;
 
@@ -141,6 +140,8 @@ static inline int img_raw_fd(struct cr_img *img)
 	BUG_ON(bfd_buffered(&img->_x));
 	return img->_x.fd;
 }
+
+extern off_t img_raw_size(struct cr_img *img);
 
 extern int open_image_dir(char *dir);
 extern void close_image_dir(void);

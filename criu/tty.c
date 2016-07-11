@@ -485,9 +485,10 @@ static struct reg_file_info *pty_alloc_fake_reg(struct tty_info *info, int subty
 		BUG_ON(!pos || !inverted_path);
 
 		memcpy(inverted_path, orig->rfe->name, slash_at + 1);
-		if (subtype == TTY_SUBTYPE_MASTER)
+		if (subtype == TTY_SUBTYPE_MASTER) {
+			inverted_path[slash_at + 1] = '\0';
 			strcat(inverted_path, "ptmx");
-		else {
+		} else {
 			if (slash_at >= 3 && strncmp(&inverted_path[slash_at - 3], "pts", 3))
 				snprintf(&inverted_path[slash_at + 1], 10, "pts/%u",
 					 info->tie->pty->index);
@@ -515,6 +516,27 @@ static void pty_free_fake_reg(struct reg_file_info **r)
 	}
 }
 
+static int do_open_tty_reg(int ns_root_fd, struct reg_file_info *rfi, void *arg)
+{
+	int fd;
+
+	fd = do_open_reg_noseek_flags(ns_root_fd, rfi, arg);
+	if (fd >= 0) {
+		/*
+		 * Peers might have differend modes set
+		 * after creation before we've dumped
+		 * them. So simply setup mode from image
+		 * the regular file engine will check
+		 * for this, so if we fail here it
+		 * gonna be catched anyway.
+		 */
+		if (rfi->rfe->has_mode)
+			fchmod(fd, rfi->rfe->mode);
+	}
+
+	return fd;
+}
+
 static int open_tty_reg(struct file_desc *reg_d, u32 flags)
 {
 	/*
@@ -522,7 +544,7 @@ static int open_tty_reg(struct file_desc *reg_d, u32 flags)
 	 * ctty magic happens only in tty_set_sid().
 	 */
 	flags |= O_NOCTTY;
-	return open_path(reg_d, do_open_reg_noseek_flags, &flags);
+	return open_path(reg_d, do_open_tty_reg, &flags);
 }
 
 static char *path_from_reg(struct file_desc *d)
@@ -1510,7 +1532,7 @@ static int collect_one_tty(void *obj, ProtobufCMessage *msg, struct cr_img *i)
 				       info->tfe->id);
 				return -1;
 			}
-		} if (info->driver->type != TTY_TYPE__EXT_TTY) {
+		} else if (info->driver->type != TTY_TYPE__EXT_TTY) {
 			pr_err("No reg_d descriptor for id %#x\n", info->tfe->id);
 			return -1;
 		}

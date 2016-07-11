@@ -59,7 +59,6 @@
 #include "tty.h"
 #include "cpu.h"
 #include "file-lock.h"
-#include "page-read.h"
 #include "vdso.h"
 #include "stats.h"
 #include "tun.h"
@@ -108,7 +107,7 @@
 #define arch_export_unmap		__export_unmap
 #endif
 
-static struct pstree_item *current;
+struct pstree_item *current;
 
 static int restore_task_with_children(void *);
 static int sigreturn_restore(pid_t pid, struct task_restore_args *ta, unsigned long alen, CoreEntry *core);
@@ -278,23 +277,78 @@ static rt_sigaction_t parent_act[SIGMAX];
 static bool sa_inherited(int sig, rt_sigaction_t *sa)
 {
 	rt_sigaction_t *pa;
+	int i;
 
 	if (current == root_item)
 		return false; /* XXX -- inherit from CRIU? */
 
 	pa = &parent_act[sig];
+
+	for (i = 0; i < _KNSIG_WORDS; i++)
+		if (pa->rt_sa_mask.sig[i] != sa->rt_sa_mask.sig[i])
+			return false;
+
 	return pa->rt_sa_handler == sa->rt_sa_handler &&
 		pa->rt_sa_flags == sa->rt_sa_flags &&
-		pa->rt_sa_restorer == sa->rt_sa_restorer &&
-		pa->rt_sa_mask.sig[0] == sa->rt_sa_mask.sig[0];
+		pa->rt_sa_restorer == sa->rt_sa_restorer;
+}
+
+/* Returns number of restored signals, -1 or negative errno on fail */
+static int restore_one_sigaction(int sig, struct cr_img *img, int pid)
+{
+	rt_sigaction_t act;
+	SaEntry *e;
+	int ret = 0;
+
+	BUG_ON(sig == SIGKILL || sig == SIGSTOP);
+
+	ret = pb_read_one_eof(img, &e, PB_SIGACT);
+	if (ret == 0) {
+		if (sig != SIGMAX_OLD + 1) { /* backward compatibility */
+			pr_err("Unexpected EOF %d\n", sig);
+			return -1;
+		}
+		pr_warn("This format of sigacts-%d.img is deprecated\n", pid);
+		return -1;
+	}
+	if (ret < 0)
+		return ret;
+
+	ASSIGN_TYPED(act.rt_sa_handler, decode_pointer(e->sigaction));
+	ASSIGN_TYPED(act.rt_sa_flags, e->flags);
+	ASSIGN_TYPED(act.rt_sa_restorer, decode_pointer(e->restorer));
+	BUILD_BUG_ON(sizeof(e->mask) != sizeof(act.rt_sa_mask.sig));
+	memcpy(act.rt_sa_mask.sig, &e->mask, sizeof(act.rt_sa_mask.sig));
+
+	sa_entry__free_unpacked(e, NULL);
+
+	if (sig == SIGCHLD) {
+		sigchld_act = act;
+		return 0;
+	}
+
+	if (sa_inherited(sig - 1, &act))
+		return 1;
+
+	/*
+	 * A pure syscall is used, because glibc
+	 * sigaction overwrites se_restorer.
+	 */
+	ret = syscall(SYS_rt_sigaction, sig, &act, NULL, sizeof(k_rtsigset_t));
+	if (ret < 0) {
+		pr_perror("Can't restore sigaction");
+		return ret;
+	}
+
+	parent_act[sig - 1] = act;
+
+	return 1;
 }
 
 static int prepare_sigactions(void)
 {
 	int pid = current->pid.virt;
-	rt_sigaction_t act;
 	struct cr_img *img;
-	SaEntry *e;
 	int sig, rst = 0;
 	int ret = 0;
 
@@ -311,52 +365,16 @@ static int prepare_sigactions(void)
 		if (sig == SIGKILL || sig == SIGSTOP)
 			continue;
 
-		ret = pb_read_one_eof(img, &e, PB_SIGACT);
-		if (ret == 0) {
-			if (sig != SIGMAX_OLD + 1) { /* backward compatibility */
-				pr_err("Unexpected EOF %d\n", sig);
-				ret = -1;
-				break;
-			}
-			pr_warn("This format of sigacts-%d.img is deprecated\n", pid);
-			break;
-		}
+		ret = restore_one_sigaction(sig, img, pid);
 		if (ret < 0)
 			break;
-
-		ASSIGN_TYPED(act.rt_sa_handler, decode_pointer(e->sigaction));
-		ASSIGN_TYPED(act.rt_sa_flags, e->flags);
-		ASSIGN_TYPED(act.rt_sa_restorer, decode_pointer(e->restorer));
-		ASSIGN_TYPED(act.rt_sa_mask.sig[0], e->mask);
-
-		sa_entry__free_unpacked(e, NULL);
-
-		if (sig == SIGCHLD) {
-			sigchld_act = act;
-			continue;
-		}
-
-		if (sa_inherited(sig - 1, &act))
-			continue;
-
-		/*
-		 * A pure syscall is used, because glibc
-		 * sigaction overwrites se_restorer.
-		 */
-		ret = syscall(SYS_rt_sigaction, sig, &act, NULL, sizeof(k_rtsigset_t));
-		if (ret < 0) {
-			pr_perror("Can't restore sigaction");
-			goto err;
-		}
-
-		parent_act[sig - 1] = act;
-		rst++;
+		if (ret)
+			rst++;
 	}
 
 	pr_info("Restored %d/%d sigacts\n", rst,
 			SIGMAX - 3 /* KILL, STOP and CHLD */);
 
-err:
 	close_image(img);
 	return ret;
 }
@@ -828,9 +846,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 		rsti(item)->has_seccomp = ca.core->tc->seccomp_mode != SECCOMP_MODE_DISABLED;
 
-		if (item->pid.state == TASK_DEAD)
-			rsti(item->parent)->nr_zombies++;
-		else if (!task_alive(item)) {
+		if (item->pid.state != TASK_DEAD && !task_alive(item)) {
 			pr_err("Unknown task state %d\n", item->pid.state);
 			return -1;
 		}
@@ -1593,6 +1609,7 @@ static int restore_root_task(struct pstree_item *init)
 	enum trace_flags flag = TRACE_ALL;
 	int ret, fd, mnt_ns_fd = -1;
 	int clean_remaps = 1, root_seized = 0;
+	struct pstree_item *item;
 
 	ret = run_scripts(ACT_PRE_RESTORE);
 	if (ret != 0) {
@@ -1712,15 +1729,15 @@ static int restore_root_task(struct pstree_item *init)
 	if (ret < 0)
 		goto out_kill;
 
+	/* Zombies die after CR_STATE_RESTORE */
+	for_each_pstree_item(item) {
+		if (item->pid.state == TASK_DEAD)
+			task_entries->nr_threads--;
+	}
+
 	ret = restore_switch_stage(CR_STATE_RESTORE_SIGCHLD);
 	if (ret < 0)
 		goto out_kill;
-
-	/*
-	 * The task_entries->nr_zombies is updated in the
-	 * CR_STATE_RESTORE_SIGCHLD in pie code.
-	 */
-	task_entries->nr_threads -= atomic_read(&task_entries->nr_zombies);
 
 	/*
 	 * There is no need to call try_clean_remaps() after this point,
@@ -1853,7 +1870,6 @@ static int prepare_task_entries(void)
 	task_entries->nr_threads = 0;
 	task_entries->nr_tasks = 0;
 	task_entries->nr_helpers = 0;
-	atomic_set(&task_entries->nr_zombies, 0);
 	futex_set(&task_entries->start, CR_STATE_RESTORE_NS);
 	mutex_init(&task_entries->userns_sync_lock);
 

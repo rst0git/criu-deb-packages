@@ -61,6 +61,7 @@
 #include "cpu.h"
 #include "elf.h"
 #include "cgroup.h"
+#include "cgroup-props.h"
 #include "file-lock.h"
 #include "page-xfer.h"
 #include "kerndat.h"
@@ -214,6 +215,8 @@ static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
 
 static int fill_fd_params_special(int fd, struct fd_parms *p)
 {
+	struct statfs fst;
+
 	*p = FD_PARMS_INIT;
 
 	if (fstat(fd, &p->stat) < 0) {
@@ -223,6 +226,13 @@ static int fill_fd_params_special(int fd, struct fd_parms *p)
 
 	if (get_fd_mntid(fd, &p->mnt_id))
 		return -1;
+
+	if (fstatfs(fd, &fst)) {
+		pr_perror("Unable to statfs fd %d", fd);
+		return -1;
+	}
+
+	p->fs_type = fst.f_type;
 
 	return 0;
 }
@@ -1470,6 +1480,11 @@ int cr_pre_dump_tasks(pid_t pid)
 	int ret = -1;
 	LIST_HEAD(ctls);
 
+	root_item = alloc_pstree_item();
+	if (!root_item)
+		goto err;
+	root_item->pid.real = pid;
+
 	if (!opts.track_mem) {
 		pr_info("Enforcing memory tracking for pre-dump.\n");
 		opts.track_mem = true;
@@ -1504,7 +1519,7 @@ int cr_pre_dump_tasks(pid_t pid)
 	if (setup_alarm_handler())
 		goto err;
 
-	if (collect_pstree(pid))
+	if (collect_pstree())
 		goto err;
 
 	if (collect_pstree_ids_predump())
@@ -1538,6 +1553,7 @@ static int cr_dump_finish(int ret)
 		ret = -1;
 
 	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
+	cgp_fini();
 
 	if (!ret) {
 		/*
@@ -1614,6 +1630,11 @@ int cr_dump_tasks(pid_t pid)
 	pr_info("Dumping processes (pid: %d)\n", pid);
 	pr_info("========================================\n");
 
+	root_item = alloc_pstree_item();
+	if (!root_item)
+		goto err;
+	root_item->pid.real = pid;
+
 	pre_dump_ret = run_scripts(ACT_PRE_DUMP);
 	if (pre_dump_ret != 0) {
 		pr_err("Pre dump script failed with %d!\n", pre_dump_ret);
@@ -1635,6 +1656,12 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	if (vdso_init())
+		goto err;
+
+	if (cgp_init(opts.cgroup_props,
+		     opts.cgroup_props ?
+		     strlen(opts.cgroup_props) : 0,
+		     opts.cgroup_props_file))
 		goto err;
 
 	if (parse_cg_info())
@@ -1660,7 +1687,7 @@ int cr_dump_tasks(pid_t pid)
 	 * afterwards.
 	 */
 
-	if (collect_pstree(pid))
+	if (collect_pstree())
 		goto err;
 
 	if (collect_pstree_ids())

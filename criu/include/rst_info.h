@@ -7,7 +7,6 @@
 
 struct task_entries {
 	int nr_threads, nr_tasks, nr_helpers;
-	atomic_t nr_zombies;
 	futex_t nr_in_progress;
 	futex_t start;
 	atomic_t cr_err;
@@ -27,6 +26,7 @@ struct fdt {
 struct _MmEntry;
 
 struct rst_info {
+	struct list_head	used;
 	struct list_head	fds;
 	struct list_head	eventpoll;
 	struct list_head	tty_slaves;
@@ -37,8 +37,6 @@ struct rst_info {
 	unsigned long		clone_flags;
 
 	void			*munmap_restorer;
-
-	int			nr_zombies;
 
 	int service_fd_id;
 	struct fdt		*fdt;

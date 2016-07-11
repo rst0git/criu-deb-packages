@@ -329,7 +329,6 @@ static int get_last_cap(void)
 	return sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0);
 }
 
-#ifdef CONFIG_HAS_MEMFD
 static bool kerndat_has_memfd_create(void)
 {
 	int ret;
@@ -347,13 +346,6 @@ static bool kerndat_has_memfd_create(void)
 
 	return 0;
 }
-#else
-static bool kerndat_has_memfd_create(void)
-{
-	kdat.has_memfd = false;
-	return 0;
-}
-#endif
 
 static int get_task_size(void)
 {
@@ -446,6 +438,17 @@ int kerndat_loginuid(bool only_dump)
 	return 0;
 }
 
+static int kerndat_iptables_has_xtlocks(void)
+{
+	char *argv[4] = { "sh", "-c", "iptables -w -L", NULL };
+
+	kdat.has_xtlocks = 1;
+	if (cr_system(-1, -1, -1, "sh", argv, CRS_CAN_FAIL) == -1)
+		kdat.has_xtlocks = 0;
+
+	return 0;
+}
+
 int kerndat_init(void)
 {
 	int ret;
@@ -467,6 +470,8 @@ int kerndat_init(void)
 		ret = get_ipv6();
 	if (!ret)
 		ret = kerndat_loginuid(true);
+	if (!ret)
+		ret = kerndat_iptables_has_xtlocks();
 
 	kerndat_lsm();
 
@@ -494,6 +499,8 @@ int kerndat_init_rst(void)
 		ret = get_ipv6();
 	if (!ret)
 		ret = kerndat_loginuid(false);
+	if (!ret)
+		ret = kerndat_iptables_has_xtlocks();
 
 	kerndat_lsm();
 

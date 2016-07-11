@@ -318,7 +318,7 @@ int collect_shmem(int pid, struct vma_area *vma)
 	if (!si)
 		return -1;
 
-	pr_info("Add new shmem 0x%"PRIx64" (0x%016"PRIx64"-0x%016"PRIx64")\n",
+	pr_info("Add new shmem 0x%"PRIx64" (%#016"PRIx64"-%#016"PRIx64")\n",
 				vi->shmid, vi->start, vi->end);
 
 	si->shmid = vi->shmid;
@@ -359,15 +359,13 @@ static int shmem_wait_and_open(int pid, struct shmem_info *si, VmaEntry *vi)
 
 static int restore_shmem_content(void *addr, struct shmem_info *si)
 {
-	int ret = 0, fd_pg;
+	int ret = 0;
 	struct page_read pr;
-	unsigned long off_real;
 
 	ret = open_page_read(si->shmid, &pr, PR_SHMEM);
 	if (ret <= 0)
 		return -1;
 
-	fd_pg = img_raw_fd(pr.pi);
 	while (1) {
 		unsigned long vaddr;
 		unsigned nr_pages;
@@ -383,20 +381,7 @@ static int restore_shmem_content(void *addr, struct shmem_info *si)
 		if (vaddr + nr_pages * PAGE_SIZE > si->size)
 			break;
 
-		off_real = lseek(fd_pg, 0, SEEK_CUR);
-
-		ret = read(fd_pg, addr + vaddr, nr_pages * PAGE_SIZE);
-		if (ret != nr_pages * PAGE_SIZE) {
-			ret = -1;
-			break;
-		}
-
-		if (opts.auto_dedup) {
-			ret = punch_hole(&pr, off_real, nr_pages * PAGE_SIZE, false);
-			if (ret == -1) {
-				break;
-			}
-		}
+		pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr);
 
 		if (pr.put_pagemap)
 			pr.put_pagemap(&pr);
@@ -415,9 +400,9 @@ static int open_shmem(int pid, struct vma_area *vma)
 	int flags;
 
 	si = shmem_find(vi->shmid);
-	pr_info("Search for 0x%016"PRIx64" shmem 0x%"PRIx64" %p/%d\n", vi->start, vi->shmid, si, si ? si->pid : -1);
+	pr_info("Search for %#016"PRIx64" shmem 0x%"PRIx64" %p/%d\n", vi->start, vi->shmid, si, si ? si->pid : -1);
 	if (!si) {
-		pr_err("Can't find my shmem 0x%016"PRIx64"\n", vi->start);
+		pr_err("Can't find my shmem %#016"PRIx64"\n", vi->start);
 		return -1;
 	}
 
@@ -437,7 +422,6 @@ static int open_shmem(int pid, struct vma_area *vma)
 	}
 
 	flags = MAP_SHARED;
-#ifdef CONFIG_HAS_MEMFD
 	if (kdat.has_memfd) {
 		f = syscall(SYS_memfd_create, "", 0);
 		if (f < 0) {
@@ -451,7 +435,6 @@ static int open_shmem(int pid, struct vma_area *vma)
 		}
 		flags |= MAP_FILE;
 	} else
-#endif
 		flags |= MAP_ANONYMOUS;
 
 	/*
