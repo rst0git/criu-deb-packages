@@ -1,3 +1,13 @@
+criu (2.4-1) experimental; urgency=low
+
+  * Imported Upstream version 2.4
+  * Add copyright information for new included file
+  * Set LIBEXECDIR to /usr/lib during installation of files.
+    Make sure that systemd-autofs-restart.sh helper is installed into
+    /usr/lib/criu/scripts/.
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 14 Jul 2016 07:24:53 +0200
+
 criu (2.3-3) unstable; urgency=medium
 
   * build: nmk -- Filter out -Wl flags from linking builtin targets
