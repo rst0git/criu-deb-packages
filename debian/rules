@@ -9,7 +9,7 @@ TMP     = $(CURDIR)/debian/$(PACKAGE)
 	dh ${@} --parallel --with python2
 
 override_dh_auto_install:
-	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr"
+	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr" LIBEXECDIR="/usr/lib"
 	# remove empty directories as spotted by lintian
 	# /usr/lib/systemd/system should not be installed
 	find $(TMP)/usr/lib -type d -empty -delete
