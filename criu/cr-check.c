@@ -23,7 +23,7 @@
 #include <linux/aio_abi.h>
 #include <sys/mount.h>
 
-#include "proc_parse.h"
+#include "fdinfo.h"
 #include "sockets.h"
 #include "crtools.h"
 #include "log.h"
@@ -1113,16 +1113,33 @@ static struct feature_list feature_list[] = {
 	{ NULL, NULL },
 };
 
+void pr_check_features(const char *offset, const char *sep, int width)
+{
+	struct feature_list *fl;
+	int pos = width + 1;
+	int sep_len = strlen(sep);
+	int offset_len = strlen(offset);
+
+	for (fl = feature_list; fl->name; fl++) {
+		int len = strlen(fl->name);
+
+		if (pos + len + sep_len > width) {
+			pr_msg("\n%s", offset);
+			pos = offset_len;
+		}
+		pr_msg("%s", fl->name);
+		pos += len;
+		if ((fl + 1)->name) { // not the last item
+			pr_msg("%s", sep);
+			pos += sep_len;
+		}
+	}
+	pr_msg("\n");
+}
+
 int check_add_feature(char *feat)
 {
 	struct feature_list *fl;
-
-	if (!strcmp(feat, "list")) {
-		for (fl = feature_list; fl->name; fl++)
-			pr_msg("%s ", fl->name);
-		pr_msg("\n");
-		return 1;
-	}
 
 	for (fl = feature_list; fl->name; fl++) {
 		if (!strcmp(feat, fl->name)) {

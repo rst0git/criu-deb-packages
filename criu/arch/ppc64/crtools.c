@@ -3,6 +3,7 @@
 #include <elf.h>
 #include <sys/user.h>
 #include <asm/unistd.h>
+#include <sys/uio.h>
 
 #include "asm/types.h"
 #include "asm/fpu.h"
@@ -21,8 +22,22 @@
 #include "images/core.pb-c.h"
 #include "images/creds.pb-c.h"
 
-#define MSR_VEC (1<<25)
-#define MSR_VSX (1<<23)
+#define MSR_TMA (1UL<<34)	/* bit 29 Trans Mem state: Transactional */
+#define MSR_TMS (1UL<<33)	/* bit 30 Trans Mem state: Suspended */
+#define MSR_TM  (1UL<<32)	/* bit 31 Trans Mem Available */
+#define MSR_VEC (1UL<<25)
+#define MSR_VSX (1UL<<23)
+
+#define MSR_TM_ACTIVE(x) ((((x) & MSR_TM) && ((x)&(MSR_TMA|MSR_TMS))) != 0)
+
+#ifndef NT_PPC_TM_SPR
+#define NT_PPC_TM_CGPR  0x108           /* TM checkpointed GPR Registers */
+#define NT_PPC_TM_CFPR  0x109           /* TM checkpointed FPR Registers */
+#define NT_PPC_TM_CVMX  0x10a           /* TM checkpointed VMX Registers */
+#define NT_PPC_TM_CVSX  0x10b           /* TM checkpointed VSX Registers */
+#define NT_PPC_TM_SPR   0x10c           /* TM Special Purpose Registers */
+#endif
+
 
 /*
  * Injected syscall instruction
@@ -84,6 +99,30 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
 	return err;
 }
 
+static UserPpc64FpstateEntry *copy_fp_regs(uint64_t *fpregs)
+{
+	UserPpc64FpstateEntry *fpe;
+	int i;
+
+	fpe = xmalloc(sizeof(UserPpc64FpstateEntry));
+	if (!fpe)
+		return NULL;
+	user_ppc64_fpstate_entry__init(fpe);
+
+	fpe->n_fpregs = NFPREG;
+	fpe->fpregs = xmalloc(fpe->n_fpregs * sizeof(fpe->fpregs[0]));
+	if (!fpe->fpregs) {
+		xfree(fpe);
+		return NULL;
+	}
+
+	/* FPSRC is the last (33th) register in the set */
+	for (i = 0; i < NFPREG; i++)
+		fpe->fpregs[i] = fpregs[i];
+
+	return fpe;
+}
+
 /* This is the layout of the POWER7 VSX registers and the way they
  * overlap with the existing FPR and VMX registers.
  *
@@ -116,36 +155,23 @@ int syscall_seized(struct parasite_ctl *ctl, int nr, unsigned long *ret,
  *
  * PTRACE_GETVSRREGS and PTRACE_GETFPREGS are required since we need
  * to save FPSCR too.
+ *
+ * There 32 VSX double word registers to save since the 32 first VSX double
+ * word registers are saved through FPR[0..32] and the remaining registers
+ * are saved when saving the Altivec registers VR[0..32].
  */
-static int get_fpu_regs(pid_t pid, CoreEntry *core)
+#define NVSXREG	32
+
+static UserPpc64FpstateEntry *get_fpu_regs(pid_t pid)
 {
 	uint64_t fpregs[NFPREG];
-	UserPpc64FpstateEntry *fpe;
-	int i;
 
 	if (ptrace(PTRACE_GETFPREGS, pid, 0, (void *)&fpregs) < 0) {
 		pr_perror("Couldn't get floating-point registers");
-		return -1;
+		return NULL;;
 	}
 
-	fpe = xmalloc(sizeof(UserPpc64FpstateEntry));
-	if (!fpe)
-		return -1;
-	user_ppc64_fpstate_entry__init(fpe);
-
-	fpe->n_fpregs = NFPREG;
-	fpe->fpregs = xmalloc(fpe->n_fpregs * sizeof(fpe->fpregs[0]));
-	if (!fpe->fpregs) {
-		xfree(fpe);
-		return -1;
-	}
-
-	/* FPSRC is the last (33th) register in the set */
-	for (i = 0; i < NFPREG; i++)
-		fpe->fpregs[i] = fpregs[i];
-
-	core->ti_ppc64->fpstate = fpe;
-	return 0;
+	return copy_fp_regs(fpregs);
 }
 
 static void put_fpu_regs(mcontext_t *mc, UserPpc64FpstateEntry *fpe)
@@ -157,7 +183,40 @@ static void put_fpu_regs(mcontext_t *mc, UserPpc64FpstateEntry *fpe)
 		mcfp[i] =  fpe->fpregs[i];
 }
 
-static int get_altivec_regs(pid_t pid, CoreEntry *core)
+static UserPpc64VrstateEntry *copy_altivec_regs(unsigned char *vrregs)
+{
+	UserPpc64VrstateEntry *vse;
+	uint64_t *p64;
+	uint32_t *p32;
+	int i;
+
+	vse = xmalloc(sizeof(*vse));
+	if (!vse)
+		return NULL;
+	user_ppc64_vrstate_entry__init(vse);
+
+	/* protocol buffer store only 64bit entries and we need 128bit */
+	vse->n_vrregs = (NVRREG-1) * 2;
+	vse->vrregs = xmalloc(vse->n_vrregs * sizeof(vse->vrregs[0]));
+	if (!vse->vrregs) {
+		xfree(vse);
+		return NULL;
+	}
+
+	/* Vectors are 2*64bits entries */
+	for (i = 0; i < (NVRREG-1); i++) {
+		p64 = (uint64_t*) &vrregs[i * 2 * sizeof(uint64_t)];
+		vse->vrregs[i*2] =  p64[0];
+		vse->vrregs[i*2 + 1] = p64[1];
+	}
+
+	p32 = (uint32_t*) &vrregs[(NVRREG-1) * 2 * sizeof(uint64_t)];
+	vse->vrsave = *p32;
+
+	return vse;
+}
+
+static UserPpc64VrstateEntry *get_altivec_regs(pid_t pid)
 {
 	/* The kernel returns :
 	 *   32 Vector registers (128bit)
@@ -168,56 +227,22 @@ static int get_altivec_regs(pid_t pid, CoreEntry *core)
 	 * "Userland shall check AT_HWCAP to know whether it can rely on the
 	 * v_regs pointer or not"
 	 */
-	unsigned char vrregs[33 * 16 + 4];
-	UserPpc64VrstateEntry *vse;
-	uint64_t *p64;
-	uint32_t *p32;
-	int i;
+	unsigned char vrregs[(NVRREG-1) * 16 + 4];
 
 	if (ptrace(PTRACE_GETVRREGS, pid, 0, (void*)&vrregs) < 0) {
 		/* PTRACE_GETVRREGS returns EIO if Altivec is not supported.
 		 * This should not happen if msr_vec is set. */
 		if (errno != EIO) {
 			pr_perror("Couldn't get Altivec registers");
-			return -1;
+			return (UserPpc64VrstateEntry*)-1L;
 		}
 		pr_debug("Altivec not supported\n");
-		return 0;
+		return NULL;
 	}
 
 	pr_debug("Dumping Altivec registers\n");
 
-	vse = xmalloc(sizeof(*vse));
-	if (!vse)
-		return -1;
-	user_ppc64_vrstate_entry__init(vse);
-
-	vse->n_vrregs = 33 * 2; /* protocol buffer store 64bit entries */
-	vse->vrregs = xmalloc(vse->n_vrregs * sizeof(vse->vrregs[0]));
-	if (!vse->vrregs) {
-		xfree(vse);
-		return -1;
-	}
-
-	/* Vectors are 2*64bits entries */
-	for (i = 0; i < 33; i++) {
-		p64 = (uint64_t*) &vrregs[i * 2 * sizeof(uint64_t)];
-		vse->vrregs[i*2] =  p64[0];
-		vse->vrregs[i*2 + 1] = p64[1];
-	}
-
-	p32 = (uint32_t*) &vrregs[33 * 2 * sizeof(uint64_t)];
-	vse->vrsave = *p32;
-
-	core->ti_ppc64->vrstate = vse;
-
-	/*
-	 * Force the MSR_VEC bit of the restored MSR otherwise the kernel
-	 * will not restore them from the signal frame.
-	 */
-	core->ti_ppc64->gpregs->msr |= MSR_VEC;
-
-	return 0;
+	return copy_altivec_regs(vrregs);
 }
 
 static int put_altivec_regs(mcontext_t *mc, UserPpc64VrstateEntry *vse)
@@ -226,7 +251,7 @@ static int put_altivec_regs(mcontext_t *mc, UserPpc64VrstateEntry *vse)
 
 	pr_debug("Restoring Altivec registers\n");
 
-	if (vse->n_vrregs != 33*2) {
+	if (vse->n_vrregs != (NVRREG-1)*2) {
 		pr_err("Corrupted Altivec dump data\n");
 		return -1;
 	}
@@ -234,7 +259,8 @@ static int put_altivec_regs(mcontext_t *mc, UserPpc64VrstateEntry *vse)
 	/* Note that this should only be done in the case MSR_VEC is set but
 	 * this is not a big deal to do that in all cases.
 	 */
-	memcpy(&v_regs->vrregs[0][0], vse->vrregs, sizeof(uint64_t) * 2 * 33);
+	memcpy(&v_regs->vrregs[0][0], vse->vrregs,
+	       sizeof(uint64_t) * 2 * (NVRREG-1));
 	/* vscr has been restored with the previous memcpy which copied 32
 	 * 128bits registers + a 128bits field containing the vscr value in
 	 * the low part.
@@ -246,6 +272,30 @@ static int put_altivec_regs(mcontext_t *mc, UserPpc64VrstateEntry *vse)
 	return 0;
 }
 
+static UserPpc64VsxstateEntry* copy_vsx_regs(uint64_t *vsregs)
+{
+	UserPpc64VsxstateEntry *vse;
+	int i;
+
+	vse = xmalloc(sizeof(*vse));
+	if (!vse)
+		return NULL;
+
+	user_ppc64_vsxstate_entry__init(vse);
+	vse->n_vsxregs = NVSXREG;
+
+	vse->vsxregs = xmalloc(vse->n_vsxregs*sizeof(vse->vsxregs[0]));
+	if (!vse->vsxregs) {
+		xfree(vse);
+		return NULL;
+	}
+
+	for (i = 0; i < vse->n_vsxregs; i++)
+		vse->vsxregs[i] = vsregs[i];
+
+	return vse;
+}
+
 /*
  * Since the FPR[0-31] is stored in the first double word of VSR[0-31] and
  * FPR are saved through the FP state, there is no need to save the upper part
@@ -255,11 +305,9 @@ static int put_altivec_regs(mcontext_t *mc, UserPpc64VrstateEntry *vse)
  * As a consequence, only the doubleword 1 of the 32 first VSX registers have
  * to be saved (the ones are returned by PTRACE_GETVSRREGS).
  */
-static int get_vsx_regs(pid_t pid, CoreEntry *core)
+static UserPpc64VsxstateEntry *get_vsx_regs(pid_t pid)
 {
-	UserPpc64VsxstateEntry *vse;
-	uint64_t vsregs[32];
-	int i;
+	uint64_t vsregs[NVSXREG];
 
 	if (ptrace(PTRACE_GETVSRREGS, pid, 0, (void*)&vsregs) < 0) {
 		/*
@@ -271,34 +319,11 @@ static int get_vsx_regs(pid_t pid, CoreEntry *core)
 			return 0;
 		}
 		pr_perror("Couldn't get VSX registers");
-		return -1;
+		return (UserPpc64VsxstateEntry *)-1L;
 	}
 
 	pr_debug("Dumping VSX registers\n");
-
-	vse = xmalloc(sizeof(*vse));
-	if (!vse)
-		return -1;
-	user_ppc64_vsxstate_entry__init(vse);
-
-	vse->n_vsxregs = 32;
-	vse->vsxregs = xmalloc(vse->n_vsxregs * sizeof(vse->vsxregs[0]));
-	if (!vse->vsxregs) {
-		xfree(vse);
-		return -1;
-	}
-
-	for (i = 0; i < vse->n_vsxregs; i++)
-		vse->vsxregs[i] = vsregs[i];
-
-	core->ti_ppc64->vsxstate = vse;
-
-	/*
-	 * Force the MSR_VSX bit of the restored MSR otherwise the kernel
-	 * will not restore them from the signal frame.
-	 */
-	core->ti_ppc64->gpregs->msr |= MSR_VSX;
-	return 0;
+	return copy_vsx_regs(vsregs);
 }
 
 static int put_vsx_regs(mcontext_t *mc, UserPpc64VsxstateEntry *vse)
@@ -317,15 +342,222 @@ static int put_vsx_regs(mcontext_t *mc, UserPpc64VsxstateEntry *vse)
 	buf = (uint64_t*) (mc->v_regs + 1);
 
 	/* Copy the value saved by get_vsx_regs in the sigframe */
-	for (i=0; i<vse->n_vsxregs; i++)
+	for (i=0; i < vse->n_vsxregs; i++)
 		buf[i] = vse->vsxregs[i];
 
 	return 0;
 }
 
-int get_task_regs(pid_t pid, user_regs_struct_t regs, CoreEntry *core)
+
+static void copy_gp_regs(UserPpc64RegsEntry *dst, user_regs_struct_t *src)
 {
 	int i;
+
+#define assign_reg(e) do {			\
+	dst->e = (__typeof__(dst->e))src->e;	\
+} while (0)
+
+	for (i=0; i<32; i++)
+		assign_reg(gpr[i]);
+	assign_reg(nip);
+	assign_reg(msr);
+	assign_reg(orig_gpr3);
+	assign_reg(ctr);
+	assign_reg(link);
+	assign_reg(xer);
+	assign_reg(ccr);
+	assign_reg(trap);
+#undef assign_reg
+}
+
+static void restore_gp_regs(mcontext_t *dst, UserPpc64RegsEntry *src)
+{
+	int i;
+
+	/* r0 to r31 */
+	for (i=0; i<32; i++)
+		dst->gp_regs[i] 	= src->gpr[i];
+
+	dst->gp_regs[PT_NIP] 		= src->nip;
+	dst->gp_regs[PT_MSR] 		= src->msr;
+	dst->gp_regs[PT_ORIG_R3]	= src->orig_gpr3;
+	dst->gp_regs[PT_CTR] 		= src->ctr;
+	dst->gp_regs[PT_LNK] 		= src->link;
+	dst->gp_regs[PT_XER] 		= src->xer;
+	dst->gp_regs[PT_CCR] 		= src->ccr;
+	dst->gp_regs[PT_TRAP] 		= src->trap;
+}
+
+static UserPpc64RegsEntry *allocate_gp_regs(void)
+{
+	UserPpc64RegsEntry *gpregs;
+
+	gpregs = xmalloc(sizeof(*gpregs));
+	if (!gpregs)
+		return NULL;
+	user_ppc64_regs_entry__init(gpregs);
+
+	gpregs->n_gpr = 32;
+	gpregs->gpr = xmalloc(32 * sizeof(uint64_t));
+	if (!gpregs->gpr) {
+		xfree(gpregs);
+		return NULL;
+	}
+
+	return gpregs;
+}
+
+/****************************************************************************
+ * TRANSACTIONAL MEMORY SUPPORT
+ */
+static void xfree_tm_state(UserPpc64TmRegsEntry *tme)
+{
+	if (tme) {
+		if (tme->fpstate) {
+			xfree(tme->fpstate->fpregs);
+			xfree(tme->fpstate);
+		}
+		if (tme->vrstate) {
+			xfree(tme->vrstate->vrregs);
+			xfree(tme->vrstate);
+		}
+		if (tme->vsxstate) {
+			xfree(tme->vsxstate->vsxregs);
+			xfree(tme->vsxstate);
+		}
+                if (tme->gpregs) {
+			if (tme->gpregs->gpr)
+				xfree(tme->gpregs->gpr);
+			xfree(tme->gpregs);
+		}
+		xfree(tme);
+	}
+}
+
+static int get_tm_regs(pid_t pid, CoreEntry *core)
+{
+	struct {
+		uint64_t tfhar, texasr, tfiar;
+	} tm_spr_regs;
+	user_regs_struct_t regs;
+	uint64_t fpregs[NFPREG], vmxregs[34][2], vsxregs[32];
+	struct iovec iov;
+	UserPpc64TmRegsEntry *tme;
+	UserPpc64RegsEntry *gpregs = core->ti_ppc64->gpregs;
+
+	pr_debug("Dumping TM registers\n");
+
+	tme = xmalloc(sizeof(*tme));
+	if (!tme)
+		return -1;
+	user_ppc64_tm_regs_entry__init(tme);
+
+	tme->gpregs = allocate_gp_regs();
+	if (!tme->gpregs)
+		goto out_free;
+
+#define TM_REQUIRED	0
+#define TM_OPTIONAL	1
+#define PTRACE_GET_TM(s,n,c,u) do {					\
+	iov.iov_base = &s;						\
+	iov.iov_len = sizeof(s);					\
+	if (ptrace(PTRACE_GETREGSET, pid, c, &iov)) {			\
+		if (!u || errno != EIO) {				\
+			pr_perror("Couldn't get TM "n);			\
+			pr_err("Your kernel seems to not support the "	\
+			       "new TM ptrace API (>= 4.8)\n");		\
+			goto out_free;					\
+		}							\
+		pr_debug("TM "n" not supported.\n");			\
+		iov.iov_base = NULL;					\
+	}								\
+} while(0)
+
+	/* Get special registers */
+	PTRACE_GET_TM(tm_spr_regs, "SPR", NT_PPC_TM_SPR, TM_REQUIRED);
+	gpregs->has_tfhar 	= true;
+	gpregs->tfhar 		= tm_spr_regs.tfhar;
+	gpregs->has_texasr 	= true;
+	gpregs->texasr		= tm_spr_regs.texasr;
+	gpregs->has_tfiar 	= true;
+	gpregs->tfiar		= tm_spr_regs.tfiar;
+
+	/* Get checkpointed regular registers */
+	PTRACE_GET_TM(regs, "GPR", NT_PPC_TM_CGPR, TM_REQUIRED);
+	copy_gp_regs(gpregs, &regs);
+
+	/* Get checkpointed FP registers */
+	PTRACE_GET_TM(fpregs, "FPR", NT_PPC_TM_CFPR, TM_OPTIONAL);
+	if (iov.iov_base) {
+		core->ti_ppc64->fpstate = copy_fp_regs(fpregs);
+		if (!core->ti_ppc64->fpstate)
+			goto out_free;
+	}
+
+	/* Get checkpointed VMX (Altivec) registers */
+	PTRACE_GET_TM(vmxregs, "VMX", NT_PPC_TM_CVMX, TM_OPTIONAL);
+	if (iov.iov_base) {
+		core->ti_ppc64->vrstate = copy_altivec_regs((unsigned char *)vmxregs);
+		if (!core->ti_ppc64->vrstate)
+			goto out_free;
+	}
+
+	/* Get checkpointed VSX registers */
+	PTRACE_GET_TM(vsxregs, "VSX", NT_PPC_TM_CVSX, TM_OPTIONAL);
+	if (iov.iov_base) {
+		core->ti_ppc64->vsxstate = copy_vsx_regs(vsxregs);
+		if (!core->ti_ppc64->vsxstate)
+			goto out_free;
+	}
+
+	core->ti_ppc64->tmstate = tme;
+	return 0;
+
+out_free:
+	xfree_tm_state(tme);
+	return -1;	/* still failing the checkpoint */
+}
+
+static int put_tm_regs(struct rt_sigframe *f, UserPpc64TmRegsEntry *tme)
+{
+/*
+ * WARNING: As stated in kernel's restore_tm_sigcontexts, TEXASR has to be
+ * restored by the process itself :
+ *   TEXASR was set by the signal delivery reclaim, as was TFIAR.
+ *   Users doing anything abhorrent like thread-switching w/ signals for
+ *   TM-Suspended code will have to back TEXASR/TFIAR up themselves.
+ *   For the case of getting a signal and simply returning from it,
+ *   we don't need to re-copy them here.
+ */
+	struct ucontext *tm_uc = &f->uc_transact;
+
+	pr_debug("Restoring TM registers FP:%d VR:%d VSX:%d\n",
+		 !!(tme->fpstate), !!(tme->vrstate), !!(tme->vsxstate));
+
+	restore_gp_regs(&tm_uc->uc_mcontext, tme->gpregs);
+
+	if (tme->fpstate)
+		put_fpu_regs(&tm_uc->uc_mcontext, tme->fpstate);
+
+	if (tme->vrstate && put_altivec_regs(&tm_uc->uc_mcontext,
+					     tme->vrstate))
+		return -1;
+
+	if (tme->vsxstate && put_vsx_regs(&tm_uc->uc_mcontext,
+					  tme->vsxstate))
+		return -1;
+
+	f->uc.uc_link = tm_uc;
+	return 0;
+}
+
+/****************************************************************************/
+int get_task_regs(pid_t pid, user_regs_struct_t regs, CoreEntry *core)
+{
+	UserPpc64RegsEntry *gpregs;
+	UserPpc64FpstateEntry **fpstate;
+	UserPpc64VrstateEntry **vrstate;
+	UserPpc64VsxstateEntry **vsxstate;
 
 	pr_info("Dumping GP/FPU registers for %d\n", pid);
 
@@ -356,35 +588,62 @@ int get_task_regs(pid_t pid, user_regs_struct_t regs, CoreEntry *core)
 	/* Resetting trap since we are now coming from user space. */
 	regs.trap = 0;
 
-#define assign_reg(dst, src, e) do {			\
-		dst->e = (__typeof__(dst->e))src.e;	\
-} while (0)
-
-	for (i=0; i<32; i++)
-		assign_reg(core->ti_ppc64->gpregs, regs, gpr[i]);
-
-	assign_reg(core->ti_ppc64->gpregs, regs, nip);
-	assign_reg(core->ti_ppc64->gpregs, regs, msr);
-	assign_reg(core->ti_ppc64->gpregs, regs, orig_gpr3);
-	assign_reg(core->ti_ppc64->gpregs, regs, ctr);
-	assign_reg(core->ti_ppc64->gpregs, regs, link);
-	assign_reg(core->ti_ppc64->gpregs, regs, xer);
-	assign_reg(core->ti_ppc64->gpregs, regs, ccr);
-	assign_reg(core->ti_ppc64->gpregs, regs, trap);
-#undef assign_reg
-
-	if (get_fpu_regs(pid, core))
-		return -1;
-
-	if (get_altivec_regs(pid, core))
-		return -1;
-
 	/*
-	 * Don't save the VSX registers if Altivec registers are not
-	 * supported
+	 * Check for Transactional Memory operation in progress.
+	 * Until we have support of TM register's state through the ptrace API,
+	 * we can't checkpoint process with TM operation in progress (almost
+	 * impossible) or suspended (easy to get).
 	 */
-	if (CORE_THREAD_ARCH_INFO(core)->vrstate && get_vsx_regs(pid, core))
+	if (MSR_TM_ACTIVE(regs.msr)) {
+		pr_debug("Task %d has %s TM operation at 0x%lx\n",
+			 pid,
+			 (regs.msr & MSR_TMS) ? "a suspended" : "an active",
+			 regs.nip);
+		if (get_tm_regs(pid, core))
+			return -1;
+
+		gpregs = core->ti_ppc64->tmstate->gpregs;
+		fpstate = &(core->ti_ppc64->tmstate->fpstate);
+		vrstate = &(core->ti_ppc64->tmstate->vrstate);
+		vsxstate = &(core->ti_ppc64->tmstate->vsxstate);
+	} else {
+		gpregs = core->ti_ppc64->gpregs;
+		fpstate = &(core->ti_ppc64->fpstate);
+		vrstate = &(core->ti_ppc64->vrstate);
+		vsxstate = &(core->ti_ppc64->vsxstate);
+	}
+
+	copy_gp_regs(gpregs, &regs);
+
+	*fpstate = get_fpu_regs(pid);
+	if (!*fpstate)
 		return -1;
+
+	*vrstate = get_altivec_regs(pid);
+	if (*vrstate) {
+		if (*vrstate == (UserPpc64VrstateEntry*)-1L)
+			return -1;
+		/*
+		 * Force the MSR_VEC bit of the restored MSR otherwise the
+		 * kernel will not restore them from the signal frame.
+		 */
+		gpregs->msr |= MSR_VEC;
+
+		/*
+		 * Save the VSX registers if Altivec registers are supported
+		 */
+		*vsxstate = get_vsx_regs(pid);
+		if (*vsxstate) {
+			if (*vsxstate == (UserPpc64VsxstateEntry *)-1L)
+				return -1;
+			/*
+			 * Force the MSR_VSX bit of the restored MSR otherwise
+			 * the kernel will not restore them from the signal
+			 * frame.
+			 */
+			gpregs->msr |= MSR_VSX;
+		}
+	}
 
 	return 0;
 }
@@ -392,30 +651,21 @@ int get_task_regs(pid_t pid, user_regs_struct_t regs, CoreEntry *core)
 int arch_alloc_thread_info(CoreEntry *core)
 {
 	ThreadInfoPpc64 *ti_ppc64;
-	UserPpc64RegsEntry *regs;
 
 	ti_ppc64 = xmalloc(sizeof(*ti_ppc64));
 	if(!ti_ppc64)
-		goto err;
+		return -1;
+
 	thread_info_ppc64__init(ti_ppc64);
+
+	ti_ppc64->gpregs = allocate_gp_regs();
+	if (!ti_ppc64->gpregs) {
+		xfree(ti_ppc64);
+		return -1;
+	}
+
 	CORE_THREAD_ARCH_INFO(core) = ti_ppc64;
-
-	/* user_ppc64_regs_entry */
-	regs = xmalloc(sizeof(*regs));
-	if (!regs)
-		goto err;
-	user_ppc64_regs_entry__init(regs);
-
-	regs->gpr = xmalloc(32*sizeof(uint64_t));
-	if (!regs->gpr)
-		goto err;
-	regs->n_gpr = 32;
-
-	ti_ppc64->gpregs = regs;
-
 	return 0;
-err:
-	return -1;
 }
 
 void arch_free_thread_info(CoreEntry *core)
@@ -433,6 +683,7 @@ void arch_free_thread_info(CoreEntry *core)
 			xfree(CORE_THREAD_ARCH_INFO(core)->vsxstate->vsxregs);
 			xfree(CORE_THREAD_ARCH_INFO(core)->vsxstate);
 		}
+		xfree_tm_state(CORE_THREAD_ARCH_INFO(core)->tmstate);
                 xfree(CORE_THREAD_ARCH_INFO(core)->gpregs->gpr);
                 xfree(CORE_THREAD_ARCH_INFO(core)->gpregs);
                 xfree(CORE_THREAD_ARCH_INFO(core));
@@ -443,6 +694,7 @@ void arch_free_thread_info(CoreEntry *core)
 int restore_fpu(struct rt_sigframe *sigframe, CoreEntry *core)
 {
 	int ret = 0;
+
 	if (CORE_THREAD_ARCH_INFO(core)->fpstate)
 		put_fpu_regs(&sigframe->uc.uc_mcontext,
 			     CORE_THREAD_ARCH_INFO(core)->fpstate);
@@ -451,7 +703,7 @@ int restore_fpu(struct rt_sigframe *sigframe, CoreEntry *core)
 		ret = put_altivec_regs(&sigframe->uc.uc_mcontext,
 				       CORE_THREAD_ARCH_INFO(core)->vrstate);
 	else if (core->ti_ppc64->gpregs->msr & MSR_VEC) {
-		pr_err("Internal error\n");
+		pr_err("Register's data mismatch, corrupted image ?\n");
 		ret = -1;
 	}
 
@@ -459,7 +711,15 @@ int restore_fpu(struct rt_sigframe *sigframe, CoreEntry *core)
 		ret = put_vsx_regs(&sigframe->uc.uc_mcontext,
 				   CORE_THREAD_ARCH_INFO(core)->vsxstate);
 	else if (core->ti_ppc64->gpregs->msr & MSR_VSX) {
-		pr_err("Internal error\n");
+		pr_err("VSX register's data mismatch, corrupted image ?\n");
+		ret = -1;
+	}
+
+	if (!ret && CORE_THREAD_ARCH_INFO(core)->tmstate)
+		ret = put_tm_regs(sigframe,
+				  CORE_THREAD_ARCH_INFO(core)->tmstate);
+	else if (MSR_TM_ACTIVE(core->ti_ppc64->gpregs->msr)) {
+		pr_err("TM register's data mismatch, corrupted image ?\n");
 		ret = -1;
 	}
 
@@ -471,10 +731,8 @@ int restore_fpu(struct rt_sigframe *sigframe, CoreEntry *core)
  * used in the context of the checkpointed process, the v_regs pointer in the
  * signal frame must be updated to match the address in the remote stack.
  */
-int sigreturn_prep_fpu_frame(struct rt_sigframe *frame, mcontext_t *rcontext)
+static inline void update_vregs(mcontext_t *lcontext, mcontext_t *rcontext)
 {
-	mcontext_t *lcontext = &frame->uc.uc_mcontext;
-
 	if (lcontext->v_regs) {
 		uint64_t offset = (uint64_t)(lcontext->v_regs) - (uint64_t)lcontext;
 		lcontext->v_regs = (vrregset_t *)((uint64_t)rcontext + offset);
@@ -483,25 +741,34 @@ int sigreturn_prep_fpu_frame(struct rt_sigframe *frame, mcontext_t *rcontext)
 			 (unsigned long long) lcontext->v_regs,
 			 (unsigned long long) rcontext);
 	}
+}
+
+int sigreturn_prep_fpu_frame(struct rt_sigframe *frame,
+			     struct rt_sigframe *rframe)
+{
+	uint64_t msr = frame->uc.uc_mcontext.gp_regs[PT_MSR];
+
+	update_vregs(&frame->uc.uc_mcontext, &rframe->uc.uc_mcontext);
+
+	/* Sanity check: If TM so uc_link should be set, otherwise not */
+	if (MSR_TM_ACTIVE(msr) ^ (!!(frame->uc.uc_link))) {
+		BUG();
+		return 1;
+	}
+
+	/* Updating the transactional state address if any */
+	if (frame->uc.uc_link) {
+		update_vregs(&frame->uc_transact.uc_mcontext,
+			     &rframe->uc_transact.uc_mcontext);
+		frame->uc.uc_link =  &rframe->uc_transact;
+	}
+
 	return 0;
 }
 
 int restore_gpregs(struct rt_sigframe *f, UserPpc64RegsEntry *r)
 {
-	int i;
-
-	/* r0 to r31 */
-	for (i=0; i<32; i++)
-		f->uc.uc_mcontext.gp_regs[i] = r->gpr[i];
-
-	f->uc.uc_mcontext.gp_regs[PT_NIP] = r->nip;
-	f->uc.uc_mcontext.gp_regs[PT_MSR] = r->msr;
-	f->uc.uc_mcontext.gp_regs[PT_ORIG_R3] = r->orig_gpr3;
-	f->uc.uc_mcontext.gp_regs[PT_CTR] = r->ctr;
-	f->uc.uc_mcontext.gp_regs[PT_LNK] = r->link;
-	f->uc.uc_mcontext.gp_regs[PT_XER] = r->xer;
-	f->uc.uc_mcontext.gp_regs[PT_CCR] = r->ccr;
-	f->uc.uc_mcontext.gp_regs[PT_TRAP] = r->trap;
+	restore_gp_regs(&f->uc.uc_mcontext, r);
 
 	return 0;
 }

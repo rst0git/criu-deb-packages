@@ -7,7 +7,7 @@ override CPPFLAGS += -I$(LIBDIR)
 CFLAGS	= -g -O2 -Wall -Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
 CFLAGS	+= $(USERCFLAGS)
 
-TST_NOFILE	=				\
+TST_NOFILE	:=				\
 		busyloop00			\
 		sleeping00			\
 		pid00				\
@@ -81,7 +81,6 @@ TST_NOFILE	=				\
 		sem				\
 		maps01				\
 		maps02				\
-		maps03				\
 		maps04				\
 		maps05				\
 		mlock_setuid			\
@@ -153,6 +152,12 @@ TST_NOFILE	=				\
 		cgroupns			\
 		helper_zombie_child		\
 #		jobctl00			\
+
+ifneq ($(SRCARCH),arm)
+ifneq ($(COMPAT_TEST),y)
+        TST_NOFILE += maps03
+endif
+endif
 
 TST_FILE	=				\
 		maps06				\
@@ -231,6 +236,7 @@ TST_DIR		=				\
 		mntns_open			\
 		mntns_link_remap		\
 		mntns_ghost			\
+		mntns_ro_root			\
 		mntns_link_ghost		\
 		mntns_shared_bind		\
 		mntns_shared_bind02		\
