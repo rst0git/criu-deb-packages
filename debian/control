@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Salvatore Bonaccorso <carnil@debian.org>
 Build-Depends:
  asciidoc,
- debhelper (>= 9.20151219),
+ debhelper (>= 10),
  dh-python,
  libcap-dev,
  libnl-3-dev,
