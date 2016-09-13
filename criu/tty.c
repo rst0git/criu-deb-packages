@@ -119,6 +119,7 @@ struct tty_dump_info {
 	size_t				tty_data_size;
 };
 
+static bool stdin_isatty = false;
 static LIST_HEAD(all_tty_info_entries);
 static LIST_HEAD(all_ttys);
 
@@ -142,6 +143,8 @@ static LIST_HEAD(all_ttys);
 #define CONSOLE_INDEX	1002
 #define VT_INDEX	1004
 #define CTTY_INDEX	1006
+#define ETTY_INDEX	1008
+#define STTY_INDEX	1010
 #define INDEX_ERR	(MAX_TTYS + 1)
 
 static DECLARE_BITMAP(tty_bitmap, (MAX_TTYS << 1));
@@ -220,12 +223,14 @@ static int open_ext_tty(struct tty_info *info);
 static struct tty_driver ext_driver = {
 	.type			= TTY_TYPE__EXT_TTY,
 	.name			= "ext",
+	.index			= ETTY_INDEX,
 	.open			= open_ext_tty,
 };
 
 static struct tty_driver serial_driver = {
 	.type			= TTY_TYPE__SERIAL,
 	.name			= "serial",
+	.index			= STTY_INDEX,
 	.open			= open_simple_tty,
 };
 
@@ -833,6 +838,16 @@ static int restore_tty_params(int fd, struct tty_info *info)
 		winsize_copy(&p.w, info->tie->winsize);
 	}
 
+	if (info->tie->has_uid && info->tie->has_gid) {
+		if (fchown(fd, info->tie->uid, info->tie->gid)) {
+			pr_perror("Can't setup uid %d gid %d on %x\n",
+				  (int)info->tie->uid,
+				  (int)info->tie->gid,
+				  info->tfe->id);
+			return -1;
+		}
+	}
+
 	return userns_call(do_restore_tty_parms, UNS_ASYNC, &p, sizeof(p), fd);
 }
 
@@ -864,11 +879,7 @@ static int pty_open_slaves(struct tty_info *info)
 	struct fdinfo_list_entry *fle;
 	struct tty_info *slave;
 
-	sock = socket(PF_UNIX, SOCK_DGRAM, 0);
-	if (sock < 0) {
-		pr_perror("Can't create socket");
-		goto err;
-	}
+	sock = get_service_fd(TRANSPORT_FD_OFF);
 
 	list_for_each_entry(slave, &info->sibling, sibling) {
 		BUG_ON(tty_is_master(slave));
@@ -900,7 +911,6 @@ static int pty_open_slaves(struct tty_info *info)
 
 err:
 	close_safe(&fd);
-	close_safe(&sock);
 	return ret;
 }
 
@@ -936,11 +946,17 @@ static int pty_open_unpaired_slave(struct file_desc *d, struct tty_info *slave)
 	 */
 
 	if (likely(slave->inherit)) {
+		if (!stdin_isatty) {
+			pr_err("Don't have tty to inherit session from, aborting\n");
+			return -1;
+		}
+
 		fd = dup(get_service_fd(SELF_STDIN_OFF));
 		if (fd < 0) {
 			pr_perror("Can't dup SELF_STDIN_OFF");
 			return -1;
 		}
+
 		pr_info("Migrated slave peer %x -> to fd %d\n",
 			slave->tfe->id, fd);
 	} else {
@@ -1708,6 +1724,11 @@ static int dump_tty_info(int lfd, u32 id, const struct fd_parms *p, struct tty_d
 	info.exclusive		= pti->st_excl;
 	info.packet_mode	= pti->st_pckt;
 
+	info.has_uid		= true;
+	info.uid		= userns_uid(p->stat.st_uid);
+	info.has_gid		= true;
+	info.gid		= userns_gid(p->stat.st_gid);
+
 	info.type = driver->type;
 	if (info.type == TTY_TYPE__PTY) {
 		info.pty	= &pty;
@@ -2046,10 +2067,10 @@ int tty_prep_fds(void)
 	if (!opts.shell_job)
 		return 0;
 
-	if (!isatty(STDIN_FILENO)) {
-		pr_err("Standard stream is not a terminal, aborting\n");
-		return -1;
-	}
+	if (!isatty(STDIN_FILENO))
+		pr_info("Standard stream is not a terminal, may fail later\n");
+	else
+		stdin_isatty = true;
 
 	if (install_service_fd(SELF_STDIN_OFF, STDIN_FILENO) < 0) {
 		pr_perror("Can't dup stdin to SELF_STDIN_OFF");

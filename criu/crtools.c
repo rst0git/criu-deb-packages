@@ -206,6 +206,17 @@ int add_external(char *key)
 	return 0;
 }
 
+bool deprecated_ok(char *what)
+{
+	if (opts.deprecated_ok)
+		return true;
+
+	pr_err("Deprecated functionality (%s) rejected.\n", what);
+	pr_err("Use the --deprecated option or set CRIU_DEPRECATED environment.\n");
+	pr_err("For details visit https://criu.org/Deprecation\n");
+	return false;
+}
+
 int main(int argc, char *argv[], char *envp[])
 {
 	pid_t pid = 0, tree_id = 0;
@@ -279,6 +290,7 @@ int main(int argc, char *argv[], char *envp[])
 		{ "cgroup-props-file",		required_argument,	0, 1081	},
 		{ "cgroup-dump-controller",	required_argument,	0, 1082	},
 		{ SK_INFLIGHT_PARAM,		no_argument,		0, 1083	},
+		{ "deprecated",			no_argument,		0, 1084 },
 		{ },
 	};
 
@@ -587,6 +599,10 @@ int main(int argc, char *argv[], char *envp[])
 			pr_msg("Will skip in-flight TCP connections\n");
 			opts.tcp_skip_in_flight = true;
 			break;
+		case 1084:
+			pr_msg("Turn deprecated stuff ON\n");
+			opts.deprecated_ok = true;
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -598,6 +614,11 @@ int main(int argc, char *argv[], char *envp[])
 		default:
 			goto usage;
 		}
+	}
+
+	if (getenv("CRIU_DEPRECATED")) {
+		pr_msg("Turn deprecated stuff ON via env\n");
+		opts.deprecated_ok = true;
 	}
 
 	if (check_namespace_opts()) {
@@ -653,6 +674,16 @@ int main(int argc, char *argv[], char *envp[])
 			return 1;
 	}
 
+	/*
+	 * When a process group becomes an orphan,
+	 * its processes are sent a SIGHUP signal
+	 */
+	if (!strcmp(argv[optind], "restore") &&
+			opts.restore_detach &&
+			opts.final_state == TASK_STOPPED &&
+			opts.shell_job)
+		pr_warn("Stopped and detached shell job will get SIGHUP from OS.");
+
 	if (chdir(opts.work_dir)) {
 		pr_perror("Can't change directory to %s", opts.work_dir);
 		return 1;
@@ -664,6 +695,8 @@ int main(int argc, char *argv[], char *envp[])
 		return 1;
 
 	pr_debug("Version: %s (gitid %s)\n", CRIU_VERSION, CRIU_GITID);
+	if (opts.deprecated_ok)
+		pr_debug("DEPRECATED ON\n");
 
 	if (!list_empty(&opts.inherit_fds)) {
 		if (strcmp(argv[optind], "restore")) {
@@ -787,20 +820,19 @@ usage:
 "     --pidfile FILE     write root task, service or page-server pid to FILE\n"
 "  -W|--work-dir DIR     directory to cd and write logs/pidfiles/stats to\n"
 "                        (if not specified, value of --images-dir is used)\n"
-"     --cpu-cap [CAP]    require certain cpu capability. CAP: may be one of:\n"
-"                        'cpu','fpu','all','ins','none'. To disable capability, prefix it with '^'.\n"
+"     --cpu-cap [CAP]    CPU capabilities to write/check. CAP is comma-separated\n"
+"                        list of: cpu, fpu, all, ins, none. To disable\n"
+"                        a capability, use ^CAP. Empty argument implies all\n"
 "     --exec-cmd         execute the command specified after '--' on successful\n"
 "                        restore making it the parent of the restored process\n"
-"  --freeze-cgroup\n"
-"                        use cgroup freezer to collect processes\n"
+"  --freeze-cgroup       use cgroup freezer to collect processes\n"
 "\n"
 "* Special resources support:\n"
-"  -x|--" USK_EXT_PARAM "inode,.." "      allow external unix connections (optionally can be assign socket's inode that allows one-sided dump)\n"
+"  -x|--" USK_EXT_PARAM " [inode,...]\n"
+"                        allow external unix connections (optional arguments\n"
+"                        are socketpair inode(s) that allow one-sided dump)\n"
 "     --" SK_EST_PARAM "  checkpoint/restore established TCP connections\n"
-"     --" SK_INFLIGHT_PARAM "   this option skips in-flight TCP connections.\n"
-"                        if TCP connections are found which are not yet completely\n"
-"                        established, criu will ignore these connections in favor\n"
-"                        of erroring out.\n"
+"     --" SK_INFLIGHT_PARAM "   skip (ignore) in-flight TCP connections\n"
 "  -r|--root PATH        change the root filesystem (when run in mount namespace)\n"
 "  --evasive-devices     use any path to a device file if the original one\n"
 "                        is inaccessible\n"
@@ -808,7 +840,7 @@ usage:
 "                        can optionally append @<bridge-name> to OUT for moving\n"
 "                        the outside veth to the named bridge\n"
 "  --link-remap          allow one to link unlinked files back when possible\n"
-"  --ghost-limit size    specify maximum size of deleted file contents to be carried inside an image file\n"
+"  --ghost-limit size    limit max size of deleted file contents inside image\n"
 "  --action-script FILE  add an external action script\n"
 "  -j|--" OPT_SHELL_JOB "        allow one to dump and restore shell jobs\n"
 "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
@@ -824,26 +856,26 @@ usage:
 "                        allow autoresolving mounts with external sharing\n"
 "  --enable-external-masters\n"
 "                        allow autoresolving mounts with external masters\n"
-"  --manage-cgroups [m]  dump or restore cgroups the process is in usig mode:\n"
-"                        'none', 'props', 'soft' (default), 'full' and 'strict'.\n"
+"  --manage-cgroups [m]  dump/restore process' cgroups; argument can be one of\n"
+"                        'none', 'props', 'soft' (default), 'full' or 'strict'\n"
 "  --cgroup-root [controller:]/newroot\n"
 "                        change the root cgroup the controller will be\n"
 "                        installed into. No controller means that root is the\n"
-"                        default for all controllers not specified.\n"
+"                        default for all controllers not specified\n"
 "  --cgroup-props STRING\n"
 "                        define cgroup controllers and properties\n"
 "                        to be checkpointed, which are described\n"
-"                        via STRING using simplified YAML format.\n"
+"                        via STRING using simplified YAML format\n"
 "  --cgroup-props-file FILE\n"
-"                        same as --cgroup-props but taking descrition\n"
-"                        from the path specified.\n"
+"                        same as --cgroup-props, but taking description\n"
+"                        from the path specified\n"
 "  --cgroup-dump-controller NAME\n"
 "                        define cgroup controller to be dumped\n"
-"                        and skip anything else present in system.\n"
-"  --skip-mnt PATH       ignore this mountpoint when dumping the mount namespace.\n"
-"  --enable-fs FSNAMES   a comma separated list of filesystem names or \"all\".\n"
+"                        and skip anything else present in system\n"
+"  --skip-mnt PATH       ignore this mountpoint when dumping the mount namespace\n"
+"  --enable-fs FSNAMES   a comma separated list of filesystem names or \"all\"\n"
 "                        force criu to (try to) dump/restore these filesystem's\n"
-"                        mountpoints even if fs is not supported.\n"
+"                        mountpoints even if fs is not supported\n"
 "  --external RES        dump objects from this list as external resources:\n"
 "                        Formats of RES on dump:\n"
 "                            tty[rdev:dev]\n"
@@ -851,35 +883,30 @@ usage:
 "                            dev[maj:min]:VAL\n"
 "                        Formats of RES on restore:\n"
 "                            dev[VAL]:DEVPATH\n"
-"  --inherit-fd fd[<num>]:<existing>\n"
-"                        Inherit file descriptors. This allows to treat file descriptor\n"
-"                        <num> as being already opened via <existing> one and instead of\n"
-"                        trying to open we inherit it:\n"
+"  --inherit-fd fd[NUM]:RES\n"
+"                        Inherit file descriptors, treating fd NUM as being\n"
+"                        already opened via an existing RES, which can be:\n"
 "                            tty[rdev:dev]\n"
 "                            pipe[inode]\n"
 "                            socket[inode]\n"
 "                            file[mnt_id:inode]\n"
-"  --empty-ns {net}\n"
-"                        Create a namespace, but don't restore its properies.\n"
-"                        An user will retore them from action scripts.\n"
-"  -J|--join-ns NS:PID|NS_FILE[,EXTRA_OPTS]\n"
-"			Join exist namespace and restore process in it.\n"
-"			Namespace can be specified in pid or file path format.\n"
-"			    --join-ns net:12345 or --join-ns net:/foo/bar.\n"
-"			Extra_opts is optional, for now only user namespace support:\n"
-"			    --join-ns user:PID,UID,GID to specify uid and gid.\n"
-"			Please NOTE: join-ns with user-namespace is not fully tested.\n"
-"			It may be dangerous to use this feature\n"
+"  --empty-ns net        Create a namespace, but don't restore its properies\n"
+"                        (assuming it will be restored by action scripts)\n"
+"  -J|--join-ns NS:{PID|NS_FILE}[,OPTIONS]\n"
+"			Join existing namespace and restore process in it.\n"
+"			Namespace can be specified as either pid or file path.\n"
+"			OPTIONS can be used to specify parameters for userns:\n"
+"			    user:PID,UID,GID\n"
+"\n"
 "Check options:\n"
-"  without any arguments, \"criu check\" checks availability of absolutely required\n"
-"  kernel features; if any of these features is missing dump and restore will fail\n"
-"  --extra               also check availability of extra kernel features\n"
-"  --experimental        also check availability of experimental kernel features\n"
-"  --all                 also check availability of extra and experimental kernel features\n"
-"  --feature FEAT        only check availability of one of the following kernel features\n"
-"                        "
+"  Without options, \"criu check\" checks availability of absolutely required\n"
+"  kernel features, critical for performing dump and restore.\n"
+"  --extra               add check for extra kernel features\n"
+"  --experimental        add check for experimental kernel features\n"
+"  --all                 same as --extra --experimental\n"
+"  --feature FEAT        only check a particular feature, one of:"
 	);
-	check_add_feature("list");
+	pr_check_features("                            ", ", ", 80);
 	pr_msg(
 "\n"
 "* Logging:\n"
@@ -898,7 +925,7 @@ usage:
 "  --auto-dedup          when used on dump it will deduplicate \"old\" data in\n"
 "                        pages images of previous dump\n"
 "                        when used on restore, as soon as page is restored, it\n"
-"                        will be punched from the image.\n"
+"                        will be punched from the image\n"
 "\n"
 "Page/Service server options:\n"
 "  --address ADDR        address of server or service\n"

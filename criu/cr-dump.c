@@ -470,8 +470,6 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
 			ret = 0;
 		else if (vma_entry_is(vma, VMA_AREA_SYSVIPC))
 			ret = check_sysvipc_map_dump(pid, vma);
-		else if (vma_entry_is(vma, VMA_ANON_SHARED))
-			ret = add_shmem_area(pid, vma);
 		else if (vma_entry_is(vma, VMA_AREA_SOCKET))
 			ret = dump_socket_map(vma_area);
 		else
@@ -1542,6 +1540,10 @@ int cr_pre_dump_tasks(pid_t pid)
 	for_each_pstree_item(item)
 		if (pre_dump_one_task(item))
 			goto err;
+
+	ret = cr_dump_shmem();
+	if (ret)
+		goto err;
 
 	if (irmap_predump_prep())
 		goto err;

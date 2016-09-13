@@ -110,6 +110,13 @@ err:
 	return -1;
 }
 
+static void set_resp_err(CriuResp *resp)
+{
+	resp->cr_errno = get_cr_errno();
+	resp->has_cr_errno = resp->cr_errno ? true : false;
+	resp->cr_errmsg = log_first_err();
+}
+
 static void send_criu_err(int sk, char *msg)
 {
 	CriuResp resp = CRIU_RESP__INIT;
@@ -118,10 +125,7 @@ static void send_criu_err(int sk, char *msg)
 
 	resp.type = CRIU_REQ_TYPE__EMPTY;
 	resp.success = false;
-	if (get_cr_errno()) {
-		resp.has_cr_errno = true;
-		resp.cr_errno = get_cr_errno();
-	}
+	set_resp_err(&resp);
 
 	send_criu_msg(sk, &resp);
 }
@@ -133,10 +137,7 @@ int send_criu_dump_resp(int socket_fd, bool success, bool restored)
 
 	msg.type = CRIU_REQ_TYPE__DUMP;
 	msg.success = success;
-	if (get_cr_errno()) {
-		msg.has_cr_errno = true;
-		msg.cr_errno = get_cr_errno();
-	}
+	set_resp_err(&msg);
 	msg.dump = &resp;
 
 	resp.has_restored = true;
@@ -151,10 +152,7 @@ static int send_criu_pre_dump_resp(int socket_fd, bool success)
 
 	msg.type = CRIU_REQ_TYPE__PRE_DUMP;
 	msg.success = success;
-	if (get_cr_errno()) {
-		msg.has_cr_errno = true;
-		msg.cr_errno = get_cr_errno();
-	}
+	set_resp_err(&msg);
 
 	return send_criu_msg(socket_fd, &msg);
 }
@@ -166,10 +164,7 @@ int send_criu_restore_resp(int socket_fd, bool success, int pid)
 
 	msg.type = CRIU_REQ_TYPE__RESTORE;
 	msg.success = success;
-	if (get_cr_errno()) {
-		msg.has_cr_errno = true;
-		msg.cr_errno = get_cr_errno();
-	}
+	set_resp_err(&msg);
 	msg.restore = &resp;
 
 	resp.pid = pid;
@@ -287,6 +282,11 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	log_set_loglevel(req->log_level);
 	if (log_init(opts.output) == -1) {
 		pr_perror("Can't initiate log");
+		goto err;
+	}
+
+	if (log_keep_err()) {
+		pr_perror("Can't tune log");
 		goto err;
 	}
 

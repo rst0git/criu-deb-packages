@@ -21,7 +21,6 @@
 #include "plugin.h"
 #include "mount.h"
 #include "pstree.h"
-#include "proc_parse.h"
 #include "image.h"
 #include "namespaces.h"
 #include "protobuf.h"
@@ -296,6 +295,9 @@ static bool mounts_sb_equal(struct mount_info *a, struct mount_info *b)
 		if (strcmp(a->options, b->options))
 			return false;
 	}
+
+	if (a->fstype->code == FSTYPE__CGROUP && strcmp(a->private, b->private))
+		return false;
 
 	return a->s_dev == b->s_dev && !strcmp(a->source, b->source);
 }
@@ -1602,7 +1604,7 @@ static int cgroup_parse(struct mount_info *pm)
 	/* cgroup namespaced mounts don't look rooted to CRIU, so let's fake it
 	 * here.
 	 */
-	xfree(pm->root);
+	pm->private = pm->root;
 	pm->root = xstrdup("/");
 	if (!pm->root)
 		return -1;
@@ -2702,8 +2704,11 @@ static int do_umount_one(struct mount_info *mi)
 
 static int cr_pivot_root(char *root)
 {
-	char put_root[] = "crtools-put-root.XXXXXX";
+	char tmp_dir_tmpl[] = "crtools-put-root.XXXXXX";
+	bool tmp_dir = false;
+	char *put_root = "tmp";
 	int exit_code = -1;
+	struct stat st;
 
 	pr_info("Move the root to %s\n", root ? : ".");
 
@@ -2714,9 +2719,13 @@ static int cr_pivot_root(char *root)
 		}
 	}
 
-	if (mkdtemp(put_root) == NULL) {
-		pr_perror("Can't create a temporary directory");
-		return -1;
+	if (stat(put_root, &st) || !S_ISDIR(st.st_mode)) {
+		put_root = mkdtemp(tmp_dir_tmpl);
+		if (put_root == NULL) {
+			pr_perror("Can't create a temporary directory");
+			return -1;
+		}
+		tmp_dir = true;
 	}
 
 	if (mount(put_root, put_root, NULL, MS_BIND, NULL)) {
@@ -2753,7 +2762,7 @@ err_tmpfs:
 	}
 
 err_root:
-	if (rmdir(put_root)) {
+	if (tmp_dir && rmdir(put_root)) {
 		pr_perror("Can't remove the directory %s", put_root);
 		return -1;
 	}
