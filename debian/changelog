@@ -1,3 +1,10 @@
+criu (2.7-1) experimental; urgency=medium
+
+  * New upstream version 2.7
+  * Update copyright years for upstream files
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 17 Oct 2016 10:47:15 +0200
+
 criu (2.6-2) unstable; urgency=medium
 
   * Upload to unstable
