@@ -24,6 +24,7 @@
 #include "compiler.h"
 #include "crtools.h"
 #include "cr_options.h"
+#include "external.h"
 #include "sockets.h"
 #include "files.h"
 #include "sk-inet.h"
@@ -36,6 +37,7 @@
 #include "cr-service.h"
 #include "plugin.h"
 #include "mount.h"
+#include "filesystems.h"
 #include "namespaces.h"
 #include "cgroup.h"
 #include "cgroup-props.h"
@@ -193,19 +195,6 @@ static size_t parse_size(char *optarg)
 	return (size_t)atol(optarg);
 }
 
-int add_external(char *key)
-{
-	struct external *ext;
-
-	ext = xmalloc(sizeof(*ext));
-	if (!ext)
-		return -1;
-	ext->id = key;
-	list_add(&ext->node, &opts.external);
-
-	return 0;
-}
-
 bool deprecated_ok(char *what)
 {
 	if (opts.deprecated_ok)
@@ -318,7 +307,7 @@ int main(int argc, char *argv[], char *envp[])
 		/*
 		 * This is to start criu service worker from libcriu calls.
 		 * The usage is "criu swrk <fd>" and is not for CLI/scripts.
-		 * The arguments semantics can change at any tyme with the
+		 * The arguments semantics can change at any time with the
 		 * corresponding lib call change.
 		 */
 		opts.swrk_restore = true;
@@ -622,7 +611,7 @@ int main(int argc, char *argv[], char *envp[])
 	}
 
 	if (check_namespace_opts()) {
-		pr_msg("Error: namespace flags confict\n");
+		pr_msg("Error: namespace flags conflict\n");
 		return 1;
 	}
 
@@ -827,6 +816,15 @@ usage:
 "                        restore making it the parent of the restored process\n"
 "  --freeze-cgroup       use cgroup freezer to collect processes\n"
 "\n"
+"* External resources support:\n"
+"  --external RES        dump objects from this list as external resources:\n"
+"                        Formats of RES on dump:\n"
+"                            tty[rdev:dev]\n"
+"                            file[mnt_id:inode]\n"
+"                            dev[maj:min]:VAL\n"
+"                        Formats of RES on restore:\n"
+"                            dev[VAL]:DEVPATH\n"
+"\n"
 "* Special resources support:\n"
 "  -x|--" USK_EXT_PARAM " [inode,...]\n"
 "                        allow external unix connections (optional arguments\n"
@@ -851,7 +849,7 @@ usage:
 "  -M|--ext-mount-map KEY:VALUE\n"
 "                        add external mount mapping\n"
 "  -M|--ext-mount-map auto\n"
-"                        attempt to autodetect external mount mapings\n"
+"                        attempt to autodetect external mount mappings\n"
 "  --enable-external-sharing\n"
 "                        allow autoresolving mounts with external sharing\n"
 "  --enable-external-masters\n"
@@ -859,8 +857,11 @@ usage:
 "  --manage-cgroups [m]  dump/restore process' cgroups; argument can be one of\n"
 "                        'none', 'props', 'soft' (default), 'full' or 'strict'\n"
 "  --cgroup-root [controller:]/newroot\n"
-"                        change the root cgroup the controller will be\n"
-"                        installed into. No controller means that root is the\n"
+"                        on dump: change the root for the controller that will\n"
+"                        be dumped. By default, only the paths with tasks in\n"
+"                        them and below will be dumped.\n"
+"                        on restore: change the root cgroup the controller will\n"
+"                        be installed into. No controller means that root is the\n"
 "                        default for all controllers not specified\n"
 "  --cgroup-props STRING\n"
 "                        define cgroup controllers and properties\n"
@@ -876,13 +877,6 @@ usage:
 "  --enable-fs FSNAMES   a comma separated list of filesystem names or \"all\"\n"
 "                        force criu to (try to) dump/restore these filesystem's\n"
 "                        mountpoints even if fs is not supported\n"
-"  --external RES        dump objects from this list as external resources:\n"
-"                        Formats of RES on dump:\n"
-"                            tty[rdev:dev]\n"
-"                            file[mnt_id:inode]\n"
-"                            dev[maj:min]:VAL\n"
-"                        Formats of RES on restore:\n"
-"                            dev[VAL]:DEVPATH\n"
 "  --inherit-fd fd[NUM]:RES\n"
 "                        Inherit file descriptors, treating fd NUM as being\n"
 "                        already opened via an existing RES, which can be:\n"
@@ -890,7 +884,7 @@ usage:
 "                            pipe[inode]\n"
 "                            socket[inode]\n"
 "                            file[mnt_id:inode]\n"
-"  --empty-ns net        Create a namespace, but don't restore its properies\n"
+"  --empty-ns net        Create a namespace, but don't restore its properties\n"
 "                        (assuming it will be restored by action scripts)\n"
 "  -J|--join-ns NS:{PID|NS_FILE}[,OPTIONS]\n"
 "			Join existing namespace and restore process in it.\n"

@@ -21,6 +21,7 @@
 #include "asm/string.h"
 #include "asm/types.h"
 #include "syscall.h"
+#include "signal.h"
 #include "config.h"
 #include "prctl.h"
 #include "log.h"
@@ -1053,6 +1054,10 @@ long __export_restore_task(struct task_restore_args *args)
 	act.rt_sa_restorer = cr_restore_rt;
 	sys_sigaction(SIGCHLD, &act, NULL, sizeof(k_rtsigset_t));
 
+	ksigfillset(&to_block);
+	ksigaddset(&to_block, SIGCHLD);
+	ret = sys_sigprocmask(SIG_UNBLOCK, &to_block, NULL, sizeof(k_rtsigset_t));
+
 	log_set_fd(args->logfd);
 	log_set_loglevel(args->loglevel);
 
@@ -1281,7 +1286,7 @@ long __export_restore_task(struct task_restore_args *args)
 	if (args->nr_threads > 1) {
 		struct thread_restore_args *thread_args = args->thread_args;
 		long clone_flags = CLONE_VM | CLONE_FILES | CLONE_SIGHAND	|
-				   CLONE_THREAD | CLONE_SYSVSEM;
+				   CLONE_THREAD | CLONE_SYSVSEM | CLONE_FS;
 		long last_pid_len;
 		long parent_tid;
 		int i, fd;

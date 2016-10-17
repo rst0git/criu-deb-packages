@@ -229,7 +229,7 @@ static int fill_fd_params_special(int fd, struct fd_parms *p)
 	return 0;
 }
 
-static int get_fs_type(int lfd)
+static long get_fs_type(int lfd)
 {
 	struct statfs fst;
 
@@ -1109,6 +1109,7 @@ static int pre_dump_one_task(struct pstree_item *item)
 	struct parasite_ctl *parasite_ctl;
 	int ret = -1;
 	struct parasite_dump_misc misc;
+	struct mem_dump_ctl mdc;
 
 	INIT_LIST_HEAD(&vmas.h);
 	vmas.nr = 0;
@@ -1156,9 +1157,11 @@ static int pre_dump_one_task(struct pstree_item *item)
 		goto err_cure;
 	}
 
-	parasite_ctl->pid.virt = item->pid.virt = misc.pid;
+	item->pid.virt = misc.pid;
 
-	ret = parasite_dump_pages_seized(parasite_ctl, &vmas, true);
+	mdc.pre_dump = true;
+
+	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 	if (ret)
 		goto err_cure;
 
@@ -1185,6 +1188,7 @@ static int dump_one_task(struct pstree_item *item)
 	struct cr_imgset *cr_imgset = NULL;
 	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
+	struct mem_dump_ctl mdc;
 
 	INIT_LIST_HEAD(&vmas.h);
 	vmas.nr = 0;
@@ -1282,7 +1286,7 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure_imgset;
 	}
 
-	parasite_ctl->pid.virt = item->pid.virt = misc.pid;
+	item->pid.virt = misc.pid;
 	pstree_insert_pid(item->pid.virt, &item->pid);
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;
@@ -1314,7 +1318,9 @@ static int dump_one_task(struct pstree_item *item)
 		}
 	}
 
-	ret = parasite_dump_pages_seized(parasite_ctl, &vmas, false);
+	mdc.pre_dump = false;
+
+	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 	if (ret)
 		goto err_cure;
 
@@ -1437,18 +1443,20 @@ static int cr_pre_dump_finish(int ret)
 	pr_info("Pre-dumping tasks' memory\n");
 	for_each_pstree_item(item) {
 		struct parasite_ctl *ctl = dmpi(item)->parasite_ctl;
+		struct page_pipe *mem_pp;
 		struct page_xfer xfer;
 
 		if (!ctl)
 			continue;
 
-		pr_info("\tPre-dumping %d\n", ctl->pid.virt);
+		pr_info("\tPre-dumping %d\n", item->pid.virt);
 		timing_start(TIME_MEMWRITE);
-		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, ctl->pid.virt);
+		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, item->pid.virt);
 		if (ret < 0)
 			goto err;
 
-		ret = page_xfer_dump_pages(&xfer, ctl->mem_pp, 0);
+		mem_pp = dmpi(item)->mem_pp;
+		ret = page_xfer_dump_pages(&xfer, mem_pp, 0);
 
 		xfer.close(&xfer);
 
@@ -1457,7 +1465,7 @@ static int cr_pre_dump_finish(int ret)
 
 		timing_stop(TIME_MEMWRITE);
 
-		destroy_page_pipe(ctl->mem_pp);
+		destroy_page_pipe(mem_pp);
 		parasite_cure_local(ctl);
 	}
 
@@ -1610,6 +1618,7 @@ static int cr_dump_finish(int ret)
 	if (ret || post_dump_ret || opts.final_state == TASK_ALIVE) {
 		network_unlock();
 		delete_link_remaps();
+		clean_cr_time_mounts();
 	}
 	pstree_switch_state(root_item,
 			    (ret || post_dump_ret) ?

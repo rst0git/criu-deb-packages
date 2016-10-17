@@ -90,6 +90,7 @@ struct mount_info {
 
 extern struct mount_info *mntinfo;
 extern struct ns_desc mnt_ns_desc;
+extern int collect_binfmt_misc(void);
 
 extern struct mount_info *mnt_entry_alloc();
 extern void mnt_entry_free(struct mount_info *mi);
@@ -101,8 +102,7 @@ extern struct ns_id *lookup_nsid_by_mnt_id(int mnt_id);
 
 extern int open_mount(unsigned int s_dev);
 extern int __open_mountpoint(struct mount_info *pm, int mnt_fd);
-extern struct fstype *find_fstype_by_name(char *fst);
-extern bool add_fsname_auto(const char *names);
+extern int open_mountpoint(struct mount_info *pm);
 
 extern struct mount_info *collect_mntinfo(struct ns_id *ns, bool for_dump);
 extern int prepare_mnt_ns(void);
@@ -127,29 +127,11 @@ extern int ext_mount_add(char *key, char *val);
 extern int mntns_maybe_create_roots(void);
 extern int read_mnt_ns_img(void);
 extern void cleanup_mnt_ns(void);
-
-struct mount_info;
-typedef int (*mount_fn_t)(struct mount_info *mi, const char *src, const
-			  char *fstype, unsigned long mountflags);
-
-struct fstype {
-	char *name;
-	int code;
-	int (*dump)(struct mount_info *pm);
-	int (*restore)(struct mount_info *pm);
-	int (*parse)(struct mount_info *pm);
-	mount_fn_t mount;
-};
+extern void clean_cr_time_mounts(void);
 
 extern bool add_skip_mount(const char *mountpoint);
 struct ns_id;
 extern struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump);
-
-/* callback for AUFS support */
-extern int aufs_parse(struct mount_info *mi);
-
-/* callback for OverlayFS support */
-extern int overlayfs_parse(struct mount_info *mi);
 
 extern int check_mnt_id(void);
 

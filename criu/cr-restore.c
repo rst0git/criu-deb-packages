@@ -136,6 +136,9 @@ static int crtools_prepare_shared(void)
 	if (collect_inet_sockets())
 		return -1;
 
+	if (collect_binfmt_misc())
+		return -1;
+
 	if (tty_prep_fds())
 		return -1;
 
@@ -1533,7 +1536,7 @@ static void finalize_restore(void)
 			continue;
 
 		/* Unmap the restorer blob */
-		ctl = parasite_prep_ctl(pid, NULL);
+		ctl = parasite_prep_ctl(pid, 0);
 		if (ctl == NULL)
 			continue;
 
@@ -2751,6 +2754,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	unsigned long creds_pos = 0;
 	unsigned long creds_pos_next;
 
+	sigset_t blockmask;
+
 	pr_info("Restore via sigreturn\n");
 
 	/* pr_info_vma_list(&self_vma_list); */
@@ -2878,6 +2883,15 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	}
 
 	task_args->breakpoint = &rsti(current)->breakpoint;
+
+	sigemptyset(&blockmask);
+	sigaddset(&blockmask, SIGCHLD);
+
+	if (sigprocmask(SIG_BLOCK, &blockmask, NULL) == -1) {
+		pr_perror("Can not set mask of blocked signals");
+		return -1;
+	}
+
 	task_args->task_entries = rst_mem_remap_ptr(task_entries_pos, RM_SHREMAP);
 
 	task_args->premmapped_addr = (unsigned long)rsti(current)->premmapped_addr;
@@ -2920,6 +2934,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	for (i = 0; i < current->nr_threads; i++) {
 		CoreEntry *tcore;
 		struct rt_sigframe *sigframe;
+		k_rtsigset_t *blkset = NULL;
 
 		thread_args[i].pid = current->threads[i].virt;
 		thread_args[i].siginfo_n = siginfo_priv_nr[i];
@@ -2931,8 +2946,12 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		if (thread_args[i].pid == pid) {
 			task_args->t = thread_args + i;
 			tcore = core;
-		} else
+			blkset = (void *)&tcore->tc->blk_sigset;
+		} else {
 			tcore = current->core[i];
+			if (tcore->thread_core->has_blk_sigset)
+				blkset = (void *)&tcore->thread_core->blk_sigset;
+		}
 
 		if ((tcore->tc || tcore->ids) && thread_args[i].pid != pid) {
 			pr_err("Thread has optional fields present %d\n",
@@ -2969,7 +2988,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		thread_args[i].mz = mz + i;
 		sigframe = (struct rt_sigframe *)&mz[i].rt_sigframe;
 
-		if (construct_sigframe(sigframe, sigframe, tcore))
+		if (construct_sigframe(sigframe, sigframe, blkset, tcore))
 			goto err;
 
 		if (thread_args[i].pid != pid)

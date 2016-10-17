@@ -49,7 +49,7 @@ struct fd_parms {
 	long		fs_type;
 	int		mnt_id;
 
-	struct parasite_ctl *ctl;
+	struct parasite_ctl *fd_ctl;
 };
 
 #define FD_PARMS_INIT			\
@@ -191,9 +191,7 @@ extern void inherit_fd_log(void);
 extern int inherit_fd_resolve_clash(int fd);
 extern int inherit_fd_fini(void);
 
-extern bool external_lookup_id(char *id);
 extern int inherit_fd_lookup_id(char *id);
-extern char *external_lookup_by_key(char *id);
 
 extern bool inherited_fd(struct file_desc *, int *fdp);
 

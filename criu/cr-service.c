@@ -17,6 +17,7 @@
 
 #include "crtools.h"
 #include "cr_options.h"
+#include "external.h"
 #include "util.h"
 #include "log.h"
 #include "cpu.h"
@@ -27,6 +28,7 @@
 #include "page-xfer.h"
 #include "net.h"
 #include "mount.h"
+#include "filesystems.h"
 #include "cgroup.h"
 #include "cgroup-props.h"
 #include "action-scripts.h"
@@ -432,7 +434,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		case CRIU_CG_MODE__IGNORE:
 			mode = CG_MODE_IGNORE;
 			break;
-		case CRIU_CG_MODE__NONE:
+		case CRIU_CG_MODE__CG_NONE:
 			mode = CG_MODE_NONE;
 			break;
 		case CRIU_CG_MODE__PROPS:

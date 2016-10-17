@@ -1,5 +1,6 @@
 ccflags-y		+= -iquote criu/$(ARCH)
 obj-y			+= action-scripts.o
+obj-y			+= external.o
 obj-y			+= aio.o
 obj-y			+= bfd.o
 obj-y			+= bitmap.o
@@ -34,6 +35,7 @@ obj-y			+= log.o
 obj-y			+= lsm.o
 obj-y			+= mem.o
 obj-y			+= mount.o
+obj-y			+= filesystems.o
 obj-y			+= namespaces.o
 obj-y			+= netfilter.o
 obj-y			+= net.o
