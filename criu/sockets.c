@@ -9,6 +9,8 @@
 #include <string.h>
 #include <netinet/in.h>
 
+#include "int.h"
+#include "bitops.h"
 #include "libnetlink.h"
 #include "sockets.h"
 #include "unix_diag.h"
@@ -20,6 +22,7 @@
 #include "sk-packet.h"
 #include "namespaces.h"
 #include "net.h"
+#include "xmalloc.h"
 #include "fs-magic.h"
 
 #ifndef SOCK_DIAG_BY_FAMILY

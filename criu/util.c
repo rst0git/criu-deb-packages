@@ -35,16 +35,17 @@
 #include <sched.h>
 #include <ctype.h>
 
-#include "compiler.h"
-#include "asm/types.h"
-#include "list.h"
+#include "bitops.h"
+#include "page.h"
+#include "common/compiler.h"
+#include "common/list.h"
 #include "util.h"
 #include "rst-malloc.h"
 #include "image.h"
 #include "vma.h"
 #include "mem.h"
 #include "namespaces.h"
-#include "log.h"
+#include "criu-log.h"
 
 #include "cr_options.h"
 #include "servicefd.h"

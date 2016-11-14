@@ -4,14 +4,14 @@
 #include <stdlib.h>
 
 #include "cr_options.h"
-#include "list.h"
+#include "common/list.h"
 #include "xmalloc.h"
 #include "log.h"
 #include "servicefd.h"
 #include "cr-service.h"
 #include "action-scripts.h"
 #include "pstree.h"
-#include "bug.h"
+#include "common/bug.h"
 
 static const char *action_names[ACT_MAX] = {
 	[ ACT_PRE_DUMP ]	= "pre-dump",

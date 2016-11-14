@@ -2,8 +2,8 @@
 #define __CR_OPTIONS_H__
 
 #include <stdbool.h>
-
-#include "list.h"
+#include "config.h"
+#include "common/list.h"
 
 /*
  * CPU capability options.
@@ -60,7 +60,6 @@ struct cr_options {
 	};
 	bool			restore_sibling;
 	bool			ext_unix_sk;
-	struct list_head        ext_unixsk_ids;
 	bool			shell_job;
 	bool			handle_file_locks;
 	bool			tcp_established_ok;
@@ -72,7 +71,6 @@ struct cr_options {
 	char			*root;
 	char			*pidfile;
 	char			*freeze_cgroup;
-	struct list_head	veth_pairs;
 	struct list_head	ext_mounts;
 	struct list_head	inherit_fds;
 	struct list_head	external;
@@ -98,7 +96,9 @@ struct cr_options {
 	bool			enable_external_masters;
 	bool			aufs;		/* auto-deteced, not via cli */
 	bool			overlayfs;
+#ifdef CONFIG_BINFMT_MISC_VIRTUALIZED
 	bool			has_binfmt_misc; /* auto-detected */
+#endif
 	size_t			ghost_limit;
 	struct list_head	irmap_scan_paths;
 	bool			lsm_supplied;
@@ -115,6 +115,7 @@ struct cr_options {
 	 * to turn one ON while the code is in.
 	 */
 	bool			deprecated_ok;
+	bool			display_stats;
 };
 
 extern struct cr_options opts;

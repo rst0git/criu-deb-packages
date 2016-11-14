@@ -7,6 +7,8 @@
 #include <stdarg.h>
 #include <sys/ioctl.h>
 
+#include "int.h"
+#include "types.h"
 #include "syscall.h"
 #include "parasite.h"
 #include "config.h"
@@ -14,15 +16,14 @@
 #include "prctl.h"
 #include "lock.h"
 #include "parasite-vdso.h"
-#include "log.h"
+#include "criu-log.h"
 #include "tty.h"
 #include "aio.h"
 
 #include <string.h>
 
-#include "asm/types.h"
 #include "asm/parasite.h"
-#include "asm/restorer.h"
+#include "restorer.h"
 
 static int tsock = -1;
 
@@ -630,7 +631,7 @@ static int fini(void)
 
 static noinline __used int noinline parasite_daemon(void *args)
 {
-	struct ctl_msg m = { };
+	struct ctl_msg m;
 	int ret = -1;
 
 	pr_debug("Running daemon thread leader\n");

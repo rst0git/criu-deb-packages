@@ -374,6 +374,8 @@ class zdtm_test:
 
 		s = subprocess.Popen(s_args, env = env, cwd = root, close_fds = True,
 				preexec_fn = self.__freezer and self.__freezer.attach or None)
+		if act == "pid":
+			try_run_hook(self, ["--post-start"])
 		s.wait()
 
 		if self.__freezer:
@@ -711,6 +713,9 @@ class criu_rpc:
 			if arg == '--root':
 				criu.opts.root = args.pop(0)
 				continue
+			if arg == '--external':
+				criu.opts.external.append(args.pop(0))
+				continue
 
 			raise test_fail_exc('RPC for %s required' % arg)
 
@@ -728,23 +733,29 @@ class criu_rpc:
 		criu.use_binary(criu_bin)
 		criu_rpc.__set_opts(criu, args, ctx)
 
-		if action == 'dump':
-			criu.dump()
-		elif action == 'restore':
-			if 'rd' not in ctx:
-				raise test_fail_exc('RPC Non-detached restore is impossible')
+		try:
+			if action == 'dump':
+				criu.dump()
+			elif action == 'restore':
+				if 'rd' not in ctx:
+					raise test_fail_exc('RPC Non-detached restore is impossible')
 
-			res = criu.restore()
-			pidf = ctx.get('pidf')
-			if pidf:
-				open(pidf, 'w').write('%d\n' % res.pid)
+				res = criu.restore()
+				pidf = ctx.get('pidf')
+				if pidf:
+					open(pidf, 'w').write('%d\n' % res.pid)
+			else:
+				raise test_fail_exc('RPC for %s required' % action)
+		except crpc.CRIUExceptionExternal:
+			print "Fail"
+			ret = -1
 		else:
-			raise test_fail_exc('RPC for %s required' % action)
+			ret = 0
 
 		imgd = ctx.get('imgd')
 		if imgd:
 			os.close(imgd)
-		return 0
+		return ret
 
 
 class criu:
@@ -877,8 +888,8 @@ class criu:
 
 		criu_dir = os.path.dirname(os.getcwd())
 		if os.getenv("GCOV"):
-			a_opts.append("--ext-mount-map")
-			a_opts.append("%s:zdtm" % criu_dir)
+			a_opts.append('--external')
+			a_opts.append('mnt[%s]:zdtm' % criu_dir)
 
 		if self.__leave_stopped:
 			a_opts += ['--leave-stopped']
@@ -907,8 +918,8 @@ class criu:
 		self.__prev_dump_iter = None
 		criu_dir = os.path.dirname(os.getcwd())
 		if os.getenv("GCOV"):
-			r_opts.append("--ext-mount-map")
-			r_opts.append("zdtm:%s" % criu_dir)
+			r_opts.append('--external')
+			r_opts.append('mnt[zdtm]:%s' % criu_dir)
 
 		if self.__leave_stopped:
 			r_opts += ['--leave-stopped']
@@ -993,6 +1004,7 @@ def cr(cr_api, test, opts):
 			sbs('pre-restore')
 			try_run_hook(test, ["--pre-restore"])
 			cr_api.restore()
+			try_run_hook(test, ["--post-restore"])
 			sbs('post-restore')
 
 		time.sleep(iters[1])
@@ -1262,6 +1274,7 @@ def do_run_test(tname, tdesc, flavs, opts):
 			print_sep("Test %s FAIL at %s" % (tname, e.step), '#')
 			t.print_output()
 			t.kill()
+			try_run_hook(t, ["--clean"])
 			if cr_api.logs():
 				add_to_report(cr_api.logs(), tname.replace('/', '_') + "_" + f + "/images")
 			if opts['keep_img'] == 'never':

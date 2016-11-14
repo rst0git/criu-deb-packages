@@ -6,9 +6,9 @@
 #include <limits.h>
 #include <errno.h>
 
-#include "asm/types.h"
-#include "asm/atomic.h"
-#include "bug.h"
+#include "atomic.h"
+#include "log.h"
+#include "common/bug.h"
 
 #ifdef CR_NOGLIBC
 # include "syscall.h"

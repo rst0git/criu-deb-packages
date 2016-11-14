@@ -5,7 +5,7 @@
 
 #include "asm/types.h"
 #include "asm/restorer.h"
-#include "compiler.h"
+#include "common/compiler.h"
 #include "ptrace.h"
 #include "asm/processor-flags.h"
 #include "protobuf.h"
@@ -15,7 +15,6 @@
 #include "log.h"
 #include "util.h"
 #include "cpu.h"
-#include "parasite-syscall.h"
 #include "restorer.h"
 
 
@@ -43,7 +42,7 @@ void parasite_setup_regs(unsigned long new_ip, void *stack, user_regs_struct_t *
 		regs->sp = (unsigned long)stack;
 }
 
-bool arch_can_dump_task(pid_t pid)
+bool arch_can_dump_task(struct parasite_ctl *ctl)
 {
 	/*
 	 * TODO: Add proper check here

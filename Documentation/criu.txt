@@ -51,6 +51,15 @@ The following levels are available:
 *--log-pid*::
     Write separate logging files per each pid.
 
+*--display-stats*::
+    During dump as well as during restore *criu* collects information
+    like the time required to dump or restore the process or the
+    number of pages dumped or restored. This information is always
+    written to the files 'stats-dump' and 'stats-restore' and can
+    be easily displayed using *crit*. The option *--display-stats*
+    additionally prints out this information on the console at the end
+    of a dump or a restore.
+
 *-D*, *--images-dir* 'path'::
     Use 'path' as a base directory where to look for sets of image files.
 
@@ -138,9 +147,44 @@ In other words, do not use it unless really needed.
 *-s*, *--leave-stopped*::
     Leave tasks in stopped state after checkpoint, instead of killing.
 
-*-x*, *--ext-unix-sk* ['inode'[,'inode'...]]::
-    Dump external unix sockets. Optionally passing a comma-separated
-    list of inodes to allow a one sided dump for those.
+*--external* 'type'*[*'id'*]:*'value'::
+    Dump an instance of an external resource. The generic syntax is
+    'type' of resource, followed by resource 'id' (enclosed in literal
+    square brackets), and optional 'value' (prepended by a literal semicolon).
+    The following resource types are currently supported: *mnt*, *dev*,
+    *file*, *tty*, *unix*. Syntax depends on type.
+    Note to restore external resources, either *--external* or *--inherit-fd*
+    is used, depending on resource type.
+
+*--external mnt[*'mountpoint'*]:*'name'::
+    Dump an external bind mount referenced by 'mountpoint', saving it
+    to image under the identifier 'name'.
+
+*--external mnt[]:*'flags'::
+    Dump all external bind mounts, autodetecting those. Optional 'flags'
+    can contain *m* to also dump external master mounts, *s* to also
+    dump external shared mounts (default behavior is to abort dumping
+    if such mounts are found). If 'flags' are not provided, semicolon
+    is optional.
+
+*--external dev[*'major'*/*'minor'*]:*'name'::
+    Allow to dump a mount namespace having a real block device mounted.
+    A block device is identified by its 'major' and 'minor' numbers,
+    and *criu* saves its information to image under the identifier 'name'.
+
+*--external file[*'mnt_id'*:*'inode'*]*::
+    Dump an external file, i.e. an opened file that is can not be resolved
+    from the current mount namespace, which can not be dumped without using
+    this option. The file is identified by 'mnt_id' (a field obtained from
+    */proc/*'pid'*/fdinfo/*'N') and 'inode' (as returned by *stat*(2)).
+
+*--external tty[*'rdev'*:*'dev'*]*::
+    Dump an external TTY, identified by *st_rdev* and *st_dev* fields
+    returned by *stat*(2).
+
+*--external unix[*'id'*]*::
+    Tell *criu* that one end of a pair of UNIX sockets (created by
+    *socketpair*(2)) with 'id' is OK to be disconnected.
 
 *--freeze-cgroup*::
    Use cgroup freezer to collect processes.
@@ -205,9 +249,6 @@ For example, the command line for the above example should look like this:
     The TCP stack on the client side is expected to handle the
     re-connect gracefully.
 
-*--veth-pair* 'IN'*=*'OUT'::
-    Relation between outside and inside names of veth devices.
-
 *--evasive-devices*::
     Use any path to a device file if the original one is inaccessible.
 
@@ -225,11 +266,6 @@ For example, the command line for the above example should look like this:
     Dump file locks. It is necessary to make sure that all file lock users
     are taken into dump, so it is only safe to use this for enclosed containers
     where locks are not held by any processes outside of dumped process tree.
-
-*-M*, *--ext-mount-map* 'KEY'*:*'VAL'::
-    Setup mapping for external mounts. Here 'KEY' is a mountpoint inside
-    a container, and corresponding 'VAL' is a string to be written into
-    the image as the mountpoint\'s root value.
 
 *--link-remap*::
     Allows to link unlinked files back, if possible (modifies filesystem
@@ -266,14 +302,30 @@ For example, the command line for the above example should look like this:
 ~~~~~~~~~
 Restores previously checkpointed processes.
 
-*--inherit-fd* *fd[*'N'*]:*'path'::
-    Inherit file descriptors. This asks *criu* to use an already opened
-    file descriptor 'N' for restoring a file indentified by 'path'. Note
-    that the 'N' must be enclosed in a literal square brackets, that
-    usually needs to be escaped from shell.
+*--inherit-fd* *fd[*'N'*]:*'resource'::
+    Inherit a file descriptor. This option lets *criu* use an already opened
+    file descriptor 'N' for restoring a file identified by 'resource'.
+    This option can be used to restore an external resource dumped
+    with the help of *--external* *file*, *tty*, and *unix* options.
++
+The 'resource' argument can be one of the following:
++
+    - *tty[*'rdev'*:*'dev'*]*
+    - *pipe[*'inode'*]*
+    - *socket[*'inode'*]*
+    - *file[*'mnt_id'*:*'inode'*]*
+    - 'path/to/file'
+
++
+Note that square brackets used in this option arguments are literals and
+usually need to be escaped from shell.
 
 *-d*, *--restore-detached*::
     Detach *criu* itself once restore is complete.
+
+*-s*, *--leave-stopped*::
+    Leave tasks in stopped state after restore (rather than resuming
+    their execution).
 
 *-S*, *--restore-sibling*::
     Restore root task as a sibling (makes sense only with
@@ -281,6 +333,39 @@ Restores previously checkpointed processes.
 
 *-r*, *--root* 'path'::
     Change the root filesystem to 'path' (when run in a mount namespace).
+
+*--external* 'type'*[*'id'*]:*'value'::
+    Restore an instance of an external resource. The generic syntax is
+    'type' of resource, followed by resource 'id' (enclosed in literal
+    square brackets), and optional 'value' (prepended by a literal semicolon).
+    The following resource types are currently supported: *mnt*, *dev*,
+    *veth*, *macvlan*. Syntax depends on type. Note to restore external
+    resources dealing with opened file descriptors (such as dumped with
+    the help of *--external* *file*, *tty*, and *unix* options), option
+    *--inherit-fd* should be used.
+
+*--external mnt[*'name'*]:*'mountpoint'::
+    Restore an external bind mount referenced in the image by 'name',
+    bind-mounting it from the host 'mountpoint' to a proper mount point.
+
+*--external mnt[]*::
+    Restore all external bind mounts (dumped with the help of
+    *--external mnt[]* auto-detection).
+
+*--external dev[*'name'*]:*'/dev/path'::
+    Restore an external mount device, identified in the image by 'name',
+    using the existing block device '/dev/path'.
+
+*--external veth[*'inner_dev'*]:*'outer_dev'*@*'bridge'::
+    Set the outer VETH device name (corresponding to 'inner_dev' being
+    restored) to 'outer_dev'. If optional *@*'bridge' is specified,
+    'outer_dev' is added to that bridge. If the option is not used,
+    'outer_dev' will be autogenerated by the kernel.
+
+*--external macvlan[*'inner_dev'*]:*'outer_dev'::
+    When restoring an image that have a MacVLAN device in it, this option
+    must be used to specify to which 'outer_dev' (an existing network device
+    in CRIU namespace) the restored 'inner_dev' should be bound to.
 
 *--manage-cgroups* ['mode']::
     Restore cgroups configuration associated with a task from the image.
@@ -317,21 +402,6 @@ The 'mode' may be one of the following:
 
 *-l*, *--file-locks*::
     Restore file locks from the image.
-
-*-M*, *--ext-mount-map* 'KEY'*:*'VAL'::
-    Setup mapping for external mounts. 'KEY' is the value from the image
-    ('VAL' from dump) and the 'VAL' is the path on host that will be
-    bind-mounted into container (to the mountpoint path from image).
-
-*--ext-mount-map* *auto*::
-    This is a special case. If this flag is passed, when an external
-    mount is missing from the command line '*--ext-mount-map* KEY:VAL' syntax,
-    criu attempts to automatically resolve this mount from its namespace.
-
-*--enable-external-sharing*::
-*--enable-external-masters*::
-    These flags enable external shared or slave mounts to be resolved
-    automatically when '*--ext-mount-map auto*' is passed.
 
 *--auto-dedup*::
     As soon as a page is restored it get punched out from image.
@@ -435,7 +505,7 @@ Launches *criu* in page server mode.
 *exec*
 ~~~~~~
 Executes a system call inside a destination task\'s context. This functionality
-is depreated; please use *Compel* instead.
+is deprecated; please use *Compel* instead.
 
 *service*
 ~~~~~~~~~

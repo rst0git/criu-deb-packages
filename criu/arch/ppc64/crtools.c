@@ -10,7 +10,7 @@
 #include "asm/restorer.h"
 
 #include "cr_options.h"
-#include "compiler.h"
+#include "common/compiler.h"
 #include "ptrace.h"
 #include "parasite-syscall.h"
 #include "log.h"
@@ -47,7 +47,7 @@ const u32 code_syscall[] = {
 	0x0fe00000		/* twi 31,0,0	*/
 };
 
-static inline void __check_code_syscall(void)
+static inline void __always_unused __check_code_syscall(void)
 {
 	BUILD_BUG_ON(sizeof(code_syscall) != BUILTIN_SYSCALL_SIZE);
 	BUILD_BUG_ON(!is_log2(sizeof(code_syscall)));
@@ -66,7 +66,7 @@ void parasite_setup_regs(unsigned long new_ip, void *stack, user_regs_struct_t *
 	regs->trap = 0;
 }
 
-bool arch_can_dump_task(pid_t pid)
+bool arch_can_dump_task(struct parasite_ctl *ctl)
 {
 	/*
 	 * TODO: We should detect 32bit task when BE support is done.

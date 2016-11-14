@@ -19,9 +19,9 @@
 
 #include <dlfcn.h>
 
-#include "asm/types.h"
-
-#include "compiler.h"
+#include "int.h"
+#include "page.h"
+#include "common/compiler.h"
 #include "crtools.h"
 #include "cr_options.h"
 #include "external.h"
@@ -36,6 +36,8 @@
 #include "file-lock.h"
 #include "cr-service.h"
 #include "plugin.h"
+#include "criu-log.h"
+#include "util.h"
 #include "mount.h"
 #include "filesystems.h"
 #include "namespaces.h"
@@ -59,8 +61,6 @@ void init_opts(void)
 
 	/* Default options */
 	opts.final_state = TASK_DEAD;
-	INIT_LIST_HEAD(&opts.ext_unixsk_ids);
-	INIT_LIST_HEAD(&opts.veth_pairs);
 	INIT_LIST_HEAD(&opts.ext_mounts);
 	INIT_LIST_HEAD(&opts.inherit_fds);
 	INIT_LIST_HEAD(&opts.external);
@@ -280,6 +280,7 @@ int main(int argc, char *argv[], char *envp[])
 		{ "cgroup-dump-controller",	required_argument,	0, 1082	},
 		{ SK_INFLIGHT_PARAM,		no_argument,		0, 1083	},
 		{ "deprecated",			no_argument,		0, 1084 },
+		{ "display-stats",		no_argument,		0, 1086 },
 		{ },
 	};
 
@@ -592,6 +593,9 @@ int main(int argc, char *argv[], char *envp[])
 			pr_msg("Turn deprecated stuff ON\n");
 			opts.deprecated_ok = true;
 			break;
+		case 1086:
+			opts.display_stats = true;
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -617,11 +621,6 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (!opts.restore_detach && opts.restore_sibling) {
 		pr_msg("--restore-sibling only makes sense with --restore-detach\n");
-		return 1;
-	}
-
-	if (!opts.autodetect_ext_mounts && (opts.enable_external_masters || opts.enable_external_sharing)) {
-		pr_msg("must specify --ext-mount-map auto with --enable-external-{sharing|masters}");
 		return 1;
 	}
 
@@ -821,22 +820,22 @@ usage:
 "                        Formats of RES on dump:\n"
 "                            tty[rdev:dev]\n"
 "                            file[mnt_id:inode]\n"
-"                            dev[maj:min]:VAL\n"
+"                            dev[major/minor]:NAME\n"
+"                            unix[ino]\n"
+"                            mnt[MOUNTPOINT]:COOKIE\n"
+"                            mnt[]{:AUTO_OPTIONS}\n"
 "                        Formats of RES on restore:\n"
-"                            dev[VAL]:DEVPATH\n"
+"                            dev[NAME]:DEVPATH\n"
+"                            veth[IFNAME]:OUTNAME{@BRIDGE}\n"
+"                            macvlan[IFNAME]:OUTNAME\n"
+"                            mnt[COOKIE]:ROOT\n"
 "\n"
 "* Special resources support:\n"
-"  -x|--" USK_EXT_PARAM " [inode,...]\n"
-"                        allow external unix connections (optional arguments\n"
-"                        are socketpair inode(s) that allow one-sided dump)\n"
 "     --" SK_EST_PARAM "  checkpoint/restore established TCP connections\n"
 "     --" SK_INFLIGHT_PARAM "   skip (ignore) in-flight TCP connections\n"
 "  -r|--root PATH        change the root filesystem (when run in mount namespace)\n"
 "  --evasive-devices     use any path to a device file if the original one\n"
 "                        is inaccessible\n"
-"  --veth-pair IN=OUT    map inside veth device name to outside one\n"
-"                        can optionally append @<bridge-name> to OUT for moving\n"
-"                        the outside veth to the named bridge\n"
 "  --link-remap          allow one to link unlinked files back when possible\n"
 "  --ghost-limit size    limit max size of deleted file contents inside image\n"
 "  --action-script FILE  add an external action script\n"
@@ -846,14 +845,6 @@ usage:
 "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
 "  --irmap-scan-path FILE\n"
 "                        add a path the irmap hints to scan\n"
-"  -M|--ext-mount-map KEY:VALUE\n"
-"                        add external mount mapping\n"
-"  -M|--ext-mount-map auto\n"
-"                        attempt to autodetect external mount mappings\n"
-"  --enable-external-sharing\n"
-"                        allow autoresolving mounts with external sharing\n"
-"  --enable-external-masters\n"
-"                        allow autoresolving mounts with external masters\n"
 "  --manage-cgroups [m]  dump/restore process' cgroups; argument can be one of\n"
 "                        'none', 'props', 'soft' (default), 'full' or 'strict'\n"
 "  --cgroup-root [controller:]/newroot\n"
@@ -884,6 +875,7 @@ usage:
 "                            pipe[inode]\n"
 "                            socket[inode]\n"
 "                            file[mnt_id:inode]\n"
+"                            path/to/file\n"
 "  --empty-ns net        Create a namespace, but don't restore its properties\n"
 "                        (assuming it will be restored by action scripts)\n"
 "  -J|--join-ns NS:{PID|NS_FILE}[,OPTIONS]\n"
@@ -911,6 +903,7 @@ usage:
 "                          -v2|-vv   - also warnings (default level)\n"
 "                          -v3|-vvv  - also information messages and timestamps\n"
 "                          -v4|-vvvv - lots of debug\n"
+"  --display-stats       print out dump/restore stats\n"
 "\n"
 "* Memory dumping options:\n"
 "  --track-mem           turn on memory changes tracker in kernel\n"

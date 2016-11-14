@@ -5,6 +5,7 @@
 #include <sys/wait.h>
 #include <sys/mman.h>
 
+#include "types.h"
 #include "protobuf.h"
 #include "images/sa.pb-c.h"
 #include "images/timer.pb-c.h"
@@ -14,7 +15,6 @@
 
 #include "imgset.h"
 #include "ptrace.h"
-#include "asm/processor-flags.h"
 #include "parasite-syscall.h"
 #include "parasite-blob.h"
 #include "parasite.h"
@@ -25,6 +25,7 @@
 #include "pstree.h"
 #include "posix-timer.h"
 #include "mem.h"
+#include "criu-log.h"
 #include "vma.h"
 #include "proc_parse.h"
 #include "aio.h"
@@ -36,9 +37,8 @@
 #include <stdlib.h>
 #include <elf.h>
 
-#include "asm/parasite-syscall.h"
-#include "asm/dump.h"
-#include "asm/restorer.h"
+#include "dump.h"
+#include "restorer.h"
 #include "pie/pie-relocs.h"
 
 #define MEMFD_FNAME	"CRIUMFD"
@@ -57,7 +57,7 @@ unsigned long get_exec_start(struct vm_area_list *vmas)
 			continue;
 
 		len = vma_area_len(vma_area);
-		if (len < BUILTIN_SYSCALL_SIZE + MEMFD_FNAME_SZ) {
+		if (len < PARASITE_START_AREA_MIN) {
 			pr_warn("Suspiciously short VMA @%#lx\n", (unsigned long)vma_area->e->start);
 			continue;
 		}
@@ -242,11 +242,11 @@ void *parasite_args_s(struct parasite_ctl *ctl, int args_size)
 	return ctl->addr_args;
 }
 
-static int parasite_execute_trap_by_pid(unsigned int cmd,
-					struct parasite_ctl *ctl, pid_t pid,
-					void *stack,
+static int parasite_run_in_thread(pid_t pid, unsigned int cmd,
+					struct parasite_ctl *ctl,
 					struct thread_ctx *octx)
 {
+	void *stack = ctl->r_thread_stack;
 	user_regs_struct_t regs = octx->regs;
 	int ret;
 
@@ -633,8 +633,7 @@ int parasite_dump_thread_seized(struct parasite_ctl *ctl, int id,
 	tc->has_blk_sigset = true;
 	memcpy(&tc->blk_sigset, &octx.sigmask, sizeof(k_rtsigset_t));
 
-	ret = parasite_execute_trap_by_pid(PARASITE_CMD_DUMP_THREAD, ctl,
-			pid, ctl->r_thread_stack, &octx);
+	ret = parasite_run_in_thread(pid, PARASITE_CMD_DUMP_THREAD, ctl, &octx);
 	if (ret) {
 		pr_err("Can't init thread in parasite %d\n", pid);
 		return -1;
@@ -1148,9 +1147,6 @@ struct parasite_ctl *parasite_prep_ctl(pid_t pid, unsigned long exec_start)
 {
 	struct parasite_ctl *ctl = NULL;
 
-	if (!arch_can_dump_task(pid))
-		goto err;
-
 	/*
 	 * Control block early setup.
 	 */
@@ -1166,6 +1162,8 @@ struct parasite_ctl *parasite_prep_ctl(pid_t pid, unsigned long exec_start)
 		goto err;
 
 	ctl->rpid = pid;
+
+	BUILD_BUG_ON(PARASITE_START_AREA_MIN < BUILTIN_SYSCALL_SIZE + MEMFD_FNAME_SZ);
 
 	ctl->syscall_ip = exec_start;
 	pr_debug("Parasite syscall_ip at %p\n", (void *)ctl->syscall_ip);
@@ -1367,6 +1365,8 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	parasite_ensure_args_size(dump_pages_args_size(vma_area_list));
 	parasite_ensure_args_size(aio_rings_args_size(vma_area_list));
 
+	if (!arch_can_dump_task(ctl))
+		goto err_restore;
 	/*
 	 * Inject a parasite engine. Ie allocate memory inside alien
 	 * space and copy engine code there. Then re-map the engine

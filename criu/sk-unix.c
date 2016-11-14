@@ -10,7 +10,6 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 
-#include "asm/types.h"
 #include "libnetlink.h"
 #include "cr_options.h"
 #include "imgset.h"
@@ -27,6 +26,7 @@
 #include "plugin.h"
 #include "namespaces.h"
 #include "pstree.h"
+#include "external.h"
 #include "crtools.h"
 
 #include "protobuf.h"
@@ -95,11 +95,6 @@ struct unix_sk_listen_icon {
 	struct unix_sk_listen_icon	*next;
 };
 
-struct  unix_sk_exception {
-	struct list_head unix_sk_list;
-	ino_t unix_sk_ino;
-};
-
 #define SK_HASH_SIZE		32
 
 static struct unix_sk_listen_icon *unix_listen_icons[SK_HASH_SIZE];
@@ -164,20 +159,17 @@ static int can_dump_unix_sk(const struct unix_sk_desc *sk)
 	return 1;
 }
 
-static bool unix_sk_exception_lookup_id(ino_t ino)
+static bool unix_sk_exception_lookup_id(unsigned int ino)
 {
-	bool ret = false;
-	struct unix_sk_exception *sk;
+	char id[20];
 
-	list_for_each_entry(sk, &opts.ext_unixsk_ids, unix_sk_list) {
-		if (sk->unix_sk_ino == ino) {
-			pr_debug("Found ino %u in exception unix sk list\n", (unsigned int)ino);
-			ret = true;
-			break;
-		}
+	snprintf(id, sizeof(id), "unix[%u]", ino);
+	if (external_lookup_id(id)) {
+		pr_debug("Found ino %u in exception unix sk list\n", (unsigned int)ino);
+		return true;
 	}
 
-	return ret;
+	return false;
 }
 
 static int write_unix_entry(struct unix_sk_desc *sk)
@@ -702,16 +694,17 @@ static int dump_external_sockets(struct unix_sk_desc *peer)
 
 		ret = run_plugins(DUMP_UNIX_SK, sk->fd, sk->sd.ino);
 		if (ret == -ENOTSUP) {
-			if (!opts.ext_unix_sk) {
-				show_one_unix("Runaway socket", peer);
-				pr_err("External socket is used. "
-						"Consider using --" USK_EXT_PARAM " option.\n");
-				return -1;
-			}
-
 			if (unix_sk_exception_lookup_id(sk->sd.ino)) {
 				pr_debug("found exception for unix name-less external socket.\n");
 			} else {
+				/* Legacy -x|--ext-unix-sk option handling */
+				if (!opts.ext_unix_sk) {
+					show_one_unix("Runaway socket", peer);
+					pr_err("External socket is used. "
+							"Consider using --" USK_EXT_PARAM " option.\n");
+					return -1;
+				}
+
 				if (peer->type != SOCK_DGRAM) {
 					show_one_unix("Ext stream not supported", peer);
 					pr_err("Can't dump half of stream unix connection.\n");
@@ -1026,7 +1019,7 @@ static int bind_unix_sk(int sk, struct unix_sk_info *ui)
 		}
 
 		if (ui->ue->deleted && unlink((char *)ui->ue->name.data) < 0) {
-			pr_perror("failed to unlink %s\n", ui->ue->name.data);
+			pr_perror("failed to unlink %s", ui->ue->name.data);
 			goto done;
 		}
 	}
@@ -1446,19 +1439,15 @@ static int resolve_unix_peers(void *unused)
 	return 0;
 }
 
-int unix_sk_id_add(ino_t ino)
+int unix_sk_id_add(unsigned int ino)
 {
-	struct unix_sk_exception *unix_sk;
+	char *e_str;
 
-	/* TODO: validate inode here? */
-
-	unix_sk = xmalloc(sizeof *unix_sk);
-	if (unix_sk == NULL)
+	e_str = xmalloc(20);
+	if (!e_str)
 		return -1;
-	unix_sk->unix_sk_ino = ino;
-	list_add_tail(&unix_sk->unix_sk_list, &opts.ext_unixsk_ids);
-
-	return 0;
+	snprintf(e_str, 20, "unix[%u]", ino);
+	return add_external(e_str);
 }
 
 int unix_sk_ids_parse(char *optarg)
@@ -1474,7 +1463,7 @@ int unix_sk_ids_parse(char *optarg)
 		if (*iter == ',')
 			iter++;
 		else {
-			ino_t ino = (ino_t)strtoul(iter, &iter, 10);
+			unsigned int ino = strtoul(iter, &iter, 10);
 
 			if (0 == ino) {
 				pr_err("Can't parse unix socket inode from optarg: %s\n", optarg);

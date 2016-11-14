@@ -7,19 +7,19 @@
 #include <sys/stat.h>
 #include <ftw.h>
 #include <libgen.h>
-#include "list.h"
+#include "common/list.h"
 #include "xmalloc.h"
 #include "cgroup.h"
 #include "cgroup-props.h"
 #include "cr_options.h"
 #include "pstree.h"
+#include "criu-log.h"
 #include "util.h"
 #include "imgset.h"
 #include "util-pie.h"
 #include "namespaces.h"
 #include "seize.h"
 #include "syscall-types.h"
-#include "parasite.h"
 #include "protobuf.h"
 #include "images/core.pb-c.h"
 #include "images/cgroup.pb-c.h"
@@ -1712,7 +1712,6 @@ static int rewrite_cgsets(CgroupEntry *cge, char **controllers, int n_controller
 					return -ENOMEM;
 				}
 				xfree(prev);
-				cg->cgns_prefix = strlen(newroot);
 
 				if (!dirnew) {
 					/* -1 because cgns_prefix includes leading "/" */
@@ -1720,6 +1719,7 @@ static int rewrite_cgsets(CgroupEntry *cge, char **controllers, int n_controller
 					if (!dirnew)
 						return -ENOMEM;
 				}
+				cg->cgns_prefix = strlen(newroot);
 			} else {
 				char *prev = cg->path;
 				/*

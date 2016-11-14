@@ -5,8 +5,7 @@
 
 #include "sockets.h"
 #include "files.h"
-#include "list.h"
-#include "protobuf.h"
+#include "common/list.h"
 #include "images/sk-inet.pb-c.h"
 
 #define INET_ADDR_LEN		48 /* max of INET_ADDRSTRLEN and INET6_ADDRSTRLEN */

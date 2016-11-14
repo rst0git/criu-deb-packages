@@ -8,14 +8,14 @@
 #include <errno.h>
 #include <sys/syscall.h>
 
+#include "int.h"
 #include "log.h"
-#include "bug.h"
+#include "restorer.h"
 #include "kerndat.h"
 #include "fs-magic.h"
 #include "mem.h"
-#include "compiler.h"
+#include "common/compiler.h"
 #include "sysctl.h"
-#include "asm/types.h"
 #include "cr_options.h"
 #include "util.h"
 #include "lsm.h"
@@ -74,10 +74,8 @@ static int parse_self_maps(unsigned long vm_start, dev_t *device)
 	char buf[1024];
 
 	maps = fopen_proc(PROC_SELF, "maps");
-	if (maps == NULL) {
-		pr_perror("Can't open self maps");
+	if (maps == NULL)
 		return -1;
-	}
 
 	while (fgets(buf, sizeof(buf), maps) != NULL) {
 		char *end, *aux;

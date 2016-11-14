@@ -1,6 +1,8 @@
+#include <stdio.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include "crtools.h"
 #include "cr_options.h"
@@ -11,6 +13,7 @@
 #include "cgroup.h"
 #include "lsm.h"
 #include "protobuf.h"
+#include "xmalloc.h"
 #include "images/inventory.pb-c.h"
 #include "images/pagemap.pb-c.h"
 
@@ -576,7 +579,7 @@ off_t img_raw_size(struct cr_img *img)
 	struct stat stat;
 
 	if (fstat(img->_x.fd, &stat)) {
-		pr_perror("Failed to get image stats\n");
+		pr_perror("Failed to get image stats");
 		return -1;
 	}
 
