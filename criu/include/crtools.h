@@ -3,8 +3,7 @@
 
 #include <sys/types.h>
 
-#include "list.h"
-#include "asm/types.h"
+#include "common/list.h"
 #include "servicefd.h"
 
 #include "images/inventory.pb-c.h"

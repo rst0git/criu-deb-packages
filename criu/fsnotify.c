@@ -22,8 +22,7 @@
 
 #include <sys/fanotify.h>
 
-#include "compiler.h"
-#include "asm/types.h"
+#include "common/compiler.h"
 #include "imgset.h"
 #include "fsnotify.h"
 #include "fdinfo.h"
@@ -34,8 +33,8 @@
 #include "files.h"
 #include "files-reg.h"
 #include "file-ids.h"
-#include "log.h"
-#include "list.h"
+#include "criu-log.h"
+#include "common/list.h"
 #include "lock.h"
 #include "irmap.h"
 #include "cr_options.h"

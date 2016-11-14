@@ -20,10 +20,9 @@
 #include "file-ids.h"
 #include "mount.h"
 #include "files.h"
-#include "list.h"
+#include "common/list.h"
 #include "rst-malloc.h"
 #include "fs-magic.h"
-#include "asm/atomic.h"
 #include "namespaces.h"
 #include "proc_parse.h"
 #include "pstree.h"
@@ -31,6 +30,7 @@
 #include "external.h"
 
 #include "protobuf.h"
+#include "util.h"
 #include "images/regfile.pb-c.h"
 #include "images/remap-file-path.pb-c.h"
 
@@ -81,7 +81,7 @@ static int note_link_remap(char *path, struct ns_id *nsid)
 	if (!rlb)
 		goto err;
 
-	rlb->path = strdup(path);
+	rlb->path = xstrdup(path);
 	if (!rlb->path)
 		goto err2;
 

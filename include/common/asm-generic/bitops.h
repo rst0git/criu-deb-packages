@@ -1,7 +1,14 @@
-#ifndef __CR_BITOPS_H__
-#define __CR_BITOPS_H__
+/*
+ * Generic bits operations.
+ *
+ * Architectures that don't want their own implementation of those,
+ * should include this file into the arch/$ARCH/include/asm/bitops.h
+ */
 
-#include "asm/bitsperlong.h"
+#ifndef __CR_GENERIC_BITOPS_H__
+#define __CR_GENERIC_BITOPS_H__
+
+#include "common/asm/bitsperlong.h"
 
 #define DIV_ROUND_UP(n,d)	(((n) + (d) - 1) / (d))
 #define BITS_TO_LONGS(nr)	DIV_ROUND_UP(nr, BITS_PER_LONG)
@@ -19,31 +26,27 @@
 
 #define ADDR				BITOP_ADDR(addr)
 
-static inline void set_bit(int nr, volatile unsigned long *addr)
-{
-	asm volatile("btsl %1,%0" : ADDR : "Ir" (nr) : "memory");
+static inline void set_bit(int nr, volatile unsigned long *addr) {
+	addr += nr / BITS_PER_LONG;
+	*addr |= (1 << (nr % BITS_PER_LONG));
 }
 
 static inline void change_bit(int nr, volatile unsigned long *addr)
 {
-	asm volatile("btcl %1,%0" : ADDR : "Ir" (nr));
+	addr += nr / BITS_PER_LONG;
+	*addr ^= (1 << (nr % BITS_PER_LONG));
 }
 
 static inline int test_bit(int nr, volatile const unsigned long *addr)
 {
-	int oldbit;
-
-	asm volatile("bt %2,%1\n\t"
-		     "sbb %0,%0"
-		     : "=r" (oldbit)
-		     : "m" (*(unsigned long *)addr), "Ir" (nr));
-
-	return oldbit;
+	addr += nr / BITS_PER_LONG;
+	return (*addr & (1 << (nr % BITS_PER_LONG))) ? -1 : 0;
 }
 
 static inline void clear_bit(int nr, volatile unsigned long *addr)
 {
-	asm volatile("btrl %1,%0" : ADDR : "Ir" (nr));
+	addr += nr / BITS_PER_LONG;
+	*addr &= ~(1 << (nr % BITS_PER_LONG));
 }
 
 /**
@@ -54,10 +57,17 @@ static inline void clear_bit(int nr, volatile unsigned long *addr)
  */
 static inline unsigned long __ffs(unsigned long word)
 {
-	asm("bsf %1,%0"
-		: "=r" (word)
-		: "rm" (word));
-	return word;
+	int p = 0;
+
+	for (; p < 8*sizeof(word); ++p) {
+		if (word & 1) {
+			break;
+		}
+
+		word >>= 1;
+	}
+
+	return p;
 }
 
 #define BITOP_WORD(nr)		((nr) / BITS_PER_LONG)
@@ -110,4 +120,4 @@ found_middle:
 	     i < sizeof(bitmask);				\
 	     i = find_next_bit(bitmask, sizeof(bitmask), i + 1))
 
-#endif /* __CR_BITOPS_H__ */
+#endif /* __CR_GENERIC_BITOPS_H__ */

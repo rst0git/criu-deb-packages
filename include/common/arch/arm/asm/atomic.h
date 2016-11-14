@@ -1,7 +1,7 @@
 #ifndef __CR_ATOMIC_H__
 #define __CR_ATOMIC_H__
 
-#include "asm/processor.h"
+#include "common/arch/arm/asm/processor.h"
 
 typedef struct {
 	int counter;
@@ -27,6 +27,7 @@ static inline int atomic_cmpxchg(atomic_t *ptr, int old, int new)
 		"ldrex	%1, [%3]\n"
 		"mov	%0, #0\n"
 		"teq	%1, %4\n"
+		"it	eq\n"
 		"strexeq %0, %5, [%3]\n"
 		    : "=&r" (res), "=&r" (oldval), "+Qo" (ptr->counter)
 		    : "r" (&ptr->counter), "Ir" (old), "r" (new)
@@ -125,6 +126,7 @@ static inline int atomic_dec(atomic_t *v) { return atomic_sub_return(1, v) + 1; 
 
 /* true if the result is 0, or false for all other cases. */
 #define atomic_dec_and_test(v) (atomic_sub_return(1, v) == 0)
+#define atomic_dec_return(v)  (atomic_sub_return(1, v))
 
 #define atomic_inc_return(v)	(atomic_add_return(1, v))
 

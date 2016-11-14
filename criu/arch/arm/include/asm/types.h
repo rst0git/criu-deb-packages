@@ -5,8 +5,8 @@
 #include <signal.h>
 #include "images/core.pb-c.h"
 
-#include "asm/page.h"
-#include "asm/bitops.h"
+#include "page.h"
+#include "bitops.h"
 #include "asm/int.h"
 
 #define SIGMAX			64

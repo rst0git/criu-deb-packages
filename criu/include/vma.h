@@ -1,9 +1,8 @@
 #ifndef __CR_VMA_H__
 #define __CR_VMA_H__
 
-#include "asm/types.h"
 #include "image.h"
-#include "list.h"
+#include "common/list.h"
 
 #include "images/vma.pb-c.h"
 

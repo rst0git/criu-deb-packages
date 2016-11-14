@@ -19,22 +19,20 @@
 #include <sys/shm.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
-
 #include <sched.h>
 
 #include <sys/sendfile.h>
 
+#include "types.h"
 #include "ptrace.h"
-#include "compiler.h"
-#include "asm/types.h"
-#include "asm/restorer.h"
+#include "common/compiler.h"
 
 #include "cr_options.h"
 #include "servicefd.h"
 #include "image.h"
 #include "util.h"
 #include "util-pie.h"
-#include "log.h"
+#include "criu-log.h"
 #include "restorer.h"
 #include "sockets.h"
 #include "sk-packet.h"
@@ -88,9 +86,7 @@
 #include "images/pagemap.pb-c.h"
 #include "images/siginfo.pb-c.h"
 
-#include "asm/restore.h"
-#include "asm/atomic.h"
-#include "asm/bitops.h"
+#include "restore.h"
 
 #include "cr-errno.h"
 
@@ -905,10 +901,8 @@ static inline int fork_with_pid(struct pstree_item *item)
 		int len;
 
 		ca.fd = open_proc_rw(PROC_GEN, LAST_PID_PATH);
-		if (ca.fd < 0) {
-			pr_perror("%d: Can't open %s", pid, LAST_PID_PATH);
+		if (ca.fd < 0)
 			goto err;
-		}
 
 		if (flock(ca.fd, LOCK_EX)) {
 			close(ca.fd);
@@ -1731,10 +1725,8 @@ static int restore_root_task(struct pstree_item *init)
 
 	if (root_ns_mask & CLONE_NEWNS) {
 		mnt_ns_fd = open_proc(init->pid.real, "ns/mnt");
-		if (mnt_ns_fd < 0) {
-			pr_perror("Can't open init's mntns fd");
+		if (mnt_ns_fd < 0)
 			goto out_kill;
-		}
 	}
 
 	ret = run_scripts(ACT_SETUP_NS);
@@ -2356,7 +2348,7 @@ static int prep_sched_info(struct rst_sched_param *sp, ThreadCoreEntry *tc)
 	return 0;
 }
 
-static unsigned long decode_rlim(u_int64_t ival)
+static rlim_t decode_rlim(rlim_t ival)
 {
 	return ival == -1 ? RLIM_INFINITY : ival;
 }

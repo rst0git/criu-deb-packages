@@ -14,8 +14,8 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 
-#include "compiler.h"
-#include "asm/types.h"
+#include "int.h"
+#include "common/compiler.h"
 #include "util.h"
 #include "ptrace.h"
 #include "pid.h"

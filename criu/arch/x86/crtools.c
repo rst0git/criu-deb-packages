@@ -10,7 +10,7 @@
 #include "asm/fpu.h"
 
 #include "cr_options.h"
-#include "compiler.h"
+#include "common/compiler.h"
 #include "restorer.h"
 #include "ptrace.h"
 #include "parasite-syscall.h"
@@ -75,8 +75,10 @@ static int task_in_compat_mode(pid_t pid)
 	return cs != 0x33 || ds == 0x2b;
 }
 
-bool arch_can_dump_task(pid_t pid)
+bool arch_can_dump_task(struct parasite_ctl *ctl)
 {
+	pid_t pid = ctl->rpid;
+
 	if (task_in_compat_mode(pid)) {
 		pr_err("Can't dump task %d running in 32-bit mode\n", pid);
 		return false;

@@ -11,7 +11,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "asm/types.h"
 #include "libnetlink.h"
 #include "cr_options.h"
 #include "imgset.h"
@@ -22,6 +21,8 @@
 #include "rst-malloc.h"
 #include "sockets.h"
 #include "sk-inet.h"
+#include "protobuf.h"
+#include "util.h"
 
 #define PB_ALEN_INET	1
 #define PB_ALEN_INET6	4

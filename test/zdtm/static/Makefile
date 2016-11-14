@@ -152,6 +152,8 @@ TST_NOFILE	:=				\
 		cgroupns			\
 		helper_zombie_child		\
 		clone_fs			\
+		macvlan			\
+		cr_veth				\
 #		jobctl00			\
 
 ifneq ($(SRCARCH),arm)
@@ -219,6 +221,7 @@ TST_DIR		=				\
 		tempfs_overmounted		\
 		tempfs_overmounted01		\
 		tempfs_ro			\
+		tempfs_ro02			\
 		tempfs_subns			\
 		mnt_ro_bind			\
 		mount_paths			\
@@ -245,6 +248,7 @@ TST_DIR		=				\
 		mntns_root_bind02		\
 		mntns_overmount			\
 		mntns_shared_vs_private		\
+		mnt_ext_manual			\
 		mnt_ext_auto			\
 		mnt_ext_master			\
 		mnt_ext_dev			\
@@ -394,6 +398,7 @@ socket-tcp6-local: override CFLAGS += -D ZDTM_TCP_LOCAL -D ZDTM_IPV6
 socket-tcp-local: override CFLAGS += -D ZDTM_TCP_LOCAL
 socket-tcp-nfconntrack: override CFLAGS += -D ZDTM_TCP_LOCAL -DZDTM_CONNTRACK
 socket_listen6: override CFLAGS += -D ZDTM_IPV6
+mnt_ext_manual: override CFLAGS += -D ZDTM_EXTMAP_MANUAL
 sigpending:		override LDLIBS += -lrt
 vdso01:			override LDLIBS += -lrt
 mntns_link_remap:	override CFLAGS += -DZDTM_LINK_REMAP
@@ -426,7 +431,7 @@ cleanout:
 	$(RM) -f -r *.pid *.out* *.test* *.state
 
 %.cleanout: %
-	$(Q) $(RM) -f -r $<.pid* $<.out* *$<.test* $<.*.test $<.state
+	$(Q) $(RM) -f -r $<.pid* $<.out* *$<.test* $<.*.test $<.*.state $<.state
 
 realclean:	cleandep cleanout
 

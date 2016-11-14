@@ -38,9 +38,9 @@
  * Copied from the kernel file arch/powerpc/include/asm/bitops.h
  */
 
-#include "compiler.h"
+#include "common/compiler.h"
 
-#include "asm/bitsperlong.h"
+#include "common/asm/bitsperlong.h"
 
 #define DIV_ROUND_UP(n,d)       (((n) + (d) - 1) / (d))
 #define BITS_TO_LONGS(nr)       DIV_ROUND_UP(nr, BITS_PER_LONG)
@@ -68,7 +68,7 @@ static __inline__ void fn(unsigned long mask,   \
         unsigned long old;                      \
         unsigned long *p = (unsigned long *)_p; \
         __asm__ __volatile__ (                  \
-"1:	ldarx	%0,0,%3,0\n"			\
+"1:	ldarx	%0,0,%3\n"			\
         stringify_in_c(op) "%0,%0,%2\n"		\
         "stdcx.	%0,0,%3\n"			\
         "bne- 1b\n"                             \

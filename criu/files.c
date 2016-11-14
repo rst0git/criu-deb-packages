@@ -13,12 +13,13 @@
 #include <sys/un.h>
 #include <stdlib.h>
 
+#include "types.h"
 #include "files.h"
 #include "file-ids.h"
 #include "files-reg.h"
 #include "file-lock.h"
 #include "image.h"
-#include "list.h"
+#include "common/list.h"
 #include "rst-malloc.h"
 #include "util-pie.h"
 #include "lock.h"
@@ -40,11 +41,11 @@
 #include "fdinfo.h"
 #include "cr_options.h"
 #include "autofs.h"
-
 #include "parasite.h"
 #include "parasite-syscall.h"
 
 #include "protobuf.h"
+#include "util.h"
 #include "images/fs.pb-c.h"
 #include "images/ext-file.pb-c.h"
 
@@ -109,6 +110,18 @@ struct fdinfo_list_entry *find_used_fd(struct list_head *head, int fd)
 			break;
 	}
 	return NULL;
+}
+
+void collect_used_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri)
+{
+	struct fdinfo_list_entry *fle;
+
+	list_for_each_entry(fle, &ri->used, used_list) {
+		if (new_fle->fe->fd < fle->fe->fd)
+			break;
+	}
+
+	list_add_tail(&new_fle->used_list, &fle->used_list);
 }
 
 unsigned int find_unused_fd(struct list_head *head, int hint_fd)

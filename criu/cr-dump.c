@@ -22,6 +22,7 @@
 #include <sched.h>
 #include <sys/resource.h>
 
+#include "types.h"
 #include "protobuf.h"
 #include "images/fdinfo.pb-c.h"
 #include "images/fs.pb-c.h"
@@ -32,12 +33,11 @@
 #include "images/rlimit.pb-c.h"
 #include "images/siginfo.pb-c.h"
 
-#include "asm/types.h"
-#include "list.h"
+#include "common/list.h"
 #include "imgset.h"
 #include "file-ids.h"
 #include "kcmp-ids.h"
-#include "compiler.h"
+#include "common/compiler.h"
 #include "crtools.h"
 #include "cr_options.h"
 #include "servicefd.h"
@@ -81,8 +81,7 @@
 #include "seccomp.h"
 #include "seize.h"
 #include "fault-injection.h"
-
-#include "asm/dump.h"
+#include "dump.h"
 
 static char loc_buf[PAGE_SIZE];
 
@@ -310,7 +309,7 @@ static int dump_task_fs(pid_t pid, struct parasite_dump_misc *misc, struct cr_im
 	return pb_write_one(img_from_set(imgset, CR_FD_FS), &fe, PB_FS);
 }
 
-static inline u_int64_t encode_rlim(unsigned long val)
+static inline rlim_t encode_rlim(rlim_t val)
 {
 	return val == RLIM_INFINITY ? -1 : val;
 }

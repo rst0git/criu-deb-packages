@@ -10,8 +10,7 @@
 #include <sys/socket.h>
 #include <sys/sendfile.h>
 
-#include "asm/types.h"
-#include "list.h"
+#include "common/list.h"
 #include "imgset.h"
 #include "image.h"
 #include "servicefd.h"

@@ -5,13 +5,13 @@
 #include <limits.h>
 #include <sys/resource.h>
 
-#include "compiler.h"
-#include "asm/types.h"
+#include "int.h"
+#include "types.h"
+#include "common/compiler.h"
 #include "asm/fpu.h"
 #include "lock.h"
 #include "util.h"
 #include "asm/restorer.h"
-#include "rst_info.h"
 #include "config.h"
 
 #include "posix-timer.h"

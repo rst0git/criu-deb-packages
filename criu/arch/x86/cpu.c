@@ -6,12 +6,12 @@
 
 #include <sys/types.h>
 
-#include "asm/bitops.h"
+#include "bitops.h"
 #include "asm/types.h"
 #include "asm/cpu.h"
 #include "asm/fpu.h"
 
-#include "compiler.h"
+#include "common/compiler.h"
 
 #include "cr_options.h"
 #include "image.h"

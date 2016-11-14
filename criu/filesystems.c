@@ -4,8 +4,9 @@
 #include <fcntl.h>
 #include <sys/mount.h>
 
-#include "asm/types.h"
-#include "compiler.h"
+#include "config.h"
+#include "int.h"
+#include "common/compiler.h"
 #include "xmalloc.h"
 #include "cr_options.h"
 #include "filesystems.h"
@@ -30,6 +31,7 @@ static int attach_option(struct mount_info *pm, char *opt)
 	return pm->options ? 0 : -1;
 }
 
+#ifdef CONFIG_BINFMT_MISC_VIRTUALIZED
 struct binfmt_misc_info {
 	BinfmtMiscEntry *bme;
 	struct list_head list;
@@ -39,8 +41,7 @@ LIST_HEAD(binfmt_misc_list);
 
 static int binfmt_misc_parse(struct mount_info *pm)
 {
-	if (pm->nsid->type == NS_ROOT)
-		opts.has_binfmt_misc = true;
+	opts.has_binfmt_misc = true;
 	return 0;
 
 }
@@ -271,25 +272,33 @@ static int binfmt_misc_restore_bme(struct mount_info *mi, BinfmtMiscEntry *bme, 
 {
 	int ret;
 
-	/* :name:type:offset:magic/extension:mask:interpreter:flags */
-	if ((!bme->magic && !bme->extension) || !bme->interpreter) {
-		pr_perror("binfmt_misc: bad dump");
-		ret = -1;
-	} else if (bme->magic) {
+	if (!bme->name || !bme->interpreter)
+		goto bad_dump;
+
+	/* Either magic or extension should be there */
+	if (bme->magic) {
 		ret = make_bfmtm_magic_str(buf, bme);
 	} else if (bme->extension) {
 		/* :name:E::extension::interpreter:flags */
 		ret = snprintf(buf, BINFMT_MISC_STR, ":%s:E::%s::%s:%s",
 			       bme->name, bme->extension, bme->interpreter,
 			       bme->flags ? : "\0");
-	}
+		if (ret >= BINFMT_MISC_STR) /* output truncated */
+			ret = -1;
+	} else
+		ret = -1;
 
-	if (ret > 0) {
-		pr_debug("binfmt_misc_pattern=%s\n", buf);
-		ret = write_binfmt_misc_entry(mi->mountpoint, buf, bme);
-	}
+	if (ret < 0)
+		goto bad_dump;
+
+	pr_debug("binfmt_misc_pattern=%s\n", buf);
+	ret = write_binfmt_misc_entry(mi->mountpoint, buf, bme);
 
 	return ret;
+
+bad_dump:
+	pr_perror("binfmt_misc: bad dump");
+	return -1;
 }
 
 static int binfmt_misc_restore(struct mount_info *mi)
@@ -363,6 +372,11 @@ int collect_binfmt_misc(void)
 {
 	return collect_image(&binfmt_misc_cinfo);
 }
+#else
+#define binfmt_misc_dump	NULL
+#define binfmt_misc_restore	NULL
+#define binfmt_misc_parse	NULL
+#endif
 
 static int tmpfs_dump(struct mount_info *pm)
 {

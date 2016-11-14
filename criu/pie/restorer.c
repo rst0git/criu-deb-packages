@@ -17,14 +17,15 @@
 #include <sys/resource.h>
 #include <signal.h>
 
-#include "compiler.h"
-#include "asm/string.h"
-#include "asm/types.h"
+#include "int.h"
+#include "types.h"
+#include "common/compiler.h"
+#include "string.h"
 #include "syscall.h"
 #include "signal.h"
 #include "config.h"
 #include "prctl.h"
-#include "log.h"
+#include "criu-log.h"
 #include "util.h"
 #include "image.h"
 #include "sk-inet.h"
@@ -39,7 +40,7 @@
 #include "images/mm.pb-c.h"
 
 #include "shmem.h"
-#include "asm/restorer.h"
+#include "restorer.h"
 
 #ifndef PR_SET_PDEATHSIG
 #define PR_SET_PDEATHSIG 1
@@ -803,7 +804,7 @@ static int timerfd_arm(struct task_restore_args *args)
 		pr_debug("timerfd: arm for fd %d (%d)\n", t->fd, i);
 
 		if (t->settime_flags & TFD_TIMER_ABSTIME) {
-			struct timespec ts = { };
+			struct timespec ts;
 
 			/*
 			 * We might need to adjust value because the checkpoint
