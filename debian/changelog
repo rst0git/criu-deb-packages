@@ -1,8 +1,12 @@
-criu (2.8-1) UNRELEASED; urgency=medium
+criu (2.8-1) experimental; urgency=medium
 
   * New upstream version 2.8
+  * debian/rules: Build enabling all hardening flags.
+    Fixes "FTBFS: ld: unrecognized option
+    '-specs=/usr/share/dpkg/no-pie-link.specs'"
+    Thanks to Adrian Bunk <bunk@stusta.de> (Closes: #844293)
 
- -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 14 Nov 2016 10:29:29 +0100
+ -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 28 Nov 2016 08:40:13 +0100
 
 criu (2.7-2) unstable; urgency=medium
 
