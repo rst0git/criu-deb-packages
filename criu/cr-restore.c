@@ -74,6 +74,7 @@
 #include "seccomp.h"
 #include "fault-injection.h"
 #include "sk-queue.h"
+#include "sigframe.h"
 
 #include "parasite-syscall.h"
 #include "files-reg.h"
@@ -1732,6 +1733,19 @@ static int restore_root_task(struct pstree_item *init)
 	ret = run_scripts(ACT_SETUP_NS);
 	if (ret)
 		goto out_kill;
+
+	if (opts.empty_ns & CLONE_NEWNET) {
+		/*
+		 * Local TCP connections were locked by network_lock_internal()
+		 * on dump and normally should have been C/R-ed by respectively
+		 * dump_iptables() and restore_iptables() in net.c. However in
+		 * the '--empty-ns net' mode no iptables C/R is done and we
+		 * need to return these rules by hands.
+		 */
+		ret = network_lock_internal();
+		if (ret)
+			goto out_kill;
+	}
 
 	timing_start(TIME_FORK);
 	ret = restore_switch_stage(CR_STATE_RESTORE_SHARED);

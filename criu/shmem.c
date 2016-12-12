@@ -480,10 +480,7 @@ static int restore_shmem_content(void *addr, struct shmem_info *si)
 		if (vaddr + nr_pages * PAGE_SIZE > si->size)
 			break;
 
-		pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr);
-
-		if (pr.put_pagemap)
-			pr.put_pagemap(&pr);
+		pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr, 0);
 	}
 
 	pr.close(&pr);
@@ -712,7 +709,9 @@ static int dump_one_shmem(struct shmem_info *si)
 
 		pgaddr = (unsigned long)addr + pfn * PAGE_SIZE;
 again:
-		if (xfer.parent && page_in_parent(pgstate == PST_DIRTY))
+		if (pgstate == PST_ZERO)
+			ret = 0;
+		else if (xfer.parent && page_in_parent(pgstate == PST_DIRTY))
 			ret = page_pipe_add_hole(pp, pgaddr);
 		else
 			ret = page_pipe_add_page(pp, pgaddr);

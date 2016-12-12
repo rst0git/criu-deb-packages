@@ -4,9 +4,9 @@
 #include <sys/user.h>
 #include <sys/mman.h>
 
+#include "types.h"
 #include "asm/processor-flags.h"
 #include "asm/restorer.h"
-#include "asm/types.h"
 #include "asm/fpu.h"
 
 #include "cr_options.h"
@@ -497,22 +497,6 @@ int restore_gpregs(struct rt_sigframe *f, UserX86RegsEntry *r)
 	CPREG1(es);
 	CPREG1(ds);
 #endif
-
-	return 0;
-}
-
-int sigreturn_prep_fpu_frame(struct rt_sigframe *sigframe,
-		struct rt_sigframe *rsigframe)
-{
-	fpu_state_t *fpu_state = RT_SIGFRAME_FPU(rsigframe);
-	unsigned long addr = (unsigned long)(void *)&fpu_state->xsave;
-
-	if ((addr % 64ul) == 0ul) {
-		sigframe->uc.uc_mcontext.fpstate = &fpu_state->xsave;
-	} else {
-		pr_err("Unaligned address passed: %lx\n", addr);
-		return -1;
-	}
 
 	return 0;
 }
