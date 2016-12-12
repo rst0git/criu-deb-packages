@@ -1,6 +1,7 @@
 #ifndef __CR_PAGE_READ_H__
 #define __CR_PAGE_READ_H__
 
+#include "common/list.h"
 #include "images/pagemap.pb-c.h"
 
 /*
@@ -47,11 +48,11 @@ struct page_read {
 	 */
 	int (*get_pagemap)(struct page_read *, struct iovec *iov);
 	/* reads page from current pagemap */
-	int (*read_pages)(struct page_read *, unsigned long vaddr, int nr, void *);
-	/* stop working on current pagemap */
-	void (*put_pagemap)(struct page_read *);
+	int (*read_pages)(struct page_read *, unsigned long vaddr, int nr,
+			  void *, unsigned flags);
 	void (*close)(struct page_read *);
 	int (*seek_page)(struct page_read *pr, unsigned long vaddr, bool warn);
+	int (*sync)(struct page_read *pr);
 
 	/* Private data of reader */
 	struct cr_img *pmi;
@@ -72,8 +73,14 @@ struct page_read {
 	PagemapEntry **pmes;
 	int nr_pmes;
 	int curr_pme;
+
+	struct list_head	async;
 };
 
+/* flags for ->read_pages */
+#define PR_ASYNC	0x1 /* may exit w/o data in the buffer */
+
+/* flags for open_page_read */
 #define PR_SHMEM	0x1
 #define PR_TASK		0x2
 

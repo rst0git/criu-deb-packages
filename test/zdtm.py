@@ -61,6 +61,7 @@ def make_tests_root():
 		atexit.register(clean_tests_root)
 	return tests_root[1]
 
+
 # Report generation
 
 report_dir = None
@@ -122,6 +123,7 @@ def check_core_files():
 		print_sep(i)
 
 	return True
+
 
 # Arch we run on
 arch = os.uname()[4]
@@ -767,6 +769,7 @@ class criu:
 		self.__page_server = (opts['page_server'] and True or False)
 		self.__restore_sibling = (opts['sibling'] and True or False)
 		self.__join_ns = (opts['join_ns'] and True or False)
+		self.__empty_ns = (opts['empty_ns'] and True or False)
 		self.__fault = (opts['fault'])
 		self.__script = opts['script']
 		self.__sat = (opts['sat'] and True or False)
@@ -893,6 +896,8 @@ class criu:
 
 		if self.__leave_stopped:
 			a_opts += ['--leave-stopped']
+		if self.__empty_ns:
+			a_opts += ['--empty-ns', 'net']
 
 		self.__criu_act(action, opts = a_opts + opts)
 		if self.__mdedup and self.__iter > 1:
@@ -914,6 +919,9 @@ class criu:
 		if self.__join_ns:
 			r_opts.append("--join-ns")
 			r_opts.append("net:%s" % join_ns_file)
+		if self.__empty_ns:
+			r_opts += ['--empty-ns', 'net']
+			r_opts += ['--action-script', os.getcwd() + '/empty-netns-prep.sh']
 
 		self.__prev_dump_iter = None
 		criu_dir = os.path.dirname(os.getcwd())
@@ -948,6 +956,7 @@ def try_run_hook(test, args):
 		hook = subprocess.Popen([hname] + args)
 		if hook.wait() != 0:
 			raise test_fail_exc("hook " + " ".join(args))
+
 
 #
 # Step by step execution
@@ -1299,6 +1308,8 @@ class launcher:
 		self.__subs = {}
 		self.__fail = False
 		self.__file_report = None
+		self.__failed = []
+		self.__nr_skip = 0
 		if self.__max > 1 and self.__total > 1:
 			self.__use_log = True
 		elif opts['report']:
@@ -1329,6 +1340,7 @@ class launcher:
 		print "Skipping %s (%s)" % (name, reason)
 		self.__nr += 1
 		self.__runtest += 1
+		self.__nr_skip += 1
 		if self.__file_report:
 			testline = "ok %d - %s # SKIP %s" % (self.__runtest, name, reason)
 			print >> self.__file_report, testline
@@ -1344,7 +1356,7 @@ class launcher:
 		self.__nr += 1
 		self.__show_progress()
 
-		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', 'stop',
+		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', 'stop', 'empty_ns',
 				'fault', 'keep_img', 'report', 'snaps', 'sat', 'script', 'rpc',
 				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup')
 		arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
@@ -1372,6 +1384,7 @@ class launcher:
 			if status != 0:
 				self.__fail = True
 				failed_flavor = decode_flav(os.WEXITSTATUS(status))
+				self.__failed.append([sub['name'], failed_flavor])
 				if self.__file_report:
 					testline = "not ok %d - %s # flavor %s" % (self.__runtest, sub['name'], failed_flavor)
 					details = {'output': open(sub['log']).read()}
@@ -1416,6 +1429,11 @@ class launcher:
 		if self.__file_report:
 			self.__file_report.close()
 		if self.__fail:
+			if opts['keep_going']:
+				print_sep("%d TEST(S) FAILED (TOTAL %d/SKIPPED %d)"
+						% (len(self.__failed), self.__total, self.__nr_skip), "#")
+				for failed in self.__failed:
+					print " * %s(%s)" % (failed[0], failed[1])
 			print_sep("FAIL", "#")
 			sys.exit(1)
 
@@ -1464,15 +1482,27 @@ def print_sep(title, sep = "=", width = 80):
 	print (" " + title + " ").center(width, sep)
 
 
+def print_error(line):
+	line = line.rstrip()
+	print line
+	if line.endswith('>'):  # combine pie output
+		return True
+	return False
+
+
 def grep_errors(fname):
 	first = True
+	print_next = False
 	for l in open(fname):
 		if "Error" in l:
 			if first:
 				print_fname(fname, 'log')
 				print_sep("grep Error", "-", 60)
 				first = False
-			print l,
+			print_next = print_error(l)
+		else:
+			if print_next:
+				print_next = print_error(l)
 	if not first:
 		print_sep("ERROR OVER", "-", 60)
 
@@ -1486,20 +1516,15 @@ def run_tests(opts):
 			print "Tracking memory is not available"
 			return
 
-	if opts['keep_going'] and (not opts['all']):
-		print "[WARNING] Option --keep-going is more useful with option --all."
-
 	if opts['all']:
 		torun = all_tests(opts)
 		run_all = True
 	elif opts['tests']:
 		r = re.compile(opts['tests'])
 		torun = filter(lambda x: r.match(x), all_tests(opts))
-		opts['keep_going'] = False
 		run_all = True
 	elif opts['test']:
 		torun = opts['test']
-		opts['keep_going'] = False
 		run_all = False
 	elif opts['from']:
 		if not os.access(opts['from'], os.R_OK):
@@ -1512,6 +1537,10 @@ def run_tests(opts):
 	else:
 		print "Specify test with -t <name> or -a"
 		return
+
+	if opts['keep_going'] and len(torun) < 2:
+		print "[WARNING] Option --keep-going is more useful when running multiple tests"
+		opts['keep_going'] = False
 
 	if opts['exclude']:
 		excl = re.compile(".*(" + "|".join(opts['exclude']) + ")")
@@ -1590,6 +1619,8 @@ def run_tests(opts):
 			# remove ns and uns flavor in join_ns
 			if opts['join_ns']:
 				run_flavs -= set(['ns', 'uns'])
+			if opts['empty_ns']:
+				run_flavs -= set(['h'])
 
 			if run_flavs:
 				l.run_test(t, tdesc, run_flavs)
@@ -1599,6 +1630,7 @@ def run_tests(opts):
 		l.finish()
 		if opts['join_ns']:
 			subprocess.Popen(["ip", "netns", "delete", "zdtm_netns"])
+
 
 sti_fmt = "%-40s%-10s%s"
 
@@ -1781,6 +1813,7 @@ rp.add_argument("-x", "--exclude", help = "Exclude tests from --all run", action
 
 rp.add_argument("--sibling", help = "Restore tests as siblings", action = 'store_true')
 rp.add_argument("--join-ns", help = "Restore tests and join existing namespace", action = 'store_true')
+rp.add_argument("--empty-ns", help = "Restore tests in empty net namespace", action = 'store_true')
 rp.add_argument("--pre", help = "Do some pre-dumps before dump (n[:pause])")
 rp.add_argument("--snaps", help = "Instead of pre-dumps do full dumps", action = 'store_true')
 rp.add_argument("--dedup", help = "Auto-deduplicate images on iterations", action = 'store_true')

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <dirent.h>
 
 #include "int.h"
@@ -247,7 +248,7 @@ static inline bool issubpath(const char *path, const char *sub_path)
 /*
  * mkdir -p
  */
-int mkdirpat(int fd, const char *path);
+int mkdirpat(int fd, const char *path, int mode);
 
 /*
  * Tests whether a path is a prefix of another path. This is different than
