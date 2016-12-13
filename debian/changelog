@@ -1,8 +1,9 @@
-criu (2.9-1) UNRELEASED; urgency=medium
+criu (2.9-1) experimental; urgency=medium
 
   * New upstream version 2.9
+  * Install crit.1 provided by upstream
 
- -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 12 Dec 2016 14:09:44 +0100
+ -- Salvatore Bonaccorso <carnil@debian.org>  Tue, 13 Dec 2016 21:20:16 +0100
 
 criu (2.8-2) unstable; urgency=medium
 
