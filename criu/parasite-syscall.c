@@ -504,7 +504,7 @@ static int parasite_init_daemon(struct parasite_ctl *ctl, struct ns_id *net)
 
 	args = parasite_args(ctl, struct parasite_init_args);
 
-	args->sigframe = ctl->rsigframe;
+	args->sigframe = (uintptr_t)ctl->rsigframe;
 	args->log_level = log_get_loglevel();
 
 	futex_set(&args->daemon_connected, 0);
@@ -836,7 +836,7 @@ int parasite_drain_fds_seized(struct parasite_ctl *ctl,
 		goto err;
 	}
 
-	ret = recv_fds(ctl->tsock, lfds, nr_fds, opts);
+	ret = recv_fds(ctl->tsock, lfds, nr_fds, opts, sizeof(struct fd_opts));
 	if (ret)
 		pr_err("Can't retrieve FDs from socket\n");
 

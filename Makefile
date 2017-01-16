@@ -188,7 +188,8 @@ endif
 
 #
 # Configure variables.
-export CONFIG_HEADER := $(SRC_DIR)/criu/include/config.h
+CONFIG_HEADER_REL := criu/include/config.h
+export CONFIG_HEADER := $(SRC_DIR)/$(CONFIG_HEADER_REL)
 ifeq ($(filter clean mrproper,$(MAKECMDGOALS)),)
 include $(SRC_DIR)/Makefile.config
 endif
@@ -201,6 +202,19 @@ $(eval $(call gen-built-in,images))
 .PHONY: .FORCE
 
 #
+# Next the socket CR library
+#
+SOCCR_A := soccr/libsoccr.a
+SOCCR_CONFIG := $(SRC_DIR)/soccr/config.h
+$(SOCCR_CONFIG): $(CONFIG_HEADER)
+	$(Q) test -f $@ || ln -s ../$(CONFIG_HEADER_REL) $@
+soccr/%: $(SOCCR_CONFIG) .FORCE
+	$(Q) $(MAKE) $(build)=soccr $@
+soccr/built-in.o: $(SOCCR_CONFIG) .FORCE
+	$(Q) $(MAKE) $(build)=soccr all
+$(SOCCR_A): |soccr/built-in.o
+
+#
 # CRIU building done in own directory
 # with slightly different rules so we
 # can't use nmk engine directly (we
@@ -210,7 +224,7 @@ $(eval $(call gen-built-in,images))
 # the nmk so we can reuse it there.
 criu/%: images/built-in.o $(VERSION_HEADER) $(CONFIG_HEADER) .FORCE
 	$(Q) $(MAKE) $(build)=criu $@
-criu: images/built-in.o $(VERSION_HEADER) $(CONFIG_HEADER)
+criu: images/built-in.o $(SOCCR_A) $(VERSION_HEADER) $(CONFIG_HEADER)
 	$(Q) $(MAKE) $(build)=criu all
 .PHONY: criu
 
@@ -234,13 +248,16 @@ subclean:
 clean: subclean
 	$(Q) $(MAKE) $(build)=images $@
 	$(Q) $(MAKE) $(build)=criu $@
+	$(Q) $(MAKE) $(build)=soccr $@
 .PHONY: clean
 
 # mrproper depends on clean in nmk
 mrproper: subclean
 	$(Q) $(MAKE) $(build)=images $@
 	$(Q) $(MAKE) $(build)=criu $@
+	$(Q) $(MAKE) $(build)=soccr $@
 	$(Q) $(RM) $(CONFIG_HEADER)
+	$(Q) $(RM) $(SOCCR_CONFIG)
 	$(Q) $(RM) $(VERSION_HEADER)
 	$(Q) $(RM) include/common/asm
 	$(Q) $(RM) cscope.*

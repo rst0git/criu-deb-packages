@@ -1005,14 +1005,19 @@ def cr(cr_api, test, opts):
 
 		sbs('pre-dump')
 
+		os.environ["ZDTM_TEST_PID"] = str(test.getpid())
 		if opts['norst']:
+			try_run_hook(test, ["--pre-dump"])
 			cr_api.dump("dump", opts = ["--leave-running"])
 		else:
+			try_run_hook(test, ["--pre-dump"])
 			cr_api.dump("dump")
 			test.gone()
 			sbs('pre-restore')
 			try_run_hook(test, ["--pre-restore"])
 			cr_api.restore()
+			os.environ["ZDTM_TEST_PID"] = str(test.getpid())
+                        os.environ["ZDTM_IMG_DIR"] = cr_api.logs()
 			try_run_hook(test, ["--post-restore"])
 			sbs('post-restore')
 
@@ -1326,15 +1331,15 @@ class launcher:
 				att += 1
 
 			self.__file_report = open(reportname, 'a')
+			print >> self.__file_report, "TAP version 13"
 			print >> self.__file_report, "# Hardware architecture: " + arch
 			print >> self.__file_report, "# Timestamp: " + now.strftime("%Y-%m-%d %H:%M") + " (GMT+1)"
 			print >> self.__file_report, "# "
-			print >> self.__file_report, "TAP version 13"
 			print >> self.__file_report, "1.." + str(nr_tests)
 
-	def __show_progress(self):
+	def __show_progress(self, msg):
 		perc = self.__nr * 16 / self.__total
-		print "=== Run %d/%d %s" % (self.__nr, self.__total, '=' * perc + '-' * (16 - perc))
+		print "=== Run %d/%d %s %s" % (self.__nr, self.__total, '=' * perc + '-' * (16 - perc), msg)
 
 	def skip(self, name, reason):
 		print "Skipping %s (%s)" % (name, reason)
@@ -1354,7 +1359,7 @@ class launcher:
 			self.wait_all()
 
 		self.__nr += 1
-		self.__show_progress()
+		self.__show_progress(name)
 
 		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', 'stop', 'empty_ns',
 				'fault', 'keep_img', 'report', 'snaps', 'sat', 'script', 'rpc',

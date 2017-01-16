@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
                 libselinux-dev \
                 pkg-config \
                 git-core \
+		libnet-dev \
                 $CC
 
 COPY . /criu
@@ -25,3 +26,4 @@ RUN make -j $(nproc) CC=$CC criu/parasite-syscall.o
 RUN make -j $(nproc) CC=$CC
 RUN make mrproper
 RUN bash -c 'CLEAN="$(git clean -ndx --exclude=scripts/build --exclude=.config)"; echo "${CLEAN}"; test -z "${CLEAN}"; exit $?'
+RUN make -j $(nproc) CC=$CC -C test/zdtm

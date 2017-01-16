@@ -267,10 +267,6 @@ static int root_prepare_shared(void)
 	if (ret)
 		goto err;
 
-	ret = open_transport_socket();
-	if (ret)
-		goto err;
-
 	show_saved_files();
 err:
 	return ret;
@@ -606,8 +602,6 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	if (prepare_vmas(current, ta))
 		return -1;
-
-	close_service_fd(TRANSPORT_FD_OFF);
 
 	return sigreturn_restore(pid, ta, args_len, core);
 }
@@ -1349,6 +1343,9 @@ static int restore_task_with_children(void *_arg)
 		fini_restore_mntns();
 	}
 
+	if (open_transport_socket())
+		return -1;
+
 	if (restore_finish_stage(task_entries, CR_STATE_FORKING) < 0)
 		goto err;
 
@@ -1634,7 +1631,7 @@ static int restore_root_task(struct pstree_item *init)
 {
 	enum trace_flags flag = TRACE_ALL;
 	int ret, fd, mnt_ns_fd = -1;
-	int clean_remaps = 1, root_seized = 0;
+	int root_seized = 0;
 	struct pstree_item *item;
 
 	ret = run_scripts(ACT_PRE_RESTORE);
@@ -1776,16 +1773,6 @@ static int restore_root_task(struct pstree_item *init)
 	if (ret < 0)
 		goto out_kill;
 
-	/*
-	 * There is no need to call try_clean_remaps() after this point,
-	 * as restore went OK and all ghosts were removed by the openers.
-	 */
-	if (depopulate_roots_yard(mnt_ns_fd, false))
-		goto out_kill;
-
-	clean_remaps = 0;
-	close_safe(&mnt_ns_fd);
-
 	ret = stop_usernsd();
 	if (ret < 0)
 		goto out_kill;
@@ -1798,6 +1785,9 @@ static int restore_root_task(struct pstree_item *init)
 	if (ret < 0)
 		goto out_kill;
 
+	if (fault_injected(FI_POST_RESTORE))
+		goto out_kill;
+
 	ret = run_scripts(ACT_POST_RESTORE);
 	if (ret != 0) {
 		pr_err("Aborting restore due to post-restore script ret code %d\n", ret);
@@ -1805,6 +1795,15 @@ static int restore_root_task(struct pstree_item *init)
 		write_stats(RESTORE_STATS);
 		goto out_kill;
 	}
+
+	/*
+	 * There is no need to call try_clean_remaps() after this point,
+	 * as restore went OK and all ghosts were removed by the openers.
+	 */
+	if (depopulate_roots_yard(mnt_ns_fd, false))
+		goto out_kill;
+
+	close_safe(&mnt_ns_fd);
 
 	if (write_restored_pid())
 		goto out_kill;
@@ -1888,8 +1887,7 @@ out_kill:
 
 out:
 	fini_cgroup();
-	if (clean_remaps)
-		depopulate_roots_yard(mnt_ns_fd, true);
+	depopulate_roots_yard(mnt_ns_fd, true);
 	stop_usernsd();
 	__restore_switch_stage(CR_STATE_FAIL);
 	pr_err("Restoring FAILED.\n");
@@ -1971,7 +1969,7 @@ static long restorer_get_vma_hint(struct list_head *tgt_vma_list,
 
 	end_vma.e = &end_e;
 	end_e.start = end_e.end = kdat.task_size;
-	prev_vma_end = PAGE_SIZE * 0x10; /* CONFIG_LSM_MMAP_MIN_ADDR=65536 */
+	prev_vma_end = kdat.mmap_min_addr;
 
 	s_vma = list_first_entry(self_vma_list, struct vma_area, list);
 	t_vma = list_first_entry(tgt_vma_list, struct vma_area, list);
