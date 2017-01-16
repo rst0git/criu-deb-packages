@@ -41,6 +41,7 @@ TST_NOFILE	:=				\
 		socket_dgram_data		\
 		packet_sock			\
 		packet_sock_mmap		\
+		packet_sock_spkt		\
 		sock_filter			\
 		msgque				\
 		inotify_system			\
@@ -72,7 +73,22 @@ TST_NOFILE	:=				\
 		socket-tcpbuf-local		\
 		socket-tcpbuf6-local		\
 		socket-tcpbuf6			\
-		socket-closed-tcp		\
+		socket-tcp-fin-wait1		\
+		socket-tcp6-fin-wait1		\
+		socket-tcp-fin-wait2		\
+		socket-tcp6-fin-wait2		\
+		socket-tcp-close-wait		\
+		socket-tcp6-close-wait		\
+		socket-tcp-last-ack		\
+		socket-tcp6-last-ack		\
+		socket-tcp-closing		\
+		socket-tcp6-closing		\
+		socket-tcp-closed		\
+		socket-tcp-closed-last-ack	\
+		socket-tcp6-closed		\
+		socket-tcp-unconn		\
+		socket-tcp6-unconn		\
+		socket-tcp-syn-sent		\
 		sock_opts00			\
 		sock_opts01			\
 		sk-unix-unconn			\
@@ -155,6 +171,7 @@ TST_NOFILE	:=				\
 		clone_fs			\
 		macvlan			\
 		cr_veth				\
+		sock_peercred			\
 #		jobctl00			\
 
 ifneq ($(SRCARCH),arm)
@@ -246,6 +263,7 @@ TST_DIR		=				\
 		mntns_link_ghost		\
 		mntns_shared_bind		\
 		mntns_shared_bind02		\
+		mntns_shared_bind03		\
 		mntns_root_bind			\
 		mntns_root_bind02		\
 		mntns_overmount			\
@@ -401,6 +419,8 @@ socket-tcp6-local: override CFLAGS += -D ZDTM_TCP_LOCAL -D ZDTM_IPV6
 socket-tcp-local: override CFLAGS += -D ZDTM_TCP_LOCAL
 socket-tcp-nfconntrack: override CFLAGS += -D ZDTM_TCP_LOCAL -DZDTM_CONNTRACK
 socket_listen6: override CFLAGS += -D ZDTM_IPV6
+socket-tcp6-closed: override CFLAGS += -D ZDTM_IPV6
+socket-tcp-closed-last-ack: override CFLAGS += -D ZDTM_TCP_LAST_ACK
 mnt_ext_manual: override CFLAGS += -D ZDTM_EXTMAP_MANUAL
 sigpending:		override LDLIBS += -lrt
 vdso01:			override LDLIBS += -lrt
@@ -417,6 +437,17 @@ stopped01:	override CFLAGS += -DZDTM_STOPPED_KILL
 stopped02:	override CFLAGS += -DZDTM_STOPPED_TKILL
 stopped12:	override CFLAGS += -DZDTM_STOPPED_KILL -DZDTM_STOPPED_TKILL
 clone_fs:		override LDLIBS += -pthread
+
+socket-tcp-fin-wait1:	override CFLAGS += -D ZDTM_TCP_FIN_WAIT1
+socket-tcp-fin-wait2:	override CFLAGS += -D ZDTM_TCP_FIN_WAIT2
+socket-tcp6-fin-wait1:	override CFLAGS += -D ZDTM_TCP_FIN_WAIT1 -D ZDTM_IPV6
+socket-tcp6-fin-wait2:	override CFLAGS += -D ZDTM_TCP_FIN_WAIT2 -D ZDTM_IPV6
+socket-tcp-close-wait:	override CFLAGS += -D ZDTM_TCP_CLOSE_WAIT
+socket-tcp6-close-wait:	override CFLAGS += -D ZDTM_TCP_CLOSE_WAIT -D ZDTM_IPV6
+socket-tcp-last-ack:	override CFLAGS += -D ZDTM_TCP_LAST_ACK
+socket-tcp6-last-ack:	override CFLAGS += -D ZDTM_TCP_LAST_ACK -D ZDTM_IPV6
+socket-tcp6-closing:	override CFLAGS += -D ZDTM_IPV6
+socket-tcp6-unconn:	override CFLAGS += -D ZDTM_IPV6
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)

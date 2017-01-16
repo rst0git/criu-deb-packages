@@ -32,6 +32,8 @@ struct inet_sk_desc {
 	int rfd;
 	int cpt_reuseaddr;
 	struct list_head rlist;
+
+	void *priv;
 };
 
 struct inet_port;
@@ -73,8 +75,6 @@ extern int restore_one_tcp(int sk, struct inet_sk_info *si);
 #define SK_EST_PARAM	"tcp-established"
 #define SK_INFLIGHT_PARAM "skip-in-flight"
 
-extern int check_tcp(void);
-
 struct task_restore_args;
 int prepare_tcp_socks(struct task_restore_args *);
 
@@ -82,5 +82,9 @@ struct rst_tcp_sock {
 	int	sk;
 	bool	reuseaddr;
 };
+
+union libsoccr_addr;
+int restore_sockaddr(union libsoccr_addr *sa,
+		int family, u32 pb_port, u32 *pb_addr, u32 ifindex);
 
 #endif /* __CR_SK_INET_H__ */

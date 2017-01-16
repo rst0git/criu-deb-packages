@@ -484,6 +484,9 @@ int clone_service_fd(int id)
 		int old = __get_service_fd(i, service_fd_id);
 		int new = __get_service_fd(i, id);
 
+		/* Do not dup parent's transport fd */
+		if (i == TRANSPORT_FD_OFF)
+			continue;
 		ret = dup2(old, new);
 		if (ret == -1) {
 			if (errno == EBADF)
@@ -710,8 +713,15 @@ int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd)
 		if (close_fd != -1)
 			close(close_fd);
 
-		if (*keep_fd != -1)
-			*keep_fd = dup2(*keep_fd, 3);
+		if ((*keep_fd != -1) && (*keep_fd != 3)) {
+			fd = dup2(*keep_fd, 3);
+			if (fd < 0) {
+				pr_perror("Dup2 failed");
+				return -1;
+			}
+			close(*keep_fd);
+			*keep_fd = fd;
+		}
 
 		fd = open("/dev/null", O_RDWR);
 		if (fd < 0) {
@@ -765,7 +775,7 @@ int vaddr_to_pfn(unsigned long vaddr, u64 *pfn)
 	int fd, ret = -1;
 	off_t off;
 
-	fd = open_proc(getpid(), "pagemap");
+	fd = open_proc(PROC_SELF, "pagemap");
 	if (fd < 0)
 		return -1;
 
