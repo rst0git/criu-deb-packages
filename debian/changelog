@@ -1,3 +1,12 @@
+criu (2.10-1) experimental; urgency=medium
+
+  * New upstream version 2.10
+  * Update copyright years for debian/* packaging files
+  * Drop 0001-build-nmk-Filter-out-Wl-flags-from-linking-builtin-t.patch
+  * Add Build-Depends on libnet1-dev
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 19 Jan 2017 20:50:21 +0100
+
 criu (2.9-2) unstable; urgency=medium
 
   * Upload to unstable
