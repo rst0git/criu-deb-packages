@@ -1,3 +1,12 @@
+criu (2.11.1-1) experimental; urgency=medium
+
+  * New upstream version 2.11.1
+  * debian/rules: Cleanup dh_auto_install override.
+    No need anymore to manually clean up /usr/lib/systemd/system, since not
+    installed anymore by upstream.
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 02 Mar 2017 10:16:48 +0100
+
 criu (2.10-1) experimental; urgency=medium
 
   * New upstream version 2.10
