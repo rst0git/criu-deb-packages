@@ -23,6 +23,7 @@ static const char *action_names[ACT_MAX] = {
 	[ ACT_NET_UNLOCK ]	= "network-unlock",
 	[ ACT_SETUP_NS ]	= "setup-namespaces",
 	[ ACT_POST_SETUP_NS ]	= "post-setup-namespaces",
+	[ ACT_PRE_RESUME ]	= "pre-resume",
 	[ ACT_POST_RESUME ]	= "post-resume",
 };
 
@@ -69,7 +70,7 @@ static int run_shell_scripts(const char *action)
 		int pid;
 		char root_item_pid[16];
 
-		pid = root_item->pid.real;
+		pid = root_item->pid->real;
 		if (pid != -1) {
 			snprintf(root_item_pid, sizeof(root_item_pid), "%d", pid);
 			if (setenv("CRTOOLS_INIT_PID", root_item_pid, 1)) {

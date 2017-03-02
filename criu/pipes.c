@@ -227,22 +227,23 @@ static int reopen_pipe(int fd, int flags)
 	return ret;
 }
 
-static int recv_pipe_fd(struct pipe_info *pi)
+static int recv_pipe_fd(struct pipe_info *pi, int *new_fd)
 {
 	struct fdinfo_list_entry *fle;
-	int tmp, fd;
+	int tmp, fd, ret;
 
 	fle = file_master(&pi->d);
 	fd = fle->fe->fd;
 
 	pr_info("\tWaiting fd for %d\n", fd);
 
-	tmp = recv_fd(fd);
-	if (tmp < 0) {
-		pr_err("Can't get fd %d\n", tmp);
-		return -1;
+	ret = recv_fd_from_peer(fle);
+	if (ret != 0) {
+		if (ret != 1)
+			pr_err("Can't get fd %d\n", fd);
+		return ret;
 	}
-	close(fd);
+	tmp = fd;
 
 	if (pi->reopen)
 		fd = reopen_pipe(tmp, pi->pe->flags);
@@ -253,9 +254,10 @@ static int recv_pipe_fd(struct pipe_info *pi)
 			close(fd);
 			return -1;
 		}
+		*new_fd = fd;
 	}
 
-	return fd;
+	return fd < 0 ? -1 : 0;
 }
 
 static char *pipe_d_name(struct file_desc *d, char *buf, size_t s)
@@ -272,12 +274,11 @@ static char *pipe_d_name(struct file_desc *d, char *buf, size_t s)
 	return buf;
 }
 
-static int open_pipe(struct file_desc *d)
+int open_pipe(struct file_desc *d, int *new_fd)
 {
 	struct pipe_info *pi, *p;
 	int ret, tmp;
 	int pfd[2];
-	int sock;
 
 	pi = container_of(d, struct pipe_info, d);
 	pr_info("\t\tCreating pipe pipe_id=%#x id=%#x\n", pi->pe->pipe_id, pi->pe->id);
@@ -286,11 +287,11 @@ static int open_pipe(struct file_desc *d)
 			return tmp;
 
 		pi->reopen = 1;
-		goto out;
+		goto reopen;
 	}
 
 	if (!pi->create)
-		return recv_pipe_fd(pi);
+		return recv_pipe_fd(pi, new_fd);
 
 	if (pipe(pfd) < 0) {
 		pr_perror("Can't create pipe");
@@ -302,8 +303,6 @@ static int open_pipe(struct file_desc *d)
 	if (ret)
 		return -1;
 
-	sock = get_service_fd(TRANSPORT_FD_OFF);
-
 	list_for_each_entry(p, &pi->pipe_list, pipe_list) {
 		struct fdinfo_list_entry *fle;
 		int fd;
@@ -311,7 +310,7 @@ static int open_pipe(struct file_desc *d)
 		fle = file_master(&p->d);
 		fd = pfd[p->pe->flags & O_WRONLY];
 
-		if (send_fd_to_peer(fd, fle, sock)) {
+		if (send_fd_to_peer(fd, fle)) {
 			pr_perror("Can't send file descriptor");
 			return -1;
 		}
@@ -320,29 +319,22 @@ static int open_pipe(struct file_desc *d)
 	close(pfd[!(pi->pe->flags & O_WRONLY)]);
 	tmp = pfd[pi->pe->flags & O_WRONLY];
 
-out:
+reopen:
 	if (pi->reopen)
 		tmp = reopen_pipe(tmp, pi->pe->flags);
 
 	if (tmp >= 0)
 		if (rst_file_params(tmp, pi->pe->fown, pi->pe->flags))
 			return -1;
-
-	return tmp;
-}
-
-static int want_transport(FdinfoEntry *fe, struct file_desc *d)
-{
-	struct pipe_info *pi;
-
-	pi = container_of(d, struct pipe_info, d);
-	return !pi->create;
+	if (tmp < 0)
+		return -1;
+	*new_fd = tmp;
+	return 0;
 }
 
 static struct file_desc_ops pipe_desc_ops = {
 	.type		= FD_TYPES__PIPE,
 	.open		= open_pipe,
-	.want_transport	= want_transport,
 	.name		= pipe_d_name,
 };
 

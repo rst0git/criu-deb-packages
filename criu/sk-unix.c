@@ -782,13 +782,8 @@ struct unix_sk_info {
 	unsigned flags;
 	struct unix_sk_info *peer;
 	struct file_desc d;
-
-	/*
-	 * Futex to signal when the socket is prepared. In particular, we
-	 * signal after bind()ing the socket if it is not in TCP_LISTEN, or
-	 * after listen() if the socket is in TCP_LISTEN.
-	 */
-	futex_t prepared;
+	struct list_head connected; /* List of sockets, connected to me */
+	struct list_head node; /* To link in peer's connected list  */
 
 	/*
 	 * For DGRAM sockets with queues, we should only restore the queue
@@ -796,6 +791,8 @@ struct unix_sk_info {
 	 * that should do the queueing.
 	 */
 	u32 queuer;
+	u8 bound:1;
+	u8 listen:1;
 };
 
 #define USK_PAIR_MASTER		0x1
@@ -811,6 +808,26 @@ static struct unix_sk_info *find_unix_sk_by_ino(int ino)
 	}
 
 	return NULL;
+}
+
+static int wake_connected_sockets(struct unix_sk_info *ui)
+{
+	struct fdinfo_list_entry *fle;
+	struct unix_sk_info *tmp;
+
+	list_for_each_entry(tmp, &ui->connected, node) {
+		fle = file_master(&tmp->d);
+		set_fds_event(fle->pid);
+	}
+	return 0;
+}
+
+static bool peer_is_not_prepared(struct unix_sk_info *peer)
+{
+	if (peer->ue->state != TCP_LISTEN)
+		return (!peer->bound);
+	else
+		return (!peer->listen);
 }
 
 static int shutdown_unix_sk(int sk, struct unix_sk_info *ui)
@@ -831,8 +848,13 @@ static int shutdown_unix_sk(int sk, struct unix_sk_info *ui)
 	return 0;
 }
 
-static void revert_unix_sk_cwd(int *prev_cwd_fd)
+static void revert_unix_sk_cwd(int *prev_cwd_fd, int *root_fd)
 {
+	if (*root_fd >= 0) {
+		if (fchdir(*root_fd) || chroot("."))
+			pr_perror("Can't revert root directory");
+		close_safe(root_fd);
+	}
 	if (prev_cwd_fd && *prev_cwd_fd >= 0) {
 		if (fchdir(*prev_cwd_fd))
 			pr_perror("Can't revert working dir");
@@ -843,25 +865,50 @@ static void revert_unix_sk_cwd(int *prev_cwd_fd)
 	}
 }
 
-static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd)
+static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd, int *prev_root_fd)
 {
-	if (ui->name_dir) {
-		*prev_cwd_fd = open(".", O_RDONLY);
-		if (*prev_cwd_fd < 0) {
-			pr_err("Can't open current dir\n");
-			return -1;
+	static struct ns_id *root = NULL;
+
+	*prev_cwd_fd = open(".", O_RDONLY);
+	if (*prev_cwd_fd < 0) {
+		pr_err("Can't open current dir\n");
+		return -1;
+	}
+
+	if (prev_root_fd && (root_ns_mask & CLONE_NEWNS)) {
+		if (root == NULL)
+			root = lookup_ns_by_id(root_item->ids->mnt_ns_id, &mnt_ns_desc);
+		*prev_root_fd = open("/", O_RDONLY);
+		if (*prev_root_fd < 0) {
+			pr_err("Can't open current root\n");
+			goto err;
 		}
+
+		if (fchdir(root->mnt.root_fd)) {
+			pr_perror("Unable to change current working dir");
+			goto err;
+		}
+		if (chroot(".")) {
+			pr_perror("Unable to change root directory");
+			goto err;
+		}
+	}
+
+	if (ui->name_dir) {
 		if (chdir(ui->name_dir)) {
 			pr_perror("Can't change working dir %s",
 				  ui->name_dir);
-			close(*prev_cwd_fd);
-			*prev_cwd_fd = -1;
-			return -1;
+			goto err;
 		}
 		pr_debug("Change working dir to %s\n", ui->name_dir);
-	} else
-		*prev_cwd_fd = -1;
+	}
+
 	return 0;
+err:
+	close_safe(prev_cwd_fd);
+	if (prev_root_fd)
+		close_safe(prev_root_fd);
+	return -1;
 }
 
 static int post_open_unix_sk(struct file_desc *d, int fd)
@@ -869,7 +916,7 @@ static int post_open_unix_sk(struct file_desc *d, int fd)
 	struct unix_sk_info *ui;
 	struct unix_sk_info *peer;
 	struct sockaddr_un addr;
-	int cwd_fd = -1;
+	int cwd_fd = -1, root_fd = -1;
 
 	ui = container_of(d, struct unix_sk_info, d);
 	if (ui->flags & (USK_PAIR_MASTER | USK_PAIR_SLAVE))
@@ -885,7 +932,8 @@ static int post_open_unix_sk(struct file_desc *d, int fd)
 
 	/* Skip external sockets */
 	if (!list_empty(&peer->d.fd_info_head))
-		futex_wait_while(&peer->prepared, 0);
+		if (peer_is_not_prepared(peer))
+			return 1;
 
 	if (ui->ue->uflags & USK_INHERIT)
 		return 0;
@@ -896,18 +944,18 @@ static int post_open_unix_sk(struct file_desc *d, int fd)
 
 	pr_info("\tConnect %#x to %#x\n", ui->ue->ino, peer->ue->ino);
 
-	if (prep_unix_sk_cwd(peer, &cwd_fd))
+	if (prep_unix_sk_cwd(peer, &cwd_fd, NULL))
 		return -1;
 
 	if (connect(fd, (struct sockaddr *)&addr,
 				sizeof(addr.sun_family) +
 				peer->ue->name.len) < 0) {
-		revert_unix_sk_cwd(&cwd_fd);
+		revert_unix_sk_cwd(&cwd_fd, &root_fd);
 		pr_perror("Can't connect %#x socket", ui->ue->ino);
 		return -1;
 	}
 
-	revert_unix_sk_cwd(&cwd_fd);
+	revert_unix_sk_cwd(&cwd_fd, &root_fd);
 
 	if (peer->queuer == ui->ue->ino && restore_sk_queue(fd, peer->ue->id))
 		return -1;
@@ -927,7 +975,7 @@ static int post_open_unix_sk(struct file_desc *d, int fd)
 static int bind_unix_sk(int sk, struct unix_sk_info *ui)
 {
 	struct sockaddr_un addr;
-	int cwd_fd = -1;
+	int cwd_fd = -1, root_fd = -1;
 	int ret = -1;
 
 	if ((ui->ue->type == SOCK_STREAM) && (ui->ue->state == TCP_ESTABLISHED)) {
@@ -946,7 +994,7 @@ static int bind_unix_sk(int sk, struct unix_sk_info *ui)
 	addr.sun_family = AF_UNIX;
 	memcpy(&addr.sun_path, ui->name, ui->ue->name.len);
 
-	if (prep_unix_sk_cwd(ui, &cwd_fd))
+	if (prep_unix_sk_cwd(ui, &cwd_fd, NULL))
 		return -1;
 
 	if (ui->ue->name.len) {
@@ -1025,27 +1073,20 @@ static int bind_unix_sk(int sk, struct unix_sk_info *ui)
 		}
 	}
 
-	if (ui->ue->state != TCP_LISTEN)
-		futex_set_and_wake(&ui->prepared, 1);
+	if (ui->ue->state != TCP_LISTEN) {
+		ui->bound = 1;
+		wake_connected_sockets(ui);
+	}
 
 	ret = 0;
 done:
-	revert_unix_sk_cwd(&cwd_fd);
+	revert_unix_sk_cwd(&cwd_fd, &root_fd);
 	return ret;
 }
 
-static int unixsk_should_open_transport(FdinfoEntry *fe,
-				struct file_desc *d)
+static int open_unixsk_pair_master(struct unix_sk_info *ui, int *new_fd)
 {
-	struct unix_sk_info *ui;
-
-	ui = container_of(d, struct unix_sk_info, d);
-	return ui->flags & USK_PAIR_SLAVE;
-}
-
-static int open_unixsk_pair_master(struct unix_sk_info *ui)
-{
-	int sk[2], tsk;
+	int sk[2];
 	struct unix_sk_info *peer = ui->peer;
 	struct fdinfo_list_entry *fle;
 
@@ -1074,35 +1115,35 @@ static int open_unixsk_pair_master(struct unix_sk_info *ui)
 	if (shutdown_unix_sk(sk[0], ui))
 		return -1;
 
-	tsk = get_service_fd(TRANSPORT_FD_OFF);
-
 	fle = file_master(&peer->d);
-	if (send_fd_to_peer(sk[1], fle, tsk)) {
+	if (send_fd_to_peer(sk[1], fle)) {
 		pr_err("Can't send pair slave\n");
 		return -1;
 	}
 
 	close(sk[1]);
 
-	return sk[0];
+	*new_fd = sk[0];
+	return 0;
 }
 
-static int open_unixsk_pair_slave(struct unix_sk_info *ui)
+static int open_unixsk_pair_slave(struct unix_sk_info *ui, int *new_fd)
 {
 	struct fdinfo_list_entry *fle;
-	int sk;
+	int sk, ret;
 
 	fle = file_master(&ui->d);
 
 	pr_info("Opening pair slave (id %#x ino %#x peer %#x) on %d\n",
 			ui->ue->id, ui->ue->ino, ui->ue->peer, fle->fe->fd);
 
-	sk = recv_fd(fle->fe->fd);
-	if (sk < 0) {
-		pr_err("Can't recv pair slave\n");
-		return -1;
+	ret = recv_fd_from_peer(fle);
+	if (ret != 0) {
+		if (ret != 1)
+			pr_err("Can't recv pair slave\n");
+		return ret;
 	}
-	close(fle->fe->fd);
+	sk = fle->fe->fd;
 
 	if (bind_unix_sk(sk, ui))
 		return -1;
@@ -1116,10 +1157,11 @@ static int open_unixsk_pair_slave(struct unix_sk_info *ui)
 	if (shutdown_unix_sk(sk, ui))
 		return -1;
 
-	return sk;
+	*new_fd = sk;
+	return 0;
 }
 
-static int open_unixsk_standalone(struct unix_sk_info *ui)
+static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 {
 	int sk;
 
@@ -1246,7 +1288,8 @@ static int open_unixsk_standalone(struct unix_sk_info *ui)
 			pr_perror("Can't make usk listen");
 			return -1;
 		}
-		futex_set_and_wake(&ui->prepared, 1);
+		ui->listen = 1;
+		wake_connected_sockets(ui);
 	}
 out:
 	if (rst_file_params(sk, ui->ue->fown, ui->ue->flags))
@@ -1255,26 +1298,33 @@ out:
 	if (restore_socket_opts(sk, ui->ue->opts))
 		return -1;
 
-	return sk;
+	*new_fd = sk;
+	return 1;
 }
 
-static int open_unix_sk(struct file_desc *d)
+static int open_unix_sk(struct file_desc *d, int *new_fd)
 {
+	struct fdinfo_list_entry *fle;
 	struct unix_sk_info *ui;
+	int ret;
+
+	fle = file_master(d);
+	if (fle->stage >= FLE_OPEN)
+		return post_open_unix_sk(d, fle->fe->fd);
 
 	ui = container_of(d, struct unix_sk_info, d);
 
-	int unixsk_fd = -1;
-
-	if (inherited_fd(d, &unixsk_fd)) {
+	if (inherited_fd(d, new_fd)) {
 		ui->ue->uflags |= USK_INHERIT;
-		return unixsk_fd;
+		ret = *new_fd >= 0 ? 0 : -1;
 	} else if (ui->flags & USK_PAIR_MASTER)
-		return open_unixsk_pair_master(ui);
+		ret = open_unixsk_pair_master(ui, new_fd);
 	else if (ui->flags & USK_PAIR_SLAVE)
-		return open_unixsk_pair_slave(ui);
+		ret = open_unixsk_pair_slave(ui, new_fd);
 	else
-		return open_unixsk_standalone(ui);
+		ret = open_unixsk_standalone(ui, new_fd);
+
+	return ret;
 }
 
 static char *socket_d_name(struct file_desc *d, char *buf, size_t s)
@@ -1295,8 +1345,6 @@ static char *socket_d_name(struct file_desc *d, char *buf, size_t s)
 static struct file_desc_ops unix_desc_ops = {
 	.type = FD_TYPES__UNIXSK,
 	.open = open_unix_sk,
-	.post_open = post_open_unix_sk,
-	.want_transport = unixsk_should_open_transport,
 	.name = socket_d_name,
 };
 
@@ -1306,12 +1354,12 @@ static struct file_desc_ops unix_desc_ops = {
  */
 static void unlink_stale(struct unix_sk_info *ui)
 {
-	int ret, cwd_fd;
+	int ret, cwd_fd = -1, root_fd = -1;
 
 	if (ui->name[0] == '\0' || (ui->ue->uflags & USK_EXTERN))
 		return;
 
-	if (prep_unix_sk_cwd(ui, &cwd_fd))
+	if (prep_unix_sk_cwd(ui, &cwd_fd, &root_fd))
 		return;
 
 	ret = unlinkat(AT_FDCWD, ui->name, 0) ? -1 : 0;
@@ -1321,7 +1369,7 @@ static void unlink_stale(struct unix_sk_info *ui)
 			ui->name ? (ui->name[0] ? ui->name : &ui->name[1]) : "-",
 			ui->name_dir ? ui->name_dir : "-");
 	}
-	revert_unix_sk_cwd(&cwd_fd);
+	revert_unix_sk_cwd(&cwd_fd, &root_fd);
 }
 
 static int resolve_unix_peers(void *unused);
@@ -1352,9 +1400,12 @@ static int collect_one_unixsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 	} else
 		ui->name = NULL;
 
-	futex_init(&ui->prepared);
 	ui->queuer = 0;
 	ui->peer = NULL;
+	ui->bound = 0;
+	ui->listen = 0;
+	INIT_LIST_HEAD(&ui->connected);
+	INIT_LIST_HEAD(&ui->node);
 	ui->flags = 0;
 	pr_info(" `- Got %#x peer %#x (name %s dir %s)\n",
 		ui->ue->ino, ui->ue->peer,
@@ -1371,6 +1422,12 @@ struct collect_image_info unix_sk_cinfo = {
 	.collect = collect_one_unixsk,
 	.flags = COLLECT_SHARED,
 };
+
+static void set_peer(struct unix_sk_info *ui, struct unix_sk_info *peer)
+{
+	ui->peer = peer;
+	list_add(&ui->node, &peer->connected);
+}
 
 static void interconnected_pair(struct unix_sk_info *ui, struct unix_sk_info *peer)
 {
@@ -1410,7 +1467,7 @@ static int resolve_unix_peers(void *unused)
 			return -1;
 		}
 
-		ui->peer = peer;
+		set_peer(ui, peer);
 		if (!peer->queuer)
 			peer->queuer = ui->ue->ino;
 		if (ui == peer)
@@ -1419,7 +1476,7 @@ static int resolve_unix_peers(void *unused)
 		if (peer->ue->peer != ui->ue->ino)
 			continue;
 
-		peer->peer = ui;
+		set_peer(peer, ui);
 
 		/* socketpair or interconnected sockets */
 		interconnected_pair(ui, peer);

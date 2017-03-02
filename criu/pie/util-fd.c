@@ -13,11 +13,11 @@
 #ifdef CR_NOGLIBC
 # include "syscall.h"
 # define __sys(foo)	sys_##foo
+# define __sys_err(ret)	ret
 #else
 # define __sys(foo)	foo
+# define __sys_err(ret)	(-errno)
 #endif
-
-#define __memcpy builtin_memcpy
 
 #include "util-pie.h"
 #include "fcntl.h"

@@ -195,7 +195,7 @@ int send_criu_rpc_script(enum script_actions act, char *name, int fd)
 		 * checking this.
 		 */
 		cn.has_pid = true;
-		cn.pid = root_item->pid.real;
+		cn.pid = root_item->pid->real;
 		break;
 	default:
 		break;
@@ -227,6 +227,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	socklen_t ids_len = sizeof(struct ucred);
 	char images_dir_path[PATH_MAX];
 	char work_dir_path[PATH_MAX];
+	char status_fd[PATH_MAX];
 	int i;
 
 	if (getsockopt(sk, SOL_SOCKET, SO_PEERCRED, &ids, &ids_len)) {
@@ -504,6 +505,13 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		}
 	}
 
+	if (req->has_status_fd) {
+		sprintf(status_fd, "/proc/%d/fd/%d", ids.pid, req->status_fd);
+		opts.status_fd = open(status_fd, O_WRONLY);
+		if (opts.status_fd < 0)
+			goto err;
+	}
+
 	if (check_namespace_opts())
 		goto err;
 
@@ -568,7 +576,7 @@ static int restore_using_req(int sk, CriuOpts *req)
 	success = true;
 exit:
 	if (send_criu_restore_resp(sk, success,
-				   root_item ? root_item->pid.real : -1) == -1) {
+				   root_item ? root_item->pid->real : -1) == -1) {
 		pr_perror("Can't send response");
 		success = false;
 	}
@@ -705,7 +713,7 @@ static int start_page_server_req(int sk, CriuOpts *req)
 		pr_debug("Starting page server\n");
 
 		pid = cr_page_server(true, start_pipe[1]);
-		if (pid <= 0)
+		if (pid < 0)
 			goto out_ch;
 
 		info.pid = pid;

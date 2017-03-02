@@ -373,7 +373,7 @@ static int dump_one_netdev(int type, struct ifinfomsg *ifi,
 	SysctlEntry *confs6 = NULL;
 	int size6 = ARRAY_SIZE(devconfs6);
 	char stable_secret[MAX_STR_CONF_LEN + 1] = {};
-	struct nlattr *info[IFLA_INFO_MAX], **arg = NULL;
+	struct nlattr *info[IFLA_INFO_MAX + 1], **arg = NULL;
 
 	if (!tb[IFLA_IFNAME]) {
 		pr_err("No name for link %d\n", ifi->ifi_index);
@@ -1774,7 +1774,7 @@ int network_lock_internal()
 				"COMMIT\n";
 	int ret = 0, nsret;
 
-	if (switch_ns(root_item->pid.real, &net_ns_desc, &nsret))
+	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
 
 
@@ -1798,7 +1798,7 @@ static int network_unlock_internal()
 			"COMMIT\n";
 	int ret = 0, nsret;
 
-	if (switch_ns(root_item->pid.real, &net_ns_desc, &nsret))
+	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
 
 

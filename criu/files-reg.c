@@ -306,12 +306,13 @@ static int open_remap_ghost(struct reg_file_info *rfi,
 	if (create_ghost(gf, gfe, img))
 		goto close_ifd;
 
-	ghost_file_entry__free_unpacked(gfe, NULL);
 	close_image(img);
 
 	gf->remap.is_dir = S_ISDIR(gfe->mode);
 	gf->remap.uid = gfe->uid;
 	gf->remap.gid = gfe->gid;
+	ghost_file_entry__free_unpacked(gfe, NULL);
+
 	return 0;
 
 close_ifd:
@@ -382,7 +383,7 @@ static int open_remap_dead_process(struct reg_file_info *rfi,
 	if (!helper)
 		return -1;
 
-	if (helper->pid.state != TASK_UNDEF) {
+	if (helper->pid->state != TASK_UNDEF) {
 		pr_info("Skipping helper for restoring /proc/%d; pid exists\n", rfe->remap_id);
 		return 0;
 	}
@@ -391,11 +392,12 @@ static int open_remap_dead_process(struct reg_file_info *rfi,
 
 	helper->sid = root_item->sid;
 	helper->pgid = root_item->pgid;
-	helper->pid.virt = rfe->remap_id;
+	helper->pid->ns[0].virt = rfe->remap_id;
 	helper->parent = root_item;
+	helper->ids = root_item->ids;
 	list_add_tail(&helper->sibling, &root_item->children);
 
-	pr_info("Added a helper for restoring /proc/%d\n", helper->pid.virt);
+	pr_info("Added a helper for restoring /proc/%d\n", helper->pid->ns[0].virt);
 
 	return 0;
 }
@@ -821,14 +823,14 @@ int dead_pid_conflict(void)
 			 * If the dead PID was given to a main thread of another
 			 * process, this is handled during restore.
 			 */
-			item = container_of(node, struct pstree_item, pid);
-			if (item->pid.real == item->threads[i].real ||
-			    item->threads[i].virt != pid)
+			item = node->item;
+			if (item->pid->real == item->threads[i].real ||
+			    item->threads[i].ns[0].virt != pid)
 				continue;
 		}
 
 		pr_err("Conflict with a dead task with the same PID as of this thread (virt %d, real %d).\n",
-			node->virt, node->real);
+			node->ns[0].virt, node->real);
 		return -1;
 	}
 
@@ -1417,7 +1419,9 @@ out_root:
 
 	if (linkat_hard(mntns_root, rpath, mntns_root, path,
 			rfi->remap->uid, rfi->remap->gid, 0) < 0) {
+		int errno_saved = errno;
 		rm_parent_dirs(mntns_root, path, *level);
+		errno = errno_saved;
 		return -1;
 	}
 
@@ -1653,15 +1657,15 @@ int collect_filemap(struct vma_area *vma)
 	return 0;
 }
 
-static void collect_reg_fd(struct file_desc *fdesc,
-		struct fdinfo_list_entry *fle, struct rst_info *ri)
+static int open_fe_fd(struct file_desc *fd, int *new_fd)
 {
-	collect_gen_fd(fle, ri);
-}
+	int tmp;
 
-static int open_fe_fd(struct file_desc *fd)
-{
-	return open_path(fd, do_open_reg, NULL);
+	tmp = open_path(fd, do_open_reg, NULL);
+	if (tmp < 0)
+		return -1;
+	*new_fd = tmp;
+	return 0;
 }
 
 static char *reg_file_path(struct file_desc *d, char *buf, size_t s)
@@ -1675,7 +1679,6 @@ static char *reg_file_path(struct file_desc *d, char *buf, size_t s)
 static struct file_desc_ops reg_desc_ops = {
 	.type = FD_TYPES__REG,
 	.open = open_fe_fd,
-	.collect_fd = collect_reg_fd,
 	.name = reg_file_path,
 };
 

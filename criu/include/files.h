@@ -6,7 +6,7 @@
 #include "int.h"
 #include "common/compiler.h"
 #include "fcntl.h"
-#include "lock.h"
+#include "common/lock.h"
 #include "common/list.h"
 #include "pid.h"
 #include "rst_info.h"
@@ -64,15 +64,30 @@ extern int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link);
 
 struct file_desc;
 
+enum {
+	FLE_INITIALIZED,
+	FLE_OPEN,
+	FLE_RESTORED,
+};
+
 struct fdinfo_list_entry {
 	struct list_head	desc_list;	/* To chain on  @fd_info_head */
 	struct file_desc	*desc;		/* Associated file descriptor */
 	struct list_head	ps_list;	/* To chain  per-task files */
 	struct list_head	used_list;	/* To chain per-task used fds */
 	int			pid;
-	futex_t			real_pid;
 	FdinfoEntry		*fe;
+	u8			received:1;
+	u8			stage:3;
 };
+
+static inline void fle_init(struct fdinfo_list_entry *fle, int pid, FdinfoEntry *fe)
+{
+	fle->pid = pid;
+	fle->fe = fe;
+	fle->received = 0;
+	fle->stage = FLE_INITIALIZED;
+}
 
 /* reports whether fd_a takes prio over fd_b */
 static inline int fdinfo_rst_prio(struct fdinfo_list_entry *fd_a, struct fdinfo_list_entry *fd_b)
@@ -89,17 +104,7 @@ struct file_desc_ops {
 	 * The returned descriptor may be closed (dup2-ed to another)
 	 * so it shouldn't be saved for any post-actions.
 	 */
-	int			(*open)(struct file_desc *d);
-	/*
-	 * Called on a file when all files of that type are opened
-	 * and with the fd being the "restored" one.
-	 */
-	int			(*post_open)(struct file_desc *d, int fd);
-	/*
-	 * Report whether the fd in question wants a transport socket
-	 * in it instead of a real file. See file_master for details.
-	 */
-	int			(*want_transport)(FdinfoEntry *fe, struct file_desc *d);
+	int			(*open)(struct file_desc *d, int *new_fd);
 	/*
 	 * Called to collect a new fd before adding it on desc. Clients
 	 * may chose to collect it to some specific rst_info list. See
@@ -110,12 +115,7 @@ struct file_desc_ops {
 	char *			(*name)(struct file_desc *, char *b, size_t s);
 };
 
-extern void collect_used_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri);
-
-static inline void collect_gen_fd(struct fdinfo_list_entry *fle, struct rst_info *ri)
-{
-	list_add_tail(&fle->ps_list, &ri->fds);
-}
+void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri);
 
 unsigned int find_unused_fd(struct list_head *head, int hint_fd);
 struct fdinfo_list_entry *find_used_fd(struct list_head *head, int fd);
@@ -148,7 +148,8 @@ extern int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops)
 extern struct fdinfo_list_entry *file_master(struct file_desc *d);
 extern struct file_desc *find_file_desc_raw(int type, u32 id);
 
-extern int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle, int sock);
+extern int recv_fd_from_peer(struct fdinfo_list_entry *fle);
+extern int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle);
 extern int restore_fown(int fd, FownEntry *fown);
 extern int rst_file_params(int fd, FownEntry *fown, int flags);
 
@@ -190,5 +191,7 @@ int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
 	    int fd, unsigned flags);
 
 extern int open_transport_socket(void);
+extern int set_fds_event(pid_t virt);
+extern void wait_fds_event(void);
 
 #endif /* __CR_FILES_H__ */
