@@ -31,7 +31,7 @@
 #include "sk-inet.h"
 #include "vma.h"
 
-#include "lock.h"
+#include "common/lock.h"
 #include "restorer.h"
 #include "aio.h"
 #include "seccomp.h"
@@ -672,7 +672,7 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 
 populate:
 	i = offsetof(struct aio_ring, io_events);
-	builtin_memcpy((void *)ctx + i, (void *)ring + i, raio->len - i);
+	memcpy((void *)ctx + i, (void *)ring + i, raio->len - i);
 
 	/*
 	 * If we failed to get the proper nr_req right and
@@ -1061,6 +1061,7 @@ long __export_restore_task(struct task_restore_args *args)
 
 	log_set_fd(args->logfd);
 	log_set_loglevel(args->loglevel);
+	log_set_start(&args->logstart);
 
 	pr_info("Switched to the restorer %d\n", my_pid);
 

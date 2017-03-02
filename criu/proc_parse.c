@@ -1973,6 +1973,8 @@ static int parse_file_lock_buf(char *buf, struct file_lock *fl,
 		fl->fl_kind = FL_POSIX;
 	else if (!strcmp(fl_flag, "FLOCK"))
 		fl->fl_kind = FL_FLOCK;
+	else if (!strcmp(fl_flag, "OFDLCK"))
+		fl->fl_kind = FL_OFD;
 	else
 		fl->fl_kind = FL_UNKNOWN;
 
@@ -2218,7 +2220,7 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 				return -1;
 			}
 			t = tmp;
-			t[nr - 1].virt = -1;
+			t[nr - 1].ns[0].virt = -1;
 		}
 		t[nr - 1].real = atoi(de->d_name);
 		t[nr - 1].state = TASK_THREAD;

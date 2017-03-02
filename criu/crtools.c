@@ -76,6 +76,7 @@ void init_opts(void)
 	opts.ghost_limit = DEFAULT_GHOST_LIMIT;
 	opts.timeout = DEFAULT_TIMEOUT;
 	opts.empty_ns = 0;
+	opts.status_fd = -1;
 }
 
 static int parse_join_ns(const char *ptr)
@@ -214,6 +215,7 @@ int main(int argc, char *argv[], char *envp[])
 	int ret = -1;
 	bool usage_error = true;
 	bool has_exec_cmd = false;
+	bool has_sub_command;
 	int opt, idx;
 	int log_level = LOG_UNSET;
 	char *imgs_dir = ".";
@@ -284,6 +286,7 @@ int main(int argc, char *argv[], char *envp[])
 		{ "deprecated",			no_argument,		0, 1084 },
 		{ "display-stats",		no_argument,		0, 1086 },
 		{ "weak-sysctls",		no_argument,		0, 1087 },
+		{ "status-fd",			required_argument,	0, 1088 },
 		{ },
 	};
 
@@ -603,6 +606,12 @@ int main(int argc, char *argv[], char *envp[])
 			pr_msg("Will skip non-existant sysctls on restore\n");
 			opts.weak_sysctls = true;
 			break;
+		case 1088:
+			if (sscanf(optarg, "%d", &opts.status_fd) != 1) {
+				pr_err("Unable to parse a value of --status-fd\n");
+				return 1;
+			}
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -639,8 +648,10 @@ int main(int argc, char *argv[], char *envp[])
 		goto usage;
 	}
 
+	has_sub_command = (argc - optind) > 1;
+
 	if (has_exec_cmd) {
-		if (argc - optind <= 1) {
+		if (!has_sub_command) {
 			pr_msg("Error: --exec-cmd requires a command\n");
 			goto usage;
 		}
@@ -660,6 +671,14 @@ int main(int argc, char *argv[], char *envp[])
 			return 1;
 		memcpy(opts.exec_cmd, &argv[optind + 1], (argc - optind - 1) * sizeof(char *));
 		opts.exec_cmd[argc - optind - 1] = NULL;
+	} else {
+		/* No subcommands except for cpuinfo and restore --exec-cmd */
+		if ((strcmp(argv[optind], "cpuinfo") && strcmp(argv[optind], "exec"))
+				&& has_sub_command) {
+			pr_msg("Error: excessive parameter%s for command %s\n",
+				(argc - optind) > 2 ? "s" : "", argv[optind]);
+			goto usage;
+		}
 	}
 
 	/* We must not open imgs dir, if service is called */
@@ -756,7 +775,7 @@ int main(int argc, char *argv[], char *envp[])
 	}
 
 	if (!strcmp(argv[optind], "page-server"))
-		return cr_page_server(opts.daemon_mode, -1) > 0 ? 0 : 1;
+		return cr_page_server(opts.daemon_mode, -1) != 0;
 
 	if (!strcmp(argv[optind], "service"))
 		return cr_service(opts.daemon_mode);
@@ -765,8 +784,10 @@ int main(int argc, char *argv[], char *envp[])
 		return cr_dedup() != 0;
 
 	if (!strcmp(argv[optind], "cpuinfo")) {
-		if (!argv[optind + 1])
+		if (!argv[optind + 1]) {
+			pr_msg("Error: cpuinfo requires an action: dump or check\n");
 			goto usage;
+		}
 		if (!strcmp(argv[optind + 1], "dump"))
 			return cpuinfo_dump();
 		else if (!strcmp(argv[optind + 1], "check"))
@@ -927,6 +948,8 @@ usage:
 "  --address ADDR        address of server or service\n"
 "  --port PORT           port of page server\n"
 "  -d|--daemon           run in the background after creating socket\n"
+"  --status-fd FD        write \\0 to the FD and close it once process is ready\n"
+"                        to handle requests\n"
 "\n"
 "Other options:\n"
 "  -h|--help             show this text\n"

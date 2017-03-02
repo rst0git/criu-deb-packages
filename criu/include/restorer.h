@@ -10,7 +10,7 @@
 #include "types.h"
 #include "common/compiler.h"
 #include "asm/fpu.h"
-#include "lock.h"
+#include "common/lock.h"
 #include "util.h"
 #include "asm/restorer.h"
 #include "config.h"
@@ -108,6 +108,7 @@ struct task_restore_args {
 	int				fd_exe_link;		/* opened self->exe file */
 	int				logfd;
 	unsigned int			loglevel;
+	struct timeval			logstart;
 
 	/* threads restoration */
 	int				nr_threads;		/* number of threads */
