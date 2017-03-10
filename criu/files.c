@@ -98,11 +98,13 @@ static inline struct file_desc *find_file_desc(FdinfoEntry *fe)
 	return find_file_desc_raw(fe->type, fe->id);
 }
 
-struct fdinfo_list_entry *find_used_fd(struct list_head *head, int fd)
+struct fdinfo_list_entry *find_used_fd(struct pstree_item *task, int fd)
 {
+	struct list_head *head;
 	struct fdinfo_list_entry *fle;
 
-	list_for_each_entry_reverse(fle, head, used_list) {
+	head = &rsti(task)->fds;
+	list_for_each_entry_reverse(fle, head, ps_list) {
 		if (fle->fe->fd == fd)
 			return fle;
 		/* List is ordered, so let's stop */
@@ -116,31 +118,30 @@ void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri)
 {
 	struct fdinfo_list_entry *fle;
 
-	/* fles in fds list are disordered */
-	list_add_tail(&new_fle->ps_list, &ri->fds);
-
-	/* fles in used list are ordered by fd */
-	list_for_each_entry(fle, &ri->used, used_list) {
+	/* fles in fds list are ordered by fd */
+	list_for_each_entry(fle, &ri->fds, ps_list) {
 		if (new_fle->fe->fd < fle->fe->fd)
 			break;
 	}
 
-	list_add_tail(&new_fle->used_list, &fle->used_list);
+	list_add_tail(&new_fle->ps_list, &fle->ps_list);
 }
 
-unsigned int find_unused_fd(struct list_head *head, int hint_fd)
+unsigned int find_unused_fd(struct pstree_item *task, int hint_fd)
 {
+	struct list_head *head;
 	struct fdinfo_list_entry *fle;
 	int fd = 0, prev_fd;
 
-	if ((hint_fd >= 0) && (!find_used_fd(head, hint_fd))) {
+	if ((hint_fd >= 0) && (!find_used_fd(task, hint_fd))) {
 		fd = hint_fd;
 		goto out;
 	}
 
 	prev_fd = service_fd_min_fd() - 1;
+	head = &rsti(task)->fds;
 
-	list_for_each_entry_reverse(fle, head, used_list) {
+	list_for_each_entry_reverse(fle, head, ps_list) {
 		fd = fle->fe->fd;
 		if (prev_fd > fd) {
 			fd++;
@@ -747,7 +748,7 @@ int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
 	if (!e)
 		return -1;
 
-	return collect_fd(task->pid->ns[0].virt, e, rsti(task));
+	return collect_fd(vpid(task), e, rsti(task));
 }
 
 int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
@@ -781,16 +782,15 @@ int prepare_fd_pid(struct pstree_item *item)
 {
 	int ret = 0;
 	struct cr_img *img;
-	pid_t pid = item->pid->ns[0].virt;
+	pid_t pid = vpid(item);
 	struct rst_info *rst_info = rsti(item);
 
-	INIT_LIST_HEAD(&rst_info->used);
 	INIT_LIST_HEAD(&rst_info->fds);
 
 	if (item->ids == NULL) /* zombie */
 		return 0;
 
-	if (rsti(item)->fdt && rsti(item)->fdt->pid != item->pid->ns[0].virt)
+	if (rsti(item)->fdt && rsti(item)->fdt->pid != vpid(item))
 		return 0;
 
 	img = open_image(CR_FD_FDINFO, O_RSTR, item->ids->files_id);
@@ -872,7 +872,7 @@ static bool task_fle(struct pstree_item *task, struct fdinfo_list_entry *fle)
 {
 	struct fdinfo_list_entry *tmp;
 
-	list_for_each_entry(tmp, &rsti(task)->used, used_list)
+	list_for_each_entry(tmp, &rsti(task)->fds, ps_list)
 		if (fle == tmp)
 			return true;
 	return false;
@@ -885,7 +885,7 @@ static int plant_fd(struct fdinfo_list_entry *fle, int fd)
 	return reopen_fd_as(fle->fe->fd, fd);
 }
 
-int recv_fd_from_peer(struct fdinfo_list_entry *fle)
+static int recv_fd_from_peer(struct fdinfo_list_entry *fle)
 {
 	struct fdinfo_list_entry *tmp;
 	int fd, ret, tsock;
@@ -903,7 +903,7 @@ int recv_fd_from_peer(struct fdinfo_list_entry *fle)
 
 		pr_info("Further fle=%p, pid=%d\n", tmp, fle->pid);
 		if (!task_fle(current, tmp)) {
-			pr_err("Unexpected fle %p, pid=%d\n", tmp, current->pid->ns[0].virt);
+			pr_err("Unexpected fle %p, pid=%d\n", tmp, vpid(current));
 			return -1;
 		}
 		if (plant_fd(tmp, fd))
@@ -913,7 +913,7 @@ int recv_fd_from_peer(struct fdinfo_list_entry *fle)
 	return 0;
 }
 
-int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle)
+static int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle)
 {
 	struct sockaddr_un saddr;
 	int len, sock, ret;
@@ -926,6 +926,25 @@ int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle)
 	if (ret < 0)
 		return -1;
 	return set_fds_event(fle->pid);
+}
+
+/*
+ * Helpers to scatter file_desc across users for those files, that
+ * create two descriptors from a single system call at once (e.g.
+ * ... or better i.e. -- pipes, socketpairs and ttys)
+ */
+int recv_desc_from_peer(struct file_desc *d, int *fd)
+{
+	struct fdinfo_list_entry *fle;
+
+	fle = file_master(d);
+	*fd = fle->fe->fd;
+	return recv_fd_from_peer(fle);
+}
+
+int send_desc_to_peer(int fd, struct file_desc *d)
+{
+	return send_fd_to_peer(fd, file_master(d));
 }
 
 static int send_fd_to_self(int fd, struct fdinfo_list_entry *fle)
@@ -1171,7 +1190,7 @@ int prepare_fds(struct pstree_item *me)
 		futex_inc_and_wake(&fdt->fdt_lock);
 		futex_wait_while_lt(&fdt->fdt_lock, fdt->nr);
 
-		if (fdt->pid != me->pid->ns[0].virt) {
+		if (fdt->pid != vpid(me)) {
 			pr_info("File descriptor table is shared with %d\n", fdt->pid);
 			futex_wait_until(&fdt->fdt_lock, fdt->nr + 1);
 			goto out;
@@ -1261,7 +1280,7 @@ out:
 
 int prepare_fs_pid(struct pstree_item *item)
 {
-	pid_t pid = item->pid->ns[0].virt;
+	pid_t pid = vpid(item);
 	struct rst_info *ri = rsti(item);
 	struct cr_img *img;
 	FsEntry *fe;
@@ -1312,15 +1331,15 @@ int shared_fdt_prepare(struct pstree_item *item)
 
 		futex_init(&fdt->fdt_lock);
 		fdt->nr = 1;
-		fdt->pid = parent->pid->ns[0].virt;
+		fdt->pid = vpid(parent);
 	} else
 		fdt = rsti(parent)->fdt;
 
 	rsti(item)->fdt = fdt;
 	rsti(item)->service_fd_id = fdt->nr;
 	fdt->nr++;
-	if (pid_rst_prio(item->pid->ns[0].virt, fdt->pid))
-		fdt->pid = item->pid->ns[0].virt;
+	if (pid_rst_prio(vpid(item), fdt->pid))
+		fdt->pid = vpid(item);
 
 	return 0;
 }
@@ -1618,7 +1637,7 @@ int inherit_fd_fini()
 int open_transport_socket(void)
 {
 	struct fdt *fdt = rsti(current)->fdt;
-	pid_t pid = current->pid->ns[0].virt;
+	pid_t pid = vpid(current);
 	struct sockaddr_un saddr;
 	int sock, slen;
 

@@ -1091,10 +1091,23 @@ int open_mountpoint(struct mount_info *pm)
 		goto out;
 
 	mnt_path = get_clean_mnt(pm, mnt_path_tmp, mnt_path_root);
-	if (mnt_path == NULL)
-		goto out;
+	if (mnt_path == NULL) {
+		/*
+		 * We probably can't create a temporary direcotry,
+		 * so we can try to clone the mount namespace, open
+		 * the required mount and destroy this mount namespace
+		 * by calling restore_ns() below in this function.
+		 */
+		if (unshare(CLONE_NEWNS)) {
+			pr_perror("Unable to clone a mount namespace");
+			goto out;
+		}
 
-	fd = open_detach_mount(mnt_path);
+		fd = open(pm->mountpoint, O_RDONLY | O_DIRECTORY, 0);
+		if (fd < 0)
+			pr_perror("Can't open directory %s: %d", pm->mountpoint, fd);
+	} else
+		fd = open_detach_mount(mnt_path);
 	if (fd < 0)
 		goto out;
 
@@ -1252,6 +1265,10 @@ static int dump_one_mountpoint(struct mount_info *pm, struct cr_img *img)
 
 
 	if (!pm->dumped && dump_one_fs(pm))
+		return -1;
+
+	if (!fsroot_mounted(pm) &&
+	    pm->fstype->check_bindmount && pm->fstype->check_bindmount(pm))
 		return -1;
 
 	if (pm->mnt_id == CRTIME_MNT_ID) {
@@ -2617,7 +2634,7 @@ static int do_restore_task_mnt_ns(struct ns_id *nsid, struct pstree_item *curren
 {
 	int fd;
 
-	fd = open_proc(root_item->pid->ns[0].virt, "fd/%d", nsid->mnt.ns_fd);
+	fd = open_proc(vpid(root_item), "fd/%d", nsid->mnt.ns_fd);
 	if (fd < 0)
 		return -1;
 
@@ -2935,15 +2952,37 @@ int prepare_mnt_ns(void)
 			goto err;
 		}
 
+		if (nsid->type == NS_ROOT) {
+			int fd;
+
+			/*
+			 * We need to create a mount namespace which will be
+			 * used to clean up remap files
+			 * (depopulate_roots_yard).  The namespace where mounts
+			 * was restored has to be restored as a root mount
+			 * namespace, because there are file descriptors
+			 * linked with it (e.g. to bind-mount slave pty-s).
+			 */
+			fd = open_proc(PROC_SELF, "ns/mnt");
+			if (fd < 0)
+				goto err;
+			if (setns(rst, CLONE_NEWNS)) {
+				pr_perror("Can't restore mntns back");
+				goto err;
+			}
+			nsid->mnt.ns_fd = rst;
+			rst = fd;
+		} else {
+			/* Pin one with a file descriptor */
+			nsid->mnt.ns_fd = open_proc(PROC_SELF, "ns/mnt");
+			if (nsid->mnt.ns_fd < 0)
+				goto err;
+		}
+
 		/* Set its root */
 		path[0] = '/';
 		print_ns_root(nsid, 0, path + 1, sizeof(path) - 1);
 		if (cr_pivot_root(path))
-			goto err;
-
-		/* Pin one with a file descriptor */
-		nsid->mnt.ns_fd = open_proc(PROC_SELF, "ns/mnt");
-		if (nsid->mnt.ns_fd < 0)
 			goto err;
 
 		/* root_fd is used to restore file mappings */
@@ -3062,7 +3101,7 @@ int mntns_get_root_fd(struct ns_id *mntns)
 	if (!mntns->ns_populated) {
 		int fd;
 
-		fd = open_proc(root_item->pid->ns[0].virt, "fd/%d", mntns->mnt.root_fd);
+		fd = open_proc(vpid(root_item), "fd/%d", mntns->mnt.root_fd);
 		if (fd < 0)
 			return -1;
 

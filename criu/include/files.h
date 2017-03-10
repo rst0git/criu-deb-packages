@@ -74,7 +74,6 @@ struct fdinfo_list_entry {
 	struct list_head	desc_list;	/* To chain on  @fd_info_head */
 	struct file_desc	*desc;		/* Associated file descriptor */
 	struct list_head	ps_list;	/* To chain  per-task files */
-	struct list_head	used_list;	/* To chain per-task used fds */
 	int			pid;
 	FdinfoEntry		*fe;
 	u8			received:1;
@@ -117,8 +116,8 @@ struct file_desc_ops {
 
 void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri);
 
-unsigned int find_unused_fd(struct list_head *head, int hint_fd);
-struct fdinfo_list_entry *find_used_fd(struct list_head *head, int fd);
+unsigned int find_unused_fd(struct pstree_item *, int hint_fd);
+struct fdinfo_list_entry *find_used_fd(struct pstree_item *, int fd);
 
 struct file_desc {
 	u32			id;		/* File id, unique */
@@ -148,8 +147,8 @@ extern int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops)
 extern struct fdinfo_list_entry *file_master(struct file_desc *d);
 extern struct file_desc *find_file_desc_raw(int type, u32 id);
 
-extern int recv_fd_from_peer(struct fdinfo_list_entry *fle);
-extern int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle);
+extern int recv_desc_from_peer(struct file_desc *d, int *fd);
+extern int send_desc_to_peer(int fd, struct file_desc *d);
 extern int restore_fown(int fd, FownEntry *fown);
 extern int rst_file_params(int fd, FownEntry *fown, int flags);
 
