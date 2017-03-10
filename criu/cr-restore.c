@@ -75,6 +75,7 @@
 #include "fault-injection.h"
 #include "sk-queue.h"
 #include "sigframe.h"
+#include "fdstore.h"
 
 #include "parasite-syscall.h"
 #include "files-reg.h"
@@ -169,9 +170,6 @@ static struct collect_image_info *cinfos[] = {
 	&inotify_mark_cinfo,
 	&fanotify_cinfo,
 	&fanotify_mark_cinfo,
-	&tty_info_cinfo,
-	&tty_cinfo,
-	&tty_cdata,
 	&tunfile_cinfo,
 	&ext_file_cinfo,
 	&timerfd_cinfo,
@@ -179,6 +177,13 @@ static struct collect_image_info *cinfos[] = {
 	&pipe_data_cinfo,
 	&fifo_data_cinfo,
 	&sk_queues_cinfo,
+};
+
+/* These images are requered to restore namespaces */
+static struct collect_image_info *before_ns_cinfos[] = {
+	&tty_info_cinfo, /* Restore devpts content */
+	&tty_cinfo,
+	&tty_cdata,
 };
 
 struct post_prepare_cb {
@@ -220,9 +225,6 @@ static int root_prepare_shared(void)
 	struct pstree_item *pi;
 
 	pr_info("Preparing info about shared resources\n");
-
-	if (prepare_shared_tty())
-		return -1;
 
 	if (prepare_shared_reg_files())
 		return -1;
@@ -348,7 +350,7 @@ static int restore_one_sigaction(int sig, struct cr_img *img, int pid)
 
 static int prepare_sigactions(void)
 {
-	int pid = current->pid->ns[0].virt;
+	int pid = vpid(current);
 	struct cr_img *img;
 	int sig, rst = 0;
 	int ret = 0;
@@ -395,7 +397,7 @@ static int __collect_child_pids(struct pstree_item *p, int state, unsigned int *
 			return -1;
 
 		(*n)++;
-		*child = pi->pid->ns[0].virt;
+		*child = vpid(pi);
 	}
 
 	return 0;
@@ -664,7 +666,7 @@ static int wait_on_helpers_zombies(void)
 	struct pstree_item *pi;
 
 	list_for_each_entry(pi, &current->children, sibling) {
-		pid_t pid = pi->pid->ns[0].virt;
+		pid_t pid = vpid(pi);
 		int status;
 
 		switch (pi->pid->state) {
@@ -715,7 +717,7 @@ static int restore_one_zombie(CoreEntry *core)
 			signr = SIGABRT;
 		}
 
-		if (kill(current->pid->ns[0].virt, signr) < 0)
+		if (kill(vpid(current), signr) < 0)
 			pr_perror("Can't kill myself, will just exit");
 
 		exit_code = 0;
@@ -852,7 +854,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 {
 	struct cr_clone_arg ca;
 	int ret = -1;
-	pid_t pid = item->pid->ns[0].virt;
+	pid_t pid = vpid(item);
 
 	if (item->pid->state != TASK_HELPER) {
 		if (open_core(pid, &ca.core))
@@ -939,7 +941,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 	if (item == root_item) {
 		item->pid->real = ret;
 		pr_debug("PID: real %d virt %d\n",
-				item->pid->real, item->pid->ns[0].virt);
+				item->pid->real, vpid(item));
 	}
 
 err_unlock:
@@ -996,7 +998,7 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 
 		/* Exited (with zero code) helpers are OK */
 		list_for_each_entry(pi, &current->children, sibling)
-			if (pi->pid->ns[0].virt == siginfo->si_pid)
+			if (vpid(pi) == siginfo->si_pid)
 				break;
 
 		BUG_ON(&pi->sibling == &current->children);
@@ -1074,8 +1076,8 @@ static void restore_sid(void)
 	 * we can call setpgid() on custom values.
 	 */
 
-	if (current->pid->ns[0].virt == current->sid) {
-		pr_info("Restoring %d to %d sid\n", current->pid->ns[0].virt, current->sid);
+	if (vpid(current) == current->sid) {
+		pr_info("Restoring %d to %d sid\n", vpid(current), current->sid);
 		sid = setsid();
 		if (sid != current->sid) {
 			pr_perror("Can't restore sid (%d)", sid);
@@ -1085,7 +1087,7 @@ static void restore_sid(void)
 		sid = getsid(getpid());
 		if (sid != current->sid) {
 			/* Skip the root task if it's not init */
-			if (current == root_item && root_item->pid->ns[0].virt != INIT_PID)
+			if (current == root_item && vpid(root_item) != INIT_PID)
 				return;
 			pr_err("Requested sid %d doesn't match inherited %d\n",
 					current->sid, sid);
@@ -1108,13 +1110,13 @@ static void restore_pgid(void)
 
 	pid_t pgid, my_pgid = current->pgid;
 
-	pr_info("Restoring %d to %d pgid\n", current->pid->ns[0].virt, my_pgid);
+	pr_info("Restoring %d to %d pgid\n", vpid(current), my_pgid);
 
 	pgid = getpgrp();
 	if (my_pgid == pgid)
 		return;
 
-	if (my_pgid != current->pid->ns[0].virt) {
+	if (my_pgid != vpid(current)) {
 		struct pstree_item *leader;
 
 		/*
@@ -1125,18 +1127,18 @@ static void restore_pgid(void)
 
 		leader = rsti(current)->pgrp_leader;
 		if (leader) {
-			BUG_ON(my_pgid != leader->pid->ns[0].virt);
+			BUG_ON(my_pgid != vpid(leader));
 			futex_wait_until(&rsti(leader)->pgrp_set, 1);
 		}
 	}
 
 	pr_info("\twill call setpgid, mine pgid is %d\n", pgid);
 	if (setpgid(0, my_pgid) != 0) {
-		pr_perror("Can't restore pgid (%d/%d->%d)", current->pid->ns[0].virt, pgid, current->pgid);
+		pr_perror("Can't restore pgid (%d/%d->%d)", vpid(current), pgid, current->pgid);
 		exit(1);
 	}
 
-	if (my_pgid == current->pid->ns[0].virt)
+	if (my_pgid == vpid(current))
 		futex_set_and_wake(&rsti(current)->pgrp_set, 1);
 }
 
@@ -1231,7 +1233,7 @@ static int restore_task_with_children(void *_arg)
 
 		current->pid->real = atoi(buf);
 		pr_debug("PID: real %d virt %d\n",
-				current->pid->real, current->pid->ns[0].virt);
+				current->pid->real, vpid(current));
 	}
 
 	if ( !(ca->clone_flags & CLONE_FILES))
@@ -1244,8 +1246,8 @@ static int restore_task_with_children(void *_arg)
 	}
 
 	pid = getpid();
-	if (current->pid->ns[0].virt != pid) {
-		pr_err("Pid %d do not match expected %d\n", pid, current->pid->ns[0].virt);
+	if (vpid(current) != pid) {
+		pr_err("Pid %d do not match expected %d\n", pid, vpid(current));
 		set_task_cr_err(EEXIST);
 		goto err;
 	}
@@ -1284,6 +1286,13 @@ static int restore_task_with_children(void *_arg)
 
 	/* Restore root task */
 	if (current->parent == NULL) {
+		int i;
+
+		if (prepare_shared_tty())
+			goto err;
+
+		if (fdstore_init())
+			goto err;
 		if (join_namespaces()) {
 			pr_perror("Join namespaces failed");
 			goto err;
@@ -1300,7 +1309,17 @@ static int restore_task_with_children(void *_arg)
 		if (mount_proc())
 			goto err;
 
+		for (i = 0; i < ARRAY_SIZE(before_ns_cinfos); i++) {
+			ret = collect_image(before_ns_cinfos[i]);
+			if (ret)
+				return -1;
+		}
+
+
 		if (prepare_namespace(current, ca->clone_flags))
+			goto err;
+
+		if (restore_finish_stage(task_entries, CR_STATE_POST_RESTORE_NS) < 0)
 			goto err;
 
 		if (root_prepare_shared())
@@ -1349,7 +1368,7 @@ static int restore_task_with_children(void *_arg)
 	if (restore_finish_stage(task_entries, CR_STATE_FORKING) < 0)
 		goto err;
 
-	if (restore_one_task(current->pid->ns[0].virt, ca->core))
+	if (restore_one_task(vpid(current), ca->core))
 		goto err;
 
 	return 0;
@@ -1366,6 +1385,7 @@ static inline int stage_participants(int next_stage)
 	case CR_STATE_FAIL:
 		return 0;
 	case CR_STATE_RESTORE_NS:
+	case CR_STATE_POST_RESTORE_NS:
 	case CR_STATE_RESTORE_SHARED:
 		return 1;
 	case CR_STATE_FORKING:
@@ -1658,7 +1678,7 @@ static int restore_root_task(struct pstree_item *init)
 	 * this later.
 	 */
 
-	if (init->pid->ns[0].virt == INIT_PID) {
+	if (vpid(init) == INIT_PID) {
 		if (!(root_ns_mask & CLONE_NEWPID)) {
 			pr_err("This process tree can only be restored "
 				"in a new pid namespace.\n"
@@ -1721,15 +1741,24 @@ static int restore_root_task(struct pstree_item *init)
 	if (ret)
 		goto out_kill;
 
+	ret = run_scripts(ACT_SETUP_NS);
+	if (ret)
+		goto out_kill;
+
+	ret = restore_switch_stage(CR_STATE_POST_RESTORE_NS);
+	if (ret < 0)
+		goto out_kill;
+
+	pr_info("Wait until namespaces are created\n");
+	ret = restore_wait_inprogress_tasks();
+	if (ret)
+		goto out_kill;
+
 	if (root_ns_mask & CLONE_NEWNS) {
 		mnt_ns_fd = open_proc(init->pid->real, "ns/mnt");
 		if (mnt_ns_fd < 0)
 			goto out_kill;
 	}
-
-	ret = run_scripts(ACT_SETUP_NS);
-	if (ret)
-		goto out_kill;
 
 	if (opts.empty_ns & CLONE_NEWNET) {
 		/*
@@ -1885,8 +1914,8 @@ out_kill:
 		struct pstree_item *pi;
 
 		for_each_pstree_item(pi)
-			if (pi->pid->ns[0].virt > 0)
-				kill(pi->pid->ns[0].virt, SIGKILL);
+			if (vpid(pi) > 0)
+				kill(vpid(pi), SIGKILL);
 	}
 
 out:
@@ -3045,6 +3074,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	close_proc();
 	close_service_fd(ROOT_FD_OFF);
 	close_service_fd(USERNSD_SK);
+	close_service_fd(FDSTORE_SK_OFF);
+	close_service_fd(RPC_SK_OFF);
 
 	__gcov_flush();
 

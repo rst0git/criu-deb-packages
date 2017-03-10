@@ -1,5 +1,5 @@
 #!/usr/bin/env python2
-# vim: noet
+# vim: noet ts=8 sw=8 sts=8
 import argparse
 import glob
 import os
@@ -962,6 +962,12 @@ class criu:
 			self.__lazy_pages_p = None
 			if ret:
 				raise test_fail_exc("criu lazy-pages exited with %s" % ret)
+
+		if self.__page_server_p:
+			ret = self.__page_server_p.wait()
+			self.__page_server_p = None
+			if ret:
+				raise test_fail_exc("criu page-server exited with %s" % ret)
 
 		if self.__leave_stopped:
 			pstree_check_stopped(self.__test.getpid())
