@@ -291,10 +291,10 @@ def encode_flav(f):
 
 
 def decode_flav(i):
-	i = i - 128
-	if i in flavors:
+	try:
 		return flavors.keys()[i - 128]
-	return "unknown"
+	except:
+		return "unknown"
 
 
 def tail(path):
@@ -676,10 +676,12 @@ join_ns_file = '/run/netns/zdtm_netns'
 class criu_cli:
 	@staticmethod
 	def run(action, args, fault = None, strace = [], preexec = None, nowait = False):
-		env = None
+		env = dict(os.environ, ASAN_OPTIONS = "log_path=asan.log:disable_coredump=0:detect_leaks=0")
+
 		if fault:
 			print "Forcing %s fault" % fault
-			env = dict(os.environ, CRIU_FAULT = fault)
+			env['CRIU_FAULT'] = fault
+
 		cr = subprocess.Popen(strace + [criu_bin, action] + args, env = env, preexec_fn = preexec)
 		if nowait:
 			return cr
@@ -1479,12 +1481,18 @@ class launcher:
 			self.__fail = True
 		if self.__file_report:
 			self.__file_report.close()
-		if self.__fail:
-			if opts['keep_going']:
+
+		if opts['keep_going']:
+			if self.__fail:
 				print_sep("%d TEST(S) FAILED (TOTAL %d/SKIPPED %d)"
 						% (len(self.__failed), self.__total, self.__nr_skip), "#")
 				for failed in self.__failed:
 					print " * %s(%s)" % (failed[0], failed[1])
+			else:
+				print_sep("ALL TEST(S) PASSED (TOTAL %d/SKIPPED %d)"
+						% (self.__total, self.__nr_skip), "#")
+
+		if self.__fail:
 			print_sep("FAIL", "#")
 			sys.exit(1)
 
@@ -1544,13 +1552,19 @@ def print_error(line):
 def grep_errors(fname):
 	first = True
 	print_next = False
+	before = []
 	for l in open(fname):
+		before.append(l)
+		if len(before) > 5:
+			before.pop(0)
 		if "Error" in l:
 			if first:
 				print_fname(fname, 'log')
 				print_sep("grep Error", "-", 60)
 				first = False
-			print_next = print_error(l)
+			for i in before:
+				print_next = print_error(i)
+			before = []
 		else:
 			if print_next:
 				print_next = print_error(l)

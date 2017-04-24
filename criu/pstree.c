@@ -217,6 +217,7 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 
 	item->pid->ns[0].virt = -1;
 	item->pid->real = -1;
+	item->pid->state = TASK_UNDEF;
 	item->born_sid = -1;
 	item->pid->item = item;
 	futex_init(&item->task_st);
@@ -585,7 +586,7 @@ err:
 	return ret;
 }
 
-#define RESERVED_PIDS           300
+#define RESERVED_PIDS		300
 static int get_free_pid()
 {
 	static struct pid *prev, *next;
@@ -709,8 +710,8 @@ static int prepare_pstree_ids(void)
 			parent = item->parent;
 			while (parent && vpid(parent) != item->sid) {
 				if (parent->born_sid != -1 && parent->born_sid != item->sid) {
-					pr_err("Can't determinate with which sid (%d or %d)"
-						"the process %d was born\n",
+					pr_err("Can't figure out which sid (%d or %d)"
+						"the process %d was born with\n",
 						parent->born_sid, item->sid, vpid(parent));
 					return -1;
 				}

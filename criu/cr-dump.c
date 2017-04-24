@@ -42,7 +42,6 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "string.h"
-#include "ptrace.h"
 #include "ptrace-compat.h"
 #include "util.h"
 #include "namespaces.h"
@@ -668,6 +667,7 @@ static int dump_task_ids(struct pstree_item *item, const struct cr_imgset *cr_im
 }
 
 int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread *ti)
+
 {
 	int ret;
 	ThreadCoreEntry *tc = core->thread_core;
@@ -679,7 +679,8 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 		ret = dump_sched_info(pid, tc);
 	if (!ret) {
 		core_put_tls(core, ti->tls);
-		CORE_THREAD_ARCH_INFO(core)->clear_tid_addr = encode_pointer(ti->tid_addr);
+		CORE_THREAD_ARCH_INFO(core)->clear_tid_addr =
+			encode_pointer(ti->tid_addr);
 		BUG_ON(!tc->sas);
 		copy_sas(tc->sas, &ti->sas);
 		if (ti->pdeath_sig) {
@@ -703,6 +704,8 @@ static int dump_task_core_all(struct parasite_ctl *ctl,
 	struct proc_status_creds *creds;
 	struct parasite_dump_cgroup_args cgroup_args, *info = NULL;
 
+	BUILD_BUG_ON(sizeof(cgroup_args) < PARASITE_ARG_SIZE_MIN);
+
 	pr_info("\n");
 	pr_info("Dumping core (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
@@ -712,12 +715,12 @@ static int dump_task_core_all(struct parasite_ctl *ctl,
 		goto err;
 
 	creds = dmpi(item)->pi_creds;
-	if (creds->seccomp_mode != SECCOMP_MODE_DISABLED) {
-		pr_info("got seccomp mode %d for %d\n", creds->seccomp_mode, vpid(item));
+	if (creds->s.seccomp_mode != SECCOMP_MODE_DISABLED) {
+		pr_info("got seccomp mode %d for %d\n", creds->s.seccomp_mode, vpid(item));
 		core->tc->has_seccomp_mode = true;
-		core->tc->seccomp_mode = creds->seccomp_mode;
+		core->tc->seccomp_mode = creds->s.seccomp_mode;
 
-		if (creds->seccomp_mode == SECCOMP_MODE_FILTER) {
+		if (creds->s.seccomp_mode == SECCOMP_MODE_FILTER) {
 			core->tc->has_seccomp_filter = true;
 			core->tc->seccomp_filter = creds->last_filter;
 		}
@@ -1170,7 +1173,7 @@ static int pre_dump_one_task(struct pstree_item *item)
 	if (ret)
 		goto err_cure;
 
-	if (parasite_cure_remote(parasite_ctl))
+	if (compel_cure_remote(parasite_ctl))
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 err_free:
 	free_mappings(&vmas);
@@ -1178,7 +1181,7 @@ err:
 	return ret;
 
 err_cure:
-	if (parasite_cure_seized(parasite_ctl))
+	if (compel_cure(parasite_ctl))
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 	goto err_free;
 }
@@ -1353,7 +1356,7 @@ static int dump_one_task(struct pstree_item *item)
 		goto err_cure;
 	}
 
-	ret = parasite_stop_daemon(parasite_ctl);
+	ret = compel_stop_daemon(parasite_ctl);
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
@@ -1365,7 +1368,7 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
-	ret = parasite_cure_seized(parasite_ctl);
+	ret = compel_cure(parasite_ctl);
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
@@ -1394,7 +1397,7 @@ err:
 err_cure:
 	close_cr_imgset(&cr_imgset);
 err_cure_imgset:
-	parasite_cure_seized(parasite_ctl);
+	compel_cure(parasite_ctl);
 	goto err;
 }
 
@@ -1471,7 +1474,7 @@ static int cr_pre_dump_finish(int ret)
 		timing_stop(TIME_MEMWRITE);
 
 		destroy_page_pipe(mem_pp);
-		parasite_cure_local(ctl);
+		compel_cure_local(ctl);
 	}
 
 	free_pstree(root_item);

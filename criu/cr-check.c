@@ -38,7 +38,7 @@
 #include "proc_parse.h"
 #include "mount.h"
 #include "tty.h"
-#include "ptrace.h"
+#include <compel/ptrace.h>
 #include "ptrace-compat.h"
 #include "kerndat.h"
 #include "timerfd.h"
@@ -49,6 +49,7 @@
 #include "cr_options.h"
 #include "libnetlink.h"
 #include "net.h"
+#include "restorer.h"
 
 static char *feature_name(int (*func)());
 
@@ -243,11 +244,9 @@ static int check_fcntl(void)
 	u32 v[2];
 	int fd;
 
-	fd = open("/proc/self/comm", O_RDONLY);
-	if (fd < 0) {
-		pr_perror("Can't open self comm file");
+	fd = open_proc(PROC_SELF, "comm");
+	if (fd < 0)
 		return -1;
-	}
 
 	if (fcntl(fd, F_GETOWNER_UIDS, (long)v)) {
 		pr_perror("Can'r fetch file owner UIDs");
@@ -725,11 +724,9 @@ static unsigned long get_ring_len(unsigned long addr)
 	FILE *maps;
 	char buf[256];
 
-	maps = fopen("/proc/self/maps", "r");
-	if (!maps) {
-		pr_perror("No maps proc file");
+	maps = fopen_proc(PROC_SELF, "maps");
+	if (!maps)
 		return 0;
-	}
 
 	while (fgets(buf, sizeof(buf), maps)) {
 		unsigned long start, end;
@@ -1058,6 +1055,14 @@ static int check_loginuid(void)
 	return 0;
 }
 
+static int check_compat_cr(void)
+{
+	if (kdat_compat_sigreturn_test())
+		return 0;
+	pr_warn("compat_cr is not supported. Requires kernel >= v4.9\n");
+	return -1;
+}
+
 static int (*chk_feature)(void);
 
 /*
@@ -1168,6 +1173,7 @@ int cr_check(void)
 	 */
 	if (opts.check_experimental_features) {
 		ret |= check_autofs();
+		ret |= check_compat_cr();
 	}
 
 	print_on_level(DEFAULT_LOGLEVEL, "%s\n", ret ? CHECK_MAYBE : CHECK_GOOD);
@@ -1208,6 +1214,7 @@ static struct feature_list feature_list[] = {
 	{ "cgroupns", check_cgroupns },
 	{ "autofs", check_autofs },
 	{ "tcp_half_closed", check_tcp_halt_closed },
+	{ "compat_cr", check_compat_cr },
 	{ NULL, NULL },
 };
 

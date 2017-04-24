@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <ftw.h>
 #include <libgen.h>
+#include <sched.h>
 #include "common/list.h"
 #include "xmalloc.h"
 #include "cgroup.h"
@@ -19,7 +20,6 @@
 #include "util-pie.h"
 #include "namespaces.h"
 #include "seize.h"
-#include "syscall-types.h"
 #include "protobuf.h"
 #include "images/core.pb-c.h"
 #include "images/cgroup.pb-c.h"
@@ -422,12 +422,12 @@ static int add_cgroup_properties(const char *fpath, struct cgroup_dir *ncd,
 		const cgp_t *cgp = cgp_get_props(controller->controllers[i]);
 
 		if (dump_cg_props_array(fpath, ncd, cgp) < 0) {
-			pr_err("dumping known properties failed");
+			pr_err("dumping known properties failed\n");
 			return -1;
 		}
 
 		if (dump_cg_props_array(fpath, ncd, &cgp_global) < 0) {
-			pr_err("dumping global properties failed");
+			pr_err("dumping global properties failed\n");
 			return -1;
 		}
 	}
@@ -1069,7 +1069,7 @@ static int move_in_cgroup(CgSetEntry *se, bool setup_cgns)
 	pr_info("Move into %d\n", se->id);
 
 	if (setup_cgns && prepare_cgns(se) < 0) {
-		pr_err("failed preparing cgns");
+		pr_err("failed preparing cgns\n");
 		return -1;
 	}
 

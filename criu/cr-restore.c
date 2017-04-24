@@ -24,9 +24,10 @@
 #include <sys/sendfile.h>
 
 #include "types.h"
-#include "ptrace.h"
+#include <compel/ptrace.h>
 #include "common/compiler.h"
 
+#include "clone-noasan.h"
 #include "cr_options.h"
 #include "servicefd.h"
 #include "image.h"
@@ -46,7 +47,7 @@
 #include "eventpoll.h"
 #include "signalfd.h"
 #include "proc_parse.h"
-#include "restorer-blob.h"
+#include "pie/restorer-blob.h"
 #include "crtools.h"
 #include "namespaces.h"
 #include "mem.h"
@@ -69,6 +70,7 @@
 #include "file-lock.h"
 #include "action-scripts.h"
 #include "shmem.h"
+#include <compel/compel.h>
 #include "aio.h"
 #include "lsm.h"
 #include "seccomp.h"
@@ -79,6 +81,8 @@
 
 #include "parasite-syscall.h"
 #include "files-reg.h"
+#include <compel/plugins/std/syscall-codes.h>
+#include "compel/include/asm/syscall.h"
 
 #include "protobuf.h"
 #include "images/sa.pb-c.h"
@@ -104,6 +108,7 @@
 
 #ifndef arch_export_unmap
 #define arch_export_unmap		__export_unmap
+#define arch_export_unmap_compat	__export_unmap_compat
 #endif
 
 struct pstree_item *current;
@@ -275,7 +280,15 @@ err:
 }
 
 static rt_sigaction_t sigchld_act;
+/*
+ * If parent's sigaction has blocked SIGKILL (which is non-sence),
+ * this parent action is non-valid and shouldn't be inherited.
+ * Used to mark parent_act* no more valid.
+ */
 static rt_sigaction_t parent_act[SIGMAX];
+#ifdef CONFIG_COMPAT
+static rt_sigaction_t_compat parent_act_compat[SIGMAX];
+#endif
 
 static bool sa_inherited(int sig, rt_sigaction_t *sa)
 {
@@ -287,6 +300,10 @@ static bool sa_inherited(int sig, rt_sigaction_t *sa)
 
 	pa = &parent_act[sig];
 
+	/* Omitting non-valid sigaction */
+	if (pa->rt_sa_mask.sig[0] & (1 << SIGKILL))
+		return false;
+
 	for (i = 0; i < _KNSIG_WORDS; i++)
 		if (pa->rt_sa_mask.sig[i] != sa->rt_sa_mask.sig[i])
 			return false;
@@ -296,34 +313,16 @@ static bool sa_inherited(int sig, rt_sigaction_t *sa)
 		pa->rt_sa_restorer == sa->rt_sa_restorer;
 }
 
-/* Returns number of restored signals, -1 or negative errno on fail */
-static int restore_one_sigaction(int sig, struct cr_img *img, int pid)
+static int restore_native_sigaction(int sig, SaEntry *e)
 {
 	rt_sigaction_t act;
-	SaEntry *e;
-	int ret = 0;
-
-	BUG_ON(sig == SIGKILL || sig == SIGSTOP);
-
-	ret = pb_read_one_eof(img, &e, PB_SIGACT);
-	if (ret == 0) {
-		if (sig != SIGMAX_OLD + 1) { /* backward compatibility */
-			pr_err("Unexpected EOF %d\n", sig);
-			return -1;
-		}
-		pr_warn("This format of sigacts-%d.img is deprecated\n", pid);
-		return -1;
-	}
-	if (ret < 0)
-		return ret;
+	int ret;
 
 	ASSIGN_TYPED(act.rt_sa_handler, decode_pointer(e->sigaction));
 	ASSIGN_TYPED(act.rt_sa_flags, e->flags);
 	ASSIGN_TYPED(act.rt_sa_restorer, decode_pointer(e->restorer));
 	BUILD_BUG_ON(sizeof(e->mask) != sizeof(act.rt_sa_mask.sig));
 	memcpy(act.rt_sa_mask.sig, &e->mask, sizeof(act.rt_sa_mask.sig));
-
-	sa_entry__free_unpacked(e, NULL);
 
 	if (sig == SIGCHLD) {
 		sigchld_act = act;
@@ -344,8 +343,114 @@ static int restore_one_sigaction(int sig, struct cr_img *img, int pid)
 	}
 
 	parent_act[sig - 1] = act;
+	/* Mark SIGKILL blocked which makes compat sigaction non-valid */
+#ifdef CONFIG_COMPAT
+	parent_act_compat[sig - 1].rt_sa_mask.sig[0] |= 1 << SIGKILL;
+#endif
 
 	return 1;
+}
+
+static void *stack32;
+
+#ifdef CONFIG_COMPAT
+static bool sa_compat_inherited(int sig, rt_sigaction_t_compat *sa)
+{
+	rt_sigaction_t_compat *pa;
+	int i;
+
+	if (current == root_item)
+		return false;
+
+	pa = &parent_act_compat[sig];
+
+	/* Omitting non-valid sigaction */
+	if (pa->rt_sa_mask.sig[0] & (1 << SIGKILL))
+		return false;
+
+	for (i = 0; i < _KNSIG_WORDS; i++)
+		if (pa->rt_sa_mask.sig[i] != sa->rt_sa_mask.sig[i])
+			return false;
+
+	return pa->rt_sa_handler == sa->rt_sa_handler &&
+		pa->rt_sa_flags == sa->rt_sa_flags &&
+		pa->rt_sa_restorer == sa->rt_sa_restorer;
+}
+
+static int restore_compat_sigaction(int sig, SaEntry *e)
+{
+	rt_sigaction_t_compat act;
+	int ret;
+
+	ASSIGN_TYPED(act.rt_sa_handler, (u32)e->sigaction);
+	ASSIGN_TYPED(act.rt_sa_flags, e->flags);
+	ASSIGN_TYPED(act.rt_sa_restorer, (u32)e->restorer);
+	BUILD_BUG_ON(sizeof(e->mask) != sizeof(act.rt_sa_mask.sig));
+	memcpy(act.rt_sa_mask.sig, &e->mask, sizeof(act.rt_sa_mask.sig));
+
+	if (sig == SIGCHLD) {
+		memcpy(&sigchld_act, &act, sizeof(rt_sigaction_t_compat));
+		return 0;
+	}
+
+	if (sa_compat_inherited(sig - 1, &act))
+		return 1;
+
+	if (!stack32) {
+		stack32 = alloc_compat_syscall_stack();
+		if (!stack32)
+			return -1;
+	}
+
+	ret = arch_compat_rt_sigaction(stack32, sig, &act);
+	if (ret < 0) {
+		pr_err("Can't restore compat sigaction: %d\n", ret);
+		return ret;
+	}
+
+	parent_act_compat[sig - 1] = act;
+	/* Mark SIGKILL blocked which makes native sigaction non-valid */
+	parent_act[sig - 1].rt_sa_mask.sig[0] |= 1 << SIGKILL;
+
+	return 1;
+}
+#else
+static int restore_compat_sigaction(int sig, SaEntry *e)
+{
+	return -1;
+}
+#endif
+
+/* Returns number of restored signals, -1 or negative errno on fail */
+static int restore_one_sigaction(int sig, struct cr_img *img, int pid)
+{
+	bool sigaction_is_compat;
+	SaEntry *e;
+	int ret = 0;
+
+	BUG_ON(sig == SIGKILL || sig == SIGSTOP);
+
+	ret = pb_read_one_eof(img, &e, PB_SIGACT);
+	if (ret == 0) {
+		if (sig != SIGMAX_OLD + 1) { /* backward compatibility */
+			pr_err("Unexpected EOF %d\n", sig);
+			return -1;
+		}
+		pr_warn("This format of sigacts-%d.img is deprecated\n", pid);
+		return -1;
+	}
+	if (ret < 0)
+		return ret;
+
+	sigaction_is_compat = e->has_compat_sigaction && e->compat_sigaction;
+	if (sigaction_is_compat)
+		ret = restore_compat_sigaction(sig, e);
+	else
+		ret = restore_native_sigaction(sig, e);
+
+	sa_entry__free_unpacked(e, NULL);
+
+	return ret;
 }
 
 static int prepare_sigactions(void)
@@ -379,6 +484,10 @@ static int prepare_sigactions(void)
 			SIGMAX - 3 /* KILL, STOP and CHLD */);
 
 	close_image(img);
+	if (stack32) {
+		free_compat_syscall_stack(stack32);
+		stack32 = NULL;
+	}
 	return ret;
 }
 
@@ -446,7 +555,7 @@ static int open_core(int pid, CoreEntry **pcore)
 
 	img = open_image(CR_FD_CORE, O_RSTR, pid);
 	if (!img) {
-		pr_err("Can't open core data for %d", pid);
+		pr_err("Can't open core data for %d\n", pid);
 		return -1;
 	}
 
@@ -801,12 +910,6 @@ static int restore_one_task(int pid, CoreEntry *core)
 
 /* All arguments should be above stack, because it grows down */
 struct cr_clone_arg {
-	/*
-	 * Reserve some space for clone() to locate arguments
-	 * and retcode in this place
-	 */
-	char stack[128] __stack_aligned__;
-	char stack_ptr[0];
 	struct pstree_item *item;
 	unsigned long clone_flags;
 	int fd;
@@ -929,9 +1032,8 @@ static inline int fork_with_pid(struct pstree_item *item)
 	 * The cgroup namespace is also unshared explicitly in the
 	 * move_in_cgroup(), so drop this flag here as well.
 	 */
-	ret = clone(restore_task_with_children, ca.stack_ptr,
-		    (ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP)) | SIGCHLD, &ca);
-
+	ret = clone_noasan(restore_task_with_children,
+			(ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP)) | SIGCHLD, &ca);
 	if (ret < 0) {
 		pr_perror("Can't fork for %d", pid);
 		goto err_unlock;
@@ -1470,7 +1572,7 @@ static int attach_to_tasks(bool root_seized)
 			 * doing an munmap in the process, which may be blocked by
 			 * seccomp and cause the task to be killed.
 			 */
-			if (rsti(item)->has_seccomp && suspend_seccomp(pid) < 0)
+			if (rsti(item)->has_seccomp && ptrace_suspend_seccomp(pid) < 0)
 				pr_err("failed to suspend seccomp, restore will probably fail...\n");
 
 			if (ptrace(PTRACE_CONT, pid, NULL, NULL) ) {
@@ -1509,7 +1611,8 @@ static int catch_tasks(bool root_seized, enum trace_flags *flag)
 				return -1;
 			}
 
-			ret = ptrace_stop_pie(pid, rsti(item)->breakpoint, flag);
+			ret = compel_stop_pie(pid, rsti(item)->breakpoint,
+					flag, fault_injected(FI_NO_BREAKPOINTS));
 			if (ret < 0)
 				return -1;
 		}
@@ -1548,11 +1651,11 @@ static void finalize_restore(void)
 			continue;
 
 		/* Unmap the restorer blob */
-		ctl = parasite_prep_ctl(pid, 0);
+		ctl = compel_prepare_noctx(pid);
 		if (ctl == NULL)
 			continue;
 
-		parasite_unmap(ctl, (unsigned long)rsti(item)->munmap_restorer);
+		compel_unmap(ctl, (unsigned long)rsti(item)->munmap_restorer);
 
 		xfree(ctl);
 
@@ -1614,7 +1717,7 @@ static int prepare_userns_hook(void)
 		return -1;
 
 	if (prepare_loginuid(INVALID_UID, LOG_ERROR) < 0) {
-		pr_err("Setting loginuid for CT init task failed, CAP_AUDIT_CONTROL?");
+		pr_err("Setting loginuid for CT init task failed, CAP_AUDIT_CONTROL?\n");
 		return -1;
 	}
 	return 0;
@@ -1627,7 +1730,7 @@ static void restore_origin_ns_hook(void)
 
 	/* not critical: it does not affect CT in any way */
 	if (prepare_loginuid(saved_loginuid, LOG_ERROR) < 0)
-		pr_err("Restore original /proc/self/loginuid failed");
+		pr_err("Restore original /proc/self/loginuid failed\n");
 }
 
 static int write_restored_pid(void)
@@ -1863,8 +1966,8 @@ static int restore_root_task(struct pstree_item *init)
 	futex_set_and_wake(&task_entries->start, CR_STATE_COMPLETE);
 
 	if (ret == 0)
-		ret = parasite_stop_on_syscall(task_entries->nr_threads,
-						__NR_rt_sigreturn, flag);
+		ret = compel_stop_on_syscall(task_entries->nr_threads,
+			__NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1), flag);
 
 	if (clear_breakpoints())
 		pr_err("Unable to flush breakpoints\n");
@@ -2326,7 +2429,7 @@ static int prepare_restorer_blob(void)
 	 * in turn will lead to set-exe-file prctl to fail with EBUSY.
 	 */
 
-	restorer_len = pie_size(restorer_blob);
+	restorer_len = pie_size(restorer);
 	restorer = mmap(NULL, restorer_len,
 			PROT_READ | PROT_WRITE | PROT_EXEC,
 			MAP_PRIVATE | MAP_ANON, 0, 0);
@@ -2350,7 +2453,9 @@ static int remap_restorer_blob(void *addr)
 		return -1;
 	}
 
-	ELF_RELOCS_APPLY_RESTORER(addr, addr);
+	compel_relocs_apply(addr, addr, sizeof(restorer_blob),
+			restorer_relocs, ARRAY_SIZE(restorer_relocs));
+
 	return 0;
 }
 
@@ -2781,6 +2886,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	struct restore_mem_zone *mz;
 
 #ifdef CONFIG_VDSO
+	struct vdso_symtable vdso_symtab_rt;
 	unsigned long vdso_rt_size = 0;
 #endif
 
@@ -2825,12 +2931,16 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 			current->nr_threads, KBYTES(task_args->bootstrap_len));
 
 #ifdef CONFIG_VDSO
+	if (core_is_compat(core))
+		vdso_symtab_rt = vdso_compat_rt;
+	else
+		vdso_symtab_rt = vdso_sym_rt;
 	/*
 	 * Figure out how much memory runtime vdso and vvar will need.
 	 */
-	vdso_rt_size = vdso_vma_size(&vdso_sym_rt);
-	if (vdso_rt_size && vvar_vma_size(&vdso_sym_rt))
-		vdso_rt_size += ALIGN(vvar_vma_size(&vdso_sym_rt), PAGE_SIZE);
+	vdso_rt_size = vdso_vma_size(&vdso_symtab_rt);
+	if (vdso_rt_size && vvar_vma_size(&vdso_symtab_rt))
+		vdso_rt_size += ALIGN(vvar_vma_size(&vdso_symtab_rt), PAGE_SIZE);
 	task_args->bootstrap_len += vdso_rt_size;
 #endif
 
@@ -2866,7 +2976,12 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 */
 	task_args->clone_restore_fn	= restorer_sym(mem, arch_export_restore_thread);
 	restore_task_exec_start		= restorer_sym(mem, arch_export_restore_task);
-	rsti(current)->munmap_restorer	= restorer_sym(mem, arch_export_unmap);
+	if (core_is_compat(core))
+		rsti(current)->munmap_restorer =
+			restorer_sym(mem, arch_export_unmap_compat);
+	else
+		rsti(current)->munmap_restorer =
+			restorer_sym(mem, arch_export_unmap);
 
 	task_args->bootstrap_start = mem;
 	mem += restorer_len;
@@ -2920,6 +3035,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	}
 
 	task_args->breakpoint = &rsti(current)->breakpoint;
+	task_args->fault_strategy = fi_strategy;
 
 	sigemptyset(&blockmask);
 	sigaddset(&blockmask, SIGCHLD);
@@ -2950,6 +3066,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	if (core->tc->has_seccomp_mode)
 		task_args->seccomp_mode = core->tc->seccomp_mode;
 
+	task_args->compatible_mode = core_is_compat(core);
 	/*
 	 * Arguments for task restoration.
 	 */
@@ -3046,7 +3163,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 */
 	mem += rst_mem_size;
 	task_args->vdso_rt_parked_at = (unsigned long)mem;
-	task_args->vdso_sym_rt = vdso_sym_rt;
+	task_args->vdso_sym_rt = vdso_symtab_rt;
 	task_args->vdso_rt_size = vdso_rt_size;
 #endif
 

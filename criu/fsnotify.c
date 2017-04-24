@@ -41,7 +41,7 @@
 #include "namespaces.h"
 #include "pstree.h"
 #include "fault-injection.h"
-#include "syscall-codes.h"
+#include <compel/plugins/std/syscall-codes.h>
 
 #include "protobuf.h"
 #include "images/fsnotify.pb-c.h"
@@ -131,6 +131,8 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 		struct stat st;
 
 		if (m->s_dev != s_dev)
+			continue;
+		if (!mnt_is_dir(m))
 			continue;
 
 		mntfd = __open_mountpoint(m, -1);
