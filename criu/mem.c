@@ -25,6 +25,7 @@
 #include "files-reg.h"
 #include "pagemap-cache.h"
 #include "fault-injection.h"
+#include <compel/compel.h>
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -56,22 +57,22 @@ int do_task_reset_dirty_track(int pid)
 
 	ret = write(fd, cmd, sizeof(cmd));
 	if (ret < 0) {
-               if (errno == EINVAL) /* No clear-soft-dirty in kernel */
-                       ret = 1;
-               else {
-                       pr_perror("Can't reset %d's dirty memory tracker (%d)", pid, errno);
-                       ret = -1;
-               }
-       } else {
-               pr_info(" ... done\n");
-               ret = 0;
+		if (errno == EINVAL) /* No clear-soft-dirty in kernel */
+			ret = 1;
+		else {
+			pr_perror("Can't reset %d's dirty memory tracker (%d)", pid, errno);
+			ret = -1;
+		}
+	} else {
+		pr_info(" ... done\n");
+		ret = 0;
 	}
 
-       close(fd);
-       return ret;
+	close(fd);
+	return ret;
 }
 
-unsigned int dump_pages_args_size(struct vm_area_list *vmas)
+unsigned long dump_pages_args_size(struct vm_area_list *vmas)
 {
 	/* In the worst case I need one iovec for each page */
 	return sizeof(struct parasite_dump_pages_args) +
@@ -188,7 +189,7 @@ static struct parasite_dump_pages_args *prep_dump_pages_args(struct parasite_ctl
 	struct parasite_vma_entry *p_vma;
 	struct vma_area *vma;
 
-	args = parasite_args_s(ctl, dump_pages_args_size(vma_area_list));
+	args = compel_parasite_args_s(ctl, dump_pages_args_size(vma_area_list));
 
 	p_vma = pargs_vmas(args);
 	args->nr_vmas = 0;
@@ -231,14 +232,14 @@ static int drain_pages(struct page_pipe *pp, struct parasite_ctl *ctl,
 		pr_debug("PPB: %d pages %d segs %u pipe %d off\n",
 				args->nr_pages, args->nr_segs, ppb->pipe_size, args->off);
 
-		ret = __parasite_execute_daemon(PARASITE_CMD_DUMPPAGES, ctl);
+		ret = compel_rpc_call(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret < 0)
 			return -1;
-		ret = parasite_send_fd(ctl, ppb->p[1]);
+		ret = compel_util_send_fd(ctl, ppb->p[1]);
 		if (ret)
 			return -1;
 
-		ret = __parasite_wait_daemon_ack(PARASITE_CMD_DUMPPAGES, ctl);
+		ret = compel_rpc_sync(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret < 0)
 			return -1;
 
@@ -416,7 +417,7 @@ int parasite_dump_pages_seized(struct pstree_item *item,
 	 */
 
 	pargs->add_prot = PROT_READ;
-	ret = parasite_execute_daemon(PARASITE_CMD_MPROTECT_VMAS, ctl);
+	ret = compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl);
 	if (ret) {
 		pr_err("Can't dump unprotect vmas with parasite\n");
 		return ret;
@@ -435,7 +436,7 @@ int parasite_dump_pages_seized(struct pstree_item *item,
 	}
 
 	pargs->add_prot = 0;
-	if (parasite_execute_daemon(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
+	if (compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
 		pr_err("Can't rollback unprotected vmas with parasite\n");
 		ret = -1;
 	}

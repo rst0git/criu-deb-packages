@@ -47,7 +47,7 @@ int check_namespace_opts(void)
 {
 	errno = 22;
 	if (join_ns_flags & opts.empty_ns) {
-		pr_perror("Conflict flags: -join-ns and -empty-ns");
+		pr_err("Conflicting flags: --join-ns and --empty-ns\n");
 		return -1;
 	}
 	if (join_ns_flags & CLONE_NEWUSER)
@@ -90,12 +90,13 @@ static int check_ns_file(char *ns_file)
 	if (!check_int_str(ns_file)) {
 		pid = atoi(ns_file);
 		if (pid <= 0) {
-			pr_perror("Invalid join_ns pid %s", ns_file);
+			pr_err("Invalid join_ns pid %s\n", ns_file);
 			return -1;
 		}
 		proc_dir = open_pid_proc(pid);
 		if (proc_dir < 0) {
-			pr_perror("Invalid join_ns pid: /proc/%s not found", ns_file);
+			pr_err("Invalid join_ns pid: /proc/%s not found\n",
+					ns_file);
 			return -1;
 		}
 		return 0;
@@ -103,7 +104,7 @@ static int check_ns_file(char *ns_file)
 
 	ret = access(ns_file, 0);
 	if (ret < 0) {
-		pr_perror("Can't access join-ns file: %s", ns_file);
+		pr_perror("Can't access join-ns file %s", ns_file);
 		return -1;
 	}
 	return 0;
@@ -237,16 +238,12 @@ int switch_ns(int pid, struct ns_desc *nd, int *rst)
 
 int switch_ns_by_fd(int nsfd, struct ns_desc *nd, int *rst)
 {
-	char buf[32];
 	int ret = -1;
 
 	if (rst) {
-		snprintf(buf, sizeof(buf), "/proc/self/ns/%s", nd->str);
-		*rst = open(buf, O_RDONLY);
-		if (*rst < 0) {
-			pr_perror("Can't open ns file");
+		*rst = open_proc(PROC_SELF, "ns/%s", nd->str);
+		if (*rst < 0)
 			goto err_ns;
-		}
 	}
 
 	ret = setns(nsfd, nd->cflag);
@@ -896,7 +893,7 @@ static int check_user_ns(int pid)
 	}
 
 	if (waitpid(chld, &status, 0) != chld) {
-		pr_perror("Unable to wait the %d process", pid);
+		pr_perror("Unable to wait for PID %d", chld);
 		return -1;
 	}
 
@@ -1501,7 +1498,7 @@ int collect_namespaces(bool for_dump)
 	return 0;
 }
 
-static int prepare_userns_creds()
+static int prepare_userns_creds(void)
 {
 	/* UID and GID must be set after restoring /proc/PID/{uid,gid}_maps */
 	if (setuid(0) || setgid(0) || setgroups(0, NULL)) {
@@ -1517,7 +1514,7 @@ static int prepare_userns_creds()
 	 */
 	if (prctl(PR_SET_DUMPABLE, 1, 0)) {
 		pr_perror("Unable to set PR_SET_DUMPABLE");
-		exit(1);
+		return -1;
 	}
 
 	return 0;
@@ -1539,7 +1536,7 @@ static int get_join_ns_fd(struct join_ns *jn)
 
 	fd = open(pnsf, O_RDONLY);
 	if (fd < 0) {
-		pr_perror("Can't open ns file: %s", pnsf);
+		pr_perror("Can't open ns file %s", pnsf);
 		return -1;
 	}
 	jn->ns_fd = fd;

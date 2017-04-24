@@ -956,8 +956,8 @@ static int post_open_unix_sk(struct file_desc *d, int fd)
 	if (connect(fd, (struct sockaddr *)&addr,
 				sizeof(addr.sun_family) +
 				peer->ue->name.len) < 0) {
-		revert_unix_sk_cwd(&cwd_fd, &root_fd);
 		pr_perror("Can't connect %#x socket", ui->ue->ino);
+		revert_unix_sk_cwd(&cwd_fd, &root_fd);
 		return -1;
 	}
 
@@ -974,6 +974,9 @@ static int bind_unix_sk(int sk, struct unix_sk_info *ui)
 	struct sockaddr_un addr;
 	int cwd_fd = -1, root_fd = -1;
 	int ret = -1;
+
+	if (ui->ue->name.len == 0)
+		return 0;
 
 	if ((ui->ue->type == SOCK_STREAM) && (ui->ue->state == TCP_ESTABLISHED)) {
 		/*
@@ -1362,6 +1365,8 @@ static int collect_one_unixsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 {
 	struct unix_sk_info *ui = o;
 	static bool post_queued = false;
+	char *uname, *prefix = "";
+	int ulen;
 
 	ui->ue = pb_msg(base, UnixSkEntry);
 	ui->name_dir = (void *)ui->ue->name_dir;
@@ -1391,10 +1396,32 @@ static int collect_one_unixsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 	INIT_LIST_HEAD(&ui->connected);
 	INIT_LIST_HEAD(&ui->node);
 	ui->flags = 0;
-	pr_info(" `- Got %#x peer %#x (name %s dir %s)\n",
+
+	uname = ui->name;
+	ulen = ui->ue->name.len;
+	if (ulen > 0 && uname[0] == 0) {
+		prefix = "@";
+		uname++;
+		ulen--;
+		if (memrchr(uname, 0, ulen)) {
+			/* replace zero characters */
+			char *s = alloca(ulen + 1);
+			int i;
+
+			for (i = 0; i < ulen; i++)
+				s[i] = uname[i] ? : '@';
+			uname = s;
+		}
+	} else if (ulen == 0) {
+		ulen = 1;
+		uname = "-";
+	}
+
+	pr_info(" `- Got %#x peer %#x (name %s%.*s dir %s)\n",
 		ui->ue->ino, ui->ue->peer,
-		ui->name ? (ui->name[0] ? ui->name : &ui->name[1]) : "-",
+		prefix, ulen, uname,
 		ui->name_dir ? ui->name_dir : "-");
+
 	list_add_tail(&ui->list, &unix_sockets);
 	return file_desc_add(&ui->d, ui->ue->id, &unix_desc_ops);
 }

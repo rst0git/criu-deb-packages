@@ -565,7 +565,8 @@ int main(int argc, char *argv[], char *envp[])
 			if (!strcmp("net", optarg))
 				opts.empty_ns |= CLONE_NEWNET;
 			else {
-				pr_err("Unsupported empty namespace: %s", optarg);
+				pr_err("Unsupported empty namespace: %s\n",
+						optarg);
 				return 1;
 			}
 			break;
@@ -646,6 +647,11 @@ int main(int argc, char *argv[], char *envp[])
 		goto usage;
 	}
 
+	if (!strcmp(argv[optind], "exec")) {
+		pr_msg("The \"exec\" action is deprecated by the Compel library.\n");
+		return -1;
+	}
+
 	has_sub_command = (argc - optind) > 1;
 
 	if (has_exec_cmd) {
@@ -671,8 +677,7 @@ int main(int argc, char *argv[], char *envp[])
 		opts.exec_cmd[argc - optind - 1] = NULL;
 	} else {
 		/* No subcommands except for cpuinfo and restore --exec-cmd */
-		if ((strcmp(argv[optind], "cpuinfo") && strcmp(argv[optind], "exec"))
-				&& has_sub_command) {
+		if (strcmp(argv[optind], "cpuinfo") && has_sub_command) {
 			pr_msg("Error: excessive parameter%s for command %s\n",
 				(argc - optind) > 2 ? "s" : "", argv[optind]);
 			goto usage;
@@ -706,6 +711,7 @@ int main(int argc, char *argv[], char *envp[])
 	if (log_init(opts.output))
 		return 1;
 	libsoccr_set_log(log_level, print_on_level);
+	compel_log_init(vprint_on_level, log_get_loglevel());
 
 	pr_debug("Version: %s (gitid %s)\n", CRIU_VERSION, CRIU_GITID);
 	if (opts.deprecated_ok)
@@ -764,14 +770,6 @@ int main(int argc, char *argv[], char *envp[])
 	if (!strcmp(argv[optind], "check"))
 		return cr_check() != 0;
 
-	if (!strcmp(argv[optind], "exec")) {
-		if (!pid)
-			pid = tree_id; /* old usage */
-		if (!pid)
-			goto opt_pid_missing;
-		return cr_exec(pid, argv + optind + 1) != 0;
-	}
-
 	if (!strcmp(argv[optind], "page-server"))
 		return cr_page_server(opts.daemon_mode, -1) != 0;
 
@@ -799,7 +797,6 @@ usage:
 "  criu dump|pre-dump -t PID [<options>]\n"
 "  criu restore [<options>]\n"
 "  criu check [--feature FEAT]\n"
-"  criu exec -p PID <syscall-string>\n"
 "  criu page-server\n"
 "  criu service [<options>]\n"
 "  criu dedup\n"
@@ -809,7 +806,6 @@ usage:
 "  pre-dump       pre-dump task(s) minimizing their frozen time\n"
 "  restore        restore a process/tree\n"
 "  check          checks whether the kernel support is up-to-date\n"
-"  exec           execute a system call by other task\n"
 "  page-server    launch page server\n"
 "  service        launch service\n"
 "  dedup          remove duplicates in memory dump\n"
