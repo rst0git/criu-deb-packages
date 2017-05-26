@@ -52,7 +52,7 @@
 			: "sp", "x0", "memory")
 
 
-#define kdat_compat_sigreturn_test()			0
+#define kdat_compatible_cr()			0
 
 int restore_gpregs(struct rt_sigframe *f, UserAarch64RegsEntry *r);
 int restore_nonsigframe_gpregs(UserAarch64RegsEntry *r);
@@ -64,7 +64,13 @@ static inline void restore_tls(tls_t *ptls)
 
 static inline void *alloc_compat_syscall_stack(void) { return NULL; }
 static inline void free_compat_syscall_stack(void *stack32) { }
-static inline int
-arch_compat_rt_sigaction(void *stack, int sig, void *act) { return -1; }
+static inline int arch_compat_rt_sigaction(void *stack, int sig, void *act)
+{
+	return -1;
+}
+static inline int set_compat_robust_list(uint32_t head_ptr, uint32_t len)
+{
+	return -1;
+}
 
 #endif

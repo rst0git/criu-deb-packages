@@ -13,52 +13,26 @@ $(__nmk_dir)%.mk: ;
 include $(__nmk_dir)include.mk
 include $(__nmk_dir)macro.mk
 
-CFLAGS		+= $(USERCFLAGS)
-export CFLAGS
+ifeq ($(origin HOSTCFLAGS), undefined)
+        HOSTCFLAGS := $(CFLAGS) $(USERCFLAGS)
+endif
 
-HOSTCFLAGS	?= $(CFLAGS)
-export HOSTCFLAGS
+UNAME-M := $(shell uname -m)
 
 #
-# Architecture specific options.
-ifneq ($(filter-out x86 arm arm64 ppc64,$(ARCH)),)
+# Supported Architectures
+ifneq ($(filter-out x86 arm aarch64 ppc64,$(ARCH)),)
         $(error "The architecture $(ARCH) isn't supported")
 endif
 
-ifeq ($(ARCH),x86)
-        SRCARCH		:= x86
-        LDARCH		:= i386:x86-64
-        VDSO		:= y
+# The PowerPC 64 bits architecture could be big or little endian.
+# They are handled in the same way.
+ifeq ($(UNAME-M),ppc64)
+        error := $(error ppc64 big endian is not yet supported)
 endif
 
-ifeq ($(ARCH),arm)
-        SRCARCH		:= arm
-endif
-
-ifeq ($(ARCH),arm64)
-        ARCH		:= aarch64
-        SRCARCH		:= aarch64
-        VDSO		:= y
-endif
-
-ifeq ($(ARCH),ppc64)
-        SRCARCH		:= ppc64
-        LDARCH		:= powerpc:common64
-        VDSO		:= y
-endif
-
-LDARCH ?= $(SRCARCH)
-
-export SRCARCH LDARCH VDSO
-
-SRCARCH			?= $(ARCH)
-LDARCH			?= $(SRCARCH)
-
-export SRCARCH LDARCH VDSO
-
-UNAME-M := $(shell uname -m)
-export UNAME-M
-
+#
+# Architecture specific options.
 ifeq ($(ARCH),arm)
         ARMV		:= $(shell echo $(UNAME-M) | sed -nr 's/armv([[:digit:]]).*/\1/p; t; i7')
         DEFINES		:= -DCONFIG_ARMV$(ARMV)
@@ -75,33 +49,30 @@ ifeq ($(ARCH),arm)
 endif
 
 ifeq ($(ARCH),aarch64)
-	DEFINES		:= -DCONFIG_AARCH64
+        VDSO		:= y
+        DEFINES		:= -DCONFIG_AARCH64
 endif
 
-ifeq ($(ARCH),x86)
-        DEFINES		:= -DCONFIG_X86_64
-endif
-
-#
-# The PowerPC 64 bits architecture could be big or little endian.
-# They are handled in the same way.
-#
 ifeq ($(ARCH),ppc64)
-        ifeq ($(UNAME-M),ppc64)
-                error := $(error ppc64 big endian not yet supported)
-        endif
-
+        LDARCH		:= powerpc:common64
+        VDSO		:= y
         DEFINES		:= -DCONFIG_PPC64
 endif
 
-export PROTOUFIX DEFINES USERCFLAGS
+ifeq ($(ARCH),x86)
+        LDARCH		:= i386:x86-64
+        VDSO		:= y
+        DEFINES		:= -DCONFIG_X86_64
+endif
+
+LDARCH ?= $(SRCARCH)
+export LDARCH VDSO
+export PROTOUFIX DEFINES
 
 #
 # Independent options for all tools.
 DEFINES			+= -D_FILE_OFFSET_BITS=64
 DEFINES			+= -D_GNU_SOURCE
-
-CFLAGS			+= $(USERCFLAGS)
 
 WARNINGS		:= -Wall -Wformat-security
 
@@ -136,7 +107,9 @@ ifeq ($(GMON),1)
 export GMON GMONLDOPT
 endif
 
-CFLAGS			+= $(WARNINGS) $(DEFINES) -iquote include/
+CFLAGS			+= $(USERCFLAGS) $(WARNINGS) $(DEFINES) -iquote include/
+HOSTCFLAGS		+= $(WARNINGS) $(DEFINES) -iquote include/
+export CFLAGS USERCLFAGS HOSTCFLAGS
 
 # Default target
 all: criu lib
@@ -194,7 +167,7 @@ criu-deps	+= include/common/asm
 #
 # Configure variables.
 export CONFIG_HEADER := criu/include/config.h
-ifeq ($(filter clean mrproper,$(MAKECMDGOALS)),)
+ifeq ($(filter tags etags cscope clean mrproper,$(MAKECMDGOALS)),)
 include Makefile.config
 else
 # To clean all files, enable make/build options here

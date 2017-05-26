@@ -29,6 +29,7 @@
 #include "sk-inet.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include <compel/compel.h>
+#include "netfilter.h"
 
 struct kerndat_s kdat = {
 };
@@ -441,22 +442,19 @@ static int get_ipv6()
 	return 0;
 }
 
-int kerndat_loginuid(bool only_dump)
+int kerndat_loginuid(void)
 {
 	unsigned int saved_loginuid;
 	int ret;
 
-	kdat.has_loginuid = false;
+	kdat.luid = LUID_NONE;
 
 	/* No such file: CONFIG_AUDITSYSCALL disabled */
 	saved_loginuid = parse_pid_loginuid(PROC_SELF, &ret, true);
 	if (ret < 0)
 		return 0;
 
-	if (only_dump) {
-		kdat.has_loginuid = true;
-		return 0;
-	}
+	kdat.luid = LUID_READ;
 
 	/*
 	 * From kernel v3.13-rc2 it's possible to unset loginuid value,
@@ -469,7 +467,7 @@ int kerndat_loginuid(bool only_dump)
 	if (prepare_loginuid(saved_loginuid, LOG_WARN) < 0)
 		return 0;
 
-	kdat.has_loginuid = true;
+	kdat.luid = LUID_FULL;
 	return 0;
 }
 
@@ -557,17 +555,101 @@ err:
 
 static int kerndat_compat_restore(void)
 {
-	int ret = kdat_compat_sigreturn_test();
+	int ret = kdat_compatible_cr();
 
 	if (ret < 0) /* failure */
 		return ret;
-	kdat.has_compat_sigreturn = !!ret;
+	kdat.compat_cr = !!ret;
 	return 0;
+}
+
+#define KERNDAT_CACHE_FILE	KDAT_RUNDIR"/criu.kdat"
+#define KERNDAT_CACHE_FILE_TMP	KDAT_RUNDIR"/.criu.kdat"
+
+static int kerndat_try_load_cache(void)
+{
+	int fd, ret;
+
+	fd = open(KERNDAT_CACHE_FILE, O_RDONLY);
+	if (fd < 0) {
+		pr_warn("Can't load %s\n", KERNDAT_CACHE_FILE);
+		return 1;
+	}
+
+	ret = read(fd, &kdat, sizeof(kdat));
+	if (ret < 0) {
+		pr_perror("Can't read kdat cache");
+		return -1;
+	}
+
+	close(fd);
+
+	if (ret != sizeof(kdat) ||
+			kdat.magic1 != KDAT_MAGIC ||
+			kdat.magic2 != KDAT_MAGIC_2) {
+		pr_warn("Stale %s file\n", KERNDAT_CACHE_FILE);
+		unlink(KERNDAT_CACHE_FILE);
+		return 1;
+	}
+
+	pr_info("Loaded kdat cache from %s\n", KERNDAT_CACHE_FILE);
+	return 0;
+}
+
+static void kerndat_save_cache(void)
+{
+	int fd, ret;
+	struct statfs s;
+
+	fd = open(KERNDAT_CACHE_FILE_TMP, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	if (fd < 0)
+		/*
+		 * It can happen that we race with some other criu
+		 * instance. That's OK, just ignore this error and
+		 * proceed.
+		 */
+		return;
+
+	if (fstatfs(fd, &s) < 0 || s.f_type != TMPFS_MAGIC) {
+		pr_warn("Can't keep kdat cache on non-tempfs\n");
+		close(fd);
+		goto unl;
+	}
+
+	/*
+	 * One magic to make sure we're reading the kdat file.
+	 * One more magic to make somehow sure we don't read kdat
+	 * from some other criu
+	 */
+	kdat.magic1 = KDAT_MAGIC;
+	kdat.magic2 = KDAT_MAGIC_2;
+	ret = write(fd, &kdat, sizeof(kdat));
+	close(fd);
+
+	if (ret == sizeof(kdat))
+		ret = rename(KERNDAT_CACHE_FILE_TMP, KERNDAT_CACHE_FILE);
+	else {
+		ret = -1;
+		errno = EIO;
+	}
+
+	if (ret < 0) {
+		pr_perror("Couldn't save %s", KERNDAT_CACHE_FILE);
+unl:
+		unlink(KERNDAT_CACHE_FILE_TMP);
+	}
 }
 
 int kerndat_init(void)
 {
 	int ret;
+
+	ret = kerndat_try_load_cache();
+	if (ret <= 0)
+		return ret;
+
+	preload_socket_modules();
+	preload_netfilter_modules();
 
 	ret = check_pagemap();
 	if (!ret)
@@ -585,61 +667,21 @@ int kerndat_init(void)
 	if (!ret)
 		ret = get_ipv6();
 	if (!ret)
-		ret = kerndat_loginuid(true);
+		ret = kerndat_loginuid();
 	if (!ret)
 		ret = kerndat_iptables_has_xtlocks();
 	if (!ret)
 		ret = kerndat_tcp_repair();
 	if (!ret)
 		ret = kerndat_compat_restore();
-
-	kerndat_lsm();
-	kerndat_mmap_min_addr();
-
-	return ret;
-}
-
-int kerndat_init_rst(void)
-{
-	int ret;
-
-	/*
-	 * Read TCP sysctls before anything else,
-	 * since the limits we're interested in are
-	 * not available inside namespaces.
-	 */
-
-	ret = check_pagemap();
-	if (!ret)
-		ret = get_last_cap();
 	if (!ret)
 		ret = kerndat_has_memfd_create();
-	if (!ret)
-		ret = get_task_size();
-	if (!ret)
-		ret = get_ipv6();
-	if (!ret)
-		ret = kerndat_loginuid(false);
-	if (!ret)
-		ret = kerndat_iptables_has_xtlocks();
-	if (!ret)
-		ret = kerndat_tcp_repair();
-	if (!ret)
-		ret = kerndat_compat_restore();
 
 	kerndat_lsm();
 	kerndat_mmap_min_addr();
 
-	return ret;
-}
-
-int kerndat_init_cr_exec(void)
-{
-	int ret;
-
-	ret = get_task_size();
 	if (!ret)
-		ret = kerndat_compat_restore();
+		kerndat_save_cache();
 
 	return ret;
 }

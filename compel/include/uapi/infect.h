@@ -16,16 +16,17 @@
 extern int compel_interrupt_task(int pid);
 
 struct seize_task_status {
-	char			state;
-	int			ppid;
 	unsigned long long	sigpnd;
 	unsigned long long	shdpnd;
+	char			state;
+	int			ppid;
 	int			seccomp_mode;
 };
 
 extern int compel_wait_task(int pid, int ppid,
-		int (*get_status)(int pid, struct seize_task_status *),
-		struct seize_task_status *st);
+		int (*get_status)(int pid, struct seize_task_status *, void *data),
+		void (*free_status)(int pid, struct seize_task_status *, void *data),
+		struct seize_task_status *st, void *data);
 
 extern int compel_stop_task(int pid);
 extern int compel_resume_task(pid_t pid, int orig_state, int state);
@@ -123,7 +124,7 @@ extern struct infect_ctx *compel_infect_ctx(struct parasite_ctl *);
 #define INFECT_NO_MEMFD		0x1	/* don't use memfd() */
 #define INFECT_FAIL_CONNECT	0x2	/* make parasite connect() fail */
 #define INFECT_NO_BREAKPOINTS	0x4	/* no breakpoints in pie tracking */
-#define INFECT_HAS_COMPAT_SIGRETURN 0x8
+#define INFECT_COMPATIBLE	0x8	/* can run parasite inside compat tasks */
 
 /*
  * There are several ways to describe a blob to compel

@@ -299,8 +299,9 @@ TST_STATE	=				\
 		conntracks			\
 		route_rules			\
 
+AUX_SRC	= get_smaps_bits.c ofd_file_locks.c
 
-SRC	= $(TST:%=%.c)
+SRC	= $(TST:%=%.c) $(AUX_SRC)
 OBJ	= $(SRC:%.c=%.o)
 DEP	= $(SRC:%.c=%.d)
 PID	= $(TST:%=%.pid)
@@ -313,9 +314,6 @@ include ../Makefile.inc
 all:	$(TST) criu-rtc.so
 install: all
 .PHONY: all install
-
-inotify_system_nodel.c: inotify_system.c
-	ln -sf inotify_system.c inotify_system_nodel.c
 
 $(TST_NOFILE:%=%.pid):	%.pid:	%
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out
@@ -387,6 +385,7 @@ $(TST):	| $(LIB)
 
 aio00:			LDLIBS += -laio
 different_creds:	LDLIBS += -lcap
+file_locks06 file_locks07 file_locks08:	ofd_file_locks.o
 futex:			CFLAGS += -pthread
 futex:			LDFLAGS += -pthread
 futex-rl:		CFLAGS += -pthread
@@ -457,7 +456,7 @@ $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)
 
 clean-more:
-	$(RM) criu-rtc.so criu-rtc.pb-c.c criu-rtc.pb-c.h get_smaps_bits.o
+	$(RM) criu-rtc.so criu-rtc.pb-c.c criu-rtc.pb-c.h
 .PHONY: clean-more
 clean: clean-more
 

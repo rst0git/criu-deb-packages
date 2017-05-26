@@ -490,7 +490,7 @@ static int collect_children(struct pstree_item *item)
 			goto free;
 		}
 
-		ret = compel_wait_task(pid, item->pid->real, parse_pid_status, &creds->s);
+		ret = compel_wait_task(pid, item->pid->real, parse_pid_status, NULL, &creds->s, NULL);
 		if (ret < 0) {
 			/*
 			 * Here is a race window between parse_children() and seize(),
@@ -629,9 +629,7 @@ static inline bool thread_collected(struct pstree_item *i, pid_t tid)
 static bool creds_dumpable(struct proc_status_creds *parent,
 				struct proc_status_creds *child)
 {
-	const size_t size = sizeof(struct proc_status_creds) -
-			offsetof(struct proc_status_creds, cap_inh);
-
+	size_t size;
 	/*
 	 * The comparison rules are the following
 	 *
@@ -640,17 +638,20 @@ static bool creds_dumpable(struct proc_status_creds *parent,
 	 *    semantic comparison (FIXME) but for
 	 *    now we require them to be exactly
 	 *    identical
+	 *  - sigpnd may be different
 	 *  - the rest of members must match
 	 */
 
-	if (memcmp(parent, child, size)) {
+	size = offsetof(struct proc_status_creds, cap_inh) -
+	       sizeof(parent->s.sigpnd);
+
+	if (memcmp(&parent->s.sigpnd, &child->s.sigpnd, size)) {
 		if (!pr_quelled(LOG_DEBUG)) {
 			pr_debug("Creds undumpable (parent:child)\n"
 				 "  uids:               %d:%d %d:%d %d:%d %d:%d\n"
 				 "  gids:               %d:%d %d:%d %d:%d %d:%d\n"
 				 "  state:              %d:%d"
 				 "  ppid:               %d:%d\n"
-				 "  sigpnd:             %llu:%llu\n"
 				 "  shdpnd:             %llu:%llu\n"
 				 "  seccomp_mode:       %d:%d\n"
 				 "  last_filter:        %u:%u\n",
@@ -664,7 +665,6 @@ static bool creds_dumpable(struct proc_status_creds *parent,
 				 parent->gids[3], child->gids[3],
 				 parent->s.state, child->s.state,
 				 parent->s.ppid, child->s.ppid,
-				 parent->s.sigpnd, child->s.sigpnd,
 				 parent->s.shdpnd, child->s.shdpnd,
 				 parent->s.seccomp_mode, child->s.seccomp_mode,
 				 parent->last_filter, child->last_filter);
@@ -716,7 +716,7 @@ static int collect_threads(struct pstree_item *item)
 		if (!opts.freeze_cgroup && compel_interrupt_task(pid))
 			continue;
 
-		ret = compel_wait_task(pid, item_ppid(item), parse_pid_status, &t_creds.s);
+		ret = compel_wait_task(pid, item_ppid(item), parse_pid_status, NULL, &t_creds.s, NULL);
 		if (ret < 0) {
 			/*
 			 * Here is a race window between parse_threads() and seize(),
@@ -855,7 +855,7 @@ int collect_pstree(void)
 	if (!creds)
 		goto err;
 
-	ret = compel_wait_task(pid, -1, parse_pid_status, &creds->s);
+	ret = compel_wait_task(pid, -1, parse_pid_status, NULL, &creds->s, NULL);
 	if (ret < 0)
 		goto err;
 
