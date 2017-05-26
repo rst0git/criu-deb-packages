@@ -1,3 +1,10 @@
+criu (3.0-1) experimental; urgency=medium
+
+  * New upstream version 3.0
+  * debian/copyright: Update copyright information for new files
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Fri, 26 May 2017 07:18:51 +0200
+
 criu (2.12.1-2) unstable; urgency=medium
 
   * Upload to unstable
