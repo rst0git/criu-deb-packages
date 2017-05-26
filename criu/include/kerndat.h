@@ -11,11 +11,9 @@ struct stat;
  */
 
 extern int kerndat_init(void);
-extern int kerndat_init_rst(void);
-extern int kerndat_init_cr_exec(void);
 extern int kerndat_get_dirty_track(void);
 extern int kerndat_fdinfo_has_lock(void);
-extern int kerndat_loginuid(bool only_dump);
+extern int kerndat_loginuid(void);
 
 enum pagemap_func {
 	PM_UNKNOWN,
@@ -24,7 +22,14 @@ enum pagemap_func {
 	PM_FULL,
 };
 
+enum loginuid_func {
+	LUID_NONE,
+	LUID_READ,
+	LUID_FULL,
+};
+
 struct kerndat_s {
+	u32 magic1, magic2;
 	dev_t shmem_dev;
 	int last_cap;
 	u64 zero_page_pfn;
@@ -33,8 +38,8 @@ struct kerndat_s {
 	bool has_fdinfo_lock;
 	unsigned long task_size;
 	bool ipv6;
-	bool has_loginuid;
-	bool has_compat_sigreturn;
+	enum loginuid_func luid;
+	bool compat_cr;
 	enum pagemap_func pmap;
 	unsigned int has_xtlocks;
 	unsigned long mmap_min_addr;

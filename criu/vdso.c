@@ -229,18 +229,27 @@ err:
 static int vdso_parse_maps(pid_t pid, struct vdso_symtable *s)
 {
 	int exit_code = -1;
-	char buf[512];
-	FILE *maps;
+	char *buf;
+	struct bfd f;
 
 	*s = (struct vdso_symtable)VDSO_SYMTABLE_INIT;
 
-	maps = fopen_proc(pid, "maps");
-	if (!maps)
+	f.fd = open_proc(pid, "maps");
+	if (f.fd < 0)
 		return -1;
 
-	while (fgets(buf, sizeof(buf), maps)) {
+	if (bfdopenr(&f))
+		goto err;
+
+	while (1) {
 		unsigned long start, end;
 		char *has_vdso, *has_vvar;
+
+		buf = breadline(&f);
+		if (buf == NULL)
+			break;
+		if (IS_ERR(buf))
+			goto err;
 
 		has_vdso = strstr(buf, "[vdso]");
 		if (!has_vdso)
@@ -275,7 +284,7 @@ static int vdso_parse_maps(pid_t pid, struct vdso_symtable *s)
 
 	exit_code = 0;
 err:
-	fclose(maps);
+	bclose(&f);
 	return exit_code;
 }
 
@@ -455,7 +464,7 @@ int vdso_init(void)
 		pr_err("Failed to fill self vdso symtable\n");
 		return -1;
 	}
-	if (kdat.has_compat_sigreturn &&
+	if (kdat.compat_cr &&
 			vdso_fill_compat_symtable(&vdso_sym_rt, &vdso_compat_rt)) {
 		pr_err("Failed to fill compat vdso symtable\n");
 		return -1;

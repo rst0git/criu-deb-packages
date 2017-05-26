@@ -12,10 +12,17 @@
 extern void restore_tls(tls_t *ptls);
 extern int arch_compat_rt_sigaction(void *stack32, int sig,
 		rt_sigaction_t_compat *act);
+extern int set_compat_robust_list(uint32_t head_ptr, uint32_t len);
 #else /* CONFIG_COMPAT */
 static inline void restore_tls(tls_t *ptls) { }
-static inline int
-arch_compat_rt_sigaction(void *stack, int sig, void *act) { return -1; }
+static inline int arch_compat_rt_sigaction(void *stack, int sig, void *act)
+{
+	return -1;
+}
+static inline int set_compat_robust_list(uint32_t head_ptr, uint32_t len)
+{
+	return -1;
+}
 #endif /* !CONFIG_COMPAT */
 
 #define RUN_CLONE_RESTORE_FN(ret, clone_flags, new_sp, parent_tid,      \
@@ -69,7 +76,7 @@ arch_compat_rt_sigaction(void *stack, int sig, void *act) { return -1; }
 # define ARCH_MAP_VDSO_32		0x2002
 #endif
 
-extern int kdat_compat_sigreturn_test(void);
+extern int kdat_compatible_cr(void);
 
 static inline void
 __setup_sas_compat(struct ucontext_ia32* uc, ThreadSasEntry *sas)

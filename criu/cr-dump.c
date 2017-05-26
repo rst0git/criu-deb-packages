@@ -341,7 +341,7 @@ static int dump_pid_misc(pid_t pid, TaskCoreEntry *tc)
 {
 	int ret;
 
-	if (kdat.has_loginuid) {
+	if (kdat.luid != LUID_NONE) {
 		pr_info("dumping /proc/%d/loginuid\n", pid);
 
 		tc->has_loginuid = true;
@@ -673,8 +673,18 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 	ThreadCoreEntry *tc = core->thread_core;
 
 	ret = collect_lsm_profile(pid, tc->creds);
-	if (!ret)
-		ret = get_task_futex_robust_list(pid, tc);
+	if (!ret) {
+		/*
+		 * XXX: It's possible to set two: 32-bit and 64-bit
+		 * futex list's heads. That makes about no sense, but
+		 * it's possible. Until we meet such application, dump
+		 * only one: native or compat futex's list pointer.
+		 */
+		if (!core_is_compat(core))
+			ret = get_task_futex_robust_list(pid, tc);
+		else
+			ret = get_task_futex_robust_list_compat(pid, tc);
+	}
 	if (!ret)
 		ret = dump_sched_info(pid, tc);
 	if (!ret) {
@@ -1332,7 +1342,7 @@ static int dump_one_task(struct pstree_item *item)
 	if (ret)
 		goto err_cure;
 
-	ret = parasite_dump_sigacts_seized(parasite_ctl, cr_imgset);
+	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
 	if (ret) {
 		pr_err("Can't dump sigactions (pid: %d) with parasite\n", pid);
 		goto err_cure;
