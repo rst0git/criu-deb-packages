@@ -59,7 +59,23 @@ struct ghost_file {
 static u32 ghost_file_ids = 1;
 static LIST_HEAD(ghost_files);
 
-static mutex_t *ghost_file_mutex;
+/*
+ * When opening remaps we first create a link on the remap
+ * target, then open one, then unlink. In case the remap
+ * source has more than one instance, these tree steps
+ * should be serialized with each other.
+ */
+static mutex_t *remap_open_lock;
+
+static inline int init_remap_lock(void)
+{
+	remap_open_lock = shmalloc(sizeof(*remap_open_lock));
+	if (!remap_open_lock)
+		return -1;
+
+	mutex_init(remap_open_lock);
+	return 0;
+}
 
 static LIST_HEAD(remaps);
 
@@ -259,6 +275,13 @@ static int collect_remap_ghost(struct reg_file_info *rfi,
 	if (!gf)
 		return -1;
 
+	/*
+	 * The rpath is shmalloc-ed because we create the ghost
+	 * file in root task context and generate its path there.
+	 * However the path should be visible by the criu task
+	 * in order to remove the ghost files from root FS (see
+	 * try_clean_remaps()).
+	 */
 	gf->remap.rpath = shmalloc(PATH_MAX);
 	if (!gf->remap.rpath)
 		return -1;
@@ -374,7 +397,7 @@ static int open_remap_linked(struct reg_file_info *rfi,
 	return 0;
 }
 
-static int open_remap_dead_process(struct reg_file_info *rfi,
+static int collect_remap_dead_process(struct reg_file_info *rfi,
 		RemapFilePathEntry *rfe)
 {
 	struct pstree_item *helper;
@@ -434,12 +457,21 @@ static int collect_one_remap(void *obj, ProtobufCMessage *msg, struct cr_img *i)
 
 	ri->rfi = container_of(fdesc, struct reg_file_info, d);
 
-	if (rfe->remap_type == REMAP_TYPE__GHOST) {
+	switch (rfe->remap_type) {
+	case REMAP_TYPE__GHOST:
 		if (collect_remap_ghost(ri->rfi, ri->rfe))
 			return -1;
-	} else if (rfe->remap_type == REMAP_TYPE__LINKED) {
+		break;
+	case REMAP_TYPE__LINKED:
 		if (collect_remap_linked(ri->rfi, ri->rfe))
 			return -1;
+		break;
+	case REMAP_TYPE__PROCFS:
+		if (collect_remap_dead_process(ri->rfi, rfe) < 0)
+			return -1;
+		break;
+	default:
+		break;
 	}
 
 	list_add_tail(&ri->list, &remaps);
@@ -463,7 +495,7 @@ static int prepare_one_remap(struct remap_info *ri)
 		ret = open_remap_ghost(rfi, rfe);
 		break;
 	case REMAP_TYPE__PROCFS:
-		/* handled earlier by prepare_procfs_remaps */
+		/* handled earlier by collect_remap_dead_process */
 		ret = 0;
 		break;
 	default:
@@ -475,35 +507,14 @@ out:
 	return ret;
 }
 
-/* We separate the preparation of PROCFS remaps because they allocate pstree
- * items, which need to be seen by the root task. We can't do all remaps here,
- * because the files haven't been loaded yet.
- */
-int prepare_procfs_remaps(void)
-{
-	struct remap_info *ri;
-
-	list_for_each_entry(ri, &remaps, list) {
-		RemapFilePathEntry *rfe = ri->rfe;
-		struct reg_file_info *rfi = ri->rfi;
-
-		switch (rfe->remap_type) {
-		case REMAP_TYPE__PROCFS:
-			if (open_remap_dead_process(rfi, rfe) < 0)
-				return -1;
-			break;
-		default:
-			continue;
-		}
-	}
-
-	return 0;
-}
-
 int prepare_remaps(void)
 {
 	struct remap_info *ri;
 	int ret = 0;
+
+	ret = init_remap_lock();
+	if (ret)
+		return ret;
 
 	list_for_each_entry(ri, &remaps, list) {
 		ret = prepare_one_remap(ri);
@@ -514,7 +525,7 @@ int prepare_remaps(void)
 	return ret;
 }
 
-static int clean_linked_remap(struct remap_info *ri)
+static int clean_one_remap(struct remap_info *ri)
 {
 	char path[PATH_MAX];
 	int mnt_id, ret, rmntns_root;
@@ -559,11 +570,11 @@ int try_clean_remaps(bool only_ghosts)
 
 	list_for_each_entry(ri, &remaps, list) {
 		if (ri->rfe->remap_type == REMAP_TYPE__GHOST)
-			ret |= clean_linked_remap(ri);
+			ret |= clean_one_remap(ri);
 		else if (only_ghosts)
 			continue;
 		else if (ri->rfe->remap_type == REMAP_TYPE__LINKED)
-			ret |= clean_linked_remap(ri);
+			ret |= clean_one_remap(ri);
 	}
 
 	return ret;
@@ -639,14 +650,11 @@ struct file_remap *lookup_ghost_remap(u32 dev, u32 ino)
 {
 	struct ghost_file *gf;
 
-	mutex_lock(ghost_file_mutex);
 	list_for_each_entry(gf, &ghost_files, list) {
 		if (gf->ino == ino && (gf->dev == dev)) {
-			mutex_unlock(ghost_file_mutex);
 			return &gf->remap;
 		}
 	}
-	mutex_unlock(ghost_file_mutex);
 
 	return NULL;
 }
@@ -1458,7 +1466,7 @@ int open_path(struct file_desc *d,
 			BUG();
 		}
 
-		mutex_lock(ghost_file_mutex);
+		mutex_lock(remap_open_lock);
 		if (rfi->remap->is_dir) {
 			/*
 			 * FIXME Can't make directory under new name.
@@ -1544,7 +1552,7 @@ ext:
 			rm_parent_dirs(mntns_root, rfi->path, level);
 		}
 
-		mutex_unlock(ghost_file_mutex);
+		mutex_unlock(remap_open_lock);
 	}
 	if (orig_path)
 		rfi->path = orig_path;
@@ -1616,6 +1624,60 @@ int open_reg_by_id(u32 id)
 	return open_reg_fd(fd);
 }
 
+struct filemap_ctx {
+	u32 flags;
+	struct file_desc *desc;
+	int fd;
+	/*
+	 * Whether or not to close the fd when we're about to
+	 * put a new one into ctx.
+	 *
+	 * True is used by premap, so that it just calls vm_open
+	 * in sequence, immediatelly mmap()s the file, then it
+	 * can be closed.
+	 *
+	 * False is used by open_vmas() which pre-opens the files
+	 * for restorer, and the latter mmap()s them and closes.
+	 *
+	 * ...
+	 */
+	bool close;
+	/* ...
+	 *
+	 * but closing all vmas won't work, as some of them share
+	 * the descriptor, so only the ones that terminate the
+	 * fd-sharing chain are marked with VMA_CLOSE flag, saying
+	 * restorer to close the vma's fd.
+	 *
+	 * Said that, this vma pointer references the previously
+	 * seen vma, so that once fd changes, this one gets the
+	 * closing flag.
+	 */
+	struct vma_area *vma;
+};
+
+static struct filemap_ctx ctx;
+
+void filemap_ctx_init(bool auto_close)
+{
+	ctx.desc = NULL;	/* to fail the first comparison in open_ */
+	ctx.fd = -1;		/* not to close random fd in _fini */
+	ctx.vma = NULL;		/* not to put spurious VMA_CLOSE in _fini */
+				/* flags may remain any */
+	ctx.close = auto_close;
+}
+
+void filemap_ctx_fini(void)
+{
+	if (ctx.close) {
+		if (ctx.fd >= 0)
+			close(ctx.fd);
+	} else {
+		if (ctx.vma)
+			ctx.vma->e->status |= VMA_CLOSE;
+	}
+}
+
 static int open_filemap(int pid, struct vma_area *vma)
 {
 	u32 flags;
@@ -1627,26 +1689,39 @@ static int open_filemap(int pid, struct vma_area *vma)
 	 * We open file w/o lseek, as mappings don't care about it
 	 */
 
-	BUG_ON(vma->vmfd == NULL);
-	if (vma->e->has_fdflags)
-		flags = vma->e->fdflags;
-	else if ((vma->e->prot & PROT_WRITE) &&
-			vma_area_is(vma, VMA_FILE_SHARED))
-		flags = O_RDWR;
-	else
-		flags = O_RDONLY;
+	BUG_ON((vma->vmfd == NULL) || !vma->e->has_fdflags);
+	flags = vma->e->fdflags;
 
-	ret = open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
-	if (ret < 0)
-		return ret;
+	if (ctx.flags != flags || ctx.desc != vma->vmfd) {
+		ret = open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
+		if (ret < 0)
+			return ret;
 
-	vma->e->fd = ret;
+		filemap_ctx_fini();
+
+		ctx.flags = flags;
+		ctx.desc = vma->vmfd;
+		ctx.fd = ret;
+	}
+
+	ctx.vma = vma;
+	vma->e->fd = ctx.fd;
 	return 0;
 }
 
 int collect_filemap(struct vma_area *vma)
 {
 	struct file_desc *fd;
+
+	if (!vma->e->has_fdflags) {
+		/* Make a wild guess for the fdflags */
+		vma->e->has_fdflags = true;
+		if ((vma->e->prot & PROT_WRITE) &&
+				vma_area_is(vma, VMA_FILE_SHARED))
+			vma->e->fdflags = O_RDWR;
+		else
+			vma->e->fdflags = O_RDONLY;
+	}
 
 	fd = collect_special_file(vma->e->shmid);
 	if (!fd)
@@ -1728,16 +1803,6 @@ static struct collect_image_info reg_file_cinfo = {
 	.collect = collect_one_regfile,
 	.flags = COLLECT_SHARED,
 };
-
-int prepare_shared_reg_files(void)
-{
-	ghost_file_mutex = shmalloc(sizeof(*ghost_file_mutex));
-	if (!ghost_file_mutex)
-		return -1;
-
-	mutex_init(ghost_file_mutex);
-	return 0;
-}
 
 int collect_remaps_and_regfiles(void)
 {

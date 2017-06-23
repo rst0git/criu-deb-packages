@@ -229,11 +229,6 @@ static int crtools_prepare_shared(void)
 	if (collect_remaps_and_regfiles())
 		return -1;
 
-	/* dead pid remap needs to allocate task helpers which all tasks need
-	 * to see */
-	if (prepare_procfs_remaps())
-		return -1;
-
 	/* Connections are unlocked from criu */
 	if (collect_inet_sockets())
 		return -1;
@@ -267,8 +262,8 @@ static struct collect_image_info *cinfos[] = {
 	&packet_sk_cinfo,
 	&netlink_sk_cinfo,
 	&eventfd_cinfo,
-	&epoll_tfd_cinfo,
 	&epoll_cinfo,
+	&epoll_tfd_cinfo,
 	&signalfd_cinfo,
 	&inotify_cinfo,
 	&inotify_mark_cinfo,
@@ -330,9 +325,6 @@ static int root_prepare_shared(void)
 
 	pr_info("Preparing info about shared resources\n");
 
-	if (prepare_shared_reg_files())
-		return -1;
-
 	if (prepare_remaps())
 		return -1;
 
@@ -364,6 +356,8 @@ static int root_prepare_shared(void)
 
 	if (ret < 0)
 		goto err;
+
+	prepare_cow_vmas();
 
 	ret = prepare_restorer_blob();
 	if (ret)
@@ -1513,11 +1507,9 @@ static int restore_task_with_children(void *_arg)
 	if (current->parent == NULL) {
 		int i;
 
-		if (prepare_shared_tty())
-			goto err;
-
 		if (fdstore_init())
 			goto err;
+
 		if (join_namespaces()) {
 			pr_perror("Join namespaces failed");
 			goto err;
@@ -3144,6 +3136,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	RST_MEM_FIXUP_PPTR(task_args->helpers);
 	RST_MEM_FIXUP_PPTR(task_args->zombies);
 	RST_MEM_FIXUP_PPTR(task_args->seccomp_filters);
+	RST_MEM_FIXUP_PPTR(task_args->vma_ios);
 
 	if (core->tc->has_seccomp_mode)
 		task_args->seccomp_mode = core->tc->seccomp_mode;
