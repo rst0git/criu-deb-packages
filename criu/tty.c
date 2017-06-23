@@ -326,8 +326,11 @@ static mutex_t *tty_mutex;
 
 static bool tty_is_master(struct tty_info *info);
 
-int prepare_shared_tty(void)
+static int init_tty_mutex(void)
 {
+	if (tty_mutex)
+		return 0;
+
 	tty_mutex = shmalloc(sizeof(*tty_mutex));
 	if (!tty_mutex) {
 		pr_err("Can't create ptmx index mutex\n");
@@ -372,7 +375,7 @@ static int tty_get_index(u32 id)
 }
 
 /* Make sure the active pairs do exist */
-static int tty_verify_active_pairs(void * unused)
+static int tty_verify_active_pairs(void)
 {
 	unsigned long i, unpaired_slaves = 0;
 
@@ -1360,7 +1363,7 @@ static int tty_setup_orphan_slavery(void)
 	return 0;
 }
 
-static int tty_setup_slavery(void * unused)
+static int tty_setup_slavery(void)
 {
 	struct tty_info *info, *peer, *m;
 
@@ -1556,6 +1559,15 @@ struct collect_image_info tty_info_cinfo = {
 	.collect	= collect_one_tty_info_entry,
 };
 
+static int prep_tty_restore(void *unused)
+{
+	if (tty_verify_active_pairs())
+		return -1;
+	if (tty_setup_slavery())
+		return -1;
+	return 0;
+}
+
 static int collect_one_tty(void *obj, ProtobufCMessage *msg, struct cr_img *i)
 {
 	struct tty_info *info = obj;
@@ -1626,8 +1638,14 @@ static int collect_one_tty(void *obj, ProtobufCMessage *msg, struct cr_img *i)
 
 	pr_info("Collected tty ID %#x (%s)\n", info->tfe->id, info->driver->name);
 
-	if (add_post_prepare_cb_once(tty_verify_active_pairs, NULL) ||
-	    add_post_prepare_cb_once(tty_setup_slavery, NULL))
+	if (add_post_prepare_cb_once(prep_tty_restore, NULL))
+		return -1;
+
+	/*
+	 * Call it explicitly. Post-callbacks will be called after
+	 * namespaces preparation, while the latter needs this mutex.
+	 */
+	if (init_tty_mutex())
 		return -1;
 
 	info->fdstore_id = -1;
@@ -2152,7 +2170,7 @@ int tty_post_actions(void)
 {
 	if (tty_verify_ctty())
 		return -1;
-	if (tty_verify_active_pairs(NULL))
+	if (tty_verify_active_pairs())
 		return -1;
 	else if (tty_dump_queued_data())
 		return -1;
