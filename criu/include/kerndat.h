@@ -1,6 +1,8 @@
 #ifndef __CR_KERNDAT_H__
 #define __CR_KERNDAT_H__
 
+#include <stdbool.h>
+
 #include "int.h"
 
 struct stat;
@@ -44,6 +46,8 @@ struct kerndat_s {
 	unsigned int has_xtlocks;
 	unsigned long mmap_min_addr;
 	bool has_tcp_half_closed;
+	bool stack_guard_gap_hidden;
+	int lsm;
 };
 
 extern struct kerndat_s kdat;
