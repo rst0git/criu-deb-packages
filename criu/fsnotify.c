@@ -57,6 +57,7 @@ struct fsnotify_mark_info {
 		InotifyWdEntry		*iwe;
 		FanotifyMarkEntry	*fme;
 	};
+	struct pprep_head		prep; /* XXX union with remap */
 	struct file_remap		*remap;
 };
 
@@ -296,18 +297,8 @@ err:
 	return -1;
 }
 
-struct watch_list {
-	struct fsnotify_params fsn_params;
-	struct list_head list;
-	int n;
-};
-
-static int dump_inotify_entry(union fdinfo_entries *e, void *arg)
+static int check_one_wd(InotifyWdEntry *we)
 {
-	struct watch_list *wd_list = (struct watch_list *) arg;
-	struct inotify_wd_entry *wd_entry = (struct inotify_wd_entry *) e;
-	InotifyWdEntry *we = &wd_entry->e;
-
 	pr_info("wd: wd %#08x s_dev %#08x i_ino %#16"PRIx64" mask %#08x\n",
 			we->wd, we->s_dev, we->i_ino, we->mask);
 	pr_info("\t[fhandle] bytes %#08x type %#08x __handle %#016"PRIx64":%#016"PRIx64"\n",
@@ -318,22 +309,15 @@ static int dump_inotify_entry(union fdinfo_entries *e, void *arg)
 		pr_warn_once("\t\tDetected FS_EVENT_ON_CHILD bit "
 			     "in mask (will be ignored on restore)\n");
 
-	if (check_open_handle(we->s_dev, we->i_ino, we->f_handle)) {
-		free_inotify_wd_entry(e);
+	if (check_open_handle(we->s_dev, we->i_ino, we->f_handle))
 		return -1;
-	}
-
-	list_add_tail(&wd_entry->node, &wd_list->list);
-	wd_list->n++;
 
 	return 0;
 }
 
 static int dump_one_inotify(int lfd, u32 id, const struct fd_parms *p)
 {
-	struct watch_list wd_list = {.list = LIST_HEAD_INIT(wd_list.list), .n = 0};
 	InotifyFileEntry ie = INOTIFY_FILE_ENTRY__INIT;
-	union fdinfo_entries *we, *tmp;
 	int exit_code = -1, i, ret;
 
 	ret = fd_has_data(lfd);
@@ -346,17 +330,12 @@ static int dump_one_inotify(int lfd, u32 id, const struct fd_parms *p)
 	ie.flags = p->flags;
 	ie.fown = (FownEntry *)&p->fown;
 
-	if (parse_fdinfo(lfd, FD_TYPES__INOTIFY, dump_inotify_entry, &wd_list))
+	if (parse_fdinfo(lfd, FD_TYPES__INOTIFY, &ie))
 		goto free;
 
-	ie.wd = xmalloc(sizeof(*ie.wd) * wd_list.n);
-	if (!ie.wd)
-		goto free;
-
-	i = 0;
-	list_for_each_entry(we, &wd_list.list, ify.node)
-		ie.wd[i++] = &we->ify.e;
-	ie.n_wd = wd_list.n;
+	for (i = 0; i < ie.n_wd; i++)
+		if (check_one_wd(ie.wd[i]))
+			goto free;
 
 	pr_info("id %#08x flags %#08x\n", ie.id, ie.flags);
 	if (pb_write_one(img_from_set(glob_imgset, CR_FD_INOTIFY_FILE), &ie, PB_INOTIFY_FILE))
@@ -364,27 +343,31 @@ static int dump_one_inotify(int lfd, u32 id, const struct fd_parms *p)
 
 	exit_code = 0;
 free:
+	for (i = 0; i < ie.n_wd; i++)
+		xfree(ie.wd[i]);
 	xfree(ie.wd);
-	list_for_each_entry_safe(we, tmp, &wd_list.list, ify.node)
-		free_inotify_wd_entry(we);
 
 	return exit_code;
 }
 
-static int pre_dump_inotify_entry(union fdinfo_entries *e, void *arg)
-{
-	InotifyWdEntry *we = &e->ify.e;
-	int ret;
-
-	ret = irmap_queue_cache(we->s_dev, we->i_ino, we->f_handle);
-	free_inotify_wd_entry(e);
-
-	return ret;
-}
-
 static int pre_dump_one_inotify(int pid, int lfd)
 {
-	return parse_fdinfo_pid(pid, lfd, FD_TYPES__INOTIFY, pre_dump_inotify_entry, NULL);
+	InotifyFileEntry ie = INOTIFY_FILE_ENTRY__INIT;
+	int i;
+
+	if (parse_fdinfo_pid(pid, lfd, FD_TYPES__INOTIFY, &ie))
+		return -1;
+
+	for (i = 0; i < ie.n_wd; i++) {
+		InotifyWdEntry *we = ie.wd[i];
+
+		if (irmap_queue_cache(we->s_dev, we->i_ino, we->f_handle))
+			return -1;
+
+		xfree(we);
+	}
+
+	return 0;
 }
 
 const struct fdtype_ops inotify_dump_ops = {
@@ -393,11 +376,8 @@ const struct fdtype_ops inotify_dump_ops = {
 	.pre_dump	= pre_dump_one_inotify,
 };
 
-static int dump_fanotify_entry(union fdinfo_entries *e, void *arg)
+static int check_one_mark(FanotifyMarkEntry *fme)
 {
-	struct watch_list *wd_list = (struct watch_list *) arg;
-	FanotifyMarkEntry *fme = &e->ffy.e;
-
 	if (fme->type == MARK_TYPE__INODE) {
 
 		BUG_ON(!fme->ie);
@@ -410,7 +390,7 @@ static int dump_fanotify_entry(union fdinfo_entries *e, void *arg)
 			fme->ie->f_handle->handle[0], fme->ie->f_handle->handle[1]);
 
 		if (check_open_handle(fme->s_dev, fme->ie->i_ino, fme->ie->f_handle))
-			goto out;
+			return -1;
 	}
 
 	if (fme->type == MARK_TYPE__MOUNT) {
@@ -421,7 +401,7 @@ static int dump_fanotify_entry(union fdinfo_entries *e, void *arg)
 		m = lookup_mnt_id(fme->me->mnt_id);
 		if (!m) {
 			pr_err("Can't find mnt_id 0x%x\n", fme->me->mnt_id);
-			goto out;
+			return -1;
 		}
 		if (!(root_ns_mask & CLONE_NEWNS))
 			fme->me->path = m->mountpoint + 1;
@@ -432,20 +412,12 @@ static int dump_fanotify_entry(union fdinfo_entries *e, void *arg)
 
 	}
 
-	list_add_tail(&e->ffy.node, &wd_list->list);
-	wd_list->n++;
-
 	return 0;
-out:
-	free_fanotify_mark_entry(e);
-	return -1;
 }
 
 static int dump_one_fanotify(int lfd, u32 id, const struct fd_parms *p)
 {
-	struct watch_list wd_list = {.list = LIST_HEAD_INIT(wd_list.list), .n = 0};
 	FanotifyFileEntry fe = FANOTIFY_FILE_ENTRY__INIT;
-	union fdinfo_entries *we, *tmp;
 	int ret = -1, i;
 
 	ret = fd_has_data(lfd);
@@ -459,49 +431,43 @@ static int dump_one_fanotify(int lfd, u32 id, const struct fd_parms *p)
 	fe.flags = p->flags;
 	fe.fown = (FownEntry *)&p->fown;
 
-	if (parse_fdinfo(lfd, FD_TYPES__FANOTIFY,
-			 dump_fanotify_entry, &wd_list) < 0)
+	if (parse_fdinfo(lfd, FD_TYPES__FANOTIFY, &fe) < 0)
 		goto free;
 
-	fe.mark = xmalloc(sizeof(*fe.mark) * wd_list.n);
-	if (!fe.mark)
-		goto free;
-
-	i = 0;
-	list_for_each_entry(we, &wd_list.list, ify.node)
-		fe.mark[i++] = &we->ffy.e;
-	fe.n_mark = wd_list.n;
+	for (i = 0; i < fe.n_mark; i++)
+		if (check_one_mark(fe.mark[i]))
+			goto free;
 
 	pr_info("id %#08x flags %#08x\n", fe.id, fe.flags);
 
-	fe.faflags = wd_list.fsn_params.faflags;
-	fe.evflags = wd_list.fsn_params.evflags;
-
 	ret = pb_write_one(img_from_set(glob_imgset, CR_FD_FANOTIFY_FILE), &fe, PB_FANOTIFY_FILE);
 free:
+	for (i = 0; i < fe.n_mark; i++)
+		xfree(fe.mark[i]);
 	xfree(fe.mark);
-	list_for_each_entry_safe(we, tmp, &wd_list.list, ify.node)
-		free_fanotify_mark_entry(we);
-	return ret;
-}
-
-static int pre_dump_fanotify_entry(union fdinfo_entries *e, void *arg)
-{
-	FanotifyMarkEntry *fme = &e->ffy.e;
-	int ret = 0;
-
-	if (fme->type == MARK_TYPE__INODE)
-		ret = irmap_queue_cache(fme->s_dev, fme->ie->i_ino,
-				fme->ie->f_handle);
-
-	free_fanotify_mark_entry(e);
 	return ret;
 }
 
 static int pre_dump_one_fanotify(int pid, int lfd)
 {
-	struct fsnotify_params fsn_params = { };
-	return parse_fdinfo_pid(pid, lfd, FD_TYPES__FANOTIFY, pre_dump_fanotify_entry, &fsn_params);
+	FanotifyFileEntry fe = FANOTIFY_FILE_ENTRY__INIT;
+	int i;
+
+	if (parse_fdinfo_pid(pid, lfd, FD_TYPES__FANOTIFY, &fe))
+		return -1;
+
+	for (i = 0; i < fe.n_mark; i++) {
+		FanotifyMarkEntry *me = fe.mark[i];
+
+		if (me->type == MARK_TYPE__INODE &&
+				irmap_queue_cache(me->s_dev, me->ie->i_ino,
+					me->ie->f_handle))
+			return -1;
+
+		xfree(me);
+	}
+	xfree(fe.mark);
+	return 0;
 }
 
 const struct fdtype_ops fanotify_dump_ops = {
@@ -756,6 +722,24 @@ static struct file_desc_ops fanotify_desc_ops = {
 	.open = open_fanotify_fd,
 };
 
+static int inotify_resolve_remap(struct pprep_head *ph)
+{
+	struct fsnotify_mark_info *m;
+
+	m = container_of(ph, struct fsnotify_mark_info, prep);
+	m->remap = lookup_ghost_remap(m->iwe->s_dev, m->iwe->i_ino);
+	return 0;
+}
+
+static int fanotify_resolve_remap(struct pprep_head *ph)
+{
+	struct fsnotify_mark_info *m;
+
+	m = container_of(ph, struct fsnotify_mark_info, prep);
+	m->remap = lookup_ghost_remap(m->fme->s_dev, m->fme->ie->i_ino);
+	return 0;
+}
+
 static int __collect_inotify_mark(struct fsnotify_file_info *p, struct fsnotify_mark_info *mark)
 {
 	struct fsnotify_mark_info *m;
@@ -769,7 +753,8 @@ static int __collect_inotify_mark(struct fsnotify_file_info *p, struct fsnotify_
 			break;
 
 	list_add_tail(&mark->list, &m->list);
-	mark->remap = lookup_ghost_remap(mark->iwe->s_dev, mark->iwe->i_ino);
+	mark->prep.actor = inotify_resolve_remap;
+	add_post_prepare_cb(&mark->prep);
 	return 0;
 }
 
@@ -777,9 +762,10 @@ static int __collect_fanotify_mark(struct fsnotify_file_info *p,
 				struct fsnotify_mark_info *mark)
 {
 	list_add(&mark->list, &p->marks);
-	if (mark->fme->type == MARK_TYPE__INODE)
-		mark->remap = lookup_ghost_remap(mark->fme->s_dev,
-						 mark->fme->ie->i_ino);
+	if (mark->fme->type == MARK_TYPE__INODE) {
+		mark->prep.actor = fanotify_resolve_remap;
+		add_post_prepare_cb(&mark->prep);
+	}
 	return 0;
 }
 

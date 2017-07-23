@@ -1559,7 +1559,7 @@ struct collect_image_info tty_info_cinfo = {
 	.collect	= collect_one_tty_info_entry,
 };
 
-static int prep_tty_restore(void *unused)
+static int prep_tty_restore_cb(struct pprep_head *ph)
 {
 	if (tty_verify_active_pairs())
 		return -1;
@@ -1567,6 +1567,8 @@ static int prep_tty_restore(void *unused)
 		return -1;
 	return 0;
 }
+
+static MAKE_PPREP_HEAD(prep_tty_restore);
 
 static int collect_one_tty(void *obj, ProtobufCMessage *msg, struct cr_img *i)
 {
@@ -1638,8 +1640,7 @@ static int collect_one_tty(void *obj, ProtobufCMessage *msg, struct cr_img *i)
 
 	pr_info("Collected tty ID %#x (%s)\n", info->tfe->id, info->driver->name);
 
-	if (add_post_prepare_cb_once(prep_tty_restore, NULL))
-		return -1;
+	add_post_prepare_cb_once(&prep_tty_restore);
 
 	/*
 	 * Call it explicitly. Post-callbacks will be called after

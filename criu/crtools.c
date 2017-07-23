@@ -290,6 +290,8 @@ int main(int argc, char *argv[], char *envp[])
 		BOOL_OPT("display-stats", &opts.display_stats),
 		BOOL_OPT("weak-sysctls", &opts.weak_sysctls),
 		{ "status-fd",			required_argument,	0, 1088 },
+		BOOL_OPT(SK_CLOSE_PARAM, &opts.tcp_close),
+		{ "verbosity",			optional_argument,	0, 'v'	},
 		{ },
 	};
 
@@ -826,6 +828,7 @@ usage:
 "* Special resources support:\n"
 "     --" SK_EST_PARAM "  checkpoint/restore established TCP connections\n"
 "     --" SK_INFLIGHT_PARAM "   skip (ignore) in-flight TCP connections\n"
+"     --" SK_CLOSE_PARAM "        restore connected TCP sockets in closed state\n"
 "  -r|--root PATH        change the root filesystem (when run in mount namespace)\n"
 "  --evasive-devices     use any path to a device file if the original one\n"
 "                        is inaccessible\n"
@@ -891,8 +894,8 @@ usage:
 "* Logging:\n"
 "  -o|--log-file FILE    log file name\n"
 "     --log-pid          enable per-process logging to separate FILE.pid files\n"
-"  -v[v...]            increase verbosity (can use multiple v)\n"
-"  -vNUM               set verbosity to NUM (higher level means more output):\n"
+"  -v[v...]|--verbosity  increase verbosity (can use multiple v)\n"
+"  -vNUM|--verbosity=NUM set verbosity to NUM (higher level means more output):\n"
 "                          -v1 - only errors and messages\n"
 "                          -v2 - also warnings (default level)\n"
 "                          -v3 - also information messages and timestamps\n"

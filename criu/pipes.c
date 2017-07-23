@@ -75,7 +75,7 @@ int do_collect_pipe_data(struct pipe_data_rst *r, ProtobufCMessage *msg,
 }
 
 /* Choose who will restore a pipe. */
-static int mark_pipe_master(void *unused)
+static int mark_pipe_master_cb(struct pprep_head *ph)
 {
 	LIST_HEAD(head);
 
@@ -140,6 +140,8 @@ static int mark_pipe_master(void *unused)
 	list_splice(&head, &pipes);
 	return 0;
 }
+
+static MAKE_PPREP_HEAD(mark_pipe_master);
 
 static struct pipe_data_rst *pd_hash_pipes[PIPE_DATA_HASH_SIZE];
 
@@ -372,9 +374,7 @@ int collect_one_pipe_ops(void *o, ProtobufCMessage *base, struct file_desc_ops *
 			list_add(&pi->pipe_list, &tmp->pipe_list);
 	}
 
-	if (add_post_prepare_cb_once(mark_pipe_master, NULL))
-		return -1;
-
+	add_post_prepare_cb_once(&mark_pipe_master);
 	list_add_tail(&pi->list, &pipes);
 
 	return 0;
