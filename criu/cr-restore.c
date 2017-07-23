@@ -285,42 +285,28 @@ static struct collect_image_info *before_ns_cinfos[] = {
 	&tty_cdata,
 };
 
-struct post_prepare_cb {
-	struct list_head list;
-	int (*actor)(void *data);
-	void *data;
-};
+static struct pprep_head *post_prepare_heads = NULL;
 
-static struct list_head post_prepare_cbs = LIST_HEAD_INIT(post_prepare_cbs);
-
-int add_post_prepare_cb(int (*actor)(void *data), void *data)
+void add_post_prepare_cb(struct pprep_head *ph)
 {
-	struct post_prepare_cb *cb;
-
-	cb = xmalloc(sizeof(*cb));
-	if (!cb)
-		return -1;
-
-	cb->actor = actor;
-	cb->data = data;
-	list_add(&cb->list, &post_prepare_cbs);
-	return 0;
+	ph->next = post_prepare_heads;
+	post_prepare_heads = ph;
 }
 
 static int run_post_prepare(void)
 {
-	struct post_prepare_cb *o;
+	struct pprep_head *ph;
 
-	list_for_each_entry(o, &post_prepare_cbs, list) {
-		if (o->actor(o->data))
+	for (ph = post_prepare_heads; ph != NULL; ph = ph->next)
+		if (ph->actor(ph))
 			return -1;
-	}
+
 	return 0;
 }
 
 static int root_prepare_shared(void)
 {
-	int ret = 0, i;
+	int ret = 0;
 	struct pstree_item *pi;
 
 	pr_info("Preparing info about shared resources\n");
@@ -331,11 +317,8 @@ static int root_prepare_shared(void)
 	if (prepare_seccomp_filters())
 		return -1;
 
-	for (i = 0; i < ARRAY_SIZE(cinfos); i++) {
-		ret = collect_image(cinfos[i]);
-		if (ret)
-			return -1;
-	}
+	if (collect_images(cinfos, ARRAY_SIZE(cinfos)))
+		return -1;
 
 	for_each_pstree_item(pi) {
 		if (pi->pid->state == TASK_HELPER)
@@ -897,7 +880,6 @@ static void zombie_prepare_signals(void)
 		(1 << SIGPOLL)	|\
 		(1 << SIGIO)	|\
 		(1 << SIGSYS)	|\
-		(1 << SIGUNUSED)|\
 		(1 << SIGSTKFLT)|\
 		(1 << SIGPWR)	 \
 	)
@@ -1505,8 +1487,6 @@ static int restore_task_with_children(void *_arg)
 
 	/* Restore root task */
 	if (current->parent == NULL) {
-		int i;
-
 		if (fdstore_init())
 			goto err;
 
@@ -1526,12 +1506,8 @@ static int restore_task_with_children(void *_arg)
 		if (mount_proc())
 			goto err;
 
-		for (i = 0; i < ARRAY_SIZE(before_ns_cinfos); i++) {
-			ret = collect_image(before_ns_cinfos[i]);
-			if (ret)
-				return -1;
-		}
-
+		if (collect_images(before_ns_cinfos, ARRAY_SIZE(before_ns_cinfos)))
+			goto err;
 
 		if (prepare_namespace(current, ca->clone_flags))
 			goto err;
