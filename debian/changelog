@@ -1,3 +1,10 @@
+criu (3.4-2) experimental; urgency=medium
+
+  * Enable support for arm64 and s390x.
+    Thanks to Dimitri John Ledkov for testing. (Closes: #791937, #873002)
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Wed, 23 Aug 2017 23:10:56 +0200
+
 criu (3.4-1) experimental; urgency=medium
 
   * New upstream version 3.4
