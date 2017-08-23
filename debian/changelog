@@ -1,3 +1,10 @@
+criu (3.4-1) experimental; urgency=medium
+
+  * New upstream version 3.4
+  * Declare compliance with Debian policy 4.1.0
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Wed, 23 Aug 2017 22:54:13 +0200
+
 criu (3.3-1) experimental; urgency=medium
 
   * New upstream version 3.3
