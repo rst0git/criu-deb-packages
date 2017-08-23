@@ -83,8 +83,9 @@ def add_to_report(path, tgt_name):
 			tgt_path = os.path.join(report_dir, tgt_name + ".%d" % att)
 			att += 1
 
+		ignore = shutil.ignore_patterns('*.socket')
 		if os.path.isdir(path):
-			shutil.copytree(path, tgt_path)
+			shutil.copytree(path, tgt_path, ignore = ignore)
 		else:
 			if not os.path.exists(os.path.dirname(tgt_path)):
 				os.mkdir(os.path.dirname(tgt_path))
@@ -363,6 +364,7 @@ class zdtm_test:
 		self._env = {}
 		self._deps = desc.get('deps', [])
 		self.auto_reap = True
+		self.__timeout = int(self.__desc.get('timeout') or 30)
 
 	def __make_action(self, act, env = None, root = None):
 		sys.stdout.flush()  # Not to let make's messages appear before ours
@@ -387,7 +389,7 @@ class zdtm_test:
 		return self.__name + '.pid'
 
 	def __wait_task_die(self):
-		wait_pid_die(int(self.__pid), self.__name)
+		wait_pid_die(int(self.__pid), self.__name, self.__timeout)
 
 	def __add_wperms(self):
 		# Add write perms for .out and .pid files

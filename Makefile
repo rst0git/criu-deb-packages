@@ -21,7 +21,7 @@ UNAME-M := $(shell uname -m)
 
 #
 # Supported Architectures
-ifneq ($(filter-out x86 arm aarch64 ppc64,$(ARCH)),)
+ifneq ($(filter-out x86 arm aarch64 ppc64 s390,$(ARCH)),)
         $(error "The architecture $(ARCH) isn't supported")
 endif
 
@@ -64,6 +64,21 @@ ifeq ($(ARCH),x86)
         VDSO		:= y
         DEFINES		:= -DCONFIG_X86_64
 endif
+
+#
+# CFLAGS_PIE:
+#
+# Ensure with -fno-optimize-sibling-calls that we don't create GOT
+# (Global Offset Table) relocations with gcc compilers that don't have
+# commit "S/390: Fix 64 bit sibcall".
+ifeq ($(ARCH),s390)
+        ARCH		:= s390
+        SRCARCH		:= s390
+        VDSO		:= y
+        DEFINES		:= -DCONFIG_S390
+        CFLAGS_PIE	:= -fno-optimize-sibling-calls
+endif
+export CFLAGS_PIE
 
 LDARCH ?= $(SRCARCH)
 export LDARCH VDSO

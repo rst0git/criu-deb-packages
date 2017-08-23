@@ -31,6 +31,7 @@
 #include "eventfd.h"
 #include "eventpoll.h"
 #include "fsnotify.h"
+#include "sk-packet.h"
 #include "mount.h"
 #include "signalfd.h"
 #include "namespaces.h"
@@ -54,14 +55,12 @@
 #define FDESC_HASH_SIZE	64
 static struct hlist_head file_desc_hash[FDESC_HASH_SIZE];
 
-int prepare_shared_fdinfo(void)
+static void init_fdesc_hash(void)
 {
 	int i;
 
 	for (i = 0; i < FDESC_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&file_desc_hash[i]);
-
-	return 0;
 }
 
 void file_desc_init(struct file_desc *d, u32 id, struct file_desc_ops *ops)
@@ -1664,4 +1663,95 @@ int open_transport_socket(void)
 	close(sock);
 
 	return 0;
+}
+
+static int collect_one_file_entry(FileEntry *fe, u_int32_t id, ProtobufCMessage *base,
+		struct collect_image_info *cinfo)
+{
+	if (fe->id != id) {
+		pr_err("ID mismatch %u != %u\n", fe->id, id);
+		return -1;
+	}
+
+	return collect_entry(base, cinfo);
+}
+
+static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
+{
+	int ret = 0;
+	FileEntry *fe;
+
+	fe = pb_msg(base, FileEntry);
+	switch (fe->type) {
+	default:
+		pr_err("Unknown file type %d\n", fe->type);
+		return -1;
+	case FD_TYPES__REG:
+		ret = collect_one_file_entry(fe, fe->reg->id, &fe->reg->base, &reg_file_cinfo);
+		break;
+	case FD_TYPES__INETSK:
+		ret = collect_one_file_entry(fe, fe->isk->id, &fe->isk->base, &inet_sk_cinfo);
+		break;
+	case FD_TYPES__NS:
+		ret = collect_one_file_entry(fe, fe->nsf->id, &fe->nsf->base, &nsfile_cinfo);
+		break;
+	case FD_TYPES__PACKETSK:
+		ret = collect_one_file_entry(fe, fe->psk->id, &fe->psk->base, &packet_sk_cinfo);
+		break;
+	case FD_TYPES__NETLINKSK:
+		ret = collect_one_file_entry(fe, fe->nlsk->id, &fe->nlsk->base, &netlink_sk_cinfo);
+		break;
+	case FD_TYPES__EVENTFD:
+		ret = collect_one_file_entry(fe, fe->efd->id, &fe->efd->base, &eventfd_cinfo);
+		break;
+	case FD_TYPES__EVENTPOLL:
+		ret = collect_one_file_entry(fe, fe->epfd->id, &fe->epfd->base, &epoll_cinfo);
+		break;
+	case FD_TYPES__SIGNALFD:
+		ret = collect_one_file_entry(fe, fe->sgfd->id, &fe->sgfd->base, &signalfd_cinfo);
+		break;
+	case FD_TYPES__TUNF:
+		ret = collect_one_file_entry(fe, fe->tunf->id, &fe->tunf->base, &tunfile_cinfo);
+		break;
+	case FD_TYPES__TIMERFD:
+		ret = collect_one_file_entry(fe, fe->tfd->id, &fe->tfd->base, &timerfd_cinfo);
+		break;
+	case FD_TYPES__INOTIFY:
+		ret = collect_one_file_entry(fe, fe->ify->id, &fe->ify->base, &inotify_cinfo);
+		break;
+	case FD_TYPES__FANOTIFY:
+		ret = collect_one_file_entry(fe, fe->ffy->id, &fe->ffy->base, &fanotify_cinfo);
+		break;
+	case FD_TYPES__EXT:
+		ret = collect_one_file_entry(fe, fe->ext->id, &fe->ext->base, &ext_file_cinfo);
+		break;
+	case FD_TYPES__UNIXSK:
+		ret = collect_one_file_entry(fe, fe->usk->id, &fe->usk->base, &unix_sk_cinfo);
+		break;
+	case FD_TYPES__FIFO:
+		ret = collect_one_file_entry(fe, fe->fifo->id, &fe->fifo->base, &fifo_cinfo);
+		break;
+	case FD_TYPES__PIPE:
+		ret = collect_one_file_entry(fe, fe->pipe->id, &fe->pipe->base, &pipe_cinfo);
+		break;
+	case FD_TYPES__TTY:
+		ret = collect_one_file_entry(fe, fe->tty->id, &fe->tty->base, &tty_cinfo);
+		break;
+	}
+
+	return ret;
+}
+
+struct collect_image_info files_cinfo = {
+	.fd_type = CR_FD_FILES,
+	.pb_type = PB_FILE,
+	.priv_size = 0,
+	.collect = collect_one_file,
+	.flags = COLLECT_NOFREE,
+};
+
+int prepare_files(void)
+{
+	init_fdesc_hash();
+	return collect_image(&files_cinfo);
 }

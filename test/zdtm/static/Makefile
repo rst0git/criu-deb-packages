@@ -171,12 +171,19 @@ TST_NOFILE	:=				\
 		macvlan			\
 		cr_veth				\
 		sock_peercred			\
+		s390x_mmap_high			\
 #		jobctl00			\
+
+include ../Makefile.inc
 
 ifneq ($(SRCARCH),arm)
 ifneq ($(COMPAT_TEST),y)
         TST_NOFILE += maps03
 endif
+endif
+
+ifeq ($(SRCARCH),s390)
+        TST_NOFILE += s390x_regs_check
 endif
 
 TST_FILE	=				\
@@ -313,8 +320,6 @@ PID	= $(TST:%=%.pid)
 OUT	= $(TST:%=%.out)
 STATE	= $(TST_STATE:%=%.state)
 STATE_OUT	= $(TST_STATE:%=%.out)
-
-include ../Makefile.inc
 
 all:	$(TST) criu-rtc.so
 install: all
@@ -460,6 +465,8 @@ socket-tcp6-unconn:	CFLAGS += -D ZDTM_IPV6
 pty-console:		CFLAGS += -D ZDTM_DEV_CONSOLE
 
 shm-unaligned:		CFLAGS += -DZDTM_SHM_UNALIGNED
+
+s390x_regs_check:	LDFLAGS += -pthread
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)

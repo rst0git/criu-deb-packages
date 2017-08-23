@@ -78,6 +78,7 @@ static bool can_dump_netlink_sk(int lfd)
 static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)
 {
 	struct netlink_sk_desc *sk;
+	FileEntry fe = FILE_ENTRY__INIT;
 	NetlinkSkEntry ne = NETLINK_SK_ENTRY__INIT;
 	SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
 
@@ -104,6 +105,22 @@ static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)
 		 * On 64-bit sk->gsize is multiple to 8 bytes (sizeof(long)),
 		 * so remove the last 4 bytes if they are empty.
 		 */
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+		/*
+		 * Big endian swap: Ugly hack for zdtm/static/sk-netlink
+		 *
+		 * For big endian systems:
+		 *
+		 * - sk->groups[0] are bits 32-64
+		 * - sk->groups[1] are bits 0-32
+		 */
+		if (ne.n_groups == 2) {
+			uint32_t tmp = sk->groups[1];
+
+			sk->groups[1] = sk->groups[0];
+			sk->groups[0] = tmp;
+		}
+#endif
 		if (ne.n_groups && sk->groups[ne.n_groups - 1] == 0)
 			ne.n_groups -= 1;
 
@@ -137,7 +154,11 @@ static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)
 	if (dump_socket_opts(lfd, &skopts))
 		goto err;
 
-	if (pb_write_one(img_from_set(glob_imgset, CR_FD_NETLINK_SK), &ne, PB_NETLINK_SK))
+	fe.type = FD_TYPES__NETLINKSK;
+	fe.id = ne.id;
+	fe.nlsk = &ne;
+
+	if (pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE))
 		goto err;
 
 	return 0;

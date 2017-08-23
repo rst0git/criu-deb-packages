@@ -162,12 +162,12 @@ static inline int stage_current_participants(int next_stage)
 	return -1;
 }
 
-static int restore_wait_inprogress_tasks()
+static int __restore_wait_inprogress_tasks(int participants)
 {
 	int ret;
 	futex_t *np = &task_entries->nr_in_progress;
 
-	futex_wait_while_gt(np, 0);
+	futex_wait_while_gt(np, participants);
 	ret = (int)futex_get(np);
 	if (ret < 0) {
 		set_cr_errno(get_task_cr_err());
@@ -175,6 +175,22 @@ static int restore_wait_inprogress_tasks()
 	}
 
 	return 0;
+}
+
+static int restore_wait_inprogress_tasks()
+{
+	return __restore_wait_inprogress_tasks(0);
+}
+
+/* Wait all tasks except the current one */
+static int restore_wait_other_tasks()
+{
+	int participants, stage;
+
+	stage = futex_get(&task_entries->start);
+	participants = stage_current_participants(stage);
+
+	return __restore_wait_inprogress_tasks(participants);
 }
 
 static inline void __restore_switch_stage_nw(int next_stage)
@@ -198,18 +214,6 @@ static int restore_switch_stage(int next_stage)
 	return restore_wait_inprogress_tasks();
 }
 
-/* Wait all tasks except the current one */
-static void restore_wait_other_tasks()
-{
-	int participants, stage;
-
-	stage = futex_get(&task_entries->start);
-	participants = stage_current_participants(stage);
-
-	futex_wait_while_gt(&task_entries->nr_in_progress,
-				participants);
-}
-
 static int restore_finish_ns_stage(int from, int to)
 {
 	if (root_ns_mask)
@@ -222,7 +226,7 @@ static int restore_finish_ns_stage(int from, int to)
 
 static int crtools_prepare_shared(void)
 {
-	if (prepare_shared_fdinfo())
+	if (prepare_files())
 		return -1;
 
 	/* We might want to remove ghost files on failed restore */
@@ -230,7 +234,7 @@ static int crtools_prepare_shared(void)
 		return -1;
 
 	/* Connections are unlocked from criu */
-	if (collect_inet_sockets())
+	if (!files_collected() && collect_image(&inet_sk_cinfo))
 		return -1;
 
 	if (collect_binfmt_misc())
@@ -255,33 +259,35 @@ static int crtools_prepare_shared(void)
  */
 
 static struct collect_image_info *cinfos[] = {
-	&nsfile_cinfo,
-	&pipe_cinfo,
-	&fifo_cinfo,
-	&unix_sk_cinfo,
-	&packet_sk_cinfo,
-	&netlink_sk_cinfo,
-	&eventfd_cinfo,
-	&epoll_cinfo,
-	&epoll_tfd_cinfo,
-	&signalfd_cinfo,
-	&inotify_cinfo,
-	&inotify_mark_cinfo,
-	&fanotify_cinfo,
-	&fanotify_mark_cinfo,
-	&tunfile_cinfo,
-	&ext_file_cinfo,
-	&timerfd_cinfo,
 	&file_locks_cinfo,
 	&pipe_data_cinfo,
 	&fifo_data_cinfo,
 	&sk_queues_cinfo,
 };
 
+static struct collect_image_info *cinfos_files[] = {
+	&unix_sk_cinfo,
+	&fifo_cinfo,
+	&pipe_cinfo,
+	&nsfile_cinfo,
+	&packet_sk_cinfo,
+	&netlink_sk_cinfo,
+	&eventfd_cinfo,
+	&epoll_cinfo,
+	&epoll_tfd_cinfo,
+	&signalfd_cinfo,
+	&tunfile_cinfo,
+	&timerfd_cinfo,
+	&inotify_cinfo,
+	&inotify_mark_cinfo,
+	&fanotify_cinfo,
+	&fanotify_mark_cinfo,
+	&ext_file_cinfo,
+};
+
 /* These images are requered to restore namespaces */
 static struct collect_image_info *before_ns_cinfos[] = {
 	&tty_info_cinfo, /* Restore devpts content */
-	&tty_cinfo,
 	&tty_cdata,
 };
 
@@ -318,6 +324,10 @@ static int root_prepare_shared(void)
 		return -1;
 
 	if (collect_images(cinfos, ARRAY_SIZE(cinfos)))
+		return -1;
+
+	if (!files_collected() &&
+			collect_images(cinfos_files, ARRAY_SIZE(cinfos_files)))
 		return -1;
 
 	for_each_pstree_item(pi) {
@@ -992,6 +1002,79 @@ out:
 	return ret;
 }
 
+/*
+ * Find if there are children which are zombies or helpers - processes
+ * which are expected to die during the restore.
+ */
+static bool child_death_expected(void)
+{
+	struct pstree_item *pi;
+
+	list_for_each_entry(pi, &current->children, sibling) {
+		switch (pi->pid->state) {
+		case TASK_DEAD:
+		case TASK_HELPER:
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Restore a helper process - artificially created by criu
+ * to restore attributes of process tree.
+ * - sessions for each leaders are dead
+ * - process groups with dead leaders
+ * - dead tasks for which /proc/<pid>/... is opened by restoring task
+ * - whatnot
+ */
+static int restore_one_helper(void)
+{
+	siginfo_t info;
+
+	if (!child_death_expected()) {
+		/*
+		 * Restoree has no children that should die, during restore,
+		 * wait for the next stage on futex.
+		 * The default SIGCHLD handler will handle an unexpected
+		 * child's death and abort the restore if someone dies.
+		 */
+		restore_finish_stage(task_entries, CR_STATE_RESTORE);
+		return 0;
+	}
+
+	/*
+	 * The restoree has children which will die - decrement itself from
+	 * nr. of tasks processing the stage and wait for anyone to die.
+	 * Tasks may die only when they're on the following stage.
+	 * If one dies earlier - that's unexpected - treat it as an error
+	 * and abort the restore.
+	 */
+	if (block_sigmask(NULL, SIGCHLD))
+		return -1;
+
+	/* Finish CR_STATE_RESTORE, but do not wait for the next stage. */
+	futex_dec_and_wake(&task_entries->nr_in_progress);
+
+	if (waitid(P_ALL, 0, &info, WEXITED | WNOWAIT)) {
+		pr_perror("Failed to wait\n");
+		return -1;
+	}
+
+	if (futex_get(&task_entries->start) == CR_STATE_RESTORE) {
+		pr_err("Child %d died too early\n", info.si_pid);
+		return -1;
+	}
+
+	if (wait_on_helpers_zombies()) {
+		pr_err("Failed to wait on helpers and zombies\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 static int restore_one_task(int pid, CoreEntry *core)
 {
 	int ret;
@@ -1003,23 +1086,7 @@ static int restore_one_task(int pid, CoreEntry *core)
 	else if (current->pid->state == TASK_DEAD)
 		ret = restore_one_zombie(core);
 	else if (current->pid->state == TASK_HELPER) {
-		sigset_t blockmask, oldmask;
-
-		sigemptyset(&blockmask);
-		sigaddset(&blockmask, SIGCHLD);
-
-		if (sigprocmask(SIG_BLOCK, &blockmask, &oldmask) == -1) {
-			pr_perror("Can not set mask of blocked signals");
-			return -1;
-		}
-
-		restore_finish_stage(task_entries, CR_STATE_RESTORE);
-		if (wait_on_helpers_zombies()) {
-			pr_err("failed to wait on helpers and zombies\n");
-			ret = -1;
-		} else {
-			ret = 0;
-		}
+		ret = restore_one_helper();
 	} else {
 		pr_err("Unknown state in code %d\n", (int)core->tc->task_state);
 		ret = -1;
@@ -1506,6 +1573,8 @@ static int restore_task_with_children(void *_arg)
 		if (mount_proc())
 			goto err;
 
+		if (!files_collected() && collect_image(&tty_cinfo))
+			goto err;
 		if (collect_images(before_ns_cinfos, ARRAY_SIZE(before_ns_cinfos)))
 			goto err;
 
@@ -1557,7 +1626,8 @@ static int restore_task_with_children(void *_arg)
 		 *
 		 * It means that all tasks entered into their namespaces.
 		 */
-		restore_wait_other_tasks();
+		if (restore_wait_other_tasks())
+			goto err;
 		fini_restore_mntns();
 		__restore_switch_stage(CR_STATE_RESTORE);
 	} else {
