@@ -16,6 +16,11 @@ Files: criu/arch/x86/call32.S
 Copyright: 2005, Andrew Lutomirski
 License: GPL-2
 
+Files: criu/include/linux/userfaultfd.h
+Copyright: 2007, Davide Libenzi <davidel@xmailserver.org>
+ 2015, Red Hat, Inc.
+License: GPL-2
+
 Files: test/zdtm/static/auto_dev-ioctl.h
 Copyright: 2008, Red Hat, Inc. All rights reserved.
  2008, Ian Kent <raven@themaw.net>
