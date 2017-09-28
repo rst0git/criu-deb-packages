@@ -4,7 +4,7 @@ criu (3.5-1) experimental; urgency=medium
   * Use HTTPS transport protocol in watch URL
   * debian/watch: Bump format to version 4.
     Use @PACKAGE@, @ANY_VERSION@ and @ARCHIVE_EXT@ substitutions.
-  * debian/copyright:Add copyright stanza for newly included file
+  * debian/copyright: Add copyright stanza for newly included file
 
  -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 28 Sep 2017 08:52:05 +0200
 
