@@ -46,13 +46,16 @@ struct page_read {
 	/* reads page from current pagemap */
 	int (*read_pages)(struct page_read *, unsigned long vaddr, int nr,
 			  void *, unsigned flags);
-	/* Advance page_read to the next entry (including zero pagemaps) */
+	/* Advance page_read to the next entry */
 	int (*advance)(struct page_read *pr);
 	void (*close)(struct page_read *);
 	void (*skip_pages)(struct page_read *, unsigned long len);
 	int (*sync)(struct page_read *pr);
 	int (*seek_pagemap)(struct page_read *pr, unsigned long vaddr);
 	void (*reset)(struct page_read *pr);
+	int (*io_complete)(struct page_read *, unsigned long vaddr, int nr);
+	int (*maybe_read_page)(struct page_read *pr, unsigned long vaddr,
+			       int nr, void *buf, unsigned flags);
 
 	/* Whether or not pages can be read in PIE code */
 	bool pieok;
@@ -72,7 +75,8 @@ struct page_read {
 
 	struct iovec bunch;		/* record consequent neighbour
 					   iovecs to punch together */
-	unsigned id; /* for logging */
+	unsigned id;			/* for logging */
+	int pid;			/* PID of the process */
 
 	PagemapEntry **pmes;
 	int nr_pmes;
@@ -83,6 +87,7 @@ struct page_read {
 
 /* flags for ->read_pages */
 #define PR_ASYNC	0x1 /* may exit w/o data in the buffer */
+#define PR_ASAP		0x2 /* PR_ASYNC, but start the IO right now */
 
 /* flags for open_page_read */
 #define PR_SHMEM	0x1
@@ -90,6 +95,7 @@ struct page_read {
 
 #define PR_TYPE_MASK	0x3
 #define PR_MOD		0x4	/* Will need to modify */
+#define PR_REMOTE	0x8
 
 /*
  * -1 -- error
@@ -106,6 +112,13 @@ int pagemap_enqueue_iovec(struct page_read *pr, void *buf,
 			      unsigned long len, struct list_head *to);
 int pagemap_render_iovec(struct list_head *from, struct task_restore_args *ta);
 
+/*
+ * Create a shallow copy of page_read object.
+ * The new object shares the pagemap structures with the original, but
+ * maintains its own set of references to those structures.
+ */
+extern void dup_page_read(struct page_read *src, struct page_read *dst);
+
 extern int dedup_one_iovec(struct page_read *pr, unsigned long base,
 			   unsigned long len);
 
@@ -113,4 +126,30 @@ static inline unsigned long pagemap_len(PagemapEntry *pe)
 {
 	return pe->nr_pages * PAGE_SIZE;
 }
+
+static inline bool page_read_has_parent(struct page_read *pr)
+{
+	return pr->parent != NULL;
+}
+
+/* Pagemap flags */
+#define PE_PARENT	(1 << 0)	/* pages are in parent snapshot */
+#define PE_LAZY		(1 << 1)	/* pages can be lazily restored */
+#define PE_PRESENT	(1 << 2)	/* pages are present in pages*img */
+
+static inline bool pagemap_in_parent(PagemapEntry *pe)
+{
+	return !!(pe->flags & PE_PARENT);
+}
+
+static inline bool pagemap_lazy(PagemapEntry *pe)
+{
+	return !!(pe->flags & PE_LAZY);
+}
+
+static inline bool pagemap_present(PagemapEntry *pe)
+{
+	return !!(pe->flags & PE_PRESENT);
+}
+
 #endif /* __CR_PAGE_READ_H__ */

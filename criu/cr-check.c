@@ -50,6 +50,7 @@
 #include "libnetlink.h"
 #include "net.h"
 #include "restorer.h"
+#include "uffd.h"
 
 static char *feature_name(int (*func)());
 
@@ -675,9 +676,6 @@ static int check_ptrace_dump_seccomp_filters(void)
 
 static int check_mem_dirty_track(void)
 {
-	if (kerndat_get_dirty_track() < 0)
-		return -1;
-
 	if (!kdat.has_dirty_track) {
 		pr_warn("Dirty tracking is OFF. Memory snapshot will not work.\n");
 		return -1;
@@ -771,9 +769,6 @@ static int check_aio_remap(void)
 
 static int check_fdinfo_lock(void)
 {
-	if (kerndat_fdinfo_has_lock())
-		return -1;
-
 	if (!kdat.has_fdinfo_lock) {
 		pr_err("fdinfo doesn't contain the lock field\n");
 		return -1;
@@ -930,12 +925,6 @@ out:
 
 static int check_tcp_halt_closed(void)
 {
-	int ret;
-
-	ret = kerndat_tcp_repair();
-	if (ret < 0)
-		return -1;
-
 	if (!kdat.has_tcp_half_closed) {
 		pr_err("TCP_REPAIR can't be enabled for half-closed sockets\n");
 		return -1;
@@ -1022,9 +1011,6 @@ static int check_userns(void)
 
 static int check_loginuid(void)
 {
-	if (kerndat_loginuid() < 0)
-		return -1;
-
 	if (kdat.luid != LUID_FULL) {
 		pr_warn("Loginuid restore is OFF.\n");
 		return -1;
@@ -1042,6 +1028,37 @@ static int check_compat_cr(void)
 #else
 	pr_warn("CRIU built without CONFIG_COMPAT - can't C/R ia32\n");
 #endif
+	return -1;
+}
+
+static int check_uffd(void)
+{
+	if (!kdat.has_uffd) {
+		pr_err("UFFD is not supported\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int check_uffd_noncoop(void)
+{
+	if (check_uffd())
+		return -1;
+
+	if (!uffd_noncooperative()) {
+		pr_err("Non-cooperative UFFD is not supported\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int check_can_map_vdso(void)
+{
+	if (kdat_can_map_vdso() == 1)
+		return 0;
+	pr_warn("Do not have API to map vDSO - will use mremap() to restore vDSO\n");
 	return -1;
 }
 
@@ -1148,6 +1165,7 @@ int cr_check(void)
 		ret |= check_tcp_halt_closed();
 		ret |= check_userns();
 		ret |= check_loginuid();
+		ret |= check_can_map_vdso();
 	}
 
 	/*
@@ -1197,6 +1215,9 @@ static struct feature_list feature_list[] = {
 	{ "autofs", check_autofs },
 	{ "tcp_half_closed", check_tcp_halt_closed },
 	{ "compat_cr", check_compat_cr },
+	{ "uffd", check_uffd },
+	{ "uffd-noncoop", check_uffd_noncoop },
+	{ "can_map_vdso", check_can_map_vdso},
 	{ NULL, NULL },
 };
 

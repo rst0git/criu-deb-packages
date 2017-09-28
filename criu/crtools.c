@@ -47,6 +47,7 @@
 #include "fault-injection.h"
 #include "lsm.h"
 #include "proc_parse.h"
+#include "kerndat.h"
 
 #include "setproctitle.h"
 #include "sysctl.h"
@@ -279,6 +280,7 @@ int main(int argc, char *argv[], char *envp[])
 		{ "timeout",			required_argument,	0, 1072 },
 		{ "external",			required_argument,	0, 1073	},
 		{ "empty-ns",			required_argument,	0, 1074	},
+		{ "lazy-pages",			no_argument,		0, 1076 },
 		BOOL_OPT("extra", &opts.check_extra_features),
 		BOOL_OPT("experimental", &opts.check_experimental_features),
 		{ "all",			no_argument,		0, 1079	},
@@ -313,6 +315,9 @@ int main(int argc, char *argv[], char *envp[])
 	init_opts();
 
 	if (init_service_fd())
+		return 1;
+
+	if (kerndat_init())
 		return 1;
 
 	if (!strcmp(argv[1], "swrk")) {
@@ -518,6 +523,9 @@ int main(int argc, char *argv[], char *envp[])
 			break;
 		case 1072:
 			opts.timeout = atoi(optarg);
+			break;
+		case 1076:
+			opts.lazy_pages = true;
 			break;
 		case 'M':
 			{
@@ -733,11 +741,14 @@ int main(int argc, char *argv[], char *envp[])
 		return -1;
 	}
 
+	if (!strcmp(argv[optind], "lazy-pages"))
+		return cr_lazy_pages(opts.daemon_mode) != 0;
+
 	if (!strcmp(argv[optind], "check"))
 		return cr_check() != 0;
 
 	if (!strcmp(argv[optind], "page-server"))
-		return cr_page_server(opts.daemon_mode, -1) != 0;
+		return cr_page_server(opts.daemon_mode, false, -1) != 0;
 
 	if (!strcmp(argv[optind], "service"))
 		return cr_service(opts.daemon_mode);
@@ -766,6 +777,7 @@ usage:
 "  criu page-server\n"
 "  criu service [<options>]\n"
 "  criu dedup\n"
+"  criu lazy-pages -D DIR [<options>]\n"
 "\n"
 "Commands:\n"
 "  dump           checkpoint a process/tree identified by pid\n"
@@ -809,6 +821,10 @@ usage:
 "                        restore making it the parent of the restored process\n"
 "  --freeze-cgroup       use cgroup freezer to collect processes\n"
 "  --weak-sysctls        skip restoring sysctls that are not available\n"
+"  --lazy-pages          restore pages on demand\n"
+"                        this requires running a second instance of criu\n"
+"                        in lazy-pages mode: 'criu lazy-pages -D DIR'\n"
+"                        --lazy-pages and lazy-pages mode require userfaultfd\n"
 "\n"
 "* External resources support:\n"
 "  --external RES        dump objects from this list as external resources:\n"

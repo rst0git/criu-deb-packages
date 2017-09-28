@@ -17,6 +17,9 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 #include "fcntl.h"
+#include "pstree.h"
+#include "parasite-syscall.h"
+#include "rst_info.h"
 
 static int page_server_sk = -1;
 
@@ -38,9 +41,14 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_OPEN	3
 #define PS_IOV_OPEN2	4
 #define PS_IOV_PARENT	5
+#define PS_IOV_ADD_F	6
+#define PS_IOV_GET	7
 
 #define PS_IOV_FLUSH		0x1023
 #define PS_IOV_FLUSH_N_CLOSE	0x1024
+
+#define PS_CMD_BITS	16
+#define PS_CMD_MASK	((1 << PS_CMD_BITS) - 1)
 
 #define PS_TYPE_BITS	8
 #define PS_TYPE_MASK	((1 << PS_TYPE_BITS) - 1)
@@ -104,38 +112,37 @@ static int decode_pm(u64 dst_id, long *id)
 	return type;
 }
 
-static inline int send_psi(int sk, u32 cmd, u32 nr_pages, u64 vaddr, u64 dst_id)
+static inline u32 encode_ps_cmd(u32 cmd, u32 flags)
 {
-	struct page_server_iov pi = {
-		.cmd		= cmd,
-		.nr_pages	= nr_pages,
-		.vaddr		= vaddr,
-		.dst_id		= dst_id,
-	};
+	return flags << PS_CMD_BITS | cmd;
+}
 
-	if (write(sk, &pi, sizeof(pi)) != sizeof(pi)) {
-		pr_perror("Can't write PSI %d to server", cmd);
+static inline u32 decode_ps_cmd(u32 cmd)
+{
+	return cmd & PS_CMD_MASK;
+}
+
+static inline u32 decode_ps_flags(u32 cmd)
+{
+	return cmd >> PS_CMD_BITS;
+}
+
+static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
+{
+	if (send(sk, pi, sizeof(*pi), flags) != sizeof(*pi)) {
+		pr_perror("Can't send PSI %d to server", pi->cmd);
 		return -1;
 	}
 
 	return 0;
 }
 
-static inline int send_iov(int sk, u32 cmd, u64 dst_id, struct iovec *iov)
+static inline int send_psi(int sk, struct page_server_iov *pi)
 {
-	u64 vaddr = encode_pointer(iov->iov_base);
-	u32 nr_pages = iov->iov_len / PAGE_SIZE;
-
-	return send_psi(sk, cmd, nr_pages, vaddr, dst_id);
+	return send_psi_flags(sk, pi, 0);
 }
 
 /* page-server xfer */
-static int write_pagemap_to_server(struct page_xfer *xfer,
-		struct iovec *iov)
-{
-	return send_iov(xfer->sk, PS_IOV_ADD, xfer->dst_id, iov);
-}
-
 static int write_pages_to_server(struct page_xfer *xfer,
 		int p, unsigned long len)
 {
@@ -149,9 +156,16 @@ static int write_pages_to_server(struct page_xfer *xfer,
 	return 0;
 }
 
-static int write_hole_to_server(struct page_xfer *xfer, struct iovec *iov)
+static int write_pagemap_to_server(struct page_xfer *xfer, struct iovec *iov, u32 flags)
 {
-	return send_iov(xfer->sk, PS_IOV_HOLE, xfer->dst_id, iov);
+	struct page_server_iov pi = {
+		.cmd = encode_ps_cmd(PS_IOV_ADD_F, flags),
+		.nr_pages = iov->iov_len / PAGE_SIZE,
+		.vaddr = encode_pointer(iov->iov_base),
+		.dst_id = xfer->dst_id,
+	};
+
+	return send_psi(xfer->sk, &pi);
 }
 
 static void close_server_xfer(struct page_xfer *xfer)
@@ -162,16 +176,19 @@ static void close_server_xfer(struct page_xfer *xfer)
 static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, long id)
 {
 	char has_parent;
+	struct page_server_iov pi = {
+		.cmd = PS_IOV_OPEN2,
+	};
 
 	xfer->sk = page_server_sk;
 	xfer->write_pagemap = write_pagemap_to_server;
 	xfer->write_pages = write_pages_to_server;
-	xfer->write_hole = write_hole_to_server;
 	xfer->close = close_server_xfer;
 	xfer->dst_id = encode_pm(fd_type, id);
 	xfer->parent = NULL;
 
-	if (send_psi(xfer->sk, PS_IOV_OPEN2, 0, 0, xfer->dst_id)) {
+	pi.dst_id = xfer->dst_id;
+	if (send_psi(xfer->sk, &pi)) {
 		pr_perror("Can't write to page server");
 		return -1;
 	}
@@ -191,25 +208,6 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, long id)
 }
 
 /* local xfer */
-static int write_pagemap_loc(struct page_xfer *xfer,
-		struct iovec *iov)
-{
-	int ret;
-	PagemapEntry pe = PAGEMAP_ENTRY__INIT;
-
-	pe.vaddr = encode_pointer(iov->iov_base);
-	pe.nr_pages = iov->iov_len / PAGE_SIZE;
-	if (opts.auto_dedup && xfer->parent != NULL) {
-		ret = dedup_one_iovec(xfer->parent, pe.vaddr,
-				pagemap_len(&pe));
-		if (ret == -1) {
-			pr_perror("Auto-deduplication failed");
-			return ret;
-		}
-	}
-	return pb_write_one(xfer->pmi, &pe, PB_PAGEMAP);
-}
-
 static int write_pages_loc(struct page_xfer *xfer,
 		int p, unsigned long len)
 {
@@ -276,25 +274,35 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
 	}
 }
 
-static int write_pagehole_loc(struct page_xfer *xfer, struct iovec *iov)
+static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flags)
 {
+	int ret;
 	PagemapEntry pe = PAGEMAP_ENTRY__INIT;
-
-	if (xfer->parent != NULL) {
-		int ret;
-
-		ret = check_pagehole_in_parent(xfer->parent, iov);
-		if (ret) {
-			pr_err("Hole %p/%zu not found in parent\n",
-					iov->iov_base, iov->iov_len);
-			return -1;
-		}
-	}
 
 	pe.vaddr = encode_pointer(iov->iov_base);
 	pe.nr_pages = iov->iov_len / PAGE_SIZE;
-	pe.has_in_parent = true;
-	pe.in_parent = true;
+	pe.has_flags = true;
+	pe.flags = flags;
+
+	if (flags & PE_PRESENT) {
+		if (opts.auto_dedup && xfer->parent != NULL) {
+			ret = dedup_one_iovec(xfer->parent, pe.vaddr,
+					      pagemap_len(&pe));
+			if (ret == -1) {
+				pr_perror("Auto-deduplication failed");
+				return ret;
+			}
+		}
+	} else if (flags & PE_PARENT) {
+		if (xfer->parent != NULL) {
+			ret = check_pagehole_in_parent(xfer->parent, iov);
+			if (ret) {
+				pr_err("Hole %p/%zu not found in parent\n",
+				       iov->iov_base, iov->iov_len);
+				return -1;
+			}
+		}
+	}
 
 	if (pb_write_one(xfer->pmi, &pe, PB_PAGEMAP) < 0)
 		return -1;
@@ -364,13 +372,15 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, long id)
 out:
 	xfer->write_pagemap = write_pagemap_loc;
 	xfer->write_pages = write_pages_loc;
-	xfer->write_hole = write_pagehole_loc;
 	xfer->close = close_page_xfer;
 	return 0;
 }
 
 int open_page_xfer(struct page_xfer *xfer, int fd_type, long id)
 {
+	xfer->offset = 0;
+	xfer->transfer_lazy = true;
+
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, id);
 	else
@@ -378,31 +388,45 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, long id)
 }
 
 static int page_xfer_dump_hole(struct page_xfer *xfer,
-		struct iovec *hole, unsigned long off)
+			       struct iovec *hole, u32 flags)
 {
-	BUG_ON(hole->iov_base < (void *)off);
-	hole->iov_base -= off;
+	BUG_ON(hole->iov_base < (void *)xfer->offset);
+	hole->iov_base -= xfer->offset;
 	pr_debug("\th %p [%u]\n", hole->iov_base,
 			(unsigned int)(hole->iov_len / PAGE_SIZE));
 
-	if (xfer->write_hole(xfer, hole))
+	if (xfer->write_pagemap(xfer, hole, flags))
 		return -1;
 
 	return 0;
 }
 
+static int get_hole_flags(struct page_pipe *pp, int n)
+{
+	unsigned int hole_flags = pp->hole_flags[n];
+
+	if (hole_flags == PP_HOLE_PARENT)
+		return PE_PARENT;
+	else
+		BUG();
+
+	return -1;
+}
+
 static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp,
-		      unsigned int *cur_hole, void *limit, unsigned long off)
+		      unsigned int *cur_hole, void *limit)
 {
 	int ret;
 
 	for (; *cur_hole < pp->free_hole ; (*cur_hole)++) {
 		struct iovec hole = pp->holes[*cur_hole];
+		u32 hole_flags;
 
 		if (limit && hole.iov_base >= limit)
 			break;
 
-		ret = page_xfer_dump_hole(xfer, &hole, off);
+		hole_flags = get_hole_flags(pp, *cur_hole);
+		ret = page_xfer_dump_hole(xfer, &hole, hole_flags);
 		if (ret)
 			return ret;
 	}
@@ -410,8 +434,20 @@ static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp,
 	return 0;
 }
 
-int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp,
-		unsigned long off)
+static inline u32 ppb_xfer_flags(struct page_xfer *xfer, struct page_pipe_buf *ppb)
+{
+	if (ppb->flags & PPB_LAZY)
+		/*
+		 * Pages that can be lazily restored are always marked as such.
+		 * In the case we actually transfer them into image mark them
+		 * as present as well.
+		 */
+		return (xfer->transfer_lazy ? PE_PRESENT : 0) | PE_LAZY;
+	else
+		return PE_PRESENT;
+}
+
+int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0;
@@ -426,24 +462,28 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp,
 
 		for (i = 0; i < ppb->nr_segs; i++) {
 			struct iovec iov = ppb->iov[i];
+			u32 flags;
 
-			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base, off);
+			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
 			if (ret)
 				return ret;
 
-			BUG_ON(iov.iov_base < (void *)off);
-			iov.iov_base -= off;
+			BUG_ON(iov.iov_base < (void *)xfer->offset);
+			iov.iov_base -= xfer->offset;
 			pr_debug("\tp %p [%u]\n", iov.iov_base,
 					(unsigned int)(iov.iov_len / PAGE_SIZE));
 
-			if (xfer->write_pagemap(xfer, &iov))
+			flags = ppb_xfer_flags(xfer, ppb);
+
+			if (xfer->write_pagemap(xfer, &iov, flags))
 				return -1;
-			if (xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+			if ((flags & PE_PRESENT) && xfer->write_pages(xfer,
+						ppb->p[0], iov.iov_len))
 				return -1;
 		}
 	}
 
-	return dump_holes(xfer, pp, &cur_hole, NULL, off);
+	return dump_holes(xfer, pp, &cur_hole, NULL);
 }
 
 /*
@@ -506,10 +546,8 @@ static int check_parent_server_xfer(int fd_type, long id)
 	pi.cmd = PS_IOV_PARENT;
 	pi.dst_id = encode_pm(fd_type, id);
 
-	if (write(page_server_sk, &pi, sizeof(pi)) != sizeof(pi)) {
-		pr_perror("Can't write to page server");
+	if (send_psi(page_server_sk, &pi))
 		return -1;
-	}
 
 	tcp_nodelay(page_server_sk, true);
 
@@ -540,10 +578,19 @@ static struct page_xfer_job cxfer = {
 	.dst_id = ~0,
 };
 
+static struct pipe_read_dest pipe_read_dest = {
+	.sink_fd = -1,
+};
+
 static void page_server_close(void)
 {
 	if (cxfer.dst_id != ~0)
 		cxfer.loc_xfer.close(&cxfer.loc_xfer);
+	if (pipe_read_dest.sink_fd != -1) {
+		close(pipe_read_dest.sink_fd);
+		close(pipe_read_dest.p[0]);
+		close(pipe_read_dest.p[1]);
+	}
 }
 
 static int page_server_open(int sk, struct page_server_iov *pi)
@@ -588,7 +635,7 @@ static int prep_loc_xfer(struct page_server_iov *pi)
 		return 0;
 }
 
-static int page_server_add(int sk, struct page_server_iov *pi)
+static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 {
 	size_t len;
 	struct page_xfer *lxfer = &cxfer.loc_xfer;
@@ -600,8 +647,11 @@ static int page_server_add(int sk, struct page_server_iov *pi)
 		return -1;
 
 	psi2iovec(pi, &iov);
-	if (lxfer->write_pagemap(lxfer, &iov))
+	if (lxfer->write_pagemap(lxfer, &iov, flags))
 		return -1;
+
+	if (!(flags & PE_PRESENT))
+		return 0;
 
 	len = iov.iov_len;
 	while (len > 0) {
@@ -644,19 +694,41 @@ static int page_server_add(int sk, struct page_server_iov *pi)
 	return 0;
 }
 
-static int page_server_hole(int sk, struct page_server_iov *pi)
+static int page_server_get_pages(int sk, struct page_server_iov *pi)
 {
-	struct page_xfer *lxfer = &cxfer.loc_xfer;
-	struct iovec iov;
+	struct pstree_item *item;
+	struct page_pipe *pp;
+	unsigned long len;
+	int ret;
 
-	pr_debug("Adding %"PRIx64"/%u hole\n", pi->vaddr, pi->nr_pages);
+	item = pstree_item_by_virt(pi->dst_id);
+	pp = dmpi(item)->mem_pp;
 
-	if (prep_loc_xfer(pi))
+	ret = page_pipe_read(pp, &pipe_read_dest, pi->vaddr,
+			     &pi->nr_pages, PPB_LAZY);
+	if (ret)
+		return ret;
+
+	/*
+	 * The pi is reused for send_psi here, so .nr_pages, .vaddr and
+	 * .dst_id all remain intact.
+	 */
+
+	if (pi->nr_pages == 0) {
+		pr_debug("no iovs found, zero pages\n");
+		return -1;
+	}
+
+	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F, PE_PRESENT);
+	if (send_psi(sk, pi))
 		return -1;
 
-	psi2iovec(pi, &iov);
-	if (lxfer->write_hole(lxfer, &iov))
+	len = pi->nr_pages * PAGE_SIZE;
+	ret = splice(pipe_read_dest.p[0], NULL, sk, NULL, len, SPLICE_F_MOVE);
+	if (ret != len)
 		return -1;
+
+	tcp_nodelay(sk, true);
 
 	return 0;
 }
@@ -665,25 +737,32 @@ static int page_server_serve(int sk)
 {
 	int ret = -1;
 	bool flushed = false;
+	bool receiving_pages = !opts.lazy_pages;
 
-	/*
-	 * This socket only accepts data except one thing -- it
-	 * writes back the has_parent bit from time to time, so
-	 * make it NODELAY all the time.
-	 */
-	tcp_nodelay(sk, true);
+	if (receiving_pages) {
+		/*
+		 * This socket only accepts data except one thing -- it
+		 * writes back the has_parent bit from time to time, so
+		 * make it NODELAY all the time.
+		 */
+		tcp_nodelay(sk, true);
 
-	if (pipe(cxfer.p)) {
-		pr_perror("Can't make pipe for xfer");
-		close(sk);
-		return -1;
+		if (pipe(cxfer.p)) {
+			pr_perror("Can't make pipe for xfer");
+			close(sk);
+			return -1;
+		}
+
+		cxfer.pipe_size = fcntl(cxfer.p[0], F_GETPIPE_SZ, 0);
+		pr_debug("Created xfer pipe size %u\n", cxfer.pipe_size);
+	} else {
+		pipe_read_dest_init(&pipe_read_dest);
+		tcp_cork(sk, true);
 	}
-
-	cxfer.pipe_size = fcntl(cxfer.p[0], F_GETPIPE_SZ, 0);
-	pr_debug("Created xfer pipe size %u\n", cxfer.pipe_size);
 
 	while (1) {
 		struct page_server_iov pi;
+		u32 cmd;
 
 		ret = recv(sk, &pi, sizeof(pi), MSG_WAITALL);
 		if (!ret)
@@ -696,8 +775,9 @@ static int page_server_serve(int sk)
 		}
 
 		flushed = false;
+		cmd = decode_ps_cmd(pi.cmd);
 
-		switch (pi.cmd) {
+		switch (cmd) {
 		case PS_IOV_OPEN:
 			ret = page_server_open(-1, &pi);
 			break;
@@ -707,12 +787,22 @@ static int page_server_serve(int sk)
 		case PS_IOV_PARENT:
 			ret = page_server_check_parent(sk, &pi);
 			break;
+		case PS_IOV_ADD_F:
 		case PS_IOV_ADD:
-			ret = page_server_add(sk, &pi);
-			break;
 		case PS_IOV_HOLE:
-			ret = page_server_hole(sk, &pi);
+		{
+			u32 flags;
+
+			if (likely(cmd == PS_IOV_ADD_F))
+				flags = decode_ps_flags(pi.cmd);
+			else if (cmd == PS_IOV_ADD)
+				flags = PE_PRESENT;
+			else    /* PS_IOV_HOLE */
+				flags = PE_PARENT;
+
+			ret = page_server_add(sk, &pi, flags);
 			break;
+		}
 		case PS_IOV_FLUSH:
 		case PS_IOV_FLUSH_N_CLOSE:
 		{
@@ -732,6 +822,9 @@ static int page_server_serve(int sk)
 			flushed = true;
 			break;
 		}
+		case PS_IOV_GET:
+			ret = page_server_get_pages(sk, &pi);
+			break;
 		default:
 			pr_err("Unknown command %u\n", pi.cmd);
 			ret = -1;
@@ -742,7 +835,7 @@ static int page_server_serve(int sk)
 			break;
 	}
 
-	if (!ret && !flushed) {
+	if (receiving_pages && !ret && !flushed) {
 		pr_err("The data were not flushed\n");
 		ret = -1;
 	}
@@ -768,13 +861,116 @@ static int page_server_serve(int sk)
 	return ret;
 }
 
-int cr_page_server(bool daemon_mode, int cfd)
+static int fill_page_pipe(struct page_read *pr, struct page_pipe *pp)
+{
+	struct page_pipe_buf *ppb;
+	int i, ret;
+
+	pr->reset(pr);
+
+	while (pr->advance(pr)) {
+		unsigned long vaddr = pr->pe->vaddr;
+
+		for (i = 0; i < pr->pe->nr_pages; i++, vaddr += PAGE_SIZE) {
+			if (pagemap_in_parent(pr->pe))
+				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
+			else
+				ret = page_pipe_add_page(pp, vaddr, pagemap_lazy(pr->pe) ? PPB_LAZY : 0);
+			if (ret) {
+				pr_err("Failed adding page at %lx\n", vaddr);
+				return -1;
+			}
+		}
+	}
+
+	list_for_each_entry(ppb, &pp->bufs, l) {
+		for (i = 0; i < ppb->nr_segs; i++) {
+			struct iovec iov = ppb->iov[i];
+
+			if (splice(img_raw_fd(pr->pi), NULL, ppb->p[1], NULL,
+				   iov.iov_len, SPLICE_F_MOVE) != iov.iov_len) {
+				pr_perror("Splice failed");
+				return -1;
+			}
+		}
+	}
+
+	debug_show_page_pipe(pp);
+
+	return 0;
+}
+
+static int page_pipe_from_pagemap(struct page_pipe **pp, int pid)
+{
+	struct page_read pr;
+	int nr_pages = 0;
+
+	if (open_page_read(pid, &pr, PR_TASK) <= 0) {
+		pr_err("Failed to open page read for %d\n", pid);
+		return -1;
+	}
+
+	while (pr.advance(&pr))
+		if (pagemap_present(pr.pe))
+			nr_pages += pr.pe->nr_pages;
+
+	*pp = create_page_pipe(nr_pages, NULL, 0);
+	if (!*pp) {
+		pr_err("Cannot create page pipe for %d\n", pid);
+		return -1;
+	}
+
+	if (fill_page_pipe(&pr, *pp))
+		return -1;
+
+	return 0;
+}
+
+static int page_server_init_send(void)
+{
+	struct pstree_item *pi;
+	struct page_pipe *pp;
+
+	BUILD_BUG_ON(sizeof(struct dmp_info) > sizeof(struct rst_info));
+
+	if (prepare_dummy_pstree())
+		return -1;
+
+	for_each_pstree_item(pi) {
+		if (prepare_dummy_task_state(pi))
+			return -1;
+
+		if (!task_alive(pi))
+			continue;
+
+		if (page_pipe_from_pagemap(&pp, vpid(pi))) {
+			pr_err("%d: failed to open page-read\n", vpid(pi));
+			return -1;
+		}
+
+		/*
+		 * prepare_dummy_pstree presumes 'restore' behaviour,
+		 * but page_server_get_pages uses dmpi() to get access
+		 * to the page-pipe, so we are faking it here.
+		 */
+		memset(rsti(pi), 0, sizeof(struct rst_info));
+		dmpi(pi)->mem_pp = pp;
+	}
+
+	return 0;
+}
+
+int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 {
 	int ask = -1;
 	int sk = -1;
 	int ret;
 
-	up_page_ids_base();
+	if (!opts.lazy_pages)
+		up_page_ids_base();
+	else if (!lazy_dump)
+		if (page_server_init_send())
+			return -1;
 
 	if (opts.ps_socket != -1) {
 		ret = 0;
@@ -800,7 +996,7 @@ no_server:
 	return ret;
 }
 
-int connect_to_page_server(void)
+static int connect_to_page_server(void)
 {
 	if (!opts.use_page_server)
 		return 0;
@@ -822,6 +1018,11 @@ out:
 	 */
 	tcp_cork(page_server_sk, true);
 	return 0;
+}
+
+int connect_to_page_server_to_send(void)
+{
+	return connect_to_page_server();
 }
 
 int disconnect_from_page_server(void)
@@ -849,10 +1050,8 @@ int disconnect_from_page_server(void)
 	else
 		pi.cmd = PS_IOV_FLUSH;
 
-	if (write(page_server_sk, &pi, sizeof(pi)) != sizeof(pi)) {
-		pr_perror("Can't write the fini command to server");
+	if (send_psi(page_server_sk, &pi))
 		goto out;
-	}
 
 	if (read(page_server_sk, &status, sizeof(status)) != sizeof(status)) {
 		pr_perror("The page server doesn't answer");
@@ -863,4 +1062,155 @@ int disconnect_from_page_server(void)
 out:
 	close_safe(&page_server_sk);
 	return ret ? : status;
+}
+
+struct ps_async_read {
+	unsigned long rb; /* read bytes */
+	unsigned long goal;
+
+	struct page_server_iov pi;
+	void *pages;
+
+	ps_async_read_complete complete;
+	void *priv;
+
+	struct list_head l;
+};
+
+static LIST_HEAD(async_reads);
+
+static void init_ps_async_read(struct ps_async_read *ar, void *buf,
+		int nr_pages, ps_async_read_complete complete, void *priv)
+{
+	ar->pages = buf;
+	ar->rb = 0;
+	ar->goal = sizeof(ar->pi) + nr_pages * PAGE_SIZE;
+	ar->complete = complete;
+	ar->priv = priv;
+}
+
+static int page_server_start_async_read(void *buf, int nr_pages,
+		ps_async_read_complete complete, void *priv)
+{
+	struct ps_async_read *ar;
+
+	ar = xmalloc(sizeof(*ar));
+	if (ar == NULL)
+		return -1;
+
+	init_ps_async_read(ar, buf, nr_pages, complete, priv);
+	list_add_tail(&ar->l, &async_reads);
+	return 0;
+}
+
+/*
+ * There are two possible event types we need to handle:
+ * - page info is available as a reply to request_remote_page
+ * - page data is available, and it follows page info we've just received
+ * Since the on dump side communications are completely synchronous,
+ * we can return to epoll right after the reception of page info and
+ * for sure the next time socket event will occur we'll get page data
+ * related to info we've just received
+ */
+static int page_server_read(struct ps_async_read *ar, int flags)
+{
+	int ret, need;
+	void *buf;
+
+	if (ar->rb < sizeof(ar->pi)) {
+		/* Header */
+		buf = ((void *)&ar->pi) + ar->rb;
+		need = sizeof(ar->pi) - ar->rb;
+	} else {
+		/* Page(s) data itself */
+		buf = ar->pages + (ar->rb - sizeof(ar->pi));
+		need = ar->goal - ar->rb;
+	}
+
+	ret = recv(page_server_sk, buf, need, flags);
+	if (ret < 0) {
+		pr_perror("Error reading async data from page server");
+		return -1;
+	}
+
+	ar->rb += ret;
+	if (ar->rb < ar->goal)
+		return 1;
+
+	/*
+	 * IO complete -- notify the caller and drop the request
+	 */
+	BUG_ON(ar->rb > ar->goal);
+	return ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr,
+				(int)ar->pi.nr_pages, ar->priv);
+}
+
+static int page_server_async_read(struct epoll_rfd *f)
+{
+	struct ps_async_read *ar;
+	int ret;
+
+	BUG_ON(list_empty(&async_reads));
+	ar = list_first_entry(&async_reads, struct ps_async_read, l);
+	ret = page_server_read(ar, MSG_DONTWAIT);
+
+	if (ret > 0)
+		return 0;
+	if (!ret) {
+		list_del(&ar->l);
+		xfree(ar);
+	}
+
+	return ret;
+}
+
+static struct epoll_rfd ps_rfd;
+
+int connect_to_page_server_to_recv(int epfd)
+{
+	if (connect_to_page_server())
+		return -1;
+
+	ps_rfd.fd = page_server_sk;
+	ps_rfd.revent = page_server_async_read;
+
+	return epoll_add_rfd(epfd, &ps_rfd);
+}
+
+int request_remote_pages(int pid, unsigned long addr, int nr_pages)
+{
+	struct page_server_iov pi = {
+		.cmd		= PS_IOV_GET,
+		.nr_pages	= nr_pages,
+		.vaddr		= addr,
+		.dst_id		= pid,
+	};
+
+	/* XXX: why MSG_DONTWAIT here? */
+	if (send_psi_flags(page_server_sk, &pi, MSG_DONTWAIT))
+		return -1;
+
+	tcp_nodelay(page_server_sk, true);
+	return 0;
+}
+
+static int page_server_start_sync_read(void *buf, int nr,
+		ps_async_read_complete complete, void *priv)
+{
+	struct ps_async_read ar;
+	int ret = 1;
+
+	init_ps_async_read(&ar, buf, nr, complete, priv);
+	while (ret == 1)
+		ret = page_server_read(&ar, MSG_WAITALL);
+	return ret;
+}
+
+int page_server_start_read(void *buf, int nr,
+		ps_async_read_complete complete, void *priv, unsigned flags)
+{
+	if (flags & PR_ASYNC)
+		return page_server_start_async_read(buf, nr, complete, priv);
+	else
+		return page_server_start_sync_read(buf, nr, complete, priv);
 }

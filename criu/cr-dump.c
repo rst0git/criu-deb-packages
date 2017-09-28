@@ -515,6 +515,9 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat,
 	mme.dumpable = misc->dumpable;
 	mme.has_dumpable = true;
 
+	mme.thp_disabled = misc->thp_disabled;
+	mme.has_thp_disabled = true;
+
 	mme.n_mm_saved_auxv = AT_VECTOR_SIZE;
 	mme.mm_saved_auxv = xmalloc(pb_repeated_size(&mme, mm_saved_auxv));
 	if (!mme.mm_saved_auxv)
@@ -1187,6 +1190,7 @@ static int pre_dump_one_task(struct pstree_item *item)
 	item->pid->ns[0].virt = misc.pid;
 
 	mdc.pre_dump = true;
+	mdc.lazy = false;
 
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 	if (ret)
@@ -1346,6 +1350,7 @@ static int dump_one_task(struct pstree_item *item)
 	}
 
 	mdc.pre_dump = false;
+	mdc.lazy = opts.lazy_pages;
 
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 	if (ret)
@@ -1387,7 +1392,10 @@ static int dump_one_task(struct pstree_item *item)
 		goto err;
 	}
 
-	ret = compel_cure(parasite_ctl);
+	if (opts.lazy_pages)
+		ret = compel_cure_remote(parasite_ctl);
+	else
+		ret = compel_cure(parasite_ctl);
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
@@ -1483,7 +1491,7 @@ static int cr_pre_dump_finish(int ret)
 			goto err;
 
 		mem_pp = dmpi(item)->mem_pp;
-		ret = page_xfer_dump_pages(&xfer, mem_pp, 0);
+		ret = page_xfer_dump_pages(&xfer, mem_pp);
 
 		xfer.close(&xfer);
 
@@ -1545,9 +1553,6 @@ int cr_pre_dump_tasks(pid_t pid)
 	if (cr_plugin_init(CR_PLUGIN_STAGE__PRE_DUMP))
 		goto err;
 
-	if (kerndat_init())
-		goto err;
-
 	if (lsm_check_opts())
 		goto err;
 
@@ -1557,10 +1562,10 @@ int cr_pre_dump_tasks(pid_t pid)
 	if (cpu_init())
 		goto err;
 
-	if (vdso_init())
+	if (vdso_init_dump())
 		goto err;
 
-	if (connect_to_page_server())
+	if (connect_to_page_server_to_send() < 0)
 		goto err;
 
 	if (setup_alarm_handler())
@@ -1589,6 +1594,27 @@ int cr_pre_dump_tasks(pid_t pid)
 	ret = 0;
 err:
 	return cr_pre_dump_finish(ret);
+}
+
+static int cr_lazy_mem_dump(void)
+{
+	struct pstree_item *item;
+	int ret = 0;
+
+	pr_info("Starting lazy pages server\n");
+	ret = cr_page_server(false, true, -1);
+
+	for_each_pstree_item(item) {
+		destroy_page_pipe(dmpi(item)->mem_pp);
+		compel_cure_local(dmpi(item)->parasite_ctl);
+	}
+
+	if (ret)
+		pr_err("Lazy pages transfer FAILED.\n");
+	else
+		pr_info("Lazy pages transfer finished successfully\n");
+
+	return ret;
 }
 
 static int cr_dump_finish(int ret)
@@ -1650,6 +1676,10 @@ static int cr_dump_finish(int ret)
 		delete_link_remaps();
 		clean_cr_time_mounts();
 	}
+
+	if (!ret && opts.lazy_pages)
+		ret = cr_lazy_mem_dump();
+
 	arch_set_thread_regs(root_item);
 	pstree_switch_state(root_item,
 			    (ret || post_dump_ret) ?
@@ -1699,9 +1729,6 @@ int cr_dump_tasks(pid_t pid)
 	if (cr_plugin_init(CR_PLUGIN_STAGE__DUMP))
 		goto err;
 
-	if (kerndat_init())
-		goto err;
-
 	if (lsm_check_opts())
 		goto err;
 
@@ -1711,7 +1738,7 @@ int cr_dump_tasks(pid_t pid)
 	if (cpu_init())
 		goto err;
 
-	if (vdso_init())
+	if (vdso_init_dump())
 		goto err;
 
 	if (cgp_init(opts.cgroup_props,
@@ -1731,7 +1758,7 @@ int cr_dump_tasks(pid_t pid)
 			goto err;
 	}
 
-	if (connect_to_page_server())
+	if (connect_to_page_server_to_send() < 0)
 		goto err;
 
 	if (setup_alarm_handler())

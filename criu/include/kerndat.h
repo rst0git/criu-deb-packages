@@ -5,6 +5,9 @@
 
 #include "int.h"
 #include "config.h"
+#ifdef CONFIG_VDSO
+#include "util-vdso.h"
+#endif
 
 struct stat;
 
@@ -49,6 +52,17 @@ struct kerndat_s {
 	bool has_tcp_half_closed;
 	bool stack_guard_gap_hidden;
 	int lsm;
+	bool has_uffd;
+	unsigned long uffd_features;
+	bool has_thp_disable;
+	bool can_map_vdso;
+	bool vdso_hint_reliable;
+#ifdef CONFIG_VDSO
+	struct vdso_symtable	vdso_sym;
+#ifdef CONFIG_COMPAT
+	struct vdso_symtable	vdso_sym_compat;
+#endif
+#endif
 };
 
 extern struct kerndat_s kdat;
@@ -70,5 +84,6 @@ enum {
 extern int kerndat_fs_virtualized(unsigned int which, u32 kdev);
 
 extern int kerndat_tcp_repair();
+extern int kerndat_uffd(void);
 
 #endif /* __CR_KERNDAT_H__ */

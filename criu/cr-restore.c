@@ -49,6 +49,7 @@
 #include "proc_parse.h"
 #include "pie/restorer-blob.h"
 #include "crtools.h"
+#include "uffd.h"
 #include "namespaces.h"
 #include "mem.h"
 #include "mount.h"
@@ -847,6 +848,9 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (prepare_vmas(current, ta))
 		return -1;
 
+	if (setup_uffd(pid, ta))
+		return -1;
+
 	return sigreturn_restore(pid, ta, args_len, core);
 }
 
@@ -936,6 +940,9 @@ static int restore_one_zombie(CoreEntry *core)
 	pr_info("Restoring zombie with %d code\n", exit_code);
 
 	if (inherit_fd_fini() < 0)
+		return -1;
+
+	if (lazy_pages_setup_zombie(vpid(current)))
 		return -1;
 
 	prctl(PR_SET_NAME, (long)(void *)core->tc->comm, 0, 0, 0);
@@ -2146,7 +2153,7 @@ out:
 	return -1;
 }
 
-static int prepare_task_entries(void)
+int prepare_task_entries(void)
 {
 	task_entries_pos = rst_mem_align_cpos(RM_SHREMAP);
 	task_entries = rst_mem_alloc(sizeof(*task_entries), RM_SHREMAP);
@@ -2164,6 +2171,19 @@ static int prepare_task_entries(void)
 	return 0;
 }
 
+int prepare_dummy_task_state(struct pstree_item *pi)
+{
+	CoreEntry *core;
+
+	if (open_core(vpid(pi), &core))
+		return -1;
+
+	pi->pid->state = core->tc->task_state;
+	core_entry__free_unpacked(core, NULL);
+
+	return 0;
+}
+
 int cr_restore_tasks(void)
 {
 	int ret = -1;
@@ -2177,9 +2197,6 @@ int cr_restore_tasks(void)
 	if (init_stats(RESTORE_STATS))
 		goto err;
 
-	if (kerndat_init())
-		goto err;
-
 	if (lsm_check_opts())
 		goto err;
 
@@ -2188,7 +2205,7 @@ int cr_restore_tasks(void)
 	if (cpu_init() < 0)
 		goto err;
 
-	if (vdso_init())
+	if (vdso_init_restore())
 		goto err;
 
 	if (opts.cpu_cap & (CPU_CAP_INS | CPU_CAP_CPU)) {
@@ -2206,6 +2223,9 @@ int cr_restore_tasks(void)
 		goto err;
 
 	if (criu_signals_setup() < 0)
+		goto err;
+
+	if (prepare_lazy_pages_socket() < 0)
 		goto err;
 
 	ret = restore_root_task(root_item);
@@ -2532,6 +2552,9 @@ static int prepare_mm(pid_t pid, struct task_restore_args *args)
 		goto out;
 
 	args->fd_exe_link = exe_fd;
+
+	args->has_thp_enabled = rsti(current)->has_thp_enabled;
+
 	ret = 0;
 out:
 	return ret;
@@ -3014,7 +3037,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	struct restore_mem_zone *mz;
 
 #ifdef CONFIG_VDSO
-	struct vdso_symtable vdso_symtab_rt;
+	struct vdso_maps vdso_maps_rt;
 	unsigned long vdso_rt_size = 0;
 #endif
 
@@ -3060,15 +3083,15 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 #ifdef CONFIG_VDSO
 	if (core_is_compat(core))
-		vdso_symtab_rt = vdso_compat_rt;
+		vdso_maps_rt = vdso_maps_compat;
 	else
-		vdso_symtab_rt = vdso_sym_rt;
+		vdso_maps_rt = vdso_maps;
 	/*
 	 * Figure out how much memory runtime vdso and vvar will need.
 	 */
-	vdso_rt_size = vdso_vma_size(&vdso_symtab_rt);
-	if (vdso_rt_size && vvar_vma_size(&vdso_symtab_rt))
-		vdso_rt_size += ALIGN(vvar_vma_size(&vdso_symtab_rt), PAGE_SIZE);
+	vdso_rt_size = vdso_maps_rt.sym.vdso_size;
+	if (vdso_rt_size && vdso_maps_rt.sym.vvar_size)
+		vdso_rt_size += ALIGN(vdso_maps_rt.sym.vvar_size, PAGE_SIZE);
 	task_args->bootstrap_len += vdso_rt_size;
 #endif
 
@@ -3204,7 +3227,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	strncpy(task_args->comm, core->tc->comm, sizeof(task_args->comm));
 
-
 	/*
 	 * Fill up per-thread data.
 	 */
@@ -3286,8 +3308,9 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 */
 	mem += rst_mem_size;
 	task_args->vdso_rt_parked_at = (unsigned long)mem;
-	task_args->vdso_sym_rt = vdso_symtab_rt;
+	task_args->vdso_maps_rt = vdso_maps_rt;
 	task_args->vdso_rt_size = vdso_rt_size;
+	task_args->can_map_vdso = kdat.can_map_vdso;
 #endif
 
 	new_sp = restorer_stack(task_args->t->mz);
