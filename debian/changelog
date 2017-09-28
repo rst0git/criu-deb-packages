@@ -1,3 +1,9 @@
+criu (3.5-2) unstable; urgency=medium
+
+  * Upload to unstable
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 28 Sep 2017 13:41:44 +0200
+
 criu (3.5-1) experimental; urgency=medium
 
   * New upstream version 3.5 (Clay Jay)
