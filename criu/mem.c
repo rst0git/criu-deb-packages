@@ -3,6 +3,8 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/syscall.h>
+#include <sys/prctl.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -17,6 +19,7 @@
 #include "stats.h"
 #include "vma.h"
 #include "shmem.h"
+#include "uffd.h"
 #include "pstree.h"
 #include "restorer.h"
 #include "rst-malloc.h"
@@ -25,6 +28,7 @@
 #include "files-reg.h"
 #include "pagemap-cache.h"
 #include "fault-injection.h"
+#include "prctl.h"
 #include <compel/compel.h>
 
 #include "protobuf.h"
@@ -80,6 +84,21 @@ unsigned long dump_pages_args_size(struct vm_area_list *vmas)
 		(vmas->priv_size + 1) * sizeof(struct iovec);
 }
 
+static inline bool __page_is_zero(u64 pme)
+{
+	return (pme & PME_PFRAME_MASK) == kdat.zero_page_pfn;
+}
+
+static inline bool __page_in_parent(bool dirty)
+{
+	/*
+	 * If we do memory tracking, but w/o parent images,
+	 * then we have to dump all memory
+	 */
+
+	return opts.track_mem && opts.img_parent && !dirty;
+}
+
 bool should_dump_page(VmaEntry *vmae, u64 pme)
 {
 #ifdef CONFIG_VDSO
@@ -107,22 +126,20 @@ bool should_dump_page(VmaEntry *vmae, u64 pme)
 		return false;
 	if (vma_entry_is(vmae, VMA_AREA_AIORING))
 		return true;
-	if (pme & PME_SWAP)
-		return true;
-	if ((pme & PME_PRESENT) && ((pme & PME_PFRAME_MASK) != kdat.zero_page_pfn))
+	if ((pme & (PME_PRESENT | PME_SWAP)) && !__page_is_zero(pme))
 		return true;
 
 	return false;
 }
 
+bool page_is_zero(u64 pme)
+{
+	return __page_is_zero(pme);
+}
+
 bool page_in_parent(bool dirty)
 {
-	/*
-	 * If we do memory tracking, but w/o parent images,
-	 * then we have to dump all memory
-	 */
-
-	return opts.track_mem && opts.img_parent && !dirty;
+	return __page_in_parent(dirty);
 }
 
 /*
@@ -138,18 +155,22 @@ static int generate_iovs(struct vma_area *vma, struct page_pipe *pp, u64 *map, u
 {
 	u64 *at = &map[PAGE_PFN(*off)];
 	unsigned long pfn, nr_to_scan;
-	unsigned long pages[2] = {};
+	unsigned long pages[3] = {};
 
 	nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
 
 	for (pfn = 0; pfn < nr_to_scan; pfn++) {
 		unsigned long vaddr;
+		unsigned int ppb_flags = 0;
 		int ret;
 
 		if (!should_dump_page(vma->e, at[pfn]))
 			continue;
 
 		vaddr = vma->e->start + *off + pfn * PAGE_SIZE;
+
+		if (vma_entry_can_be_lazy(vma->e))
+			ppb_flags |= PPB_LAZY;
 
 		/*
 		 * If we're doing incremental dump (parent images
@@ -159,11 +180,14 @@ static int generate_iovs(struct vma_area *vma, struct page_pipe *pp, u64 *map, u
 		 */
 
 		if (has_parent && page_in_parent(at[pfn] & PME_SOFT_DIRTY)) {
-			ret = page_pipe_add_hole(pp, vaddr);
+			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			pages[0]++;
 		} else {
-			ret = page_pipe_add_page(pp, vaddr);
-			pages[1]++;
+			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+				pages[1]++;
+			else
+				pages[2]++;
 		}
 
 		if (ret) {
@@ -176,9 +200,11 @@ static int generate_iovs(struct vma_area *vma, struct page_pipe *pp, u64 *map, u
 
 	cnt_add(CNT_PAGES_SCANNED, nr_to_scan);
 	cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
-	cnt_add(CNT_PAGES_WRITTEN, pages[1]);
+	cnt_add(CNT_PAGES_LAZY, pages[1]);
+	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
 
-	pr_info("Pagemap generated: %lu pages %lu holes\n", pages[1], pages[0]);
+	pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n",
+		pages[2] + pages[1], pages[1], pages[0]);
 	return 0;
 }
 
@@ -258,7 +284,7 @@ static int xfer_pages(struct page_pipe *pp, struct page_xfer *xfer)
 	 *           pre-dump action (see pre_dump_one_task)
 	 */
 	timing_start(TIME_MEMWRITE);
-	ret = page_xfer_dump_pages(xfer, pp, 0);
+	ret = page_xfer_dump_pages(xfer, pp);
 	timing_stop(TIME_MEMWRITE);
 
 	return ret;
@@ -298,7 +324,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item,
 		return -1;
 
 	ret = -1;
-	if (!mdc->pre_dump)
+	if (!(mdc->pre_dump || mdc->lazy))
 		/*
 		 * Chunk mode pushes pages portion by portion. This mode
 		 * only works when we don't need to keep pp for later
@@ -306,7 +332,8 @@ static int __parasite_dump_pages_seized(struct pstree_item *item,
 		 */
 		cpp_flags |= PP_CHUNK_MODE;
 	pp = create_page_pipe(vma_area_list->priv_size,
-					    pargs_iovs(args), cpp_flags);
+					    mdc->lazy ? NULL : pargs_iovs(args),
+					    cpp_flags);
 	if (!pp)
 		goto out;
 
@@ -319,6 +346,8 @@ static int __parasite_dump_pages_seized(struct pstree_item *item,
 		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
 		if (ret < 0)
 			goto out_pp;
+
+		xfer.transfer_lazy = !mdc->lazy;
 	} else {
 		ret = check_parent_page_xfer(CR_FD_PAGEMAP, vpid(item));
 		if (ret < 0)
@@ -371,6 +400,9 @@ again:
 			goto out_xfer;
 	}
 
+	if (mdc->lazy)
+		memcpy(pargs_iovs(args), pp->iovs,
+		       sizeof(struct iovec) * pp->nr_iovs);
 	ret = drain_pages(pp, ctl, args);
 	if (!ret && !mdc->pre_dump)
 		ret = xfer_pages(pp, &xfer);
@@ -388,7 +420,7 @@ out_xfer:
 	if (!mdc->pre_dump)
 		xfer.close(&xfer);
 out_pp:
-	if (ret || !mdc->pre_dump)
+	if (ret || !(mdc->pre_dump || mdc->lazy))
 		destroy_page_pipe(pp);
 	else
 		dmpi(item)->mem_pp = pp;
@@ -821,6 +853,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	unsigned int nr_shared = 0;
 	unsigned int nr_droped = 0;
 	unsigned int nr_compared = 0;
+	unsigned int nr_lazy = 0;
 	unsigned long va;
 
 	vma = list_first_entry(vmas, struct vma_area, list);
@@ -838,6 +871,17 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 		va = (unsigned long)decode_pointer(pr->pe->vaddr);
 		nr_pages = pr->pe->nr_pages;
+
+		/*
+		 * This means that userfaultfd is used to load the pages
+		 * on demand.
+		 */
+		if (opts.lazy_pages && pagemap_lazy(pr->pe)) {
+			pr_debug("Lazy restore skips %ld pages at %lx\n", nr_pages, va);
+			pr->skip_pages(pr, nr_pages * PAGE_SIZE);
+			nr_lazy += nr_pages;
+			continue;
+		}
 
 		for (i = 0; i < nr_pages; i++) {
 			unsigned char buf[PAGE_SIZE];
@@ -986,6 +1030,7 @@ err_read:
 	pr_info("nr_restored_pages: %d\n", nr_restored);
 	pr_info("nr_shared_pages:   %d\n", nr_shared);
 	pr_info("nr_droped_pages:   %d\n", nr_droped);
+	pr_info("nr_lazy:           %d\n", nr_lazy);
 
 	return 0;
 
@@ -993,6 +1038,38 @@ err_addr:
 	pr_err("Page entry address %lx outside of VMA %lx-%lx\n",
 	       va, (long)vma->e->start, (long)vma->e->end);
 	return -1;
+}
+
+static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
+{
+	struct _MmEntry *mm = rsti(t)->mm;
+
+	/*
+	 * There is no need to disable it if the page read doesn't
+	 * have parent. In this case VMA will be empty until
+	 * userfaultfd_register, so there would be no pages to
+	 * collapse. And, once we register the VMA with uffd,
+	 * khugepaged will skip it.
+	 */
+	if (!(opts.lazy_pages && page_read_has_parent(pr)))
+		return 0;
+
+	if (!kdat.has_thp_disable)
+		pr_warn("Disabling transparent huge pages. "
+			"It may affect performance!\n");
+
+	/*
+	 * temporarily disable THP to avoid collapse of pages
+	 * in the areas that will be monitored by uffd
+	 */
+	if (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)) {
+		pr_perror("Cannot disable THP");
+		return -1;
+	}
+	if (!(mm->has_thp_disabled && mm->thp_disabled))
+		rsti(t)->has_thp_enabled = true;
+
+	return 0;
 }
 
 int prepare_mappings(struct pstree_item *t)
@@ -1024,6 +1101,9 @@ int prepare_mappings(struct pstree_item *t)
 
 	ret = open_page_read(vpid(t), &pr, PR_TASK);
 	if (ret <= 0)
+		return -1;
+
+	if (maybe_disable_thp(t, &pr))
 		return -1;
 
 	pr.advance(&pr); /* shift to the 1st iovec */
@@ -1175,4 +1255,3 @@ int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta)
 
 	return prepare_vma_ios(t, ta);
 }
-

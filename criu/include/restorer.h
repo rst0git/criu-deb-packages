@@ -117,6 +117,9 @@ struct task_restore_args {
 	unsigned int			loglevel;
 	struct timeval			logstart;
 
+	int				uffd;
+	bool				has_thp_enabled;
+
 	/* threads restoration */
 	int				nr_threads;		/* number of threads */
 	thread_restore_fcall_t		clone_restore_fn;	/* helper address for clone() call */
@@ -188,9 +191,10 @@ struct task_restore_args {
 
 	bool				compatible_mode;
 
+	bool				can_map_vdso;
 #ifdef CONFIG_VDSO
 	unsigned long			vdso_rt_size;
-	struct vdso_symtable		vdso_sym_rt;		/* runtime vdso symbols */
+	struct vdso_maps		vdso_maps_rt;		/* runtime vdso symbols */
 	unsigned long			vdso_rt_parked_at;	/* safe place to keep vdso */
 #endif
 	void				**breakpoint;

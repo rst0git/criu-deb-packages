@@ -54,6 +54,8 @@ TST_NOFILE	:=				\
 		pthread02			\
 		vdso00				\
 		vdso01				\
+		vdso02				\
+		vdso-proxy			\
 		utsname				\
 		pstree				\
 		sockets01			\
@@ -172,6 +174,7 @@ TST_NOFILE	:=				\
 		cr_veth				\
 		sock_peercred			\
 		s390x_mmap_high			\
+		uffd-events			\
 #		jobctl00			\
 
 include ../Makefile.inc

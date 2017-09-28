@@ -17,6 +17,8 @@
 #include <sys/resource.h>
 #include <signal.h>
 
+#include "linux/userfaultfd.h"
+
 #include "int.h"
 #include "types.h"
 #include "common/compiler.h"
@@ -31,6 +33,7 @@
 #include "image.h"
 #include "sk-inet.h"
 #include "vma.h"
+#include "uffd.h"
 
 #include "common/lock.h"
 #include "restorer.h"
@@ -783,8 +786,46 @@ static void rst_tcp_socks_all(struct task_restore_args *ta)
 		rst_tcp_repair_off(&ta->tcp_socks[i]);
 }
 
-static int vma_remap(unsigned long src, unsigned long dst, unsigned long len)
+static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 {
+	int rc;
+	struct uffdio_register uffdio_register;
+	unsigned long expected_ioctls;
+
+	/*
+	 * If uffd == -1, this means that userfaultfd is not enabled
+	 * or it is not available.
+	 */
+	if (uffd == -1)
+		return 0;
+
+	uffdio_register.range.start = addr;
+	uffdio_register.range.len = len;
+	uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+
+	pr_info("lazy-pages: register: %lx, len %lx\n", addr, len);
+
+	rc = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long) &uffdio_register);
+	if (rc != 0) {
+		pr_err("lazy-pages: register %lx failed: rc:%d, \n", addr, rc);
+		return -1;
+	}
+
+	expected_ioctls = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO_COPY) | (1 << _UFFDIO_ZEROPAGE);
+
+	if ((uffdio_register.ioctls & expected_ioctls) != expected_ioctls) {
+		pr_err("lazy-pages: unexpected missing uffd ioctl for anon memory\n");
+	}
+
+	return 0;
+}
+
+
+static int vma_remap(VmaEntry *vma_entry, int uffd)
+{
+	unsigned long src = vma_premmaped_start(vma_entry);
+	unsigned long dst = vma_entry->start;
+	unsigned long len = vma_entry_len(vma_entry);
 	unsigned long guard = 0, tmp;
 
 	pr_info("Remap %lx->%lx len %lx\n", src, dst, len);
@@ -855,6 +896,18 @@ static int vma_remap(unsigned long src, unsigned long dst, unsigned long len)
 		pr_err("Unable to remap %lx -> %lx\n", src, dst);
 		return -1;
 	}
+
+	/*
+	 * If running in userfaultfd/lazy-pages mode pages with
+	 * MAP_ANONYMOUS and MAP_PRIVATE are remapped but without the
+	 * real content.
+	 * The function enable_uffd() marks the page(s) as userfaultfd
+	 * pages, so that the processes will hang until the memory is
+	 * injected via userfaultfd.
+	 */
+	if (vma_entry_can_be_lazy(vma_entry))
+		if (enable_uffd(uffd, dst, len) != 0)
+			return -1;
 
 	return 0;
 }
@@ -956,7 +1009,7 @@ static void restore_posix_timers(struct task_restore_args *args)
  * trap us on the exit from sys_munmap.
  */
 #ifdef CONFIG_VDSO
-static unsigned long vdso_rt_size;
+unsigned long vdso_rt_size = 0;
 #else
 #define vdso_rt_size	(0)
 #endif
@@ -1081,6 +1134,34 @@ static int wait_zombies(struct task_restore_args *task_args)
 	return 0;
 }
 
+static bool vdso_unmapped(struct task_restore_args *args)
+{
+	unsigned int i;
+
+	/* Don't park rt-vdso or rt-vvar if dumpee doesn't have them */
+	for (i = 0; i < args->vmas_n; i++) {
+		VmaEntry *vma = &args->vmas[i];
+
+		if (vma_entry_is(vma, VMA_AREA_VDSO) ||
+				vma_entry_is(vma, VMA_AREA_VVAR))
+			return false;
+	}
+
+	return true;
+}
+
+static bool vdso_needs_parking(struct task_restore_args *args)
+{
+	/* Compatible vDSO will be mapped, not moved */
+	if (args->compatible_mode)
+		return false;
+
+	if (args->can_map_vdso)
+		return false;
+
+	return !vdso_unmapped(args);
+}
+
 /*
  * The main routine to restore task via sigreturn.
  * This one is very special, we never return there
@@ -1134,9 +1215,12 @@ long __export_restore_task(struct task_restore_args *args)
 
 	pr_info("Switched to the restorer %d\n", my_pid);
 
-	if (!args->compatible_mode) {
-		/* Compatible vDSO will be mapped, not moved */
-		if (vdso_do_park(&args->vdso_sym_rt,
+	if (args->uffd > -1) {
+		pr_debug("lazy-pages: uffd %d\n", args->uffd);
+	}
+
+	if (vdso_needs_parking(args)) {
+		if (vdso_do_park(&args->vdso_maps_rt,
 				args->vdso_rt_parked_at, vdso_rt_size))
 			goto core_restore_end;
 	}
@@ -1145,9 +1229,13 @@ long __export_restore_task(struct task_restore_args *args)
 				bootstrap_start, bootstrap_len, args->task_size))
 		goto core_restore_end;
 
-	/* Map compatible vdso */
-	if (args->compatible_mode && vdso_map_compat(args->vdso_rt_parked_at))
-		goto core_restore_end;
+	/* Map vdso that wasn't parked */
+	if (!vdso_unmapped(args) && args->can_map_vdso) {
+		if (arch_map_vdso(args->vdso_rt_parked_at,
+				args->compatible_mode) < 0) {
+			goto core_restore_end;
+		}
+	}
 
 	/* Shift private vma-s to the left */
 	for (i = 0; i < args->vmas_n; i++) {
@@ -1162,8 +1250,7 @@ long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start > vma_entry->shmid)
 			break;
 
-		if (vma_remap(vma_premmaped_start(vma_entry),
-				vma_entry->start, vma_entry_len(vma_entry)))
+		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
 	}
 
@@ -1180,9 +1267,26 @@ long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start < vma_entry->shmid)
 			break;
 
-		if (vma_remap(vma_premmaped_start(vma_entry),
-				vma_entry->start, vma_entry_len(vma_entry)))
+		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
+	}
+
+	if (args->uffd > -1) {
+		/* re-enable THP if we disabled it previously */
+		if (args->has_thp_enabled) {
+			if (sys_prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0)) {
+				pr_err("Cannot re-enable THP\n");
+				goto core_restore_end;
+			}
+		}
+
+		pr_debug("lazy-pages: closing uffd %d\n", args->uffd);
+		/*
+		 * All userfaultfd configuration has finished at this point.
+		 * Let's close the UFFD file descriptor, so that the restored
+		 * process does not have an opened UFFD FD for ever.
+		 */
+		sys_close(args->uffd);
 	}
 
 	/*
@@ -1253,7 +1357,7 @@ long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * Proxify vDSO.
 	 */
-	if (vdso_proxify(&args->vdso_sym_rt, args->vdso_rt_parked_at,
+	if (vdso_proxify(&args->vdso_maps_rt.sym, args->vdso_rt_parked_at,
 		     args->vmas, args->vmas_n, args->compatible_mode,
 		     fault_injected(FI_VDSO_TRAMPOLINES)))
 		goto core_restore_end;

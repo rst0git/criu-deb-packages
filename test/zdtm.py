@@ -775,6 +775,9 @@ class criu:
 		self.__iter = 0
 		self.__prev_dump_iter = None
 		self.__page_server = (opts['page_server'] and True or False)
+		self.__remote_lazy_pages = (opts['remote_lazy_pages'] and True or False)
+		self.__lazy_pages = (self.__remote_lazy_pages or
+				     opts['lazy_pages'] and True or False)
 		self.__restore_sibling = (opts['sibling'] and True or False)
 		self.__join_ns = (opts['join_ns'] and True or False)
 		self.__empty_ns = (opts['empty_ns'] and True or False)
@@ -788,6 +791,19 @@ class criu:
 		self.__criu = (opts['rpc'] and criu_rpc or criu_cli)
 		self.__lazy_pages_p = None
 		self.__page_server_p = None
+
+	def fini(self):
+		if self.__lazy_pages_p:
+			ret = self.__lazy_pages_p.wait()
+			self.__lazy_pages_p = None
+			if ret:
+				raise test_fail_exc("criu lazy-pages exited with %s" % ret)
+		if self.__page_server_p:
+			ret = self.__page_server_p.wait()
+			self.__page_server_p = None
+			if ret:
+				raise test_fail_exc("criu page-server exited with %s" % ret)
+                return
 
 	def logs(self):
 		return self.__dump_path
@@ -961,22 +977,20 @@ class criu:
 			r_opts.append('--external')
 			r_opts.append('mnt[zdtm]:%s' % criu_dir)
 
+		if self.__lazy_pages:
+			lp_opts = []
+			if self.__remote_lazy_pages:
+				lp_opts += ['--page-server', "--port", "12345"]
+				ps_opts = ["--pidfile", "ps.pid",
+					   "--port", "12345", "--lazy-pages"]
+				self.__page_server_p = self.__criu_act("page-server", opts = ps_opts, nowait = True)
+			self.__lazy_pages_p = self.__criu_act("lazy-pages", opts = lp_opts, nowait = True)
+			r_opts += ["--lazy-pages"]
+
 		if self.__leave_stopped:
 			r_opts += ['--leave-stopped']
 
 		self.__criu_act("restore", opts = r_opts + ["--restore-detached"])
-
-		if self.__lazy_pages_p:
-			ret = self.__lazy_pages_p.wait()
-			self.__lazy_pages_p = None
-			if ret:
-				raise test_fail_exc("criu lazy-pages exited with %s" % ret)
-
-		if self.__page_server_p:
-			ret = self.__page_server_p.wait()
-			self.__page_server_p = None
-			if ret:
-				raise test_fail_exc("criu page-server exited with %s" % ret)
 
 		if self.__leave_stopped:
 			pstree_check_stopped(self.__test.getpid())
@@ -1337,6 +1351,7 @@ def do_run_test(tname, tdesc, flavs, opts):
 				if opts['join_ns']:
 					check_joinns_state(t)
 				t.stop()
+				cr_api.fini()
 				try_run_hook(t, ["--clean"])
 		except test_fail_exc as e:
 			print_sep("Test %s FAIL at %s" % (tname, e.step), '#')
@@ -1426,8 +1441,8 @@ class launcher:
 		self.__show_progress(name)
 
 		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', 'stop', 'empty_ns',
-				'fault', 'keep_img', 'report', 'snaps', 'sat', 'script', 'rpc',
-				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup')
+				'fault', 'keep_img', 'report', 'snaps', 'sat', 'script', 'rpc', 'lazy_pages',
+				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup', 'remote_lazy_pages')
 		arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
 		if self.__use_log:
@@ -1640,6 +1655,15 @@ def run_tests(opts):
 		if subprocess.Popen(["ip", "netns", "exec", "zdtm_netns", "ip", "link", "set", "up", "dev", "lo"]).wait():
 			raise Exception("ip link set up dev lo")
 
+	if opts['lazy_pages'] or opts['remote_lazy_pages']:
+		uffd = criu.check("uffd")
+		uffd_noncoop = criu.check("uffd-noncoop")
+		if not uffd:
+			raise Exception("UFFD is not supported, cannot run with --lazy-pages")
+		if not uffd_noncoop:
+			# Most tests will work with 4.3 - 4.11
+			print "[WARNING] Non-cooperative UFFD is missing, some tests might spuriously fail"
+
 	l = launcher(opts, len(torun))
 	try:
 		for t in torun:
@@ -1687,6 +1711,16 @@ def run_tests(opts):
 			if opts['join_ns']:
 				if test_flag(tdesc, 'samens'):
 					l.skip(t, "samens test in the same namespace")
+					continue
+
+			if opts['lazy_pages'] or opts['remote_lazy_pages']:
+				if test_flag(tdesc, 'nolazy'):
+					l.skip(t, "lazy pages are not supported")
+					continue
+
+			if opts['remote_lazy_pages']:
+				if test_flag(tdesc, 'noremotelazy'):
+					l.skip(t, "remote lazy pages are not supported")
 					continue
 
 			test_flavs = tdesc.get('flavor', 'h ns uns').split()
@@ -1923,6 +1957,8 @@ rp.add_argument("-k", "--keep-img", help = "Whether or not to keep images after 
 rp.add_argument("--report", help = "Generate summary report in directory")
 rp.add_argument("--keep-going", help = "Keep running tests in spite of failures", action = 'store_true')
 rp.add_argument("--ignore-taint", help = "Don't care about a non-zero kernel taint flag", action = 'store_true')
+rp.add_argument("--lazy-pages", help = "restore pages on demand", action = 'store_true')
+rp.add_argument("--remote-lazy-pages", help = "simulate lazy migration", action = 'store_true')
 
 lp = sp.add_parser("list", help = "List tests")
 lp.set_defaults(action = list_tests)

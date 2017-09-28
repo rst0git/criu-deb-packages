@@ -193,7 +193,7 @@ extern int read_fd_link(int lfd, char *buf, size_t size);
 #define USEC_PER_SEC	1000000L
 #define NSEC_PER_SEC    1000000000L
 
-int vaddr_to_pfn(unsigned long vaddr, u64 *pfn);
+int vaddr_to_pfn(int fd, unsigned long vaddr, u64 *pfn);
 
 /*
  * Check whether @str starts with @sub and report the
@@ -310,5 +310,21 @@ int setup_tcp_client(char *addr);
 		}									\
 		___ret;									\
 	})
+
+/*
+ * Helpers to organize asynchronous reading from a bunch
+ * of file descriptors.
+ */
+#include <sys/epoll.h>
+
+struct epoll_rfd {
+	int fd;
+	int (*revent)(struct epoll_rfd *);
+};
+
+extern int epoll_add_rfd(int epfd, struct epoll_rfd *);
+extern int epoll_del_rfd(int epfd, struct epoll_rfd *rfd);
+extern int epoll_run_rfds(int epfd, struct epoll_event *evs, int nr_fds, int tmo);
+extern int epoll_prepare(int nr_events, struct epoll_event **evs);
 
 #endif /* __CR_UTIL_H__ */

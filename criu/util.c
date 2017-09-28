@@ -784,14 +784,23 @@ out:
 	return ret;
 }
 
-int vaddr_to_pfn(unsigned long vaddr, u64 *pfn)
+/*
+ * Get PFN from pagemap file for virtual address vaddr.
+ * Optionally if fd >= 0, it's used as pagemap file descriptor
+ * (may be other task's pagemap)
+ */
+int vaddr_to_pfn(int fd, unsigned long vaddr, u64 *pfn)
 {
-	int fd, ret = -1;
+	int ret = -1;
 	off_t off;
+	bool close_fd = false;
 
-	fd = open_proc(PROC_SELF, "pagemap");
-	if (fd < 0)
-		return -1;
+	if (fd < 0) {
+		fd = open_proc(PROC_SELF, "pagemap");
+		if (fd < 0)
+			return -1;
+		close_fd = true;
+	}
 
 	off = (vaddr / page_size()) * sizeof(u64);
 	ret = pread(fd, pfn, sizeof(*pfn), off);
@@ -803,7 +812,9 @@ int vaddr_to_pfn(unsigned long vaddr, u64 *pfn)
 		ret = 0;
 	}
 
-	close(fd);
+	if (close_fd)
+		close(fd);
+
 	return ret;
 }
 
@@ -1212,4 +1223,82 @@ int setup_tcp_client(char *addr)
 	}
 
 	return sk;
+}
+
+int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
+{
+	struct epoll_event ev;
+
+	ev.events = EPOLLIN;
+	ev.data.ptr = rfd;
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, rfd->fd, &ev) == -1) {
+		pr_perror("epoll_ctl failed");
+		return -1;
+	}
+
+	return 0;
+}
+
+int epoll_del_rfd(int epfd, struct epoll_rfd *rfd)
+{
+	if (epoll_ctl(epfd, EPOLL_CTL_DEL, rfd->fd, NULL) == -1) {
+		pr_perror("epoll_ctl failed");
+		return -1;
+	}
+
+	return 0;
+}
+
+int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout)
+{
+	int ret, i, nr_events;
+	bool have_a_break = false;
+
+	while (1) {
+		/* FIXME -- timeout should decrease over time...  */
+		ret = epoll_wait(epollfd, evs, nr_fds, timeout);
+		if (ret <= 0) {
+			if (ret < 0)
+				pr_perror("polling failed");
+			break;
+		}
+
+		nr_events = ret;
+		for (i = 0; i < nr_events; i++) {
+			struct epoll_rfd *rfd;
+
+			rfd = (struct epoll_rfd *)evs[i].data.ptr;
+			ret = rfd->revent(rfd);
+			if (ret < 0)
+				goto out;
+			if (ret > 0)
+				have_a_break = true;
+		}
+
+		if (have_a_break)
+			return 1;
+	}
+out:
+	return ret;
+}
+
+int epoll_prepare(int nr_fds, struct epoll_event **events)
+{
+	int epollfd;
+
+	*events = xmalloc(sizeof(struct epoll_event) * nr_fds);
+	if (!*events)
+		return -1;
+
+	epollfd = epoll_create(nr_fds);
+	if (epollfd == -1) {
+		pr_perror("epoll_create failed");
+		goto free_events;
+	}
+
+	return epollfd;
+
+free_events:
+	xfree(*events);
+	return -1;
 }

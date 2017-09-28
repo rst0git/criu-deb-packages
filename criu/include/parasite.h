@@ -49,8 +49,9 @@ struct parasite_vma_entry
 struct parasite_vdso_vma_entry {
 	unsigned long	start;
 	unsigned long	len;
-	unsigned long	proxy_vdso_addr;
-	unsigned long	proxy_vvar_addr;
+	unsigned long	orig_vdso_addr;
+	unsigned long	orig_vvar_addr;
+	unsigned long	rt_vvar_addr;
 	int		is_marked;
 	bool		try_fill_symtable;
 	bool		is_vdso;
@@ -124,6 +125,7 @@ struct parasite_dump_misc {
 	u32 umask;
 
 	int dumpable;
+	int thp_disabled;
 };
 
 /*

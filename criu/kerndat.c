@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>  /* for sockaddr_in and inet_ntoa() */
+#include <sys/prctl.h>
 
 #include "int.h"
 #include "log.h"
@@ -30,6 +31,10 @@
 #include <compel/plugins/std/syscall-codes.h>
 #include <compel/compel.h>
 #include "netfilter.h"
+#include "linux/userfaultfd.h"
+#include "prctl.h"
+#include "uffd.h"
+#include "vdso.h"
 
 struct kerndat_s kdat = {
 };
@@ -349,7 +354,7 @@ static int init_zero_page_pfn()
 		return -1;
 	}
 
-	ret = vaddr_to_pfn((unsigned long)addr, &kdat.zero_page_pfn);
+	ret = vaddr_to_pfn(-1, (unsigned long)addr, &kdat.zero_page_pfn);
 	munmap(addr, PAGE_SIZE);
 
 	if (kdat.zero_page_pfn == 0)
@@ -555,11 +560,16 @@ err:
 
 static int kerndat_compat_restore(void)
 {
-	int ret = kdat_compatible_cr();
+	int ret;
 
-	if (ret < 0) /* failure */
+	ret = kdat_can_map_vdso();
+	if (ret < 0)
 		return ret;
-	kdat.compat_cr = !!ret;
+	kdat.can_map_vdso = !!ret;
+
+	/* depends on kdat.can_map_vdso result */
+	kdat.compat_cr = kdat_compatible_cr();
+
 	return 0;
 }
 
@@ -714,6 +724,108 @@ unl:
 	}
 }
 
+int kerndat_uffd(void)
+{
+	int uffd;
+
+	kdat.uffd_features = 0;
+	uffd = uffd_open(0, &kdat.uffd_features);
+
+	/*
+	 * uffd == -ENOSYS means userfaultfd is not supported on this
+	 * system and we just happily return with kdat.has_uffd = false.
+	 * Error other than -ENOSYS would mean "Houston, Houston, we
+	 * have a problem!"
+	 */
+	if (uffd < 0) {
+		if (uffd == -ENOSYS)
+			return 0;
+
+		pr_err("Lazy pages are not available\n");
+		return -1;
+	}
+
+	kdat.has_uffd = true;
+
+	/*
+	 * we have to close the uffd and reopen in later in restorer
+	 * to enable non-cooperative features
+	 */
+	close(uffd);
+
+	return 0;
+}
+
+int kerndat_has_thp_disable(void)
+{
+	struct bfd f;
+	void *addr;
+	char *str;
+	int ret = -1;
+	bool vma_match = false;
+
+	if (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)) {
+		if (errno != EINVAL)
+			return -1;
+		pr_info("PR_SET_THP_DISABLE is not available\n");
+		return 0;
+	}
+
+	addr = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	if (addr == MAP_FAILED) {
+		pr_perror("Can't mmap memory for THP disable test");
+		return -1;
+	}
+
+	if (prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0))
+		return -1;
+
+	f.fd = open("/proc/self/smaps", O_RDONLY);
+	if (f.fd < 0) {
+		pr_perror("Can't open /proc/self/smaps");
+		goto out_unmap;
+	}
+	if (bfdopenr(&f))
+		goto out_unmap;
+
+	while ((str = breadline(&f)) != NULL) {
+		if (IS_ERR(str))
+			goto out_close;
+
+		if (is_vma_range_fmt(str)) {
+			unsigned long vma_addr;
+
+			if (sscanf(str, "%lx-", &vma_addr) != 1) {
+				pr_err("Can't parse: %s\n", str);
+				goto out_close;
+			}
+
+			if (vma_addr == (unsigned long)addr)
+				vma_match = true;
+		}
+
+		if (vma_match && !strncmp(str, "VmFlags: ", 9)) {
+			u32 flags = 0;
+			u64 madv = 0;
+			int io_pf = 0;
+
+			parse_vmflags(str, &flags, &madv, &io_pf);
+			kdat.has_thp_disable = !(madv & (1 << MADV_NOHUGEPAGE));
+			break;
+		}
+	}
+
+	ret = 0;
+
+out_close:
+	bclose(&f);
+out_unmap:
+	munmap(addr, PAGE_SIZE);
+
+	return ret;
+}
+
 int kerndat_init(void)
 {
 	int ret;
@@ -752,6 +864,16 @@ int kerndat_init(void)
 		ret = kerndat_has_memfd_create();
 	if (!ret)
 		ret = kerndat_detect_stack_guard_gap();
+	if (!ret)
+		ret = kerndat_uffd();
+	if (!ret)
+		ret = kerndat_has_thp_disable();
+	/* Needs kdat.compat_cr filled before */
+	if (!ret)
+		ret = kerndat_vdso_fill_symtable();
+	/* Depends on kerndat_vdso_fill_symtable() */
+	if (!ret)
+		ret = kerndat_vdso_preserves_hint();
 
 	kerndat_lsm();
 	kerndat_mmap_min_addr();
