@@ -63,6 +63,7 @@ TST_NOFILE	:=				\
 		sockets_spair			\
 		socket_queues			\
 		socket-tcp			\
+		socket-tcp-reseted		\
 		socket-tcp6			\
 		socket-tcp-local		\
 		socket-tcp-nfconntrack		\
@@ -153,6 +154,10 @@ TST_NOFILE	:=				\
 		remap_dead_pid			\
 		remap_dead_pid_root			\
 		scm00				\
+		scm01				\
+		scm02				\
+		scm03				\
+		scm04				\
 		aio00				\
 		aio01				\
 		fd				\
@@ -171,10 +176,12 @@ TST_NOFILE	:=				\
 		helper_zombie_child		\
 		clone_fs			\
 		macvlan			\
+		sit				\
 		cr_veth				\
 		sock_peercred			\
 		s390x_mmap_high			\
 		uffd-events			\
+		thread_different_uid_gid	\
 #		jobctl00			\
 
 include ../Makefile.inc
@@ -186,7 +193,9 @@ endif
 endif
 
 ifeq ($(SRCARCH),s390)
-        TST_NOFILE += s390x_regs_check
+        TST_NOFILE +=	s390x_regs_check	\
+			s390x_gs_threads	\
+			s390x_runtime_instr
 endif
 
 TST_FILE	=				\
@@ -434,6 +443,9 @@ socket-tcp-closed-last-ack:	CFLAGS += -D ZDTM_TCP_LAST_ACK
 mnt_ext_manual:		CFLAGS += -D ZDTM_EXTMAP_MANUAL
 sigpending:		LDLIBS += -lrt
 vdso01:			LDLIBS += -lrt
+scm01:			CFLAGS += -DKEEP_SENT_FD
+scm02:			CFLAGS += -DSEND_BOTH
+scm04:			CFLAGS += -DSEPARATE
 mntns_link_remap:	CFLAGS += -DZDTM_LINK_REMAP
 mntns_shared_bind02:	CFLAGS += -DSHARED_BIND02
 mntns_root_bind02:	CFLAGS += -DROOT_BIND02
@@ -470,6 +482,9 @@ pty-console:		CFLAGS += -D ZDTM_DEV_CONSOLE
 shm-unaligned:		CFLAGS += -DZDTM_SHM_UNALIGNED
 
 s390x_regs_check:	LDFLAGS += -pthread
+s390x_gs_threads:	LDFLAGS += -pthread
+
+thread_different_uid_gid:	LDLIBS += -pthread -lcap
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)

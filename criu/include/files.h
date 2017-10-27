@@ -83,19 +83,13 @@ struct fdinfo_list_entry {
 	struct list_head	desc_list;	/* To chain on  @fd_info_head */
 	struct file_desc	*desc;		/* Associated file descriptor */
 	struct list_head	ps_list;	/* To chain  per-task files */
-	int			pid;
+	struct pstree_item	*task;
 	FdinfoEntry		*fe;
+	int			pid;
 	u8			received:1;
 	u8			stage:3;
+	u8			fake:1;
 };
-
-static inline void fle_init(struct fdinfo_list_entry *fle, int pid, FdinfoEntry *fe)
-{
-	fle->pid = pid;
-	fle->fe = fe;
-	fle->received = 0;
-	fle->stage = FLE_INITIALIZED;
-}
 
 /* reports whether fd_a takes prio over fd_b */
 static inline int fdinfo_rst_prio(struct fdinfo_list_entry *fd_a, struct fdinfo_list_entry *fd_b)
@@ -113,17 +107,13 @@ struct file_desc_ops {
 	 * so it shouldn't be saved for any post-actions.
 	 */
 	int			(*open)(struct file_desc *d, int *new_fd);
-	/*
-	 * Called to collect a new fd before adding it on desc. Clients
-	 * may chose to collect it to some specific rst_info list. See
-	 * prepare_fds() for details.
-	 */
-	void			(*collect_fd)(struct file_desc *, struct fdinfo_list_entry *,
-						struct rst_info *);
 	char *			(*name)(struct file_desc *, char *b, size_t s);
 };
 
+int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool ghost);
 void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri);
+struct fdinfo_list_entry *collect_fd_to(int pid, FdinfoEntry *e,
+		struct rst_info *rst_info, struct file_desc *fdesc, bool fake);
 
 unsigned int find_unused_fd(struct pstree_item *, int hint_fd);
 struct fdinfo_list_entry *find_used_fd(struct pstree_item *, int fd);
@@ -133,6 +123,8 @@ struct file_desc {
 	struct hlist_node	hash;		/* Descriptor hashing and lookup */
 	struct list_head	fd_info_head;	/* Chain of fdinfo_list_entry-s with same ID and type but different pids */
 	struct file_desc_ops	*ops;		/* Associated operations */
+	struct list_head	fake_master_list;/* To chain in the list of file_desc, which don't
+						    have a fle in a task, that having permissions */
 };
 
 struct fdtype_ops {
@@ -143,9 +135,10 @@ struct fdtype_ops {
 
 struct cr_img;
 
+extern int dump_my_file(int lfd, u32 *, int *type);
 extern int do_dump_gen_file(struct fd_parms *p, int lfd,
 			    const struct fdtype_ops *ops,
-			    struct cr_img *);
+			    FdinfoEntry *e);
 struct parasite_drain_fd;
 int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 		struct parasite_drain_fd *dfds);
@@ -153,6 +146,7 @@ int predump_task_files(int pid);
 
 extern void file_desc_init(struct file_desc *d, u32 id, struct file_desc_ops *ops);
 extern int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops);
+extern struct fdinfo_list_entry *try_file_master(struct file_desc *d);
 extern struct fdinfo_list_entry *file_master(struct file_desc *d);
 extern struct file_desc *find_file_desc_raw(int type, u32 id);
 
@@ -185,7 +179,7 @@ extern int shared_fdt_prepare(struct pstree_item *item);
 
 extern struct collect_image_info ext_file_cinfo;
 extern int dump_unsupp_fd(struct fd_parms *p, int lfd,
-			  struct cr_img *, char *more, char *info);
+		char *more, char *info, FdinfoEntry *);
 
 extern int inherit_fd_parse(char *optarg);
 extern int inherit_fd_add(int fd, char *key);

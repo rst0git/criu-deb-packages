@@ -17,17 +17,9 @@ fi
 ./test/zdtm.py run --all --keep-going --report report --parallel 4 \
 	       --lazy-pages $LAZY_EXCLUDE || fail
 
-# lazy restore from "remote" dump
-./test/zdtm.py run --all --keep-going --report report --parallel 4 \
-	       --remote-lazy-pages $LAZY_EXCLUDE -x maps04 || fail
-
 # During pre-dump + lazy-pages we leave VM_NOHUGEPAGE set
 LAZY_EXCLUDE="$LAZY_EXCLUDE -x maps02"
 
 # lazy restore from images with pre-dumps
 ./test/zdtm.py run --all --keep-going --report report --parallel 4 \
 	       --lazy-pages --pre 2 $LAZY_EXCLUDE || fail
-
-# lazy restore from "remote" dump with pre-dumps
-./test/zdtm.py run --all --keep-going --report report --parallel 4 \
-	       --remote-lazy-pages --pre 2 $LAZY_EXCLUDE || fail
