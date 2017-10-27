@@ -86,8 +86,13 @@
 /*
  * Architectures can overwrite this function to restore register sets that
  * are not covered by ptrace_set/get_regs().
+ *
+ * with_threads = false: Only the register sets of the tasks are restored
+ * with_threads = true : The register sets of the tasks with all their threads
+ *			 are restored
  */
-int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item)
+int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item,
+					       bool with_threads)
 {
 	return 0;
 }
@@ -1281,7 +1286,7 @@ static int dump_one_task(struct pstree_item *item)
 
 	if (fault_injected(FI_DUMP_EARLY)) {
 		pr_info("fault: CRIU sudden detach\n");
-		BUG();
+		kill(getpid(), SIGKILL);
 	}
 
 	if (root_ns_mask & CLONE_NEWPID && root_item == item) {
@@ -1468,6 +1473,12 @@ static int cr_pre_dump_finish(int ret)
 {
 	struct pstree_item *item;
 
+	/*
+	 * Restore registers for tasks only. The threads have not been
+	 * infected. Therefore, the thread register sets have not been changed.
+	 */
+	if (arch_set_thread_regs(root_item, false) < 0)
+		goto err;
 	pstree_switch_state(root_item, TASK_ALIVE);
 
 	timing_stop(TIME_FROZEN);
@@ -1680,7 +1691,8 @@ static int cr_dump_finish(int ret)
 	if (!ret && opts.lazy_pages)
 		ret = cr_lazy_mem_dump();
 
-	arch_set_thread_regs(root_item);
+	if (arch_set_thread_regs(root_item, true) < 0)
+		return -1;
 	pstree_switch_state(root_item,
 			    (ret || post_dump_ret) ?
 			    TASK_ALIVE : opts.final_state);
@@ -1822,15 +1834,21 @@ int cr_dump_tasks(pid_t pid)
 	if (dump_pstree(root_item))
 		goto err;
 
+	/*
+	 * TODO: cr_dump_shmem has to be called before dump_namespaces(),
+	 * because page_ids is a global variable and it is used to dump
+	 * ipc shared memory, but an ipc namespace is dumped in a child
+	 * process.
+	 */
+	ret = cr_dump_shmem();
+	if (ret)
+		goto err;
+
 	if (root_ns_mask)
 		if (dump_namespaces(root_item, root_ns_mask) < 0)
 			goto err;
 
 	ret = dump_cgroups();
-	if (ret)
-		goto err;
-
-	ret = cr_dump_shmem();
 	if (ret)
 		goto err;
 

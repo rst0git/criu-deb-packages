@@ -54,6 +54,8 @@
 
 #define FDESC_HASH_SIZE	64
 static struct hlist_head file_desc_hash[FDESC_HASH_SIZE];
+/* file_desc's, which fle is not owned by a process, that is able to open them */
+static LIST_HEAD(fake_master_head);
 
 static void init_fdesc_hash(void)
 {
@@ -66,6 +68,7 @@ static void init_fdesc_hash(void)
 void file_desc_init(struct file_desc *d, u32 id, struct file_desc_ops *ops)
 {
 	INIT_LIST_HEAD(&d->fd_info_head);
+	INIT_LIST_HEAD(&d->fake_master_list);
 	INIT_HLIST_NODE(&d->hash);
 
 	d->id	= id;
@@ -86,7 +89,15 @@ struct file_desc *find_file_desc_raw(int type, u32 id)
 
 	chain = &file_desc_hash[id % FDESC_HASH_SIZE];
 	hlist_for_each_entry(d, chain, hash)
-		if (d->ops->type == type && d->id == id)
+		if ((d->id == id) &&
+				(d->ops->type == type || type == FD_TYPES__UND))
+			/*
+			 * Warning -- old CRIU might generate matching IDs
+			 * for different file types! So any code that uses
+			 * FD_TYPES__UND for fdesc search MUST make sure it's
+			 * dealing with the merged files images where all
+			 * descs are forced to have different IDs.
+			 */
 			return d;
 
 	return NULL;
@@ -183,16 +194,27 @@ void wait_fds_event(void)
 	clear_fds_event();
 }
 
+struct fdinfo_list_entry *try_file_master(struct file_desc *d)
+{
+	if (list_empty(&d->fd_info_head))
+		return NULL;
+
+	return list_first_entry(&d->fd_info_head,
+			struct fdinfo_list_entry, desc_list);
+}
+
 struct fdinfo_list_entry *file_master(struct file_desc *d)
 {
-	if (list_empty(&d->fd_info_head)) {
+	struct fdinfo_list_entry *fle;
+
+	fle = try_file_master(d);
+	if (!fle) {
 		pr_err("Empty list on file desc id %#x(%d)\n", d->id,
 				d->ops ? d->ops->type : -1);
 		BUG();
 	}
 
-	return list_first_entry(&d->fd_info_head,
-			struct fdinfo_list_entry, desc_list);
+	return fle;
 }
 
 void show_saved_files(void)
@@ -275,27 +297,20 @@ static u32 make_gen_id(const struct fd_parms *p)
 }
 
 int do_dump_gen_file(struct fd_parms *p, int lfd,
-		const struct fdtype_ops *ops, struct cr_img *img)
+		const struct fdtype_ops *ops, FdinfoEntry *e)
 {
-	FdinfoEntry e = FDINFO_ENTRY__INIT;
 	int ret = -1;
 
-	e.type	= ops->type;
-	e.id	= make_gen_id(p);
-	e.fd	= p->fd;
-	e.flags = p->fd_flags;
+	e->type	= ops->type;
+	e->id	= make_gen_id(p);
+	e->fd	= p->fd;
+	e->flags = p->fd_flags;
 
-	ret = fd_id_generate(p->pid, &e, p);
+	ret = fd_id_generate(p->pid, e, p);
 	if (ret == 1) /* new ID generated */
-		ret = ops->dump(lfd, e.id, p);
+		ret = ops->dump(lfd, e->id, p);
 
-	if (ret < 0)
-		return ret;
-
-	pr_info("fdinfo: type: %#2x flags: %#o/%#o pos: %#8"PRIx64" fd: %d\n",
-		ops->type, p->flags, (int)p->fd_flags, p->pos, p->fd);
-
-	return pb_write_one(img, &e, PB_FDINFO);
+	return ret;
 }
 
 int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
@@ -404,7 +419,7 @@ static const struct fdtype_ops *get_mem_dev_ops(struct fd_parms *p, int minor)
 	return ops;
 }
 
-static int dump_chrdev(struct fd_parms *p, int lfd, struct cr_img *img)
+static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
 {
 	struct fd_link *link_old = p->link;
 	int maj = major(p->stat.st_rdev);
@@ -433,19 +448,19 @@ static int dump_chrdev(struct fd_parms *p, int lfd, struct cr_img *img)
 		}
 
 		sprintf(more, "%d:%d", maj, minor(p->stat.st_rdev));
-		err = dump_unsupp_fd(p, lfd, img, "chr", more);
+		err = dump_unsupp_fd(p, lfd, "chr", more, e);
 		p->link = link_old;
 		return err;
 	}
 	}
 
-	err = do_dump_gen_file(p, lfd, ops, img);
+	err = do_dump_gen_file(p, lfd, ops, e);
 	p->link = link_old;
 	return err;
 }
 
 static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
-		       struct cr_img *img, struct parasite_ctl *ctl)
+		struct parasite_ctl *ctl, FdinfoEntry *e)
 {
 	struct fd_parms p = FD_PARMS_INIT;
 	const struct fdtype_ops *ops;
@@ -462,10 +477,10 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	p.fd_ctl = ctl; /* Some dump_opts require this to talk to parasite */
 
 	if (S_ISSOCK(p.stat.st_mode))
-		return dump_socket(&p, lfd, img);
+		return dump_socket(&p, lfd, e);
 
 	if (S_ISCHR(p.stat.st_mode))
-		return dump_chrdev(&p, lfd, img);
+		return dump_chrdev(&p, lfd, e);
 
 	if (p.fs_type == ANON_INODE_FS_MAGIC) {
 		char link[32];
@@ -486,9 +501,9 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 		else if (is_timerfd_link(link))
 			ops = &timerfd_dump_ops;
 		else
-			return dump_unsupp_fd(&p, lfd, img, "anon", link);
+			return dump_unsupp_fd(&p, lfd, "anon", link, e);
 
-		return do_dump_gen_file(&p, lfd, ops, img);
+		return do_dump_gen_file(&p, lfd, ops, e);
 	}
 
 	if (S_ISREG(p.stat.st_mode) || S_ISDIR(p.stat.st_mode)) {
@@ -497,12 +512,12 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 
 		p.link = &link;
 		if (link.name[1] == '/')
-			return do_dump_gen_file(&p, lfd, &regfile_dump_ops, img);
+			return do_dump_gen_file(&p, lfd, &regfile_dump_ops, e);
 
 		if (check_ns_proc(&link))
-			return do_dump_gen_file(&p, lfd, &nsfile_dump_ops, img);
+			return do_dump_gen_file(&p, lfd, &nsfile_dump_ops, e);
 
-		return dump_unsupp_fd(&p, lfd, img, "reg", link.name + 1);
+		return dump_unsupp_fd(&p, lfd, "reg", link.name + 1, e);
 	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {
@@ -511,7 +526,7 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 		else
 			ops = &fifo_dump_ops;
 
-		return do_dump_gen_file(&p, lfd, ops, img);
+		return do_dump_gen_file(&p, lfd, ops, e);
 	}
 
 	/*
@@ -522,7 +537,24 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	if (fill_fdlink(lfd, &p, &link))
 		memzero(&link, sizeof(link));
 
-	return dump_unsupp_fd(&p, lfd, img, "unknown", link.name + 1);
+	return dump_unsupp_fd(&p, lfd, "unknown", link.name + 1, e);
+}
+
+int dump_my_file(int lfd, u32 *id, int *type)
+{
+	struct pid me = {};
+	struct fd_opts fo = {};
+	FdinfoEntry e = FDINFO_ENTRY__INIT;
+
+	me.real = getpid();
+	me.ns[0].virt = -1; /* FIXME */
+
+	if (dump_one_file(&me, lfd, lfd, &fo, NULL, &e))
+		return -1;
+
+	*id = e.id;
+	*type = e.type;
+	return 0;
 }
 
 int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
@@ -561,9 +593,15 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 			goto err;
 
 		for (i = 0; i < nr_fds; i++) {
+			FdinfoEntry e = FDINFO_ENTRY__INIT;
+
 			ret = dump_one_file(item->pid, dfds->fds[i + off],
-						lfds[i], opts + i, img, ctl);
+						lfds[i], opts + i, ctl, &e);
 			close(lfds[i]);
+			if (ret)
+				break;
+
+			ret = pb_write_one(img, &e, PB_FDINFO);
 			if (ret)
 				break;
 		}
@@ -674,6 +712,9 @@ int restore_fown(int fd, FownEntry *fown)
 		return -1;
 	}
 
+	if (prctl(PR_SET_DUMPABLE, 1, 0))
+		pr_perror("Unable to set PR_SET_DUMPABLE");
+
 	return 0;
 }
 
@@ -686,19 +727,61 @@ int rst_file_params(int fd, FownEntry *fown, int flags)
 	return 0;
 }
 
-static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
+static struct fdinfo_list_entry *alloc_fle(int pid, FdinfoEntry *fe)
 {
-	struct fdinfo_list_entry *le, *new_le;
+	struct fdinfo_list_entry *fle;
+
+	fle = shmalloc(sizeof(*fle));
+	if (!fle)
+		return NULL;
+	fle->pid = pid;
+	fle->fe = fe;
+	fle->received = 0;
+	fle->fake = 0;
+	fle->stage = FLE_INITIALIZED;
+	fle->task = pstree_item_by_virt(pid);
+	if (!fle->task) {
+		pr_err("Can't find task with pid %d\n", pid);
+		shfree_last(fle);
+		return NULL;
+	}
+
+	return fle;
+}
+
+static void collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_desc *fdesc)
+{
+	struct fdinfo_list_entry *le;
+
+	new_le->desc = fdesc;
+
+	list_for_each_entry(le, &fdesc->fd_info_head, desc_list)
+		if (pid_rst_prio(new_le->pid, le->pid))
+			break;
+	list_add_tail(&new_le->desc_list, &le->desc_list);
+}
+
+struct fdinfo_list_entry *collect_fd_to(int pid, FdinfoEntry *e,
+		struct rst_info *rst_info, struct file_desc *fdesc, bool fake)
+{
+	struct fdinfo_list_entry *new_le;
+
+	new_le = alloc_fle(pid, e);
+	if (new_le) {
+		new_le->fake = (!!fake);
+		collect_desc_fle(new_le, fdesc);
+		collect_task_fd(new_le, rst_info);
+	}
+
+	return new_le;
+}
+
+int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool fake)
+{
 	struct file_desc *fdesc;
 
 	pr_info("Collect fdinfo pid=%d fd=%d id=%#x\n",
 		pid, e->fd, e->id);
-
-	new_le = shmalloc(sizeof(*new_le));
-	if (!new_le)
-		return -1;
-
-	fle_init(new_le, pid, e);
 
 	fdesc = find_file_desc(e);
 	if (fdesc == NULL) {
@@ -706,17 +789,8 @@ static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 		return -1;
 	}
 
-	list_for_each_entry(le, &fdesc->fd_info_head, desc_list)
-		if (pid_rst_prio(new_le->pid, le->pid))
-			break;
-
-	if (fdesc->ops->collect_fd)
-		fdesc->ops->collect_fd(fdesc, new_le, rst_info);
-
-	collect_task_fd(new_le, rst_info);
-
-	list_add_tail(&new_le->desc_list, &le->desc_list);
-	new_le->desc = fdesc;
+	if (!collect_fd_to(pid, e, rst_info, fdesc, fake))
+		return -1;
 
 	return 0;
 }
@@ -747,7 +821,7 @@ int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
 	if (!e)
 		return -1;
 
-	return collect_fd(vpid(task), e, rsti(task));
+	return collect_fd(vpid(task), e, rsti(task), false);
 }
 
 int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
@@ -769,7 +843,7 @@ int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
 	e->fd		= reserve_service_fd(CTL_TTY_OFF);
 	e->type		= FD_TYPES__TTY;
 
-	if (collect_fd(pid, e, rst_info)) {
+	if (collect_fd(pid, e, rst_info, false)) {
 		xfree(e);
 		return -1;
 	}
@@ -809,7 +883,7 @@ int prepare_fd_pid(struct pstree_item *item)
 			break;
 		}
 
-		ret = collect_fd(pid, e, rst_info);
+		ret = collect_fd(pid, e, rst_info, false);
 		if (ret < 0) {
 			fdinfo_entry__free_unpacked(e, NULL);
 			break;
@@ -1087,11 +1161,20 @@ static int receive_fd(struct fdinfo_list_entry *fle)
 	return 0;
 }
 
+static void close_fdinfos(struct list_head *list)
+{
+	struct fdinfo_list_entry *fle;
+
+	list_for_each_entry(fle, list, ps_list)
+		close(fle->fe->fd);
+}
+
 static int open_fdinfos(struct pstree_item *me)
 {
 	struct list_head *list = &rsti(me)->fds;
 	struct fdinfo_list_entry *fle, *tmp;
 	LIST_HEAD(completed);
+	LIST_HEAD(fake);
 	bool progress, again;
 	int st, ret = 0;
 
@@ -1103,8 +1186,11 @@ static int open_fdinfos(struct pstree_item *me)
 			st = fle->stage;
 			BUG_ON(st == FLE_RESTORED);
 			ret = open_fd(fle);
-			if (ret == -1)
+			if (ret == -1) {
+				pr_err("Unable to open fd=%d id=%#x\n",
+					fle->fe->fd, fle->fe->id);
 				goto splice;
+			}
 			if (st != fle->stage || ret == 0)
 				progress = true;
 			if (ret == 0) {
@@ -1114,7 +1200,10 @@ static int open_fdinfos(struct pstree_item *me)
 				 * and reduce number of fles in their checks.
 				 */
 				list_del(&fle->ps_list);
-				list_add(&fle->ps_list, &completed);
+				if (!fle->fake)
+					list_add(&fle->ps_list, &completed);
+				else
+					list_add(&fle->ps_list, &fake);
 			}
 			if (ret == 1)
 			       again = true;
@@ -1124,7 +1213,13 @@ static int open_fdinfos(struct pstree_item *me)
 	} while (again || progress);
 
 	BUG_ON(!list_empty(list));
+	/*
+	 * Fake fles may be used for restore other
+	 * file types, so their closing is delayed.
+	 */
+	close_fdinfos(&fake);
 splice:
+	list_splice(&fake, list);
 	list_splice(&completed, list);
 
 	return ret;

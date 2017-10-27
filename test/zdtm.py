@@ -1153,6 +1153,11 @@ def check_visible_state(test, state, opts):
 
 		old_maps = state[1][pid]
 		new_maps = new[1][pid]
+		if os.getenv("COMPAT_TEST"):
+			# the vsyscall vma isn't unmapped from x32 processes
+			vsyscall = "ffffffffff600000-ffffffffff601000 ['r-xp']"
+			if vsyscall in new_maps and vsyscall not in old_maps:
+				new_maps.remove(vsyscall)
 		if old_maps != new_maps:
 			print "%s: Old maps lost: %s" % (pid, old_maps - new_maps)
 			print "%s: New maps appeared: %s" % (pid, new_maps - old_maps)
@@ -1383,6 +1388,8 @@ class launcher:
 		self.__subs = {}
 		self.__fail = False
 		self.__file_report = None
+		self.__junit_file = None
+		self.__junit_test_cases = None
 		self.__failed = []
 		self.__nr_skip = 0
 		if self.__max > 1 and self.__total > 1:
@@ -1393,12 +1400,19 @@ class launcher:
 			self.__use_log = False
 
 		if opts['report'] and (opts['keep_going'] or self.__total == 1):
+			global TestSuite, TestCase
+			from junit_xml import TestSuite, TestCase
 			now = datetime.datetime.now()
 			att = 0
 			reportname = os.path.join(report_dir, "criu-testreport.tap")
-			while os.access(reportname, os.F_OK):
+			junitreport = os.path.join(report_dir, "criu-testreport.xml")
+			while os.access(reportname, os.F_OK) or os.access(junitreport, os.F_OK):
 				reportname = os.path.join(report_dir, "criu-testreport" + ".%d.tap" % att)
+				junitreport = os.path.join(report_dir, "criu-testreport" + ".%d.xml" % att)
 				att += 1
+
+			self.__junit_file = open(junitreport, 'a')
+			self.__junit_test_cases = []
 
 			self.__file_report = open(reportname, 'a')
 			print >> self.__file_report, "TAP version 13"
@@ -1421,6 +1435,11 @@ class launcher:
 		self.__nr += 1
 		self.__runtest += 1
 		self.__nr_skip += 1
+
+		if self.__junit_test_cases is not None:
+			tc = TestCase(name)
+			tc.add_skipped_info(reason)
+			self.__junit_test_cases.append(tc)
 		if self.__file_report:
 			testline = "ok %d - %s # SKIP %s" % (self.__runtest, name, reason)
 			print >> self.__file_report, testline
@@ -1455,7 +1474,7 @@ class launcher:
 		sub = subprocess.Popen(["./zdtm_ct", "zdtm.py"],
 				env = dict(os.environ, CR_CT_TEST_INFO = arg),
 				stdout = log, stderr = subprocess.STDOUT, close_fds = True)
-		self.__subs[sub.pid] = {'sub': sub, 'log': logf, 'name': name}
+		self.__subs[sub.pid] = {'sub': sub, 'log': logf, 'name': name, "start": time.time()}
 
 		if test_flag(desc, 'excl'):
 			self.wait()
@@ -1465,13 +1484,19 @@ class launcher:
 		self.__runtest += 1
 		if pid != 0:
 			sub = self.__subs.pop(pid)
+			tc = None
+			if self.__junit_test_cases is not None:
+				tc = TestCase(sub['name'], elapsed_sec=time.time() - sub['start'])
+				self.__junit_test_cases.append(tc)
 			if status != 0:
 				self.__fail = True
 				failed_flavor = decode_flav(os.WEXITSTATUS(status))
 				self.__failed.append([sub['name'], failed_flavor])
 				if self.__file_report:
 					testline = "not ok %d - %s # flavor %s" % (self.__runtest, sub['name'], failed_flavor)
-					details = {'output': open(sub['log']).read()}
+					output = open(sub['log']).read()
+					details = {'output': output}
+					tc.add_error_info(output = output)
 					print >> self.__file_report, testline
 					print >> self.__file_report, yaml.dump(details, explicit_start=True, explicit_end=True, default_style='|')
 				if sub['log']:
@@ -1511,6 +1536,8 @@ class launcher:
 		if not opts['fault'] and check_core_files():
 			self.__fail = True
 		if self.__file_report:
+			ts = TestSuite(opts['title'], self.__junit_test_cases, os.getenv("NODE_NAME"))
+			self.__junit_file.write(TestSuite.to_xml_string([ts]))
 			self.__file_report.close()
 
 		if opts['keep_going']:
@@ -1530,16 +1557,25 @@ class launcher:
 
 def all_tests(opts):
 	desc = eval(open(opts['set'] + '.desc').read())
-	lst = subprocess.Popen(['find', desc['dir'], '-type', 'f', '-executable'],
-			stdout = subprocess.PIPE)
+
+	files = []
+	mask = stat.S_IFREG | stat.S_IXUSR
+	for d in os.walk(desc['dir']):
+		for f in d[2]:
+			fp = os.path.join(d[0], f)
+			st = os.lstat(fp)
+			if (st.st_mode & mask) != mask:
+				continue
+			if stat.S_IFMT(st.st_mode) in [stat.S_IFLNK, stat.S_IFSOCK]:
+				continue
+			files.append(fp)
 	excl = map(lambda x: os.path.join(desc['dir'], x), desc['exclude'])
 	tlist = filter(lambda x:
 			not x.endswith('.checkskip') and
 			not x.endswith('.hook') and
 			x not in excl,
-			map(lambda x: x.strip(), lst.stdout.readlines())
+			map(lambda x: x.strip(), files)
 			)
-	lst.wait()
 	return tlist
 
 
@@ -1959,6 +1995,7 @@ rp.add_argument("--keep-going", help = "Keep running tests in spite of failures"
 rp.add_argument("--ignore-taint", help = "Don't care about a non-zero kernel taint flag", action = 'store_true')
 rp.add_argument("--lazy-pages", help = "restore pages on demand", action = 'store_true')
 rp.add_argument("--remote-lazy-pages", help = "simulate lazy migration", action = 'store_true')
+rp.add_argument("--title", help = "A test suite title", default = "criu")
 
 lp = sp.add_parser("list", help = "List tests")
 lp.set_defaults(action = list_tests)
