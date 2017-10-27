@@ -1,3 +1,9 @@
+criu (3.6-1) UNRELEASED; urgency=medium
+
+  * New upstream version 3.6
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Fri, 27 Oct 2017 13:33:15 +0200
+
 criu (3.5-2) unstable; urgency=medium
 
   * Upload to unstable
