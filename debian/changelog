@@ -1,3 +1,10 @@
+criu (3.6-2) unstable; urgency=medium
+
+  * Upload to unstable
+  * Set Rules-Requires-Root to no
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Sun, 05 Nov 2017 15:31:39 +0100
+
 criu (3.6-1) experimental; urgency=medium
 
   * New upstream version 3.6
