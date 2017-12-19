@@ -8,12 +8,12 @@
 #include <errno.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
-#include <sys/sysmacros.h>
 #include <stdint.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>  /* for sockaddr_in and inet_ntoa() */
 #include <sys/prctl.h>
 
+#include "common/config.h"
 #include "int.h"
 #include "log.h"
 #include "restorer.h"
@@ -26,7 +26,6 @@
 #include "util.h"
 #include "lsm.h"
 #include "proc_parse.h"
-#include "config.h"
 #include "sk-inet.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include <compel/compel.h>

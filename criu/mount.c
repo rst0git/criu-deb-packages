@@ -688,7 +688,7 @@ static int validate_mounts(struct mount_info *info, bool for_dump)
 			return -1;
 
 		if (mnt_is_external(m))
-			goto skip_fstype;
+			continue;
 
 		/*
 		 * Mountpoint can point to / of an FS. In that case this FS
@@ -737,13 +737,6 @@ static int validate_mounts(struct mount_info *info, bool for_dump)
 					return -1;
 				}
 			}
-		}
-skip_fstype:
-		if (does_mnt_overmount(m) &&
-		    !list_empty(&m->parent->mnt_share)) {
-			pr_err("Unable to handle mounts under %d:%s\n",
-					m->mnt_id, m->mountpoint);
-			return -1;
 		}
 	}
 
@@ -1438,7 +1431,7 @@ static int dump_mnt_ns(struct ns_id *ns, struct mount_info *pms)
 	struct mount_info *pm;
 	int ret = -1;
 	struct cr_img *img;
-	int ns_id = ns->id;
+	unsigned int ns_id = ns->id;
 
 	pr_info("Dumping mountpoints\n");
 	img = open_image(CR_FD_MNTS, O_DUMP, ns_id);
@@ -1685,12 +1678,21 @@ static int propagate_mount(struct mount_info *mi)
 		char path[PATH_MAX], *mp;
 		bool found = false;
 
+		/*
+		 * If a mount from parent's shared group is not yet mounted
+		 * it shouldn't have 'sibling' in it - see can_mount_now()
+		 */
+		if (!t->mounted)
+			continue;
+
 		mp = mnt_get_sibling_path(mi, t, path, sizeof(path));
 		if (mp == NULL)
 			continue;
 
 		list_for_each_entry(c, &t->children, siblings) {
 			if (mounts_equal(mi, c) && !strcmp(mp, c->mountpoint)) {
+				/* Should not propagate the same mount twice */
+				BUG_ON(c->mounted);
 				pr_debug("\t\tPropagate %s\n", c->mountpoint);
 
 				/*
@@ -2132,18 +2134,27 @@ static bool can_mount_now(struct mount_info *mi)
 
 shared:
 	if (mi->parent->shared_id) {
-		struct mount_info *p = mi->parent, *n;
+		struct mount_info *n;
 
-		if (mi->parent->shared_id == mi->shared_id) {
-			int rlen = strlen(mi->root);
-			list_for_each_entry(n, &p->mnt_share, mnt_share)
-				if (strlen(n->root) < rlen && !n->mounted)
-					return false;
-		} else {
-			list_for_each_entry(n, &p->mnt_share, mnt_share)
-				if (!n->mounted)
-					return false;
-		}
+		list_for_each_entry(n, &mi->parent->mnt_share, mnt_share)
+			/*
+			 * All mounts from mi's parent shared group which
+			 * have mi's 'sibling' should receive it through
+			 * mount propagation, so all such mounts in parent
+			 * shared group should be mounted beforehand.
+			 */
+			if (!n->mounted) {
+				char path[PATH_MAX], *mp;
+				struct mount_info *c;
+
+				mp = mnt_get_sibling_path(mi, n, path, sizeof(path));
+				if (mp == NULL)
+					continue;
+
+				list_for_each_entry(c, &n->children, siblings)
+					if (mounts_equal(mi, c) && !strcmp(mp, c->mountpoint))
+						return false;
+			}
 	}
 
 	return true;
@@ -2278,7 +2289,7 @@ static int try_remap_mount(struct mount_info *m)
 	if (!does_mnt_overmount(m))
 		return 0;
 
-	BUG_ON(!m->parent || !list_empty(&m->parent->mnt_share));
+	BUG_ON(!m->parent);
 
 	r = xmalloc(sizeof(struct mnt_remap_entry));
 	if (!r)

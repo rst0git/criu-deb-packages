@@ -466,8 +466,6 @@ close_ifd:
 err:
 	if (gfe)
 		ghost_file_entry__free_unpacked(gfe, NULL);
-	xfree(gf->remap.rpath);
-	shfree_last(gf);
 	return -1;
 }
 
@@ -1476,10 +1474,8 @@ static int make_parent_dirs_if_need(int mntns_root, char *path)
 	struct stat st;
 
 	p = last_delim = strrchr(path, '/');
-	if (!p) {
-		pr_err("Path %s has no parent dir\n", path);
-		return -1;
-	}
+	if (!p)
+		return 0;
 	*p = '\0';
 
 	if (fstatat(mntns_root, path, &st, AT_EMPTY_PATH) == 0)

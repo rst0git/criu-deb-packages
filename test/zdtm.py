@@ -171,8 +171,9 @@ class ns_flavor:
 			# run in parallel
 			try:
 				os.makedirs(self.root + os.path.dirname(fname))
-			except:
-				pass
+			except OSError, e:
+				if e.errno != errno.EEXIST:
+					raise
 			dst = tempfile.mktemp(".tso", "", self.root + os.path.dirname(fname))
 			shutil.copy2(fname, dst)
 			os.rename(dst, tfname)
@@ -292,10 +293,7 @@ def encode_flav(f):
 
 
 def decode_flav(i):
-	try:
-		return flavors.keys()[i - 128]
-	except:
-		return "unknown"
+	return flavors.get(i - 128, "unknown")
 
 
 def tail(path):
@@ -315,7 +313,8 @@ def wait_pid_die(pid, who, tmo = 30):
 	while stime < tmo:
 		try:
 			os.kill(int(pid), 0)
-		except:  # Died
+		except Exception, e:
+			print "Unable to kill %d: %s" % (pid, e)
 			break
 
 		print "Wait for %s(%d) to die for %f" % (who, pid, stime)
@@ -434,8 +433,8 @@ class zdtm_test:
 
 		try:
 			os.kill(int(self.getpid()), 0)
-		except:
-			raise test_fail_exc("start")
+		except Exception, e:
+			raise test_fail_exc("start: %s" % e)
 
 		if not self.static():
 			# Wait less than a second to give the test chance to
@@ -560,7 +559,8 @@ class inhfd_test:
 			os.close(start_pipe[1])
 			try:
 				data = peer_file.read(16)
-			except:
+			except Exception, e:
+				print "Unable to read a peer file: %s" % e
 				sys.exit(1)
 
 			sys.exit(data == self.__message and 42 or 2)
@@ -672,6 +672,7 @@ test_classes = {'zdtm': zdtm_test, 'inhfd': inhfd_test, 'groups': groups_test}
 #
 
 criu_bin = "../criu/criu"
+crit_bin = "../crit/crit"
 join_ns_file = '/run/netns/zdtm_netns'
 
 
@@ -688,6 +689,14 @@ class criu_cli:
 		if nowait:
 			return cr
 		return cr.wait()
+
+
+class criu_rpc_process:
+	def wait(self):
+		return self.criu.wait_pid(self.pid)
+
+	def terminate(self):
+		os.kill(self.pid, signal.SIGTERM)
 
 
 class criu_rpc:
@@ -724,6 +733,25 @@ class criu_rpc:
 			if arg == '--external':
 				criu.opts.external.append(args.pop(0))
 				continue
+			if arg == '--status-fd':
+				fd = int(args.pop(0))
+				os.write(fd, "\0")
+				fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+				continue
+			if arg == '--port':
+				criu.opts.ps.port = int(args.pop(0))
+				continue
+			if arg == '--address':
+				criu.opts.ps.address = args.pop(0)
+				continue
+			if arg == '--page-server':
+				continue
+			if arg == '--prev-images-dir':
+				criu.opts.parent_img = args.pop(0)
+				continue
+			if arg == '--track-mem':
+				criu.opts.track_mem = True
+				continue
 
 			raise test_fail_exc('RPC for %s required' % arg)
 
@@ -735,17 +763,18 @@ class criu_rpc:
 			raise test_fail_exc('RPC and SAT not supported')
 		if preexec:
 			raise test_fail_exc('RPC and PREEXEC not supported')
-		if nowait:
-			raise test_fail_exc("RPC and status-fd not supported")
 
 		ctx = {}  # Object used to keep info untill action is done
 		criu = crpc.criu()
 		criu.use_binary(criu_bin)
 		criu_rpc.__set_opts(criu, args, ctx)
+		p = None
 
 		try:
 			if action == 'dump':
 				criu.dump()
+			elif action == 'pre-dump':
+				criu.pre_dump()
 			elif action == 'restore':
 				if 'rd' not in ctx:
 					raise test_fail_exc('RPC Non-detached restore is impossible')
@@ -754,10 +783,15 @@ class criu_rpc:
 				pidf = ctx.get('pidf')
 				if pidf:
 					open(pidf, 'w').write('%d\n' % res.pid)
+			elif action == "page-server":
+				res = criu.page_server_chld()
+				p = criu_rpc_process()
+				p.pid = res.pid
+				p.criu = criu
 			else:
 				raise test_fail_exc('RPC for %s required' % action)
-		except crpc.CRIUExceptionExternal:
-			print "Fail"
+		except crpc.CRIUExceptionExternal, e:
+			print "Fail", e
 			ret = -1
 		else:
 			ret = 0
@@ -765,6 +799,10 @@ class criu_rpc:
 		imgd = ctx.get('imgd')
 		if imgd:
 			os.close(imgd)
+
+		if nowait and ret == 0:
+			return p
+
 		return ret
 
 
@@ -789,17 +827,20 @@ class criu:
 		self.__user = (opts['user'] and True or False)
 		self.__leave_stopped = (opts['stop'] and True or False)
 		self.__criu = (opts['rpc'] and criu_rpc or criu_cli)
+		self.__show_stats = (opts['show_stats'] and True or False)
 		self.__lazy_pages_p = None
 		self.__page_server_p = None
 
 	def fini(self):
 		if self.__lazy_pages_p:
 			ret = self.__lazy_pages_p.wait()
+		        grep_errors(os.path.join(self.__ddir(), "lazy-pages.log"))
 			self.__lazy_pages_p = None
 			if ret:
 				raise test_fail_exc("criu lazy-pages exited with %s" % ret)
 		if self.__page_server_p:
 			ret = self.__page_server_p.wait()
+		        grep_errors(os.path.join(self.__ddir(), "page-server.log"))
 			self.__page_server_p = None
 			if ret:
 				raise test_fail_exc("criu page-server exited with %s" % ret)
@@ -907,6 +948,14 @@ class criu:
 			else:
 				raise test_fail_exc("CRIU %s" % action)
 
+	def show_stats(self, action):
+		if not self.__show_stats:
+			return
+
+		subprocess.Popen([crit_bin, "show",
+				os.path.join(self.__dump_path,
+				str(self.__iter), "stats-%s" % action)]).wait()
+
 	def dump(self, action, opts = []):
 		self.__iter += 1
 		os.mkdir(self.__ddir())
@@ -948,12 +997,15 @@ class criu:
 		if self.__mdedup and self.__iter > 1:
 			self.__criu_act("dedup", opts = [])
 
+		self.show_stats("dump")
+
 		if self.__leave_stopped:
 			pstree_check_stopped(self.__test.getpid())
 			pstree_signal(self.__test.getpid(), signal.SIGKILL)
 
 		if self.__page_server_p:
 			ret = self.__page_server_p.wait()
+		        grep_errors(os.path.join(self.__ddir(), "page-server.log"))
 			self.__page_server_p = None
 			if ret:
 				raise test_fail_exc("criu page-server exited with %d" % ret)
@@ -991,6 +1043,7 @@ class criu:
 			r_opts += ['--leave-stopped']
 
 		self.__criu_act("restore", opts = r_opts + ["--restore-detached"])
+		self.show_stats("restore")
 
 		if self.__leave_stopped:
 			pstree_check_stopped(self.__test.getpid())
@@ -1009,11 +1062,13 @@ class criu:
 	def kill(self):
 		if self.__lazy_pages_p:
 			self.__lazy_pages_p.terminate()
-			print "criu lazy-pages exited with %s" & self.wait()
+			print "criu lazy-pages exited with %s" % self.__lazy_pages_p.wait()
+		        grep_errors(os.path.join(self.__ddir(), "lazy-pages.log"))
 			self.__lazy_pages_p = None
 		if self.__page_server_p:
 			self.__page_server_p.terminate()
-			print "criu page-server exited with %s" & self.wait()
+			print "criu page-server exited with %s" % self.__page_server_p.wait()
+		        grep_errors(os.path.join(self.__ddir(), "page-server.log"))
 			self.__page_server_p = None
 
 
@@ -1265,7 +1320,8 @@ def pstree_each_pid(root_pid):
 			pid_line = f_children.readline().strip(" \n")
 			if pid_line:
 				child_pids += pid_line.split(" ")
-	except:
+	except Exception, e:
+		print "Unable to read /proc/*/children: %s" % e
 		return  # process is dead
 
 	yield root_pid
@@ -1281,7 +1337,8 @@ def is_proc_stopped(pid):
 				for line in f_status.readlines():
 					if line.startswith("State:"):
 						return line.split(":", 1)[1].strip().split(" ")[0]
-		except:
+		except Exception, e:
+			print "Unable to read a thread status: %s" % e
 			pass  # process is dead
 		return None
 
@@ -1292,7 +1349,8 @@ def is_proc_stopped(pid):
 	thread_dirs = []
 	try:
 		thread_dirs = os.listdir(tasks_dir)
-	except:
+	except Exception, e:
+		print "Unable to read threads: %s" % e
 		pass  # process is dead
 
 	for thread_dir in thread_dirs:
@@ -1316,7 +1374,8 @@ def pstree_signal(root_pid, signal):
 	for pid in pstree_each_pid(root_pid):
 		try:
 			os.kill(int(pid), signal)
-		except:
+		except Exception, e:
+			print "Unable to kill %d: %s" % (pid, e)
 			pass  # process is dead
 
 
@@ -1378,7 +1437,7 @@ def do_run_test(tname, tdesc, flavs, opts):
 			print_sep("Test %s PASS" % tname)
 
 
-class launcher:
+class Launcher:
 	def __init__(self, opts, nr_tests):
 		self.__opts = opts
 		self.__total = nr_tests
@@ -1461,7 +1520,8 @@ class launcher:
 
 		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', 'stop', 'empty_ns',
 				'fault', 'keep_img', 'report', 'snaps', 'sat', 'script', 'rpc', 'lazy_pages',
-				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup', 'remote_lazy_pages')
+				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup',
+				'remote_lazy_pages', 'show_stats')
 		arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
 		if self.__use_log:
@@ -1700,26 +1760,26 @@ def run_tests(opts):
 			# Most tests will work with 4.3 - 4.11
 			print "[WARNING] Non-cooperative UFFD is missing, some tests might spuriously fail"
 
-	l = launcher(opts, len(torun))
+	launcher = Launcher(opts, len(torun))
 	try:
 		for t in torun:
 			global arch
 
 			if excl and excl.match(t):
-				l.skip(t, "exclude")
+				launcher.skip(t, "exclude")
 				continue
 
 			tdesc = get_test_desc(t)
 			if tdesc.get('arch', arch) != arch:
-				l.skip(t, "arch %s" % tdesc['arch'])
+				launcher.skip(t, "arch %s" % tdesc['arch'])
 				continue
 
 			if test_flag(tdesc, 'reqrst') and opts['norst']:
-				l.skip(t, "restore stage is required")
+				launcher.skip(t, "restore stage is required")
 				continue
 
 			if run_all and test_flag(tdesc, 'noauto'):
-				l.skip(t, "manual run only")
+				launcher.skip(t, "manual run only")
 				continue
 
 			feat = tdesc.get('feature', None)
@@ -1729,34 +1789,34 @@ def run_tests(opts):
 					features[feat] = criu.check(feat)
 
 				if not features[feat]:
-					l.skip(t, "no %s feature" % feat)
+					launcher.skip(t, "no %s feature" % feat)
 					continue
 
 			if self_checkskip(t):
-				l.skip(t, "checkskip failed")
+				launcher.skip(t, "checkskip failed")
 				continue
 
 			if opts['user']:
 				if test_flag(tdesc, 'suid'):
-					l.skip(t, "suid test in user mode")
+					launcher.skip(t, "suid test in user mode")
 					continue
 				if test_flag(tdesc, 'nouser'):
-					l.skip(t, "criu root prio needed")
+					launcher.skip(t, "criu root prio needed")
 					continue
 
 			if opts['join_ns']:
 				if test_flag(tdesc, 'samens'):
-					l.skip(t, "samens test in the same namespace")
+					launcher.skip(t, "samens test in the same namespace")
 					continue
 
 			if opts['lazy_pages'] or opts['remote_lazy_pages']:
 				if test_flag(tdesc, 'nolazy'):
-					l.skip(t, "lazy pages are not supported")
+					launcher.skip(t, "lazy pages are not supported")
 					continue
 
 			if opts['remote_lazy_pages']:
 				if test_flag(tdesc, 'noremotelazy'):
-					l.skip(t, "remote lazy pages are not supported")
+					launcher.skip(t, "remote lazy pages are not supported")
 					continue
 
 			test_flavs = tdesc.get('flavor', 'h ns uns').split()
@@ -1778,11 +1838,11 @@ def run_tests(opts):
 				run_flavs -= set(['h'])
 
 			if run_flavs:
-				l.run_test(t, tdesc, run_flavs)
+				launcher.run_test(t, tdesc, run_flavs)
 			else:
-				l.skip(t, "no flavors")
+				launcher.skip(t, "no flavors")
 	finally:
-		l.finish()
+		launcher.finish()
 		if opts['join_ns']:
 			subprocess.Popen(["ip", "netns", "delete", "zdtm_netns"]).wait()
 
@@ -1996,6 +2056,7 @@ rp.add_argument("--ignore-taint", help = "Don't care about a non-zero kernel tai
 rp.add_argument("--lazy-pages", help = "restore pages on demand", action = 'store_true')
 rp.add_argument("--remote-lazy-pages", help = "simulate lazy migration", action = 'store_true')
 rp.add_argument("--title", help = "A test suite title", default = "criu")
+rp.add_argument("--show-stats", help = "Show criu statistics", action = 'store_true')
 
 lp = sp.add_parser("list", help = "List tests")
 lp.set_defaults(action = list_tests)
