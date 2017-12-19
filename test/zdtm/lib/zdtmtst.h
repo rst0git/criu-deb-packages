@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #define INPROGRESS ".inprogress"
 
@@ -54,6 +55,8 @@ extern int datasum(const uint8_t *buffer, unsigned length, uint32_t *crc);
 /* streaming helpers */
 extern int set_nonblock(int fd, int on);
 extern int pipe_in2out(int infd, int outfd, uint8_t *buffer, int length);
+extern int read_data(int fd, unsigned char *buf, int len);
+extern int write_data(int fd, const unsigned char *buf, int len);
 
 /* command line args */
 struct long_opt {
@@ -140,5 +143,13 @@ extern void task_waiter_complete_current(task_waiter_t *t);
 extern int tcp_init_server(int family, int *port);
 extern int tcp_accept_server(int sock);
 extern int tcp_init_client(int family, char *servIP, unsigned short servPort);
+
+struct zdtm_tcp_opts {
+	bool reuseaddr;
+	bool reuseport;
+	int flags;
+};
+
+extern int tcp_init_server_with_opts(int family, int *port, struct zdtm_tcp_opts *opts);
 
 #endif /* _VIMITESU_H_ */
