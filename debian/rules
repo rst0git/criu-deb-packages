@@ -6,7 +6,7 @@ PACKAGE = $(firstword $(shell dh_listpackages))
 TMP     = $(CURDIR)/debian/$(PACKAGE)
 
 %:
-	dh ${@} --parallel --with python2
+	dh ${@} --with python2
 
 override_dh_auto_install:
 	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr" LIBEXECDIR="/usr/lib"
