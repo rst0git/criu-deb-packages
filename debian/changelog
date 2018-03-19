@@ -1,3 +1,12 @@
+criu (3.8-1) experimental; urgency=medium
+
+  * Remove unnecessary dh argument --parallel.
+    Debhelper compat level 10 enables by default --parallel for all
+    buildsystems that support parallel building.
+  * New upstream version 3.8
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 19 Mar 2018 10:00:01 +0100
+
 criu (3.7-2) experimental; urgency=medium
 
   * Update copyright years for debian/* packaging files
