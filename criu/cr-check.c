@@ -250,7 +250,7 @@ static int check_fcntl(void)
 		return -1;
 
 	if (fcntl(fd, F_GETOWNER_UIDS, (long)v)) {
-		pr_perror("Can'r fetch file owner UIDs");
+		pr_perror("Can't fetch file owner UIDs");
 		close(fd);
 		return -1;
 	}
@@ -1062,6 +1062,17 @@ static int check_can_map_vdso(void)
 	return -1;
 }
 
+static int check_sk_netns(void)
+{
+	if (kerndat_socket_netns() < 0)
+		return -1;
+
+	if (!kdat.sk_ns)
+		return -1;
+
+	return 0;
+}
+
 static int (*chk_feature)(void);
 
 /*
@@ -1168,6 +1179,7 @@ int cr_check(void)
 		ret |= check_can_map_vdso();
 		ret |= check_uffd();
 		ret |= check_uffd_noncoop();
+		ret |= check_sk_netns();
 	}
 
 	/*
@@ -1197,6 +1209,32 @@ static int check_tun(void)
 	return check_tun_cr(-1);
 }
 
+static int check_nsid(void)
+{
+	if (kerndat_nsid() < 0)
+		return -1;
+
+	if (!kdat.has_nsid) {
+		pr_warn("NSID isn't supported\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int check_link_nsid(void)
+{
+	if (kerndat_link_nsid() < 0)
+		return -1;
+
+	if (!kdat.has_link_nsid) {
+		pr_warn("NSID isn't supported\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 struct feature_list {
 	char *name;
 	int (*func)();
@@ -1220,6 +1258,9 @@ static struct feature_list feature_list[] = {
 	{ "uffd", check_uffd },
 	{ "uffd-noncoop", check_uffd_noncoop },
 	{ "can_map_vdso", check_can_map_vdso},
+	{ "sk_ns", check_sk_netns },
+	{ "nsid", check_nsid },
+	{ "link_nsid", check_link_nsid},
 	{ NULL, NULL },
 };
 

@@ -225,11 +225,35 @@ int sigreturn_prep_fpu_frame_plain(struct rt_sigframe *sigframe,
 	((user_regs_native(pregs)) ? (int64_t)((pregs)->native.name) :	\
 				(int32_t)((pregs)->compat.name))
 
-int get_task_regs(pid_t pid, user_regs_struct_t *regs, save_regs_t save, void *arg)
+static int get_task_xsave(pid_t pid, user_fpregs_struct_t *xsave)
 {
-	user_fpregs_struct_t xsave	= {  }, *xs = NULL;
-
 	struct iovec iov;
+
+	iov.iov_base = xsave;
+	iov.iov_len = sizeof(*xsave);
+
+	if (ptrace(PTRACE_GETREGSET, pid, (unsigned int)NT_X86_XSTATE, &iov) < 0) {
+		pr_perror("Can't obtain FPU registers for %d", pid);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int get_task_fpregs(pid_t pid, user_fpregs_struct_t *xsave)
+{
+	if (ptrace(PTRACE_GETFPREGS, pid, NULL, xsave)) {
+		pr_perror("Can't obtain FPU registers for %d", pid);
+		return -1;
+	}
+
+	return 0;
+}
+
+int get_task_regs(pid_t pid, user_regs_struct_t *regs, save_regs_t save,
+		  void *arg, unsigned long flags)
+{
+	user_fpregs_struct_t xsave = { }, *xs = NULL;
 	int ret = -1;
 
 	pr_info("Dumping general registers for %d in %s mode\n", pid,
@@ -262,20 +286,23 @@ int get_task_regs(pid_t pid, user_regs_struct_t *regs, save_regs_t save, void *a
 
 	pr_info("Dumping GP/FPU registers for %d\n", pid);
 
-	if (compel_cpu_has_feature(X86_FEATURE_OSXSAVE)) {
-		iov.iov_base = &xsave;
-		iov.iov_len = sizeof(xsave);
-
-		if (ptrace(PTRACE_GETREGSET, pid, (unsigned int)NT_X86_XSTATE, &iov) < 0) {
-			pr_perror("Can't obtain FPU registers for %d", pid);
-			goto err;
-		}
+	if (!compel_cpu_has_feature(X86_FEATURE_OSXSAVE)) {
+		ret = get_task_fpregs(pid, &xsave);
+	} else if (unlikely(flags & INFECT_X86_PTRACE_MXCSR_BUG)) {
+		/*
+		 * get_task_fpregs() will fill FP state,
+		 * get_task_xsave() will overwrite rightly sse/mmx/etc
+		 */
+		pr_warn("Skylake xsave fpu bug workaround used\n");
+		ret = get_task_fpregs(pid, &xsave);
+		if (!ret)
+			ret = get_task_xsave(pid, &xsave);
 	} else {
-		if (ptrace(PTRACE_GETFPREGS, pid, NULL, &xsave)) {
-			pr_perror("Can't obtain FPU registers for %d", pid);
-			goto err;
-		}
+		ret = get_task_xsave(pid, &xsave);
 	}
+
+	if (ret)
+		goto err;
 
 	xs = &xsave;
 out:

@@ -589,7 +589,6 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 			break;
 		}
 
-		pr_debug("\t\tWatch got 0x%x but 0x%x expected\n", wd, iwe->wd);
 		inotify_rm_watch(inotify_fd, wd);
 	}
 
@@ -687,8 +686,9 @@ static int open_inotify_fd(struct file_desc *d, int *new_fd)
 		pr_info("\tRestore 0x%x wd for %#08x\n", wd_info->iwe->wd, wd_info->iwe->id);
 		if (restore_one_inotify(tmp, wd_info)) {
 			close_safe(&tmp);
-			break;
+			return -1;
 		}
+		pr_info("\t 0x%x wd for %#08x is restored\n", wd_info->iwe->wd, wd_info->iwe->id);
 	}
 
 	if (restore_fown(tmp, info->ife->fown))
@@ -723,7 +723,7 @@ static int open_fanotify_fd(struct file_desc *d, int *new_fd)
 		pr_info("\tRestore fanotify for %#08x\n", mark->fme->id);
 		if (restore_one_fanotify(ret, mark)) {
 			close_safe(&ret);
-			break;
+			return -1;
 		}
 	}
 

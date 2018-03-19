@@ -10,8 +10,10 @@ TST_NOFILE	:=				\
 		caps00				\
 		wait00				\
 		zombie00			\
+		zombie01			\
 		fpu00				\
 		fpu01				\
+		fpu02				\
 		arm-neon00			\
 		futex				\
 		futex-rl			\
@@ -169,9 +171,12 @@ TST_NOFILE	:=				\
 		scm02				\
 		scm03				\
 		scm04				\
+		scm05				\
+		scm06				\
 		aio00				\
 		aio01				\
 		fd				\
+		fd01				\
 		apparmor				\
 		seccomp_strict			\
 		seccomp_filter			\
@@ -194,6 +199,8 @@ TST_NOFILE	:=				\
 		uffd-events			\
 		thread_different_uid_gid	\
 		pipe03				\
+		netns_sub			\
+		netns_sub_veth			\
 #		jobctl00			\
 
 include ../Makefile.inc
@@ -303,6 +310,7 @@ TST_DIR		=				\
 		mntns_open			\
 		mntns_link_remap		\
 		mntns_ghost			\
+		mntns_ghost01			\
 		mntns_ro_root			\
 		mntns_link_ghost		\
 		mntns_shared_bind		\

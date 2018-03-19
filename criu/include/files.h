@@ -25,7 +25,7 @@ struct fd_link {
 	union {
 		/* Link info for generic file (path) */
 		struct {
-			char	name[PATH_MAX + 1];
+			char	name[PATH_MAX];
 			size_t	len;
 		};
 
@@ -91,6 +91,8 @@ struct fdinfo_list_entry {
 	u8			fake:1;
 };
 
+extern int inh_fd_max;
+
 /* reports whether fd_a takes prio over fd_b */
 static inline int fdinfo_rst_prio(struct fdinfo_list_entry *fd_a, struct fdinfo_list_entry *fd_b)
 {
@@ -111,10 +113,11 @@ struct file_desc_ops {
 };
 
 int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool ghost);
-void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri);
 struct fdinfo_list_entry *collect_fd_to(int pid, FdinfoEntry *e,
-		struct rst_info *rst_info, struct file_desc *fdesc, bool fake);
+		struct rst_info *rst_info, struct file_desc *fdesc,
+		bool fake, bool force_master);
 
+u32 find_unused_file_desc_id(void);
 unsigned int find_unused_fd(struct pstree_item *, int hint_fd);
 struct fdinfo_list_entry *find_used_fd(struct pstree_item *, int fd);
 
@@ -150,6 +153,7 @@ extern struct fdinfo_list_entry *try_file_master(struct file_desc *d);
 extern struct fdinfo_list_entry *file_master(struct file_desc *d);
 extern struct file_desc *find_file_desc_raw(int type, u32 id);
 
+extern int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd);
 extern int recv_desc_from_peer(struct file_desc *d, int *fd);
 extern int send_desc_to_peer(int fd, struct file_desc *d);
 extern int restore_fown(int fd, FownEntry *fown);
@@ -159,7 +163,6 @@ extern void show_saved_files(void);
 
 extern int prepare_fds(struct pstree_item *me);
 extern int prepare_fd_pid(struct pstree_item *me);
-extern int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id);
 extern int prepare_files(void);
 extern int restore_fs(struct pstree_item *);
 extern int prepare_fs_pid(struct pstree_item *);

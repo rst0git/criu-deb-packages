@@ -14,6 +14,8 @@
 #include "mount.h"
 #include "dump.h"
 #include "util.h"
+#include "net.h"
+
 #include "protobuf.h"
 #include "images/pstree.pb-c.h"
 #include "crtools.h"
@@ -227,11 +229,15 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 	return item;
 }
 
-void init_pstree_helper(struct pstree_item *ret)
+int init_pstree_helper(struct pstree_item *ret)
 {
+	BUG_ON(!ret->parent);
 	ret->pid->state = TASK_HELPER;
 	rsti(ret)->clone_flags = CLONE_FILES | CLONE_FS;
+	if (shared_fdt_prepare(ret) < 0)
+		return -1;
 	task_entries->nr_helpers++;
+	return 0;
 }
 
 /* Deep first search on children */
@@ -475,6 +481,10 @@ static int read_pstree_ids(struct pstree_item *pi)
 		if (rst_add_ns_id(pi->ids->mnt_ns_id, pi, &mnt_ns_desc))
 			return -1;
 	}
+	if (pi->ids->has_net_ns_id) {
+		if (rst_add_ns_id(pi->ids->net_ns_id, pi, &net_ns_desc))
+			return -1;
+	}
 
 	return 0;
 }
@@ -669,7 +679,10 @@ static int prepare_pstree_ids(void)
 			helper->ids = root_item->ids;
 			list_add_tail(&helper->sibling, &helpers);
 		}
-		init_pstree_helper(helper);
+		if (init_pstree_helper(helper)) {
+			pr_err("Can't init helper\n");
+			return -1;
+		}
 
 		pr_info("Add a helper %d for restoring SID %d\n",
 				vpid(helper), helper->sid);
@@ -757,13 +770,16 @@ static int prepare_pstree_ids(void)
 			continue;
 
 		helper = pid->item;
-		init_pstree_helper(helper);
 
 		helper->sid = item->sid;
 		helper->pgid = item->pgid;
 		helper->pid->ns[0].virt = item->pgid;
 		helper->parent = item;
 		helper->ids = item->ids;
+		if (init_pstree_helper(helper)) {
+			pr_err("Can't init helper\n");
+			return -1;
+		}
 		list_add(&helper->sibling, &item->children);
 		rsti(item)->pgrp_leader = helper;
 

@@ -57,6 +57,8 @@ static struct hlist_head file_desc_hash[FDESC_HASH_SIZE];
 /* file_desc's, which fle is not owned by a process, that is able to open them */
 static LIST_HEAD(fake_master_head);
 
+static u32 max_file_desc_id = 0;
+
 static void init_fdesc_hash(void)
 {
 	int i;
@@ -79,6 +81,10 @@ int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops)
 {
 	file_desc_init(d, id, ops);
 	hlist_add_head(&d->hash, &file_desc_hash[id % FDESC_HASH_SIZE]);
+
+	if (id > max_file_desc_id)
+		max_file_desc_id = id;
+
 	return 0; /* this is to make tail-calls in collect_one_foo look nice */
 }
 
@@ -108,6 +114,11 @@ static inline struct file_desc *find_file_desc(FdinfoEntry *fe)
 	return find_file_desc_raw(fe->type, fe->id);
 }
 
+u32 find_unused_file_desc_id(void)
+{
+	return max_file_desc_id + 1;
+}
+
 struct fdinfo_list_entry *find_used_fd(struct pstree_item *task, int fd)
 {
 	struct list_head *head;
@@ -124,7 +135,7 @@ struct fdinfo_list_entry *find_used_fd(struct pstree_item *task, int fd)
 	return NULL;
 }
 
-void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri)
+static void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri)
 {
 	struct fdinfo_list_entry *fle;
 
@@ -148,7 +159,7 @@ unsigned int find_unused_fd(struct pstree_item *task, int hint_fd)
 		goto out;
 	}
 
-	prev_fd = service_fd_min_fd() - 1;
+	prev_fd = service_fd_min_fd(task) - 1;
 	head = &rsti(task)->fds;
 
 	list_for_each_entry_reverse(fle, head, ps_list) {
@@ -238,7 +249,7 @@ void show_saved_files(void)
  *
  * This is here only to support the Linux Kernel between versions
  * 3.18 and 4.2. After that, this workaround is not needed anymore,
- * but it will work properly on both a kernel with and withouth the bug.
+ * but it will work properly on both a kernel with and without the bug.
  *
  * When a process has a file open in an OverlayFS directory,
  * the information in /proc/<pid>/fd/<fd> and /proc/<pid>/fdinfo/<fd>
@@ -273,7 +284,8 @@ static int fixup_overlayfs(struct fd_parms *p, struct fd_link *link)
 		char buf[PATH_MAX];
 		int n;
 
-		strncpy(buf, link->name, PATH_MAX - 1);
+		strncpy(buf, link->name, PATH_MAX);
+		buf[PATH_MAX - 1] = 0;
 		n = snprintf(link->name, PATH_MAX, "%s/%s", m->mountpoint, buf + 2);
 		if (n >= PATH_MAX) {
 			pr_err("Not enough space to replace %s\n", buf);
@@ -760,11 +772,9 @@ static struct fdinfo_list_entry *alloc_fle(int pid, FdinfoEntry *fe)
 	return fle;
 }
 
-static void collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_desc *fdesc)
+static void __collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_desc *fdesc)
 {
 	struct fdinfo_list_entry *le;
-
-	new_le->desc = fdesc;
 
 	list_for_each_entry(le, &fdesc->fd_info_head, desc_list)
 		if (pid_rst_prio(new_le->pid, le->pid))
@@ -772,15 +782,29 @@ static void collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_desc 
 	list_add_tail(&new_le->desc_list, &le->desc_list);
 }
 
+static void collect_desc_fle(struct fdinfo_list_entry *new_le,
+			     struct file_desc *fdesc, bool force_master)
+{
+	new_le->desc = fdesc;
+
+	if (!force_master)
+		__collect_desc_fle(new_le, fdesc);
+	else {
+		/* Link as first entry */
+		list_add(&new_le->desc_list, &fdesc->fd_info_head);
+	}
+}
+
 struct fdinfo_list_entry *collect_fd_to(int pid, FdinfoEntry *e,
-		struct rst_info *rst_info, struct file_desc *fdesc, bool fake)
+		struct rst_info *rst_info, struct file_desc *fdesc,
+		bool fake, bool force_master)
 {
 	struct fdinfo_list_entry *new_le;
 
 	new_le = alloc_fle(pid, e);
 	if (new_le) {
 		new_le->fake = (!!fake);
-		collect_desc_fle(new_le, fdesc);
+		collect_desc_fle(new_le, fdesc, force_master);
 		collect_task_fd(new_le, rst_info);
 	}
 
@@ -800,7 +824,7 @@ int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool fake)
 		return -1;
 	}
 
-	if (!collect_fd_to(pid, e, rst_info, fdesc, fake))
+	if (!collect_fd_to(pid, e, rst_info, fdesc, fake, false))
 		return -1;
 
 	return 0;
@@ -835,33 +859,6 @@ int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
 	return collect_fd(vpid(task), e, rsti(task), false);
 }
 
-int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
-{
-	FdinfoEntry *e;
-
-	if (!ctl_tty_id)
-		return 0;
-
-	pr_info("Requesting for ctl tty %#x into service fd\n", ctl_tty_id);
-
-	e = xmalloc(sizeof(*e));
-	if (!e)
-		return -1;
-
-	fdinfo_entry__init(e);
-
-	e->id		= ctl_tty_id;
-	e->fd		= reserve_service_fd(CTL_TTY_OFF);
-	e->type		= FD_TYPES__TTY;
-
-	if (collect_fd(pid, e, rst_info, false)) {
-		xfree(e);
-		return -1;
-	}
-
-	return 0;
-}
-
 int prepare_fd_pid(struct pstree_item *item)
 {
 	int ret = 0;
@@ -888,7 +885,7 @@ int prepare_fd_pid(struct pstree_item *item)
 		if (ret <= 0)
 			break;
 
-		if (e->fd >= service_fd_min_fd()) {
+		if (e->fd >= service_fd_min_fd(item)) {
 			ret = -1;
 			pr_err("Too big FD number to restore %d\n", e->fd);
 			break;
@@ -1084,7 +1081,7 @@ out:
 	return ret;
 }
 
-static int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
+int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
 {
 	struct file_desc *d = fle->desc;
 	pid_t pid = fle->pid;
@@ -1117,12 +1114,12 @@ static int open_fd(struct fdinfo_list_entry *fle)
 		ret = receive_fd(fle);
 		if (ret != 0)
 			return ret;
-		goto fixup_ctty;
+		goto out;
 	}
 
 	/*
 	 * Open method returns the following values:
-	 * 0  -- restore is successefuly finished;
+	 * 0  -- restore is successfully finished;
 	 * 1  -- restore is in process or can't be started
 	 *       yet, because of it depends on another fles,
 	 *       so the method should be called once again;
@@ -1138,16 +1135,9 @@ static int open_fd(struct fdinfo_list_entry *fle)
 		if (setup_and_serve_out(fle, new_fd) < 0)
 			return -1;
 	}
-fixup_ctty:
-	if (ret == 0) {
-		if (fle->fe->fd == get_service_fd(CTL_TTY_OFF)) {
-			ret = tty_restore_ctl_terminal(fle->desc, fle->fe->fd);
-			if (ret == -1)
-				return ret;
-		}
-
+out:
+	if (ret == 0)
 		fle->stage = FLE_RESTORED;
-	}
 	return ret;
 }
 
@@ -1281,8 +1271,10 @@ int prepare_fds(struct pstree_item *me)
 	 * correct /tasks file if it is in a different cgroup
 	 * set than its parent
 	 */
+	sfds_protected = false;
 	close_service_fd(CGROUP_YARD);
-	close_pid_proc(); /* flush any proc cached fds we may have */
+	sfds_protected = true;
+	set_proc_self_fd(-1); /* flush any proc cached fds we may have */
 
 	if (rsti(me)->fdt) {
 		struct fdt *fdt = rsti(me)->fdt;
@@ -1302,14 +1294,12 @@ int prepare_fds(struct pstree_item *me)
 		}
 	}
 
+	BUG_ON(current->pid->state == TASK_HELPER);
 	ret = open_fdinfos(me);
 
-	close_service_fd(TRANSPORT_FD_OFF);
 	if (rsti(me)->fdt)
 		futex_inc_and_wake(&rsti(me)->fdt->fdt_lock);
 out:
-	close_service_fd(CR_PROC_FD_OFF);
-	tty_fini_fds();
 	return ret;
 }
 
@@ -1443,8 +1433,6 @@ int shared_fdt_prepare(struct pstree_item *item)
 	rsti(item)->fdt = fdt;
 	rsti(item)->service_fd_id = fdt->nr;
 	fdt->nr++;
-	if (pid_rst_prio(vpid(item), fdt->pid))
-		fdt->pid = vpid(item);
 
 	return 0;
 }
@@ -1490,6 +1478,8 @@ struct inherit_fd {
 	mode_t inh_mode;
 	dev_t inh_rdev;
 };
+
+int inh_fd_max = -1;
 
 /*
  * Return 1 if inherit fd has been closed or reused, 0 otherwise.
@@ -1586,6 +1576,9 @@ int inherit_fd_add(int fd, char *key)
 	inh = xmalloc(sizeof *inh);
 	if (inh == NULL)
 		return -1;
+
+	if (fd > inh_fd_max)
+		inh_fd_max = fd;
 
 	inh->inh_id = key;
 	inh->inh_fd = fd;
@@ -1741,34 +1734,31 @@ int inherit_fd_fini()
 
 int open_transport_socket(void)
 {
-	struct fdt *fdt = rsti(current)->fdt;
 	pid_t pid = vpid(current);
 	struct sockaddr_un saddr;
-	int sock, slen;
-
-	if (!task_alive(current) || (fdt && fdt->pid != pid))
-		return 0;
+	int sock, slen, ret = -1;
 
 	sock = socket(PF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 	if (sock < 0) {
 		pr_perror("Can't create socket");
-		return -1;
+		goto out;
 	}
 
 	transport_name_gen(&saddr, &slen, pid);
 	if (bind(sock, (struct sockaddr *)&saddr, slen) < 0) {
 		pr_perror("Can't bind transport socket %s", saddr.sun_path + 1);
 		close(sock);
-		return -1;
+		goto out;
 	}
 
 	if (install_service_fd(TRANSPORT_FD_OFF, sock) < 0) {
 		close(sock);
-		return -1;
+		goto out;
 	}
 	close(sock);
-
-	return 0;
+	ret = 0;
+out:
+	return ret;
 }
 
 static int collect_one_file_entry(FileEntry *fe, u_int32_t id, ProtobufCMessage *base,

@@ -302,7 +302,7 @@ static int ghost_apply_metadata(const char *path, GhostFileEntry *gfe)
 		tv[1].tv_sec = gfe->mtim->tv_sec;
 		tv[1].tv_usec = gfe->mtim->tv_usec;
 		if (lutimes(path, tv)) {
-			pr_perror("Can't set access and modufication times on ghost %s", path);
+			pr_perror("Can't set access and modification times on ghost %s", path);
 			goto err;
 		}
 	}
@@ -532,13 +532,16 @@ static int collect_remap_dead_process(struct reg_file_info *rfi,
 		return 0;
 	}
 
-	init_pstree_helper(helper);
 
 	helper->sid = root_item->sid;
 	helper->pgid = root_item->pgid;
 	helper->pid->ns[0].virt = rfe->remap_id;
 	helper->parent = root_item;
 	helper->ids = root_item->ids;
+	if (init_pstree_helper(helper)) {
+		pr_err("Can't init helper\n");
+		return -1;
+	}
 	list_add_tail(&helper->sibling, &root_item->children);
 
 	pr_info("Added a helper for restoring /proc/%d\n", vpid(helper));
@@ -666,7 +669,7 @@ static int clean_one_remap(struct remap_info *ri)
 
 	rmntns_root = open(path, O_RDONLY);
 	if (rmntns_root < 0) {
-		pr_perror("Unbale to open %s", path);
+		pr_perror("Unable to open %s", path);
 		return -1;
 	}
 
@@ -1196,7 +1199,7 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms,
 		/*
 		 * Linked file, but path is not accessible (unless any
 		 * other error occurred). We can create a temporary link to it
-		 * uning linkat with AT_EMPTY_PATH flag and remap it to this
+		 * using linkat with AT_EMPTY_PATH flag and remap it to this
 		 * name.
 		 */
 
@@ -1217,7 +1220,7 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms,
 		 * FIXME linked file, but the name we see it by is reused
 		 * by somebody else. We can dump it with linked remaps, but
 		 * we'll have difficulties on restore -- we will have to
-		 * move the exisint file aside, then restore this one,
+		 * move the existing file aside, then restore this one,
 		 * unlink, then move the original file back. It's fairly
 		 * easy to do, but we don't do it now, since unlinked files
 		 * have the "(deleted)" suffix in proc and name conflict
@@ -1344,7 +1347,7 @@ static void convert_path_from_another_mp(char *src, char *dst, int dlen,
 	 * Absolute path to the mount point + difference between source
 	 * and destination roots + path relative to the mountpoint.
 	 */
-	snprintf(dst, dlen, "%s/%s/%s",
+	snprintf(dst, dlen, "./%s/%s/%s",
 				dmi->ns_mountpoint + 1,
 				smi->root + strlen(dmi->root),
 				src + off);
@@ -1363,13 +1366,13 @@ static int linkat_hard(int odir, char *opath, int ndir, char *npath, uid_t uid, 
 
 	if (!( (errno == EPERM || errno == EOVERFLOW) && (root_ns_mask & CLONE_NEWUSER) )) {
 		errno_save = errno;
-		pr_perror("Can't link %s -> %s", opath, npath);
+		pr_warn("Can't link %s -> %s", opath, npath);
 		errno = errno_save;
 		return ret;
 	}
 
 	/*
-	 * Kernel before 4.3 has strange secutiry restrictions about
+	 * Kernel before 4.3 has strange security restrictions about
 	 * linkat. If the fsuid of the caller doesn't equals
 	 * the uid of the file and the file is not "safe"
 	 * one, then only global CAP_CHOWN will be allowed
@@ -1775,7 +1778,7 @@ struct filemap_ctx {
 	 * put a new one into ctx.
 	 *
 	 * True is used by premap, so that it just calls vm_open
-	 * in sequence, immediatelly mmap()s the file, then it
+	 * in sequence, immediately mmap()s the file, then it
 	 * can be closed.
 	 *
 	 * False is used by open_vmas() which pre-opens the files
@@ -1826,7 +1829,7 @@ static int open_filemap(int pid, struct vma_area *vma)
 	int ret;
 
 	/*
-	 * Thevma->fd should have been assigned in collect_filemap
+	 * The vma->fd should have been assigned in collect_filemap
 	 *
 	 * We open file w/o lseek, as mappings don't care about it
 	 */
