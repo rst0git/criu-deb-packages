@@ -292,7 +292,7 @@ static int dump_tunfile(int lfd, u32 id, const struct fd_parms *p)
 
 		/*
 		 * Otherwise this is just opened file with not yet attached
-		 * tun device. Go agead an write the respective entry.
+		 * tun device. Go ahead an write the respective entry.
 		 */
 	} else {
 		tfe.netdev = ifr.ifr_name;
@@ -439,8 +439,9 @@ int dump_tun_link(NetDeviceEntry *nde, struct cr_imgset *fds, struct nlattr **in
 	return write_netdev_img(nde, fds, info);
 }
 
-int restore_one_tun(NetDeviceEntry *nde, int nlsk)
+int restore_one_tun(struct net_link *link, int nlsk)
 {
+	NetDeviceEntry *nde = link->nde;
 	int fd, ret = -1, aux;
 
 	if (!nde->tun) {
@@ -489,7 +490,7 @@ int restore_one_tun(NetDeviceEntry *nde, int nlsk)
 		goto out;
 	}
 
-	if (restore_link_parms(nde, nlsk)) {
+	if (restore_link_parms(link, nlsk)) {
 		pr_err("Error restoring %s link params\n", nde->name);
 		goto out;
 	}

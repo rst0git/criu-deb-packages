@@ -112,7 +112,7 @@ static void log_note_err(char *msg)
 		/*
 		 * In any action other than restore this locking is
 		 * actually not required, but ... it's error path
-		 * anyway, so it doesn't make much sence to try hard
+		 * anyway, so it doesn't make much sense to try hard
 		 * and optimize this out.
 		 */
 		mutex_lock(&first_err->l);
@@ -142,7 +142,7 @@ int log_init(const char *output)
 	if (output && !strncmp(output, "-", 2)) {
 		new_logfd = dup(STDOUT_FILENO);
 		if (new_logfd < 0) {
-			pr_perror("Cant't dup stdout stream");
+			pr_perror("Can't dup stdout stream");
 			return -1;
 		}
 	} else if (output) {
@@ -171,7 +171,7 @@ err:
 	return -1;
 }
 
-int log_init_by_pid(void)
+int log_init_by_pid(pid_t pid)
 {
 	char path[PATH_MAX];
 
@@ -182,14 +182,14 @@ int log_init_by_pid(void)
 	reset_buf_off();
 
 	if (!opts.log_file_per_pid) {
-		buf_off += snprintf(buffer + buf_off, sizeof buffer - buf_off, "%6d: ", getpid());
+		buf_off += snprintf(buffer + buf_off, sizeof buffer - buf_off, "%6d: ", pid);
 		return 0;
 	}
 
 	if (!opts.output)
 		return 0;
 
-	snprintf(path, PATH_MAX, "%s.%d", opts.output, getpid());
+	snprintf(path, PATH_MAX, "%s.%d", opts.output, pid);
 
 	return log_init(path);
 }

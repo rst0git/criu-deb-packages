@@ -27,6 +27,8 @@
 #include "lsm.h"
 #include "proc_parse.h"
 #include "sk-inet.h"
+#include "sockets.h"
+#include "net.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include <compel/compel.h>
 #include "netfilter.h"
@@ -148,6 +150,74 @@ static void kerndat_mmap_min_addr(void)
 
 	pr_debug("Found mmap_min_addr %#lx\n",
 		 (unsigned long)kdat.mmap_min_addr);
+}
+
+int kerndat_files_stat(bool early)
+{
+	static const uint32_t NR_OPEN_DEFAULT = 1024 * 1024;
+	static const uint64_t MAX_FILES_DEFAULT = 8192;
+	uint64_t max_files;
+	uint32_t nr_open;
+
+	struct sysctl_req req[] = {
+		{
+			.name	= "fs/file-max",
+			.arg	= &max_files,
+			.type	= CTL_U64,
+		},
+		{
+			.name	= "fs/nr_open",
+			.arg	= &nr_open,
+			.type	= CTL_U32,
+		},
+	};
+
+	if (!early) {
+		if (sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0)) {
+			pr_warn("Can't fetch file_stat, using kernel defaults\n");
+			nr_open = NR_OPEN_DEFAULT;
+			max_files = MAX_FILES_DEFAULT;
+		}
+	} else {
+		char buf[64];
+		int fd1, fd2;
+		ssize_t ret;
+
+		fd1 = open("/proc/sys/fs/file-max", O_RDONLY);
+		fd2 = open("/proc/sys/fs/nr_open", O_RDONLY);
+
+		nr_open = NR_OPEN_DEFAULT;
+		max_files = MAX_FILES_DEFAULT;
+
+		if (fd1 < 0 || fd2 < 0) {
+			pr_warn("Can't fetch file_stat, using kernel defaults\n");
+		} else {
+			ret = read(fd1, buf, sizeof(buf) - 1);
+			if (ret > 0) {
+				buf[ret] = '\0';
+				max_files = atol(buf);
+			}
+			ret = read(fd2, buf, sizeof(buf) - 1);
+			if (ret > 0) {
+				buf[ret] = '\0';
+				nr_open = atol(buf);
+			}
+		}
+
+		if (fd1 >= 0)
+			close(fd1);
+		if (fd2 >= 0)
+			close(fd2);
+	}
+
+	kdat.sysctl_nr_open = nr_open;
+	kdat.files_stat_max_files = max_files;
+
+	pr_debug("files stat: %s %lu, %s %u\n",
+		 req[0].name, kdat.files_stat_max_files,
+		 req[1].name, kdat.sysctl_nr_open);
+
+	return 0;
 }
 
 static int kerndat_get_shmemdev(void)
@@ -557,6 +627,27 @@ err:
 	return exit_code;
 }
 
+int kerndat_nsid(void)
+{
+	int nsid, sk;
+
+	sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sk < 0) {
+		pr_perror("Unable to create a netlink socket");
+		return -1;
+	}
+
+	if (net_get_nsid(sk, getpid(), &nsid) < 0) {
+		pr_err("NSID is not supported\n");
+		close(sk);
+		return -1;
+	}
+
+	kdat.has_nsid = true;
+	close(sk);
+	return 0;
+}
+
 static int kerndat_compat_restore(void)
 {
 	int ret;
@@ -612,7 +703,7 @@ static int kerndat_detect_stack_guard_gap(void)
 
 		/*
 		 * When reading /proc/$pid/[s]maps the
-		 * start/end addresses migh be cutted off
+		 * start/end addresses might be cutted off
 		 * with PAGE_SIZE on kernels prior 4.12
 		 * (see kernel commit 1be7107fbe18ee).
 		 *
@@ -646,6 +737,22 @@ err:
 	return ret;
 }
 
+int __attribute__((weak)) kdat_x86_has_ptrace_fpu_xsave_bug(void)
+{
+	return 0;
+}
+
+static int kerndat_x86_has_ptrace_fpu_xsave_bug(void)
+{
+	int ret = kdat_x86_has_ptrace_fpu_xsave_bug();
+
+	if (ret < 0)
+		return ret;
+
+	kdat.x86_has_ptrace_fpu_xsave_bug = !!ret;
+	return 0;
+}
+
 #define KERNDAT_CACHE_FILE	KDAT_RUNDIR"/criu.kdat"
 #define KERNDAT_CACHE_FILE_TMP	KDAT_RUNDIR"/.criu.kdat"
 
@@ -662,6 +769,7 @@ static int kerndat_try_load_cache(void)
 	ret = read(fd, &kdat, sizeof(kdat));
 	if (ret < 0) {
 		pr_perror("Can't read kdat cache");
+		close(fd);
 		return -1;
 	}
 
@@ -860,6 +968,12 @@ int kerndat_init(void)
 	if (!ret)
 		ret = kerndat_compat_restore();
 	if (!ret)
+		ret = kerndat_socket_netns();
+	if (!ret)
+		ret = kerndat_nsid();
+	if (!ret)
+		ret = kerndat_link_nsid();
+	if (!ret)
 		ret = kerndat_has_memfd_create();
 	if (!ret)
 		ret = kerndat_detect_stack_guard_gap();
@@ -873,9 +987,16 @@ int kerndat_init(void)
 	/* Depends on kerndat_vdso_fill_symtable() */
 	if (!ret)
 		ret = kerndat_vdso_preserves_hint();
+	if (!ret)
+		ret = kerndat_socket_netns();
+	if (!ret)
+		ret = kerndat_nsid();
+	if (!ret)
+		ret = kerndat_x86_has_ptrace_fpu_xsave_bug();
 
 	kerndat_lsm();
 	kerndat_mmap_min_addr();
+	kerndat_files_stat(false);
 
 	if (!ret)
 		kerndat_save_cache();
