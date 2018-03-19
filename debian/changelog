@@ -1,3 +1,11 @@
+criu (3.7-2) experimental; urgency=medium
+
+  * Update copyright years for debian/* packaging files
+  * Declare compliance with Debian policy 4.1.3
+  * Update Vcs-* fields for switch to salsa.debian.org
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Mon, 19 Mar 2018 09:45:41 +0100
+
 criu (3.7-1) experimental; urgency=medium
 
   * New upstream version 3.7
