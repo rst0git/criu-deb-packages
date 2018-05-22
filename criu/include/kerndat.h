@@ -48,6 +48,8 @@ struct kerndat_s {
 	enum loginuid_func luid;
 	bool compat_cr;
 	bool sk_ns;
+	bool sk_unix_file;
+	bool tun_ns;
 	enum pagemap_func pmap;
 	unsigned int has_xtlocks;
 	unsigned long mmap_min_addr;
@@ -70,6 +72,7 @@ struct kerndat_s {
 	unsigned int sysctl_nr_open;
 	unsigned long files_stat_max_files;
 	bool x86_has_ptrace_fpu_xsave_bug;
+	bool has_inotify_setnextwd;
 };
 
 extern struct kerndat_s kdat;

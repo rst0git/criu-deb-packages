@@ -155,7 +155,7 @@ class host_flavor:
 
 
 class ns_flavor:
-	__root_dirs = ["/bin", "/sbin", "/etc", "/lib", "/lib64", "/dev", "/dev/pts", "/dev/net", "/tmp", "/usr", "/proc"]
+	__root_dirs = ["/bin", "/sbin", "/etc", "/lib", "/lib64", "/dev", "/dev/pts", "/dev/net", "/tmp", "/usr", "/proc", "/run"]
 
 	def __init__(self, opts):
 		self.name = "ns"
@@ -282,6 +282,7 @@ class userns_flavor(ns_flavor):
 
 
 flavors = {'h': host_flavor, 'ns': ns_flavor, 'uns': userns_flavor}
+flavors_codes = dict(zip(xrange(len(flavors)), sorted(flavors.keys())))
 
 #
 # Helpers
@@ -289,11 +290,11 @@ flavors = {'h': host_flavor, 'ns': ns_flavor, 'uns': userns_flavor}
 
 
 def encode_flav(f):
-	return (flavors.keys().index(f) + 128)
+	return sorted(flavors.keys()).index(f) + 128
 
 
 def decode_flav(i):
-	return flavors.get(i - 128, "unknown")
+	return flavors_codes.get(i - 128, "unknown")
 
 
 def tail(path):
@@ -757,6 +758,9 @@ class criu_rpc:
 			if arg == '--track-mem':
 				criu.opts.track_mem = True
 				continue
+			if arg == '--tcp-established':
+				criu.opts.tcp_established = True
+				continue
 
 			raise test_fail_exc('RPC for %s required' % arg)
 
@@ -958,7 +962,8 @@ class criu:
 				grep_errors(os.path.join(__ddir, log))
 				if ret == 0:
 					return
-			if self.__test.blocking() or (self.__sat and action == 'restore'):
+			rst_succeeded = os.access(os.path.join(__ddir, "restore-succeeded"), os.F_OK)
+			if self.__test.blocking() or (self.__sat and action == 'restore' and rst_succeeded):
 				raise test_fail_expected_exc(action)
 			else:
 				raise test_fail_exc("CRIU %s" % action)
@@ -1145,7 +1150,7 @@ def cr(cr_api, test, opts):
 		pres = iter_parm(opts['pre'], 0)
 		for p in pres[0]:
 			if opts['snaps']:
-				cr_api.dump("dump", opts = ["--leave-running"])
+				cr_api.dump("dump", opts = ["--leave-running", "--track-mem"])
 			else:
 				cr_api.dump("pre-dump")
 				try_run_hook(test, ["--post-pre-dump"])
@@ -1723,6 +1728,7 @@ def grep_errors(fname):
 		else:
 			if print_next:
 				print_next = print_error(l)
+				before = []
 	if not first:
 		print_sep("ERROR OVER", "-", 60)
 
@@ -1810,15 +1816,18 @@ def run_tests(opts):
 				launcher.skip(t, "manual run only")
 				continue
 
-			feat = tdesc.get('feature', None)
-			if feat:
+			feat_list = tdesc.get('feature', "")
+			for feat in feat_list.split():
 				if feat not in features:
 					print "Checking feature %s" % feat
 					features[feat] = criu.check(feat)
 
 				if not features[feat]:
 					launcher.skip(t, "no %s feature" % feat)
-					continue
+					feat_list = None
+					break
+			if feat_list is None:
+				continue
 
 			if self_checkskip(t):
 				launcher.skip(t, "checkskip failed")

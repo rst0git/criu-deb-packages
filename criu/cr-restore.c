@@ -1164,15 +1164,26 @@ static int wait_exiting_children(void)
  */
 static int restore_one_helper(void)
 {
+	int i;
+
 	if (prepare_fds(current))
 		return -1;
 
-	return wait_exiting_children();
+	if (wait_exiting_children())
+		return -1;
+
+	sfds_protected = false;
+	close_image_dir();
+	close_proc();
+	for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
+		close_service_fd(i);
+
+	return 0;
 }
 
 static int restore_one_task(int pid, CoreEntry *core)
 {
-	int i, ret;
+	int ret;
 
 	/* No more fork()-s => no more per-pid logs */
 
@@ -1182,11 +1193,6 @@ static int restore_one_task(int pid, CoreEntry *core)
 		ret = restore_one_zombie(core);
 	else if (current->pid->state == TASK_HELPER) {
 		ret = restore_one_helper();
-		sfds_protected = false;
-		close_image_dir();
-		close_proc();
-		for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
-			close_service_fd(i);
 	} else {
 		pr_err("Unknown state in code %d\n", (int)core->tc->task_state);
 		ret = -1;
@@ -1240,6 +1246,11 @@ static void maybe_clone_parent(struct pstree_item *item,
 			pr_warn("Root task has pdeath_sig configured, so it will receive one _right_"
 				"after restore on CRIU exit\n");
 	}
+}
+
+static bool needs_prep_creds(struct pstree_item *item)
+{
+	return (!item->parent && (root_ns_mask & CLONE_NEWUSER));
 }
 
 static inline int fork_with_pid(struct pstree_item *item)
@@ -1636,6 +1647,9 @@ static int restore_task_with_children(void *_arg)
 		if (restore_finish_ns_stage(CR_STATE_ROOT_TASK, CR_STATE_PREPARE_NAMESPACES) < 0)
 			goto err;
 	}
+
+	if (needs_prep_creds(current) && (prepare_userns_creds()))
+		goto err;
 
 	/*
 	 * Call this _before_ forking to optimize cgroups

@@ -20,6 +20,13 @@ travis_prep () {
 		CC=clang
 	fi
 
+	[ -n "$GCOV" ] && {
+		apt-add-repository -y "ppa:ubuntu-toolchain-r/test"
+		apt-get update -yq
+		apt-get -yq --no-install-suggests --no-install-recommends --force-yes install g++-7
+		CC=gcc-7
+	}
+
 	# ccache support, only enable for non-GCOV case
 	if [ "$CCACHE" = "1" -a -z "$GCOV" ]; then
 		# ccache is installed by default, need to set it up
@@ -80,7 +87,7 @@ chmod 0777 test/zdtm/transition
 KERN_MAJ=`uname -r | cut -d. -f1`
 KERN_MIN=`uname -r | cut -d. -f2`
 if [ $KERN_MAJ -ge "4" ] && [ $KERN_MIN -ge "11" ]; then
-	LAZY_EXCLUDE="-x cmdlinenv00"
+	LAZY_EXCLUDE="-x cmdlinenv00 -x maps007"
 else
 	LAZY_EXCLUDE="-x maps007 -x fork -x fork2 -x uffd-events -x cgroupns
 		      -x socket_listen -x socket_listen6 -x cmdlinenv00
@@ -99,7 +106,8 @@ bash ./test/jenkins/criu-inhfd.sh
 
 make -C test/others/mnt-ext-dev/ run
 #make -C test/others/exec/ run
-make -C test/others/make/ run
+make -C test/others/make/ run CC="$CC"
+make -C test/others/shell-job/ run
 
 ./test/zdtm.py run -t zdtm/static/env00 --sibling
 
@@ -119,6 +127,8 @@ ip net add test
 ./test/zdtm.py run -t zdtm/static/ptrace_sig -f h --rpc # Error handling (crfail test)
 
 ./test/zdtm.py run --empty-ns -T zdtm/static/socket-tcp*-local --iter 2
+
+make -C test/others/shell-job
 
 pip install flake8
 make lint

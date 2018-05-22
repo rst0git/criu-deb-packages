@@ -155,6 +155,7 @@ TST_NOFILE	:=				\
 		grow_map02			\
 		grow_map03			\
 		tun				\
+		tun_ns				\
 		stopped				\
 		stopped01			\
 		stopped02			\
@@ -201,9 +202,8 @@ TST_NOFILE	:=				\
 		pipe03				\
 		netns_sub			\
 		netns_sub_veth			\
+		unlink_multiple_largefiles	\
 #		jobctl00			\
-
-include ../Makefile.inc
 
 ifneq ($(SRCARCH),arm)
 ifneq ($(COMPAT_TEST),y)
@@ -306,6 +306,7 @@ TST_DIR		=				\
 		cgroup_ifpriomap		\
 		cgroup_stray		\
 		unlink_fstat04			\
+		unlink_fstat041			\
 		mntns_remap			\
 		mntns_open			\
 		mntns_link_remap		\
@@ -330,6 +331,7 @@ TST_DIR		=				\
 		mnt_enablefs			\
 		autofs				\
 		del_standalone_un		\
+		sk-unix-mntns			\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -360,6 +362,8 @@ PID	= $(TST:%=%.pid)
 OUT	= $(TST:%=%.out)
 STATE	= $(TST_STATE:%=%.state)
 STATE_OUT	= $(TST_STATE:%=%.out)
+
+include ../Makefile.inc
 
 all:	$(TST) criu-rtc.so
 install: all
@@ -472,6 +476,7 @@ socket_listen4v6:	CFLAGS += -D ZDTM_IPV4V6
 socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV6
 socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV4V6
 socket-tcp-closed-last-ack:	CFLAGS += -D ZDTM_TCP_LAST_ACK
+tun_ns:			CFLAGS += -DTUN_NS
 mnt_ext_manual:		CFLAGS += -D ZDTM_EXTMAP_MANUAL
 sigpending:		LDLIBS += -lrt
 vdso01:			LDLIBS += -lrt
@@ -486,6 +491,7 @@ mlock_setuid: get_smaps_bits.o
 inotify01:		CFLAGS += -DINOTIFY01
 unlink_fstat01+:	CFLAGS += -DUNLINK_OVER
 unlink_fstat04:		CFLAGS += -DUNLINK_FSTAT04
+unlink_fstat041:		CFLAGS += -DUNLINK_FSTAT041 -DUNLINK_FSTAT04
 ghost_holes01:		CFLAGS += -DTAIL_HOLE
 ghost_holes02:		CFLAGS += -DHEAD_HOLE
 sk-freebind-false:	CFLAGS += -DZDTM_FREEBIND_FALSE

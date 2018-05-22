@@ -19,6 +19,8 @@
 #include "net.h"
 #include "namespaces.h"
 #include "xmalloc.h"
+#include "kerndat.h"
+#include "sockets.h"
 
 #include "images/tun.pb-c.h"
 
@@ -68,6 +70,25 @@ int check_tun_cr(int no_tun_err)
 
 	close(fd);
 	return ret;
+}
+
+int check_tun_netns_cr(bool *result)
+{
+	bool val;
+	int tun;
+
+	tun = open(TUN_DEV_GEN_PATH, O_RDONLY);
+	if (tun < 0) {
+		pr_perror("Unable to create tun");
+		return -1;
+	}
+	check_has_netns_ioc(tun, &val, "tun");
+	close(tun);
+
+	if (result)
+		*result = val;
+
+	return 0;
 }
 
 static LIST_HEAD(tun_links);
@@ -270,11 +291,22 @@ static int dump_tunfile(int lfd, u32 id, const struct fd_parms *p)
 	struct cr_img *img;
 	FileEntry fe = FILE_ENTRY__INIT;
 	TunfileEntry tfe = TUNFILE_ENTRY__INIT;
+	struct ns_id *ns;
 	struct ifreq ifr;
 
 	if (!(root_ns_mask & CLONE_NEWNET)) {
 		pr_err("Net namespace is required to dump tun link\n");
 		return -1;
+	}
+
+	if (kdat.tun_ns) {
+		ns = get_socket_ns(lfd);
+		if (!ns) {
+			pr_err("No net_ns for tun device\n");
+			return -1;
+		}
+		tfe.has_ns_id = true;
+		tfe.ns_id = ns->id;
 	}
 
 	if (dump_one_reg_file(lfd, id, p))
@@ -327,7 +359,7 @@ struct tunfile_info {
 
 static int tunfile_open(struct file_desc *d, int *new_fd)
 {
-	int fd;
+	int fd, ns_id;
 	struct tunfile_info *ti;
 	struct ifreq ifr;
 	struct tun_link *tl;
@@ -337,9 +369,13 @@ static int tunfile_open(struct file_desc *d, int *new_fd)
 	if (fd < 0)
 		return -1;
 
+	ns_id = ti->tfe->ns_id;
+	if (set_netns(ns_id))
+		goto err;
+
 	if (!ti->tfe->netdev)
 		/* just-opened tun file */
-		goto ok;;
+		goto ok;
 
 	tl = find_tun_link(ti->tfe->netdev);
 	if (!tl) {
