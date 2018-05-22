@@ -828,7 +828,7 @@ static int dump_one_link(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 	nlmsg_parse(hdr, sizeof(struct ifinfomsg), tb, IFLA_MAX, NULL);
 	pr_info("\tLD: Got link %d, type %d\n", ifi->ifi_index, ifi->ifi_type);
 
-	if (ifi->ifi_type == ARPHRD_LOOPBACK) 
+	if (ifi->ifi_type == ARPHRD_LOOPBACK)
 		return dump_one_netdev(ND_TYPE__LOOPBACK, ifi, tb, ns, fds, NULL);
 
 	kind = link_kind(ifi, tb);
@@ -1965,6 +1965,48 @@ out:
 	return ret;
 }
 
+/*
+ * iptables-restore is executed from a target userns and it may have not enough
+ * rights to open /run/xtables.lock. Here we try to workaround this problem.
+ */
+static int prepare_xtable_lock()
+{
+	int fd;
+
+	fd = open("/run/xtables.lock", O_RDONLY);
+	if (fd >= 0) {
+		close(fd);
+		return 0;
+	}
+
+	/*
+	 * __prepare_net_namespaces is executed in a separate process,
+	 * so a mount namespace can be changed.
+	 */
+	if (unshare(CLONE_NEWNS)) {
+		pr_perror("Unable to create a mount namespace");
+		return -1;
+	}
+
+	if (mount(NULL, "/",  NULL, MS_SLAVE | MS_REC, NULL)) {
+		pr_perror("Unable to conver mounts to slave mounts");
+		return -1;
+	}
+	/*
+	 * /run/xtables.lock may not exist, so we can't just bind-mount a file
+	 * over it.
+	 * A new mount will not be propagated to the host mount namespace,
+	 * because we are in another userns.
+	 */
+
+	if (mount("criu-xtable-lock", "/run", "tmpfs", 0, NULL)) {
+		pr_perror("Unable to mount tmpfs into /run");
+		return -1;
+	}
+
+	return 0;
+}
+
 static inline int restore_iptables(int pid)
 {
 	int ret = -1;
@@ -2311,6 +2353,9 @@ static int __prepare_net_namespaces(void *unused)
 	struct ns_id *nsid;
 	int root_ns;
 
+	if (prepare_xtable_lock())
+		return -1;
+
 	root_ns = open_proc(PROC_SELF, "ns/net");
 	if (root_ns < 0)
 		return -1;
@@ -2459,7 +2504,7 @@ static int iptables_restore(bool ipv6, char *buf, int size)
 	int pfd[2], ret = -1;
 	char *cmd4[] = {"iptables-restore", "-w", "--noflush", NULL};
 	char *cmd6[] = {"ip6tables-restore", "-w", "--noflush", NULL};
-	char **cmd = ipv6 ? cmd6 : cmd4;;
+	char **cmd = ipv6 ? cmd6 : cmd4;
 
 	if (pipe(pfd) < 0) {
 		pr_perror("Unable to create pipe");
@@ -2664,7 +2709,7 @@ int collect_net_namespaces(bool for_dump)
 
 struct ns_desc net_ns_desc = NS_DESC_ENTRY(CLONE_NEWNET, "net");
 
-static struct ns_id *get_root_netns()
+struct ns_id *net_get_root_ns()
 {
 	static struct ns_id *root_netns = NULL;
 
@@ -2693,7 +2738,7 @@ struct ns_id *get_socket_ns(int lfd)
 	if (ns_fd < 0) {
 		/* backward compatiblity with old kernels */
 		if (netns_nr == 1)
-			return get_root_netns();
+			return net_get_root_ns();
 
 		pr_perror("Unable to get a socket net namespace");
 		return NULL;
@@ -2714,26 +2759,30 @@ struct ns_id *get_socket_ns(int lfd)
 	return ns;
 }
 
+void check_has_netns_ioc(int fd, bool *kdat_val, const char *name)
+{
+	int ns_fd;
+
+	ns_fd = ioctl(fd, SIOCGSKNS);
+	*kdat_val = (ns_fd >= 0);
+
+	if (ns_fd < 0)
+		pr_warn("Unable to get %s network namespace\n", name);
+	else
+		close(ns_fd);
+}
+
 int kerndat_socket_netns(void)
 {
-	int sk, ns_fd;
+	int sk;
 
 	sk = socket(AF_UNIX, SOCK_DGRAM, 0);
 	if (sk < 0) {
 		pr_perror("Unable to create socket");
 		return -1;
 	}
-	ns_fd = ioctl(sk, SIOCGSKNS);
-	if (ns_fd < 0) {
-		pr_warn("Unable to get a socket network namespace\n");
-		kdat.sk_ns = false;
-		close(sk);
-		return 0;
-	}
+	check_has_netns_ioc(sk, &kdat.sk_ns, "socket");
 	close(sk);
-	close(ns_fd);
-
-	kdat.sk_ns = true;
 
 	return 0;
 }

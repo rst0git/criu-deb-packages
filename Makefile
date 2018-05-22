@@ -91,7 +91,7 @@ DEFINES			+= -D_GNU_SOURCE
 
 WARNINGS		:= -Wall -Wformat-security
 
-CFLAGS-GCOV		:= --coverage -fno-exceptions -fno-inline
+CFLAGS-GCOV		:= --coverage -fno-exceptions -fno-inline -fprofile-update=atomic
 export CFLAGS-GCOV
 
 ifneq ($(GCOV),)
@@ -278,11 +278,11 @@ docs:
 .PHONY: docs
 
 zdtm: all
-	$(Q) MAKEFLAGS= $(MAKE) -C test/zdtm all
+	$(Q) $(MAKE) -C test/zdtm all
 .PHONY: zdtm
 
 test: zdtm
-	$(Q) MAKEFLAGS= $(MAKE) -C test
+	$(Q) $(MAKE) -C test
 .PHONY: test
 
 #

@@ -589,7 +589,10 @@ static int choose_service_fd_base(struct pstree_item *me)
 	real_nr = nr;
 
 	nr /= (1024 / sizeof(void *));
-	nr = 1 << (32 - __builtin_clz(nr));
+	if (nr)
+		nr = 1 << (32 - __builtin_clz(nr));
+	else
+		nr = 1;
 	nr *= (1024 / sizeof(void *));
 
 	if (nr > service_fd_rlim_cur) {
@@ -617,7 +620,7 @@ int clone_service_fd(struct pstree_item *me)
 		return 0;
 
 	/* Dup sfds in memmove() style: they may overlap */
-	if (get_service_fd(LOG_FD_OFF) > new_base - LOG_FD_OFF - SERVICE_FD_MAX * id)
+	if (get_service_fd(LOG_FD_OFF) < new_base - LOG_FD_OFF - SERVICE_FD_MAX * id)
 		for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
 			move_service_fd(me, i, id, new_base);
 	else

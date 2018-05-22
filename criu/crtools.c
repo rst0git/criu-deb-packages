@@ -57,8 +57,6 @@
 #include "setproctitle.h"
 #include "sysctl.h"
 
-#include "../soccr/soccr.h"
-
 struct cr_options opts;
 
 void init_opts(void)
@@ -213,42 +211,6 @@ bool deprecated_ok(char *what)
 	return false;
 }
 
-static void soccr_print_on_level(unsigned int loglevel, const char *format, ...)
-{
-	va_list args;
-	int lv;
-
-	switch (loglevel) {
-	case SOCCR_LOG_DBG:
-		lv = LOG_DEBUG;
-		break;
-	case SOCCR_LOG_ERR:
-		lv = LOG_ERROR;
-		break;
-	default:
-		lv = LOG_INFO;
-		break;
-	}
-
-	va_start(args, format);
-	vprint_on_level(lv, format, args);
-	va_end(args);
-}
-
-static void print_kernel_version(void)
-{
-	struct utsname buf;
-
-	if (uname(&buf) < 0) {
-		pr_perror("Reading kernel version failed!");
-		/* This pretty unlikely, just keep on running. */
-		return;
-	}
-
-	pr_info("Running on %s %s %s %s %s\n", buf.nodename, buf.sysname,
-		buf.release, buf.version, buf.machine);
-}
-
 static void rlimit_unlimit_nofile_self(void)
 {
 	struct rlimit new;
@@ -357,6 +319,9 @@ int main(int argc, char *argv[], char *envp[])
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 	BUILD_BUG_ON(CTL_32 != SYSCTL_TYPE__CTL_32);
 	BUILD_BUG_ON(__CTL_STR != SYSCTL_TYPE__CTL_STR);
+	/* We use it for fd overlap handling in clone_service_fd() */
+	BUG_ON(get_service_fd(SERVICE_FD_MIN+1) <
+	       get_service_fd(SERVICE_FD_MAX-1));
 
 	if (fault_injection_init())
 		return 1;
@@ -761,12 +726,6 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (log_init(opts.output))
 		return 1;
-	libsoccr_set_log(log_level, soccr_print_on_level);
-	compel_log_init(vprint_on_level, log_get_loglevel());
-
-	pr_info("Version: %s (gitid %s)\n", CRIU_VERSION, CRIU_GITID);
-
-	print_kernel_version();
 
 	if (opts.deprecated_ok)
 		pr_debug("DEPRECATED ON\n");

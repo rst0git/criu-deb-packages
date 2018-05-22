@@ -12,6 +12,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>  /* for sockaddr_in and inet_ntoa() */
 #include <sys/prctl.h>
+#include <sys/inotify.h>
+
 
 #include "common/config.h"
 #include "int.h"
@@ -29,9 +31,11 @@
 #include "sk-inet.h"
 #include "sockets.h"
 #include "net.h"
+#include "tun.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include <compel/compel.h>
 #include "netfilter.h"
+#include "fsnotify.h"
 #include "linux/userfaultfd.h"
 #include "prctl.h"
 #include "uffd.h"
@@ -737,6 +741,29 @@ err:
 	return ret;
 }
 
+int kerndat_has_inotify_setnextwd(void)
+{
+	int ret = 0;
+	int fd;
+
+	fd = inotify_init();
+	if (fd < 0) {
+		pr_perror("Can't create inotify");
+		return -1;
+	}
+
+	if (ioctl(fd, INOTIFY_IOC_SETNEXTWD, 0x10)) {
+		if (errno != ENOTTY) {
+			pr_perror("Can't call ioctl");
+			ret = -1;
+		}
+	} else
+		kdat.has_inotify_setnextwd = true;
+
+	close(fd);
+	return ret;
+}
+
 int __attribute__((weak)) kdat_x86_has_ptrace_fpu_xsave_bug(void)
 {
 	return 0;
@@ -933,6 +960,11 @@ out_unmap:
 	return ret;
 }
 
+static int kerndat_tun_netns(void)
+{
+	return check_tun_netns_cr(&kdat.tun_ns);
+}
+
 int kerndat_init(void)
 {
 	int ret;
@@ -940,6 +972,9 @@ int kerndat_init(void)
 	ret = kerndat_try_load_cache();
 	if (ret <= 0)
 		return ret;
+
+	/* kerndat_try_load_cache can leave some trash in kdat */
+	memset(&kdat, 0, sizeof(kdat));
 
 	preload_socket_modules();
 	preload_netfilter_modules();
@@ -970,6 +1005,10 @@ int kerndat_init(void)
 	if (!ret)
 		ret = kerndat_socket_netns();
 	if (!ret)
+		ret = kerndat_tun_netns();
+	if (!ret)
+		ret = kerndat_socket_unix_file();
+	if (!ret)
 		ret = kerndat_nsid();
 	if (!ret)
 		ret = kerndat_link_nsid();
@@ -993,6 +1032,8 @@ int kerndat_init(void)
 		ret = kerndat_nsid();
 	if (!ret)
 		ret = kerndat_x86_has_ptrace_fpu_xsave_bug();
+	if (!ret)
+		ret = kerndat_has_inotify_setnextwd();
 
 	kerndat_lsm();
 	kerndat_mmap_min_addr();
