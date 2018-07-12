@@ -23,7 +23,7 @@ Rules-Requires-Root: no
 
 Package: criu
 Architecture: amd64 armhf arm64 ppc64el s390x
-Depends: python-ipaddr, python-protobuf, ${misc:Depends}, ${python:Depends}, ${shlibs:Depends}
+Depends: python-future, python-ipaddr, python-protobuf, ${misc:Depends}, ${python:Depends}, ${shlibs:Depends}
 Recommends: iproute2 | iproute
 Description: checkpoint and restore in userspace
  criu contains the utilities to checkpoint and restore processes in
