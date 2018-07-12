@@ -16,6 +16,7 @@
 #include "xmalloc.h"
 #include "images/inventory.pb-c.h"
 #include "images/pagemap.pb-c.h"
+#include "proc_parse.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -103,6 +104,53 @@ int write_img_inventory(InventoryEntry *he)
 	xfree(he->root_ids);
 	close_image(img);
 	return 0;
+}
+
+void prepare_inventory_pre_dump(InventoryEntry *he)
+{
+	pr_info("Perparing image inventory for pre-dump (version %u)\n", CRTOOLS_IMAGES_V1);
+
+	he->img_version = CRTOOLS_IMAGES_V1_1;
+
+	if (!parse_uptime(&he->dump_uptime))
+		he->has_dump_uptime = true;
+}
+
+InventoryEntry *get_parent_inventory(void)
+{
+	struct cr_img *img;
+	InventoryEntry *ie;
+	int dir;
+
+	dir = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
+	if (dir == -1) {
+		pr_warn("Failed to open parent directory");
+		return NULL;
+	}
+
+	img = open_image_at(dir, CR_FD_INVENTORY, O_RSTR);
+	if (!img) {
+		pr_warn("Failed to open parent pre-dump inventory image");
+		close(dir);
+		return NULL;
+	}
+
+	if (pb_read_one(img, &ie, PB_INVENTORY) < 0) {
+		pr_warn("Failed to read parent pre-dump inventory entry");
+		close_image(img);
+		close(dir);
+		return NULL;
+	}
+
+	if (!ie->has_dump_uptime) {
+		pr_warn("Parent pre-dump inventory has no uptime");
+		inventory_entry__free_unpacked(ie, NULL);
+		ie = NULL;
+	}
+
+	close_image(img);
+	close(dir);
+	return ie;
 }
 
 int prepare_inventory(InventoryEntry *he)

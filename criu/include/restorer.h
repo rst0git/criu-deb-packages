@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <limits.h>
 #include <sys/resource.h>
+#include <linux/filter.h>
 
 #include "common/config.h"
 #include "types.h"
@@ -75,6 +76,11 @@ struct thread_creds_args {
 	unsigned long			mem_pos_next;
 };
 
+struct thread_seccomp_filter {
+	struct sock_fprog		sock_fprog;
+	unsigned int			flags;
+};
+
 struct thread_restore_args {
 	struct restore_mem_zone		*mz;
 
@@ -97,6 +103,13 @@ struct thread_restore_args {
 	int				pdeath_sig;
 
 	struct thread_creds_args	*creds_args;
+
+	int				seccomp_mode;
+	unsigned long			seccomp_filters_pos;
+	struct thread_seccomp_filter	*seccomp_filters;
+	void				*seccomp_filters_data;
+	unsigned int			seccomp_filters_n;
+	bool				seccomp_force_tsync;
 } __aligned(64);
 
 typedef long (*thread_restore_fcall_t) (struct thread_restore_args *args);
@@ -160,9 +173,6 @@ struct task_restore_args {
 	pid_t				*zombies;
 	unsigned int			zombies_n;
 
-	struct sock_fprog		*seccomp_filters;
-	unsigned int			seccomp_filters_n;
-
 	/* * * * * * * * * * * * * * * * * * * * */
 
 	unsigned long			task_size;
@@ -200,6 +210,9 @@ struct task_restore_args {
 	void				**breakpoint;
 
 	enum faults			fault_strategy;
+#ifdef ARCH_HAS_LONG_PAGES
+	unsigned			page_size;
+#endif
 } __aligned(64);
 
 /*
@@ -260,7 +273,7 @@ enum {
 	 * almost ready and what's left is:
 	 *   pick up zombies and helpers
 	 *   restore sigchild handlers used to detect restore errors
-	 *   restore credentials
+	 *   restore credentials, seccomp, dumpable and pdeath_sig
 	 */
 	CR_STATE_RESTORE,
 	/*
@@ -275,6 +288,8 @@ enum {
 	 * credentials are restored. Otherwise someone can attach to a
 	 * process, which are not restored credentials yet and execute
 	 * some code.
+	 * Seccomp needs to be restored after creds.
+	 * Dumpable and pdeath signal are restored after seccomp.
 	 */
 	CR_STATE_RESTORE_CREDS,
 	CR_STATE_COMPLETE

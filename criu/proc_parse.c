@@ -61,15 +61,15 @@
 #define SIGEV_THREAD_ID 4       /* deliver to thread */
 #endif
 
+#define BUF_SIZE	4096	/* Good enough value - can be changed */
+
 struct buffer {
-	char buf[PAGE_SIZE];
+	char buf[BUF_SIZE];
 	char end; /* '\0' */
 };
 
 static struct buffer __buf;
 static char *buf = __buf.buf;
-
-#define BUF_SIZE sizeof(__buf.buf)
 
 /*
  * This is how AIO ring buffers look like in proc
@@ -1782,7 +1782,7 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 
 			if (type != FD_TYPES__SIGNALFD)
 				goto parse_err;
-			ret = sscanf(str, "sigmask: %Lx",
+			ret = sscanf(str, "sigmask: %llx",
 					(unsigned long long *)&sfd->sigmask);
 			if (ret != 1)
 				goto parse_err;
@@ -2628,4 +2628,29 @@ err:
 	closedir(dir);
 	xfree(ch);
 	return -1;
+}
+
+#define CSEC_PER_SEC 100
+
+int parse_uptime(uint64_t *upt)
+{
+	unsigned long sec, csec;
+	FILE *f;
+
+	f = fopen("/proc/uptime", "r");
+	if (!f) {
+		pr_perror("Failed to fopen /proc/uptime");
+		return -1;
+	}
+
+	if (fscanf(f, "%lu.%2lu", &sec, &csec) != 2) {
+		pr_perror("Failed to parse /proc/uptime");
+		fclose(f);
+		return -1;
+	}
+
+	*upt = sec * USEC_PER_SEC + csec * (USEC_PER_SEC / CSEC_PER_SEC);
+
+	fclose(f);
+	return 0;
 }

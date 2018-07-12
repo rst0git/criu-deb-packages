@@ -8,20 +8,20 @@ def create_fds():
 		raise Exception("Unable to mount tmpfs")
 	tfifo = os.path.join(tdir, "test_fifo")
 	os.mkfifo(tfifo)
-	fd2 = open(tfifo, "w+")
-	fd1 = open(tfifo, "r")
+	fd2 = open(tfifo, "w+b", buffering=0)
+	fd1 = open(tfifo, "rb")
 	os.system("umount -l %s" % tdir)
 	os.rmdir(tdir)
 
 	mnt_id = -1;
-	f = open("/proc/self/fdinfo/%d" % fd1.fileno())
-	for l in f:
-		l = l.split()
-		if l[0] == "mnt_id:":
-			mnt_id = int(l[1])
-			break
-	else:
-		raise Exception("Unable to find mnt_id")
+	with open("/proc/self/fdinfo/%d" % fd1.fileno()) as f:
+		for l in f:
+			l = l.split()
+			if l[0] == "mnt_id:":
+				mnt_id = int(l[1])
+				break
+		else:
+			raise Exception("Unable to find mnt_id")
 
 	global id_str
 	id_str = "file[%x:%x]" % (mnt_id, os.fstat(fd1.fileno()).st_ino)

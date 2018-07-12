@@ -311,12 +311,12 @@ int main(int argc, char *argv[], char *envp[])
 		{ "status-fd",			required_argument,	0, 1088 },
 		BOOL_OPT(SK_CLOSE_PARAM, &opts.tcp_close),
 		{ "verbosity",			optional_argument,	0, 'v'	},
+		{ "ps-socket",			required_argument,	0, 1091},
 		{ },
 	};
 
 #undef BOOL_OPT
 
-	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 	BUILD_BUG_ON(CTL_32 != SYSCTL_TYPE__CTL_32);
 	BUILD_BUG_ON(__CTL_STR != SYSCTL_TYPE__CTL_STR);
 	/* We use it for fd overlap handling in clone_service_fd() */
@@ -475,7 +475,7 @@ int main(int argc, char *argv[], char *envp[])
 			opts.addr = optarg;
 			break;
 		case 1052:
-			opts.port = htons(atoi(optarg));
+			opts.port = atoi(optarg);
 			if (!opts.port)
 				goto bad_arg;
 			break;
@@ -615,6 +615,9 @@ int main(int argc, char *argv[], char *envp[])
 				pr_err("Unable to parse a value of --status-fd\n");
 				return 1;
 			}
+			break;
+		case 1091:
+			opts.ps_socket = atoi(optarg);
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
@@ -965,6 +968,7 @@ usage:
 "Page/Service server options:\n"
 "  --address ADDR        address of server or service\n"
 "  --port PORT           port of page server\n"
+"  --ps-socket FD        use specified FD as page server socket\n"
 "  -d|--daemon           run in the background after creating socket\n"
 "  --status-fd FD        write \\0 to the FD and close it once process is ready\n"
 "                        to handle requests\n"
