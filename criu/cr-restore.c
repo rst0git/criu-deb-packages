@@ -330,7 +330,7 @@ static int root_prepare_shared(void)
 	if (prepare_remaps())
 		return -1;
 
-	if (prepare_seccomp_filters())
+	if (seccomp_read_image())
 		return -1;
 
 	if (collect_images(cinfos, ARRAY_SIZE(cinfos)))
@@ -375,6 +375,10 @@ static int root_prepare_shared(void)
 		goto err;
 
 	ret = run_post_prepare();
+	if (ret)
+		goto err;
+
+	ret = unix_prepare_root_shared();
 	if (ret)
 		goto err;
 
@@ -766,6 +770,23 @@ static int open_cores(int pid, CoreEntry *leader_core)
 
 	current->core = cores;
 
+	/*
+	 * Walk over all threads and if one them is having
+	 * active seccomp mode we will suspend filtering
+	 * on the whole group until restore complete.
+	 *
+	 * Otherwise any criu code which might use same syscall
+	 * if present inside a filter chain would take filter
+	 * action and might break restore procedure.
+	 */
+	for (i = 0; i < current->nr_threads; i++) {
+		ThreadCoreEntry *thread_core = cores[i]->thread_core;
+		if (thread_core->seccomp_mode != SECCOMP_MODE_DISABLED) {
+			rsti(current)->has_seccomp = true;
+			break;
+		}
+	}
+
 	return 0;
 err:
 	xfree(cores);
@@ -883,7 +904,7 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (prepare_timerfds(ta))
 		return -1;
 
-	if (seccomp_filters_get_rst_pos(core, ta) < 0)
+	if (seccomp_prepare_threads(current, ta) < 0)
 		return -1;
 
 	if (prepare_itimers(pid, ta, core) < 0)
@@ -1082,6 +1103,21 @@ static int check_core(CoreEntry *core, struct pstree_item *me)
 			pr_err("Core info data missed for non-zombie\n");
 			goto out;
 		}
+
+		/*
+		 * Seccomp are moved to per-thread origin,
+		 * so for old images we need to move per-task
+		 * data into proper place.
+		 */
+		if (core->tc->has_old_seccomp_mode) {
+			core->thread_core->has_seccomp_mode = core->tc->has_old_seccomp_mode;
+			core->thread_core->seccomp_mode = core->tc->old_seccomp_mode;
+		}
+		if (core->tc->has_old_seccomp_filter) {
+			core->thread_core->has_seccomp_filter = core->tc->has_old_seccomp_filter;
+			core->thread_core->seccomp_filter = core->tc->old_seccomp_filter;
+			rsti(me)->has_old_seccomp_filter = true;
+		}
 	}
 
 	ret = 0;
@@ -1269,12 +1305,19 @@ static inline int fork_with_pid(struct pstree_item *item)
 		item->pid->state = ca.core->tc->task_state;
 		rsti(item)->cg_set = ca.core->tc->cg_set;
 
-		rsti(item)->has_seccomp = ca.core->tc->seccomp_mode != SECCOMP_MODE_DISABLED;
-
 		if (item->pid->state != TASK_DEAD && !task_alive(item)) {
 			pr_err("Unknown task state %d\n", item->pid->state);
 			return -1;
 		}
+
+		/*
+		 * By default we assume that seccomp is not
+		 * used at all (especially on dead task). Later
+		 * we will walk over all threads and check in
+		 * details if filter is present setting up
+		 * this flag as appropriate.
+		 */
+		rsti(item)->has_seccomp = false;
 
 		if (unlikely(item == root_item))
 			maybe_clone_parent(item, &ca);
@@ -2254,8 +2297,8 @@ out_kill:
 		struct pstree_item *pi;
 
 		for_each_pstree_item(pi)
-			if (vpid(pi) > 0)
-				kill(vpid(pi), SIGKILL);
+			if (pi->pid->real > 0)
+				kill(pi->pid->real, SIGKILL);
 	}
 
 out:
@@ -3321,6 +3364,9 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	task_args->premmapped_len = rsti(current)->premmapped_len;
 
 	task_args->task_size = kdat.task_size;
+#ifdef ARCH_HAS_LONG_PAGES
+	task_args->page_size = PAGE_SIZE;
+#endif
 
 	RST_MEM_FIXUP_PPTR(task_args->vmas);
 	RST_MEM_FIXUP_PPTR(task_args->rings);
@@ -3331,11 +3377,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	RST_MEM_FIXUP_PPTR(task_args->rlims);
 	RST_MEM_FIXUP_PPTR(task_args->helpers);
 	RST_MEM_FIXUP_PPTR(task_args->zombies);
-	RST_MEM_FIXUP_PPTR(task_args->seccomp_filters);
 	RST_MEM_FIXUP_PPTR(task_args->vma_ios);
-
-	if (core->tc->has_seccomp_mode)
-		task_args->seccomp_mode = core->tc->seccomp_mode;
 
 	task_args->compatible_mode = core_is_compat(core);
 	/*
@@ -3409,6 +3451,9 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		ret = prep_sched_info(&thread_args[i].sp, tcore->thread_core);
 		if (ret)
 			goto err;
+
+		seccomp_rst_reloc(&thread_args[i]);
+		thread_args[i].seccomp_force_tsync = rsti(current)->has_old_seccomp_filter;
 
 		thread_args[i].mz = mz + i;
 		sigframe = (struct rt_sigframe *)&mz[i].rt_sigframe;

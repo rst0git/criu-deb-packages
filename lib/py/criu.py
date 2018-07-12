@@ -9,7 +9,7 @@ import signal
 import sys
 import struct
 
-import rpc_pb2 as rpc
+import pycriu.rpc_pb2 as rpc
 
 class _criu_comm:
 	"""
@@ -85,6 +85,8 @@ class _criu_comm_bin(_criu_comm):
 		css = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 		flags = fcntl.fcntl(css[1], fcntl.F_GETFD)
 		fcntl.fcntl(css[1], fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+		flags = fcntl.fcntl(css[0], fcntl.F_GETFD)
+		fcntl.fcntl(css[0], fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
 
 		self.daemon = daemon
 
