@@ -1,3 +1,14 @@
+criu (3.10-1) experimental; urgency=medium
+
+  * New upstream version 3.10
+  * Add Depends on python-future
+  * debian/control: Wrap and sort fields
+  * Declare compliance with Debian policy 4.1.5
+  * debian/copyright: Switch Source URL to new location for source repository
+  * debian/control: Use HTTPS transport protocol for Homepage URI
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Thu, 12 Jul 2018 22:13:17 +0200
+
 criu (3.9-1) experimental; urgency=medium
 
   * New upstream version 3.9
