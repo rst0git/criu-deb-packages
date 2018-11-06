@@ -30,6 +30,7 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sched.h>
@@ -241,10 +242,6 @@ int reopen_fd_as_safe(char *file, int line, int new_fd, int old_fd, bool allow_r
 	int tmp;
 
 	if (old_fd != new_fd) {
-		/* make sure we won't clash with an inherit fd */
-		if (inherit_fd_resolve_clash(new_fd) < 0)
-			return -1;
-
 		if (!allow_reuse_fd) {
 			if (fcntl(new_fd, F_GETFD) != -1 || errno != EBADF) {
 				pr_err("fd %d already in use (called at %s:%d)\n",
@@ -314,7 +311,6 @@ static inline int set_proc_pid_fd(int pid, int fd)
 
 	open_proc_pid = pid;
 	ret = install_service_fd(PROC_PID_FD_OFF, fd);
-	close(fd);
 
 	return ret;
 }
@@ -348,7 +344,7 @@ void close_proc()
 
 int set_proc_fd(int fd)
 {
-	if (install_service_fd(PROC_FD_OFF, fd) < 0)
+	if (install_service_fd(PROC_FD_OFF, dup(fd)) < 0)
 		return -1;
 	return 0;
 }
@@ -365,7 +361,6 @@ static int open_proc_sfd(char *path)
 	}
 
 	ret = install_service_fd(PROC_FD_OFF, fd);
-	close(fd);
 	if (ret < 0)
 		return -1;
 
@@ -456,8 +451,6 @@ int init_service_fd(void)
 	}
 
 	service_fd_rlim_cur = (int)rlimit.rlim_cur;
-	service_fd_base = service_fd_rlim_cur;
-	BUG_ON(service_fd_base < SERVICE_FD_MAX);
 
 	return 0;
 }
@@ -478,6 +471,7 @@ int service_fd_min_fd(struct pstree_item *item)
 }
 
 static DECLARE_BITMAP(sfd_map, SERVICE_FD_MAX);
+static int sfd_arr[SERVICE_FD_MAX];
 /*
  * Variable for marking areas of code, where service fds modifications
  * are prohibited. It's used to safe them from reusing their numbers
@@ -500,12 +494,20 @@ int install_service_fd(enum sfd_type type, int fd)
 	if (sfds_protected && !test_bit(type, sfd_map))
 		sfds_protection_bug(type);
 
+	if (service_fd_base == 0) {
+		sfd_arr[type] = fd;
+		set_bit(type, sfd_map);
+		return fd;
+	}
+
 	if (dup3(fd, sfd, O_CLOEXEC) != sfd) {
 		pr_perror("Dup %d -> %d failed", fd, sfd);
+		close(fd);
 		return -1;
 	}
 
 	set_bit(type, sfd_map);
+	close(fd);
 	return sfd;
 }
 
@@ -515,6 +517,9 @@ int get_service_fd(enum sfd_type type)
 
 	if (!test_bit(type, sfd_map))
 		return -1;
+
+	if (service_fd_base == 0)
+		return sfd_arr[type];
 
 	return __get_service_fd(type, service_fd_id);
 }
@@ -1237,7 +1242,8 @@ void print_data(unsigned long addr, unsigned char *data, size_t size)
 	}
 }
 
-static int get_sockaddr_in(struct sockaddr_storage *addr, char *host)
+static int get_sockaddr_in(struct sockaddr_storage *addr, char *host,
+			unsigned short port)
 {
 	memset(addr, 0, sizeof(*addr));
 
@@ -1254,31 +1260,38 @@ static int get_sockaddr_in(struct sockaddr_storage *addr, char *host)
 	}
 
 	if (addr->ss_family == AF_INET6) {
-		((struct sockaddr_in6 *)addr)->sin6_port = htons(opts.port);
+		((struct sockaddr_in6 *)addr)->sin6_port = htons(port);
 	} else if (addr->ss_family == AF_INET) {
-		((struct sockaddr_in *)addr)->sin_port = htons(opts.port);
+		((struct sockaddr_in *)addr)->sin_port = htons(port);
 	}
 
 	return 0;
 }
 
-int setup_tcp_server(char *type)
+int setup_tcp_server(char *type, char *addr, unsigned short *port)
 {
 	int sk = -1;
+	int sockopt = 1;
 	struct sockaddr_storage saddr;
 	socklen_t slen = sizeof(saddr);
 
-	if (get_sockaddr_in(&saddr, opts.addr)) {
+	if (get_sockaddr_in(&saddr, addr, (*port))) {
 		return -1;
 	}
 
-	pr_info("Starting %s server on port %u\n", type, opts.port);
+	pr_info("Starting %s server on port %u\n", type, *port);
 
 	sk = socket(saddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
 
 	if (sk < 0) {
 		pr_perror("Can't init %s server", type);
 		return -1;
+	}
+
+	if (setsockopt(
+		sk, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof(sockopt)) == -1) {
+		pr_perror("Unable to set SO_REUSEADDR");
+		goto out;
 	}
 
 	if (bind(sk, (struct sockaddr *)&saddr, slen)) {
@@ -1292,19 +1305,19 @@ int setup_tcp_server(char *type)
 	}
 
 	/* Get socket port in case of autobind */
-	if (opts.port == 0) {
+	if ((*port) == 0) {
 		if (getsockname(sk, (struct sockaddr *)&saddr, &slen)) {
 			pr_perror("Can't get %s server name", type);
 			goto out;
 		}
 
 		if (saddr.ss_family == AF_INET6) {
-			opts.port = ntohs(((struct sockaddr_in *)&saddr)->sin_port);
+			(*port) = ntohs(((struct sockaddr_in *)&saddr)->sin_port);
 		} else if (saddr.ss_family == AF_INET) {
-			opts.port = ntohs(((struct sockaddr_in6 *)&saddr)->sin6_port);
+			(*port) = ntohs(((struct sockaddr_in6 *)&saddr)->sin6_port);
 		}
 
-		pr_info("Using %u port\n", opts.port);
+		pr_info("Using %u port\n", (*port));
 	}
 
 	return sk;
@@ -1360,28 +1373,66 @@ out:
 	return -1;
 }
 
-int setup_tcp_client(char *addr)
+int setup_tcp_client(char *hostname)
 {
 	struct sockaddr_storage saddr;
-	int sk;
+	struct addrinfo addr_criteria, *addr_list, *p;
+	char ipstr[INET6_ADDRSTRLEN];
+	int sk = -1;
+	void *ip;
 
-	pr_info("Connecting to server %s:%u\n", addr, opts.port);
+	memset(&addr_criteria, 0, sizeof(addr_criteria));
+	addr_criteria.ai_family = AF_UNSPEC;
+	addr_criteria.ai_socktype = SOCK_STREAM;
+	addr_criteria.ai_protocol = IPPROTO_TCP;
 
-	if (get_sockaddr_in(&saddr, addr))
-		return -1;
-
-	sk = socket(saddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
-	if (sk < 0) {
-		pr_perror("Can't create socket");
-		return -1;
+	/*
+	 * addr_list contains a list of addrinfo structures that corresponding
+	 * to the criteria specified in hostname and addr_criteria.
+	 */
+	if (getaddrinfo(hostname, NULL, &addr_criteria, &addr_list)) {
+		pr_perror("Failed to resolve hostname: %s", hostname);
+		goto out;
 	}
 
-	if (connect(sk, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
-		pr_perror("Can't connect to server");
-		close(sk);
-		return -1;
+	/*
+	 * Iterate through addr_list and try to connect. The loop stops if the
+	 * connection is successful or we reach the end of the list.
+	 */
+	for(p = addr_list; p != NULL; p = p->ai_next) {
+
+		if (p->ai_family == AF_INET) {
+			struct sockaddr_in *ipv4 = (struct sockaddr_in *)p->ai_addr;
+			ip = &(ipv4->sin_addr);
+		} else {
+			struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)p->ai_addr;
+			ip = &(ipv6->sin6_addr);
+		}
+
+		inet_ntop(p->ai_family, ip, ipstr, sizeof(ipstr));
+		pr_info("Connecting to server %s:%u\n", ipstr, opts.port);
+
+		if (get_sockaddr_in(&saddr, ipstr, opts.port))
+			goto out;
+
+		sk = socket(saddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
+		if (sk < 0) {
+			pr_perror("Can't create socket");
+			goto out;
+		}
+
+		if (connect(sk, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
+			pr_info("Can't connect to server %s:%u\n", ipstr, opts.port);
+			close(sk);
+			sk = -1;
+		} else {
+			/* Connected successfully */
+			break;
+		}
 	}
 
+out:
+	freeaddrinfo(addr_list);
 	return sk;
 }
 

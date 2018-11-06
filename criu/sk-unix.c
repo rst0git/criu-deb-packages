@@ -117,7 +117,7 @@ struct unix_sk_listen_icon {
 
 static struct unix_sk_listen_icon *unix_listen_icons[SK_HASH_SIZE];
 
-static struct unix_sk_listen_icon *lookup_unix_listen_icons(int peer_ino)
+static struct unix_sk_listen_icon *lookup_unix_listen_icons(unsigned int peer_ino)
 {
 	struct unix_sk_listen_icon *ic;
 
@@ -302,7 +302,7 @@ static int resolve_rel_name(uint32_t id, struct unix_sk_desc *sk, const struct f
 		dir[ret] = 0;
 
 		if (snprintf(path, sizeof(path), ".%s/%s", dir, sk->name) >= sizeof(path)) {
-			pr_err("The path .%s/%s is too long", dir, sk->name);
+			pr_err("The path .%s/%s is too long\n", dir, sk->name);
 			goto err;
 		}
 		if (fstatat(mntns_root, path, &st, 0)) {
@@ -717,8 +717,8 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 	}
 
 	if (tb[UNIX_DIAG_ICONS]) {
-		int len = nla_len(tb[UNIX_DIAG_ICONS]);
-		int i;
+		unsigned int len = nla_len(tb[UNIX_DIAG_ICONS]);
+		unsigned int i;
 
 		d->icons = xmalloc(len);
 		if (!d->icons)
@@ -733,7 +733,7 @@ static int unix_collect_one(const struct unix_diag_msg *m,
 		 */
 		for (i = 0; i < d->nr_icons; i++) {
 			struct unix_sk_listen_icon *e, **chain;
-			int n;
+			unsigned int n;
 
 			e = xzalloc(sizeof(*e));
 			if (!e)
@@ -1408,7 +1408,7 @@ static int bind_on_deleted(int sk, struct unix_sk_info *ui)
 	bool renamed = false;
 	int ret;
 
-	if (ui->ue->name.len >= sizeof(path)) {
+	if (ui->ue->name.len >= UNIX_PATH_MAX) {
 		pr_err("ghost: Too long name for socket id %#x ino %d name %s\n",
 		       ui->ue->id, ui->ue->ino, ui->name);
 		return -ENOSPC;
@@ -1586,7 +1586,7 @@ static int bind_unix_sk(int sk, struct unix_sk_info *ui)
 	 * Order binding for sake of ghost sockets. We might rename
 	 * existing socket to some temp name, bind ghost, delete it,
 	 * and finally move the former back, thus while we're doing
-	 * this stuff we should not be interruped by connection
+	 * this stuff we should not be interrupted by connection
 	 * from another sockets.
 	 *
 	 * FIXME: Probably wort make it per address rather for
@@ -2060,9 +2060,12 @@ int unix_prepare_root_shared(void)
 	pr_debug("ghost: Resolving addresses\n");
 
 	list_for_each_entry(ui, &unix_ghost_addr, ghost_node) {
+		char tp_name[32];
+		char st_name[32];
+
 		pr_debug("ghost: id %#x type %s state %s ino %d peer %d address %s\n",
-			 ui->ue->id, socket_type_name(ui->ue->type),
-			 tcp_state_name(ui->ue->state),
+			 ui->ue->id, __socket_type_name(ui->ue->type, tp_name),
+			 __tcp_state_name(ui->ue->state, st_name),
 			 ui->ue->ino, ui->peer ? ui->peer->ue->ino : 0,
 			 ui->name);
 
@@ -2109,9 +2112,9 @@ static int collect_one_unixsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 	}
 
 	pr_info(" `- Got id %#x ino %d type %s state %s peer %d (name %s%.*s dir %s)\n",
-		ui->ue->id, ui->ue->ino, socket_type_name(ui->ue->type),
-		tcp_state_name(ui->ue->state), ui->ue->peer, prefix, ulen, uname,
-		ui->name_dir ? ui->name_dir : "-");
+		ui->ue->id, ui->ue->ino, ___socket_type_name(ui->ue->type),
+		___tcp_state_name(ui->ue->state), ui->ue->peer, prefix, ulen,
+		uname, ui->name_dir ? ui->name_dir : "-");
 
 	if (ui->ue->peer || ui->name) {
 		if (ui->ue->peer)

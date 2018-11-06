@@ -136,7 +136,7 @@ static int self_stdin_fdid = -1;
  * Pretty acceptable trade off in a sake of simplicity.
  */
 
-#define MAX_TTYS	1024
+#define MAX_TTYS	1088
 
 /*
  * Custom indices should be even numbers just in case if we
@@ -147,8 +147,9 @@ static int self_stdin_fdid = -1;
 #define CONSOLE_INDEX	1002
 #define VT_INDEX	1004
 #define CTTY_INDEX	1006
-#define ETTY_INDEX	1008
 #define STTY_INDEX	1010
+#define ETTY_INDEX	1012
+#define ETTY_INDEX_MAX	1076
 #define INDEX_ERR	(MAX_TTYS + 1)
 
 static DECLARE_BITMAP(tty_bitmap, (MAX_TTYS << 1));
@@ -187,6 +188,20 @@ static int ptm_fd_get_index(int fd, const struct fd_parms *p)
 static int pty_get_index(struct tty_info *ti)
 {
 	return ti->tie->pty->index;
+}
+
+static int ext_fd_get_index(int fd, const struct fd_parms *p)
+{
+	static int index;
+
+	index++;
+
+	if (index + ETTY_INDEX > ETTY_INDEX_MAX) {
+		pr_err("Too many external terminals\n");
+		return INDEX_ERR;
+	}
+
+	return index + ETTY_INDEX;
 }
 
 static int pty_open_ptmx(struct tty_info *info);
@@ -229,6 +244,7 @@ static struct tty_driver ext_driver = {
 	.name			= "ext",
 	.index			= ETTY_INDEX,
 	.open			= open_ext_tty,
+	.fd_get_index		= ext_fd_get_index,
 };
 
 static struct tty_driver serial_driver = {
@@ -546,7 +562,7 @@ static int do_open_tty_reg(int ns_root_fd, struct reg_file_info *rfi, void *arg)
 	fd = do_open_reg_noseek_flags(ns_root_fd, rfi, arg);
 	if (fd >= 0) {
 		/*
-		 * Peers might have differend modes set
+		 * Peers might have different modes set
 		 * after creation before we've dumped
 		 * them. So simply setup mode from image
 		 * the regular file engine will check
@@ -883,7 +899,7 @@ static int restore_tty_params(int fd, struct tty_info *info)
 
 /*
  * When we restore queued data we don't exit if error happened:
- * the terminals never was a transport with guaranted delivery,
+ * the terminals never was a transport with guaranteed delivery,
  * it's up to application which uses it to guaratee the data
  * integrity.
  */
@@ -2208,7 +2224,7 @@ static void tty_dinfo_free(struct tty_dump_info *dinfo)
  * checkpoint procedure -- it's tail optimization, we trying
  * to defer this procedure until everything else passed
  * successfully because in real it is time consuming on
- * its own which might require writting data back to the
+ * its own which might require writing data back to the
  * former peers if case something go wrong.
  *
  * Moreover when we gather PTYs peers into own list we

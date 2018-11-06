@@ -3,7 +3,6 @@
 import socket
 import sys
 import rpc_pb2 as rpc
-import argparse
 import subprocess
 
 print('Connecting to CRIU in swrk mode to check the version:')
@@ -44,5 +43,5 @@ else:
 		if resp.version.HasField('name'):
 			print('CRIU name %s' % resp.version.name)
 	else:
-		print 'Fail'
+		print('Fail')
 		sys.exit(-1)

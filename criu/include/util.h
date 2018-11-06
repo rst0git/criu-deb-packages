@@ -206,12 +206,10 @@ int vaddr_to_pfn(int fd, unsigned long vaddr, u64 *pfn);
  */
 static inline bool strstartswith2(const char *str, const char *sub, char *end)
 {
-	const char *osub = sub;
-
 	while (1) {
 		if (*sub == '\0') /* end of sub -- match */ {
 			if (end) {
-				if (sub == osub + 1) /* pure root */
+				if (*(sub-1) == '/') /* "/", "./" or "path/" */
 					*end = '/';
 				else
 					*end = *str;
@@ -291,9 +289,9 @@ char *xsprintf(const char *fmt, ...)
 
 void print_data(unsigned long addr, unsigned char *data, size_t size);
 
-int setup_tcp_server(char *type);
+int setup_tcp_server(char *type, char *addr, unsigned short *port);
 int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk);
-int setup_tcp_client(char *addr);
+int setup_tcp_client(char *hostname);
 
 #define LAST_PID_PATH		"sys/kernel/ns_last_pid"
 #define PID_MAX_PATH		"sys/kernel/pid_max"

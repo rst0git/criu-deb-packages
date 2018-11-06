@@ -108,13 +108,10 @@ def add_to_output(path):
 	if not report_dir:
 		return
 
-	fdi = open(path, "r")
-	fdo = open(os.path.join(report_dir, "output"), "a")
-	while True:
-		buf = fdi.read(1 << 20)
-		if not buf:
-			break
-		fdo.write(buf)
+	output_path = os.path.join(report_dir, "output")
+	with open(path, "r") as fdi, open(output_path, "a") as fdo:
+		for line in fdi:
+			fdo.write(line)
 
 
 prev_crash_reports = set(glob.glob("/tmp/zdtm-core-*.txt"))
@@ -125,13 +122,14 @@ def check_core_files():
 	if not reports:
 		return False
 
-	while subprocess.Popen("ps axf | grep 'abrt\.sh'", shell = True).wait() == 0:
+	while subprocess.Popen(r"ps axf | grep 'abrt\.sh'", shell = True).wait() == 0:
 		time.sleep(1)
 
 	for i in reports:
 		add_to_report(i, os.path.basename(i))
 		print_sep(i)
-		print(open(i).read())
+		with open(i, "r") as report:
+			print(report.read())
 		print_sep(i)
 
 	return True
@@ -191,7 +189,7 @@ class ns_flavor:
 
 	def __copy_libs(self, binary):
 		ldd = subprocess.Popen(["ldd", binary], stdout = subprocess.PIPE)
-		xl = re.compile('^(linux-gate.so|linux-vdso(64)?.so|not a dynamic|.*\s*ldd\s)')
+		xl = re.compile(r'^(linux-gate.so|linux-vdso(64)?.so|not a dynamic|.*\s*ldd\s)')
 
 		# This Mayakovsky-style code gets list of libraries a binary
 		# needs minus vdso and gate .so-s
@@ -318,7 +316,8 @@ def tail(path):
 
 
 def rpidfile(path):
-	return open(path).readline().strip()
+	with open(path) as fd:
+		return fd.readline().strip()
 
 
 def wait_pid_die(pid, who, tmo = 30):
@@ -353,6 +352,9 @@ def test_flag(tdesc, flag):
 class test_fail_exc(Exception):
 	def __init__(self, step):
 		self.step = step
+
+	def __str__(self):
+		return str(self.step)
 
 
 class test_fail_expected_exc(Exception):
@@ -393,7 +395,8 @@ class zdtm_test:
 				preexec_fn = self.__freezer and self.__freezer.attach or None)
 		if act == "pid":
 			try_run_hook(self, ["--post-start"])
-		s.wait()
+		if s.wait():
+			raise test_fail_exc(str(s_args))
 
 		if self.__freezer:
 			self.__freezer.freeze()
@@ -498,7 +501,8 @@ class zdtm_test:
 		if 'PASS' not in list(map(lambda s: s.strip(), res.split())):
 			if os.access(self.__name + '.out.inprogress', os.F_OK):
 				print_sep(self.__name + '.out.inprogress')
-				print(open(self.__name + '.out.inprogress').read())
+				with open(self.__name + '.out.inprogress') as fd:
+					print(fd.read())
 				print_sep(self.__name + '.out.inprogress')
 			raise test_fail_exc("result check")
 
@@ -543,7 +547,8 @@ class zdtm_test:
 	def print_output(self):
 		if os.access(self.__name + '.out', os.R_OK):
 			print("Test output: " + "=" * 32)
-			print(open(self.__name + '.out').read())
+			with open(self.__name + '.out') as output:
+				print(output.read())
 			print(" <<< " + "=" * 32)
 
 	def static(self):
@@ -565,34 +570,45 @@ class zdtm_test:
 			subprocess.check_call(["make", "-C", "zdtm/"])
 		subprocess.check_call(["flock", "zdtm_mount_cgroups.lock", "./zdtm_mount_cgroups"])
 
+	@staticmethod
+	def cleanup():
+		subprocess.check_call(["flock", "zdtm_mount_cgroups.lock", "./zdtm_umount_cgroups"])
+
 
 class inhfd_test:
 	def __init__(self, name, desc, flavor, freezer):
 		self.__name = os.path.basename(name)
 		print("Load %s" % name)
 		self.__fdtyp = imp.load_source(self.__name, name)
-		self.__my_file = None
 		self.__peer_pid = 0
-		self.__peer_file = None
-		self.__peer_file_name = None
-		self.__dump_opts = None
+		self.__files = None
+		self.__peer_file_names = []
+		self.__dump_opts = []
+
+	def __get_message(self, i):
+		return b"".join([random.choice(string.ascii_letters).encode() for _ in range(10)]) + b"%06d" % i
 
 	def start(self):
-		self.__message = b"".join([random.choice(string.ascii_letters).encode() for _ in range(16)])
-		(self.__my_file, peer_file) = self.__fdtyp.create_fds()
+		self.__files = self.__fdtyp.create_fds()
 
 		# Check FDs returned for inter-connection
-		self.__my_file.write(self.__message)
-		self.__my_file.flush()
-		if peer_file.read(16) != self.__message:
-			raise test_fail_exc("FDs screwup")
+		i = 0
+		for my_file, peer_file in self.__files:
+			msg = self.__get_message(i)
+			my_file.write(msg)
+			my_file.flush()
+			data = peer_file.read(len(msg))
+			if data != msg:
+				raise test_fail_exc("FDs screwup: %r %r" % (msg, data))
+			i += 1
 
 		start_pipe = os.pipe()
 		self.__peer_pid = os.fork()
 		if self.__peer_pid == 0:
 			os.setsid()
 
-			getattr(self.__fdtyp, "child_prep", lambda fd: None)(peer_file)
+			for _, peer_file in self.__files:
+				getattr(self.__fdtyp, "child_prep", lambda fd: None)(peer_file)
 
 			try:
 				os.unlink(self.__name + ".out")
@@ -602,31 +618,48 @@ class inhfd_test:
 			os.dup2(fd, 1)
 			os.dup2(fd, 2)
 			os.close(0)
-			self.__my_file.close()
+			for my_file, _ in self.__files:
+				my_file.close()
 			os.close(start_pipe[0])
 			os.close(start_pipe[1])
-			try:
-				data = peer_file.read(16)
-			except Exception as e:
-				print("Unable to read a peer file: %s" % e)
-				sys.exit(1)
+			i = 0
+			for _, peer_file in self.__files:
+				msg = self.__get_message(i)
+				my_file.close()
+				try:
+					data = peer_file.read(16)
+				except Exception as e:
+					print("Unable to read a peer file: %s" % e)
+					sys.exit(1)
 
-			if data != self.__message:
-				print("%r %r" % (data, self.__message))
-			sys.exit(data == self.__message and 42 or 2)
+				if data != msg:
+					print("%r %r" % (data, msg))
+				i += 1
+			sys.exit(data == msg and 42 or 2)
 
 		os.close(start_pipe[1])
 		os.read(start_pipe[0], 12)
 		os.close(start_pipe[0])
 
-		self.__peer_file_name = self.__fdtyp.filename(peer_file)
-		self.__dump_opts = self.__fdtyp.dump_opts(peer_file)
+		for _, peer_file in self.__files:
+			self.__peer_file_names.append(self.__fdtyp.filename(peer_file))
+			self.__dump_opts += self.__fdtyp.dump_opts(peer_file)
+
+		self.__fds = set(os.listdir("/proc/%s/fd" % self.__peer_pid))
 
 	def stop(self):
-		self.__my_file.write(self.__message)
-		self.__my_file.flush()
+		fds = set(os.listdir("/proc/%s/fd" % self.__peer_pid))
+		if fds != self.__fds:
+			raise test_fail_exc("File descriptors mismatch: %s %s" % (fds, self.__fds))
+		i = 0
+		for my_file, _ in self.__files:
+			msg = self.__get_message(i)
+			my_file.write(msg)
+			my_file.flush()
+			i += 1
 		pid, status = os.waitpid(self.__peer_pid, 0)
-		print(open(self.__name + ".out").read())
+		with open(self.__name + ".out") as output:
+			print(output.read())
 		self.__peer_pid = 0
 		if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 42:
 			raise test_fail_exc("test failed with %d" % status)
@@ -644,18 +677,22 @@ class inhfd_test:
 	def gone(self, force = True):
 		os.waitpid(self.__peer_pid, 0)
 		wait_pid_die(self.__peer_pid, self.__name)
-		self.__my_file = None
-		self.__peer_file = None
+		self.__files = None
 
 	def getdopts(self):
 		return self.__dump_opts
 
 	def getropts(self):
-		(self.__my_file, self.__peer_file) = self.__fdtyp.create_fds()
-		fd = self.__peer_file.fileno()
-		fdflags = fcntl.fcntl(fd, fcntl.F_GETFD) & ~fcntl.FD_CLOEXEC
-		fcntl.fcntl(fd, fcntl.F_SETFD, fdflags)
-		return ["--restore-sibling", "--inherit-fd", "fd[%d]:%s" % (fd, self.__peer_file_name)]
+		self.__files = self.__fdtyp.create_fds()
+		ropts = ["--restore-sibling"]
+		for i in range(len(self.__files)):
+			my_file, peer_file = self.__files[i]
+			fd = peer_file.fileno()
+			fdflags = fcntl.fcntl(fd, fcntl.F_GETFD) & ~fcntl.FD_CLOEXEC
+			fcntl.fcntl(fd, fcntl.F_SETFD, fdflags)
+			peer_file_name = self.__peer_file_names[i]
+			ropts.extend(["--inherit-fd", "fd[%d]:%s" % (fd, peer_file_name)])
+		return ropts
 
 	def print_output(self):
 		pass
@@ -670,13 +707,18 @@ class inhfd_test:
 	def available():
 		pass
 
+	@staticmethod
+	def cleanup():
+		pass
+
 
 class groups_test(zdtm_test):
 	def __init__(self, name, desc, flavor, freezer):
 		zdtm_test.__init__(self, 'zdtm/lib/groups', desc, flavor, freezer)
 		if flavor.ns:
 			self.__real_name = name
-			self.__subs = map(lambda x: x.strip(), open(name).readlines())
+			with open(name) as fd:
+				self.__subs = map(lambda x: x.strip(), fd.readlines())
 			print("Subs:\n%s" % '\n'.join(self.__subs))
 		else:
 			self.__real_name = ''
@@ -738,8 +780,8 @@ class criu_cli:
 			print("Forcing %s fault" % fault)
 			env['CRIU_FAULT'] = fault
 
-		cr = subprocess.Popen(strace + [criu_bin, action] + args, env = env,
-				close_fds = False, preexec_fn = preexec)
+		cr = subprocess.Popen(strace + [criu_bin, action, "--no-default-config"] + args,
+				env = env, close_fds = False, preexec_fn = preexec)
 		if nowait:
 			return cr
 		return cr.wait()
@@ -809,6 +851,16 @@ class criu_rpc:
 			if arg == '--tcp-established':
 				criu.opts.tcp_established = True
 				continue
+			if arg == '--restore-sibling':
+				criu.opts.rst_sibling = True
+				continue
+			if arg == "--inherit-fd":
+				inhfd = criu.opts.inherit_fd.add()
+				key = args.pop(0)
+				fd, key = key.split(":", 1)
+				inhfd.fd = int(fd[3:-1])
+				inhfd.key = key
+				continue
 
 			raise test_fail_exc('RPC for %s required' % arg)
 
@@ -839,7 +891,8 @@ class criu_rpc:
 				res = criu.restore()
 				pidf = ctx.get('pidf')
 				if pidf:
-					open(pidf, 'w').write('%d\n' % res.pid)
+					with open(pidf, 'w') as fd:
+						fd.write('%d\n' % res.pid)
 			elif action == "page-server":
 				res = criu.page_server_chld()
 				p = criu_rpc_process()
@@ -983,7 +1036,8 @@ class criu:
 			fcntl.fcntl(fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)
 			s_args += ["--status-fd", str(fd)]
 
-		ns_last_pid = open("/proc/sys/kernel/ns_last_pid").read()
+		with open("/proc/sys/kernel/ns_last_pid") as ns_last_pid_fd:
+			ns_last_pid = ns_last_pid_fd.read()
 
 		ret = self.__criu.run(action, s_args, self.__criu_bin, self.__fault, strace, preexec, nowait)
 
@@ -1009,7 +1063,8 @@ class criu:
 					os.rename(os.path.join(__ddir, log), os.path.join(__ddir, log + ".fail"))
 				# restore ns_last_pid to avoid a case when criu gets
 				# PID of one of restored processes.
-				open("/proc/sys/kernel/ns_last_pid", "w+").write(ns_last_pid)
+				with open("/proc/sys/kernel/ns_last_pid", "w+") as fd:
+					fd.write(ns_last_pid)
 				# try again without faults
 				print("Run criu " + action)
 				ret = self.__criu.run(action, s_args, self.__criu_bin, False, strace, preexec)
@@ -1101,6 +1156,9 @@ class criu:
 			r_opts += ['--empty-ns', 'net']
 			r_opts += ['--action-script', os.getcwd() + '/empty-netns-prep.sh']
 
+		if self.__dedup:
+			r_opts += ["--auto-dedup"]
+
 		self.__prev_dump_iter = None
 		criu_dir = os.path.dirname(os.getcwd())
 		if os.getenv("GCOV"):
@@ -1110,7 +1168,7 @@ class criu:
 		if self.__lazy_pages or self.__lazy_migrate:
 			lp_opts = []
 			if self.__remote_lazy_pages or self.__lazy_migrate:
-				lp_opts += ['--page-server', "--port", "12345"]
+				lp_opts += ['--page-server', "--port", "12345", "--address", "127.0.0.1"]
 			if self.__remote_lazy_pages:
 				ps_opts = ["--pidfile", "ps.pid",
 					   "--port", "12345", "--lazy-pages"]
@@ -1130,8 +1188,8 @@ class criu:
 
 	@staticmethod
 	def check(feature):
-		return criu_cli.run("check", ["-v0", "--feature", feature],
-				opts['criu_bin']) == 0
+		return criu_cli.run("check", ["--no-default-config", "-v0",
+				"--feature", feature], opts['criu_bin']) == 0
 
 	@staticmethod
 	def available():
@@ -1254,7 +1312,8 @@ def get_visible_state(test):
 
 		cmaps = [[0, 0, ""]]
 		last = 0
-		for mp in open("/proc/%s/root/proc/%s/maps" % (test.getpid(), pid)):
+		mapsfd = open("/proc/%s/root/proc/%s/maps" % (test.getpid(), pid))
+		for mp in mapsfd:
 			m = list(map(lambda x: int('0x' + x, 0), mp.split()[0].split('-')))
 
 			m.append(mp.split()[1])
@@ -1269,14 +1328,16 @@ def get_visible_state(test):
 			else:
 				cmaps.append(m)
 				last += 1
+		mapsfd.close()
 
 		maps[pid] = set(map(lambda x: '%x-%x %s' % (x[0], x[1], " ".join(x[2:])), cmaps))
 
 		cmounts = []
 		try:
-			r = re.compile("^\S+\s\S+\s\S+\s(\S+)\s(\S+)")
-			for m in open("/proc/%s/root/proc/%s/mountinfo" % (test.getpid(), pid)):
-				cmounts.append(r.match(m).groups())
+			r = re.compile(r"^\S+\s\S+\s\S+\s(\S+)\s(\S+)\s\S+\s[^-]*?(shared)?[^-]*?(master)?[^-]*?-")
+			with open("/proc/%s/root/proc/%s/mountinfo" % (test.getpid(), pid)) as mountinfo:
+				for m in mountinfo:
+					cmounts.append(r.match(m).groups())
 		except IOError as e:
 			if e.errno != errno.EINVAL:
 				raise e
@@ -1567,7 +1628,8 @@ class Launcher:
 			print(u"# Timestamp: " + now.strftime("%Y-%m-%d %H:%M") + " (GMT+1)", file=self.__file_report)
 			print(u"# ", file=self.__file_report)
 			print(u"1.." + str(nr_tests), file=self.__file_report)
-		self.__taint = open("/proc/sys/kernel/tainted").read()
+		with open("/proc/sys/kernel/tainted") as taintfd:
+			self.__taint = taintfd.read()
 		if int(self.__taint, 0) != 0:
 			print("The kernel is tainted: %r" % self.__taint)
 			if not opts["ignore_taint"]:
@@ -1596,7 +1658,8 @@ class Launcher:
 		if len(self.__subs) >= self.__max:
 			self.wait()
 
-		taint = open("/proc/sys/kernel/tainted").read()
+		with open("/proc/sys/kernel/tainted") as taintfd:
+			taint = taintfd.read()
 		if self.__taint != taint:
 			raise Exception("The kernel is tainted: %r (%r)" % (taint, self.__taint))
 
@@ -1658,11 +1721,13 @@ class Launcher:
 				self.__failed.append([sub['name'], failed_flavor])
 				if self.__file_report:
 					testline = u"not ok %d - %s # flavor %s" % (self.__runtest, sub['name'], failed_flavor)
-					output = open(sub['log']).read()
+					with open(sub['log']) as sublog:
+						output = sublog.read()
 					details = {'output': output}
 					tc.add_error_info(output = output)
 					print(testline, file=self.__file_report)
-					print("%s" % yaml.dump(details, explicit_start=True, explicit_end=True, default_style='|'), file=self.__file_report)
+					print("%s" % yaml.safe_dump(details, explicit_start=True,
+						explicit_end=True, default_style='|'), file=self.__file_report)
 				if sub['log']:
 					add_to_output(sub['log'])
 			else:
@@ -1671,7 +1736,8 @@ class Launcher:
 					print(testline, file=self.__file_report)
 
 			if sub['log']:
-				print(open(sub['log']).read().encode('ascii', 'ignore'))
+				with open(sub['log']) as sublog:
+					print(sublog.read().encode('ascii', 'ignore'))
 				os.unlink(sub['log'])
 
 			return True
@@ -1702,6 +1768,7 @@ class Launcher:
 		if self.__file_report:
 			ts = TestSuite(opts['title'], self.__junit_test_cases, os.getenv("NODE_NAME"))
 			self.__junit_file.write(TestSuite.to_xml_string([ts]))
+			self.__junit_file.close()
 			self.__file_report.close()
 
 		if opts['keep_going']:
@@ -1720,7 +1787,8 @@ class Launcher:
 
 
 def all_tests(opts):
-	desc = eval(open(opts['set'] + '.desc').read())
+	with open(opts['set'] + '.desc') as fd:
+		desc = eval(fd.read())
 
 	files = []
 	mask = stat.S_IFREG | stat.S_IXUSR
@@ -1750,7 +1818,8 @@ default_test = {}
 def get_test_desc(tname):
 	d_path = tname + '.desc'
 	if os.access(d_path, os.F_OK) and os.path.getsize(d_path) > 0:
-		return eval(open(d_path).read())
+		with open(d_path) as fd:
+			return eval(fd.read())
 
 	return default_test
 
@@ -1784,22 +1853,23 @@ def grep_errors(fname):
 	first = True
 	print_next = False
 	before = []
-	for l in open(fname):
-		before.append(l)
-		if len(before) > 5:
-			before.pop(0)
-		if "Error" in l:
-			if first:
-				print_fname(fname, 'log')
-				print_sep("grep Error", "-", 60)
-				first = False
-			for i in before:
-				print_next = print_error(i)
-			before = []
-		else:
-			if print_next:
-				print_next = print_error(l)
+	with open(fname) as fd:
+		for l in fd:
+			before.append(l)
+			if len(before) > 5:
+				before.pop(0)
+			if "Error" in l:
+				if first:
+					print_fname(fname, 'log')
+					print_sep("grep Error", "-", 60)
+					first = False
+				for i in before:
+					print_next = print_error(i)
 				before = []
+			else:
+				if print_next:
+					print_next = print_error(l)
+					before = []
 	if not first:
 		print_sep("ERROR OVER", "-", 60)
 
@@ -1828,7 +1898,8 @@ def run_tests(opts):
 			print("No such file")
 			return
 
-		torun = map(lambda x: x.strip(), open(opts['from']))
+		with open(opts['from']) as fd:
+			torun = map(lambda x: x.strip(), fd)
 		opts['keep_going'] = False
 		run_all = True
 	else:
@@ -2191,8 +2262,12 @@ if opts.get('sat', False):
 if opts['debug']:
 	sys.settrace(traceit)
 
-criu.available()
+if opts['action'] == 'run':
+	criu.available()
 for tst in test_classes.values():
 	tst.available()
 
 opts['action'](opts)
+
+for tst in test_classes.values():
+	tst.cleanup()

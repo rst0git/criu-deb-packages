@@ -147,11 +147,19 @@ static inline int send_psi(int sk, struct page_server_iov *pi)
 static int write_pages_to_server(struct page_xfer *xfer,
 		int p, unsigned long len)
 {
+	ssize_t ret, left = len;
+
 	pr_debug("Splicing %lu bytes / %lu pages into socket\n", len, len / PAGE_SIZE);
 
-	if (splice(p, NULL, xfer->sk, NULL, len, SPLICE_F_MOVE) != len) {
-		pr_perror("Can't write pages to socket");
-		return -1;
+	while (left > 0) {
+		ret = splice(p, NULL, xfer->sk, NULL, left, SPLICE_F_MOVE);
+		if (ret < 0) {
+			pr_perror("Can't write pages to socket");
+			return -1;
+		}
+
+		pr_debug("\tSpliced: %lu bytes sent\n", (unsigned long)ret);
+		left -= ret;
 	}
 
 	return 0;
@@ -983,7 +991,7 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 		goto no_server;
 	}
 
-	sk = setup_tcp_server("page");
+	sk = setup_tcp_server("page", opts.addr, &opts.port);
 	if (sk == -1)
 		return -1;
 no_server:

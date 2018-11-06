@@ -137,7 +137,7 @@ int compel_interrupt_task(int pid)
 	 */
 	ret = ptrace(PTRACE_INTERRUPT, pid, NULL, NULL);
 	if (ret < 0) {
-		pr_warn("SEIZE %d: can't interrupt task: %s", pid, strerror(errno));
+		pr_warn("SEIZE %d: can't interrupt task: %s\n", pid, strerror(errno));
 		if (ptrace(PTRACE_DETACH, pid, NULL, NULL))
 			pr_perror("Unable to detach from %d", pid);
 	}
@@ -1351,7 +1351,7 @@ void *compel_parasite_args_p(struct parasite_ctl *ctl)
 	return ctl->addr_args;
 }
 
-void *compel_parasite_args_s(struct parasite_ctl *ctl, int args_size)
+void *compel_parasite_args_s(struct parasite_ctl *ctl, unsigned long args_size)
 {
 	BUG_ON(args_size > ctl->args_size);
 	return compel_parasite_args_p(ctl);
@@ -1584,4 +1584,14 @@ struct infect_ctx *compel_infect_ctx(struct parasite_ctl *ctl)
 struct parasite_blob_desc *compel_parasite_blob_desc(struct parasite_ctl *ctl)
 {
 	return &ctl->pblob;
+}
+
+uint64_t compel_get_leader_sp(struct parasite_ctl *ctl)
+{
+	return REG_SP(ctl->orig.regs);
+}
+
+uint64_t compel_get_thread_sp(struct parasite_thread_ctl *tctl)
+{
+	return REG_SP(tctl->th.regs);
 }

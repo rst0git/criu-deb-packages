@@ -82,6 +82,7 @@
 #include "seize.h"
 #include "fault-injection.h"
 #include "dump.h"
+#include "eventpoll.h"
 
 /*
  * Architectures can overwrite this function to restore register sets that
@@ -715,6 +716,9 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 			tc->has_pdeath_sig = true;
 			tc->pdeath_sig = ti->pdeath_sig;
 		}
+		tc->comm = xstrdup(ti->comm);
+		if (tc->comm == NULL)
+			return -1;
 	}
 	if (!ret)
 		ret = seccomp_dump_thread(pid, tc);
@@ -837,6 +841,7 @@ static int collect_file_locks(void)
 static int dump_task_thread(struct parasite_ctl *parasite_ctl,
 				const struct pstree_item *item, int id)
 {
+	struct parasite_thread_ctl *tctl = dmpi(item)->thread_ctls[id];
 	struct pid *tid = &item->threads[id];
 	CoreEntry *core = item->core[id];
 	pid_t pid = tid->real;
@@ -847,7 +852,7 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl,
 	pr_info("Dumping core for thread (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
 
-	ret = parasite_dump_thread_seized(parasite_ctl, id, tid, core);
+	ret = parasite_dump_thread_seized(tctl, parasite_ctl, id, tid, core);
 	if (ret) {
 		pr_err("Can't dump thread for pid %d\n", pid);
 		goto err;
@@ -1292,8 +1297,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 		if (install_service_fd(CR_PROC_FD_OFF, pfd) < 0)
 			goto err_cure_imgset;
-
-		close(pfd);
 	}
 
 	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
@@ -1342,6 +1345,11 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		ret = dump_task_files_seized(parasite_ctl, item, dfds);
 		if (ret) {
 			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
+			goto err_cure;
+		}
+		ret = flush_eventpoll_dinfo_queue();
+		if (ret) {
+			pr_err("Dump eventpoll (pid: %d) failed with %d\n", pid, ret);
 			goto err_cure;
 		}
 	}
@@ -1472,10 +1480,14 @@ static int cr_pre_dump_finish(int ret)
 	 * Restore registers for tasks only. The threads have not been
 	 * infected. Therefore, the thread register sets have not been changed.
 	 */
-	if (arch_set_thread_regs(root_item, false) < 0)
+	ret = arch_set_thread_regs(root_item, false);
+	if (ret)
 		goto err;
 
-	prepare_inventory_pre_dump(&he);
+	ret = invertory_save_uptime(&he);
+	if (ret)
+		goto err;
+
 	pstree_switch_state(root_item, TASK_ALIVE);
 
 	timing_stop(TIME_FROZEN);
@@ -1777,7 +1789,7 @@ int cr_dump_tasks(pid_t pid)
 	if (prepare_inventory(&he))
 		goto err;
 
-	if (opts.cpu_cap & (CPU_CAP_CPU | CPU_CAP_INS)) {
+	if (opts.cpu_cap & CPU_CAP_IMAGE) {
 		if (cpu_dump_cpuinfo())
 			goto err;
 	}
@@ -1879,6 +1891,10 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	ret = tty_post_actions();
+	if (ret)
+		goto err;
+
+	ret = invertory_save_uptime(&he);
 	if (ret)
 		goto err;
 
