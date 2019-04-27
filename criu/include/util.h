@@ -180,6 +180,8 @@ extern int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd);
 extern int close_status_fd(void);
 extern int is_root_user(void);
 
+extern void set_proc_self_fd(int fd);
+
 static inline bool dir_dots(const struct dirent *de)
 {
 	return !strcmp(de->d_name, ".") || !strcmp(de->d_name, "..");
@@ -274,6 +276,7 @@ static inline int sk_wait_data(int sk)
 	return poll(&pfd, 1, -1);
 }
 
+void fd_set_nonblocking(int fd, bool on);
 void tcp_nodelay(int sk, bool on);
 void tcp_cork(int sk, bool on);
 
@@ -346,6 +349,8 @@ extern int epoll_add_rfd(int epfd, struct epoll_rfd *);
 extern int epoll_del_rfd(int epfd, struct epoll_rfd *rfd);
 extern int epoll_run_rfds(int epfd, struct epoll_event *evs, int nr_fds, int tmo);
 extern int epoll_prepare(int nr_events, struct epoll_event **evs);
+
+extern void rlimit_unlimit_nofile(void);
 
 extern int call_in_child_process(int (*fn)(void *), void *arg);
 #ifdef __GLIBC__

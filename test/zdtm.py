@@ -18,7 +18,6 @@ import sys
 import linecache
 import random
 import string
-import imp
 import fcntl
 import errno
 import datetime
@@ -575,18 +574,35 @@ class zdtm_test:
 		subprocess.check_call(["flock", "zdtm_mount_cgroups.lock", "./zdtm_umount_cgroups"])
 
 
+def load_module_from_file(name, path):
+	if sys.version_info[0] == 3 and sys.version_info[1] >= 5:
+		import importlib.util
+		spec = importlib.util.spec_from_file_location(name, path)
+		mod = importlib.util.module_from_spec(spec)
+		spec.loader.exec_module(mod)
+	else:
+		import imp
+		mod = imp.load_source(name, path)
+	return mod
+
+
 class inhfd_test:
 	def __init__(self, name, desc, flavor, freezer):
 		self.__name = os.path.basename(name)
 		print("Load %s" % name)
-		self.__fdtyp = imp.load_source(self.__name, name)
+		self.__fdtyp = load_module_from_file(self.__name, name)
 		self.__peer_pid = 0
 		self.__files = None
 		self.__peer_file_names = []
 		self.__dump_opts = []
+		self.__messages = {}
 
 	def __get_message(self, i):
-		return b"".join([random.choice(string.ascii_letters).encode() for _ in range(10)]) + b"%06d" % i
+		m = self.__messages.get(i, None)
+		if not m:
+			m = b"".join([random.choice(string.ascii_letters).encode() for _ in range(10)]) + b"%06d" % i
+		self.__messages[i] = m
+		return m
 
 	def start(self):
 		self.__files = self.__fdtyp.create_fds()
@@ -617,7 +633,9 @@ class inhfd_test:
 			fd = os.open(self.__name + ".out", os.O_WRONLY | os.O_APPEND | os.O_CREAT)
 			os.dup2(fd, 1)
 			os.dup2(fd, 2)
-			os.close(0)
+			os.close(fd)
+			fd = os.open("/dev/null", os.O_RDONLY)
+			os.dup2(fd, 0)
 			for my_file, _ in self.__files:
 				my_file.close()
 			os.close(start_pipe[0])
@@ -1045,7 +1063,10 @@ class criu:
 			os.close(status_fds[1])
 			if os.read(status_fds[0], 1) != b'\0':
 				ret = ret.wait()
-				raise test_fail_exc("criu %s exited with %s" % (action, ret))
+				if self.__test.blocking():
+					raise test_fail_expected_exc(action)
+				else:
+					raise test_fail_exc("criu %s exited with %s" % (action, ret))
 			os.close(status_fds[0])
 			return ret
 
@@ -1123,7 +1144,7 @@ class criu:
 			a_opts += ['--empty-ns', 'net']
 
 		nowait = False
-		if self.__lazy_migrate:
+		if self.__lazy_migrate and action == "dump":
 			a_opts += ["--lazy-pages", "--port", "12345"]
 			nowait = True
 		self.__dump_process = self.__criu_act(action, opts = a_opts + opts, nowait = nowait)
@@ -1155,6 +1176,9 @@ class criu:
 		if self.__empty_ns:
 			r_opts += ['--empty-ns', 'net']
 			r_opts += ['--action-script', os.getcwd() + '/empty-netns-prep.sh']
+
+		if self.__dedup:
+			r_opts += ["--auto-dedup"]
 
 		if self.__dedup:
 			r_opts += ["--auto-dedup"]
@@ -1334,7 +1358,7 @@ def get_visible_state(test):
 
 		cmounts = []
 		try:
-			r = re.compile(r"^\S+\s\S+\s\S+\s(\S+)\s(\S+)\s\S+\s[^-]*?(shared)?[^-]*?(master)?[^-]*?-")
+			r = re.compile(r"^\S+\s\S+\s\S+\s(\S+)\s(\S+)\s(\S+)\s[^-]*?(shared)?[^-]*?(master)?[^-]*?-")
 			with open("/proc/%s/root/proc/%s/mountinfo" % (test.getpid(), pid)) as mountinfo:
 				for m in mountinfo:
 					cmounts.append(r.match(m).groups())
@@ -1737,7 +1761,7 @@ class Launcher:
 
 			if sub['log']:
 				with open(sub['log']) as sublog:
-					print(sublog.read().encode('ascii', 'ignore'))
+					print("%s" % sublog.read().encode('ascii', 'ignore').decode('utf-8'))
 				os.unlink(sub['log'])
 
 			return True

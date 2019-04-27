@@ -3,16 +3,13 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdlib.h>
 #include <signal.h>
 #include <string.h>
 #include <utime.h>
-#include <dirent.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/inotify.h>
-#include <sys/vfs.h>
 #include <linux/magic.h>
 #include <sys/wait.h>
 #include <poll.h>

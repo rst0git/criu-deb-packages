@@ -3,7 +3,6 @@
 #include <limits.h>
 #include <unistd.h>
 #include <errno.h>
-#include <getopt.h>
 #include <string.h>
 #include <ctype.h>
 #include <sched.h>
@@ -20,9 +19,6 @@
 #include <dlfcn.h>
 
 #include <sys/utsname.h>
-
-#include <sys/time.h>
-#include <sys/resource.h>
 
 #include "int.h"
 #include "page.h"
@@ -45,20 +41,11 @@
 #include "cgroup.h"
 #include "cpu.h"
 #include "fault-injection.h"
-#include "lsm.h"
 #include "proc_parse.h"
 #include "kerndat.h"
 
 #include "setproctitle.h"
 #include "sysctl.h"
-
-static int early_init(void)
-{
-	if (init_service_fd())
-		return 1;
-
-	return 0;
-}
 
 int main(int argc, char *argv[], char *envp[])
 {
@@ -95,9 +82,6 @@ int main(int argc, char *argv[], char *envp[])
 
 	log_set_loglevel(opts.log_level);
 
-	if (early_init())
-		return -1;
-
 	if (!strcmp(argv[1], "swrk")) {
 		if (argc < 3)
 			goto usage;
@@ -111,31 +95,8 @@ int main(int argc, char *argv[], char *envp[])
 		return cr_service_work(atoi(argv[2]));
 	}
 
-	if (opts.deprecated_ok)
-		pr_msg("Turn deprecated stuff ON\n");
-	if (opts.tcp_skip_in_flight)
-		pr_msg("Will skip in-flight TCP connections\n");
-	if (opts.tcp_established_ok)
-		pr_info("Will dump TCP connections\n");
-	if (opts.link_remap_ok)
-		pr_info("Will allow link remaps on FS\n");
-	if (opts.weak_sysctls)
-		pr_msg("Will skip non-existant sysctls on restore\n");
-
-	if (getenv("CRIU_DEPRECATED")) {
-		pr_msg("Turn deprecated stuff ON via env\n");
-		opts.deprecated_ok = true;
-	}
-
-	if (check_namespace_opts()) {
-		pr_msg("Error: namespace flags conflict\n");
+	if (check_options())
 		return 1;
-	}
-
-	if (!opts.restore_detach && opts.restore_sibling) {
-		pr_msg("--restore-sibling only makes sense with --restore-detach\n");
-		return 1;
-	}
 
 	if (opts.imgs_dir == NULL)
 		SET_CHAR_OPTS(imgs_dir, ".");
@@ -146,11 +107,6 @@ int main(int argc, char *argv[], char *envp[])
 	if (optind >= argc) {
 		pr_msg("Error: command is required\n");
 		goto usage;
-	}
-
-	if (!strcmp(argv[optind], "exec")) {
-		pr_msg("The \"exec\" action is deprecated by the Compel library.\n");
-		return -1;
 	}
 
 	has_sub_command = (argc - optind) > 1;
@@ -238,6 +194,11 @@ int main(int argc, char *argv[], char *envp[])
 		if (!opts.tree_id)
 			goto opt_pid_missing;
 
+		if (opts.lazy_pages) {
+			pr_err("Cannot pre-dump with --lazy-pages\n");
+			return 1;
+		}
+
 		return cr_pre_dump_tasks(opts.tree_id) != 0;
 	}
 
@@ -254,12 +215,6 @@ int main(int argc, char *argv[], char *envp[])
 		}
 
 		return ret != 0;
-	}
-
-	if (!strcmp(argv[optind], "show")) {
-		pr_msg("The \"show\" action is deprecated by the CRIT utility.\n");
-		pr_msg("To view an image use the \"crit decode -i $name --pretty\" command.\n");
-		return -1;
 	}
 
 	if (!strcmp(argv[optind], "lazy-pages"))
@@ -286,6 +241,17 @@ int main(int argc, char *argv[], char *envp[])
 			return cpuinfo_dump();
 		else if (!strcmp(argv[optind + 1], "check"))
 			return cpuinfo_check();
+	}
+
+	if (!strcmp(argv[optind], "exec")) {
+		pr_msg("The \"exec\" action is deprecated by the Compel library.\n");
+		return -1;
+	}
+
+	if (!strcmp(argv[optind], "show")) {
+		pr_msg("The \"show\" action is deprecated by the CRIT utility.\n");
+		pr_msg("To view an image use the \"crit decode -i $name --pretty\" command.\n");
+		return -1;
 	}
 
 	pr_msg("Error: unknown command: %s\n", argv[optind]);
@@ -397,6 +363,9 @@ usage:
 "  --cgroup-dump-controller NAME\n"
 "                        define cgroup controller to be dumped\n"
 "                        and skip anything else present in system\n"
+"  --lsm-profile TYPE:NAME\n"
+"                        Specify an LSM profile to be used during restore.\n"
+"                        The type can be either 'apparmor' or 'selinux'.\n"
 "  --skip-mnt PATH       ignore this mountpoint when dumping the mount namespace\n"
 "  --enable-fs FSNAMES   a comma separated list of filesystem names or \"all\"\n"
 "                        force criu to (try to) dump/restore these filesystem's\n"
