@@ -11,6 +11,7 @@ Build-Depends:
  libnl-3-dev,
  libprotobuf-c-dev,
  libprotobuf-dev,
+ pkg-config,
  protobuf-c-compiler,
  protobuf-compiler,
  python-all (>= 2.6.6-3~),
