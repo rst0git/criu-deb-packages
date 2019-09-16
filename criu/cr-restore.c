@@ -390,10 +390,10 @@ static int populate_root_fd_off(void)
 	struct ns_id *mntns = NULL;
 	int ret;
 
-        if (root_ns_mask & CLONE_NEWNS) {
-                mntns = lookup_ns_by_id(root_item->ids->mnt_ns_id, &mnt_ns_desc);
-                BUG_ON(!mntns);
-        }
+	if (root_ns_mask & CLONE_NEWNS) {
+		mntns = lookup_ns_by_id(root_item->ids->mnt_ns_id, &mnt_ns_desc);
+		BUG_ON(!mntns);
+	}
 
 	ret = mntns_get_root_fd(mntns);
 	if (ret < 0)
@@ -726,6 +726,40 @@ static int collect_zombie_pids(struct task_restore_args *ta)
 	return collect_child_pids(TASK_DEAD, &ta->zombies_n);
 }
 
+static int collect_inotify_fds(struct task_restore_args *ta)
+{
+	struct list_head *list = &rsti(current)->fds;
+	struct fdt *fdt = rsti(current)->fdt;
+	struct fdinfo_list_entry *fle;
+
+	/* Check we are an fdt-restorer */
+	if (fdt && fdt->pid != vpid(current))
+		return 0;
+
+	ta->inotify_fds = (int *)rst_mem_align_cpos(RM_PRIVATE);
+
+	list_for_each_entry(fle, list, ps_list) {
+		struct file_desc *d = fle->desc;
+		int *inotify_fd;
+
+		if (d->ops->type != FD_TYPES__INOTIFY)
+			continue;
+
+		if (fle != file_master(d))
+			continue;
+
+		inotify_fd = rst_mem_alloc(sizeof(*inotify_fd), RM_PRIVATE);
+		if (!inotify_fd)
+			return -1;
+
+		ta->inotify_fds_n++;
+		*inotify_fd = fle->fe->fd;
+
+		pr_debug("Collect inotify fd %d to cleanup later\n", *inotify_fd);
+	}
+	return 0;
+}
+
 static int open_core(int pid, CoreEntry **pcore)
 {
 	int ret;
@@ -806,9 +840,12 @@ static int prepare_oom_score_adj(int value)
 	return ret;
 }
 
-static int prepare_proc_misc(pid_t pid, TaskCoreEntry *tc)
+static int prepare_proc_misc(pid_t pid, TaskCoreEntry *tc, struct task_restore_args *args)
 {
 	int ret;
+
+	if (tc->has_child_subreaper)
+		args->child_subreaper = tc->child_subreaper;
 
 	/* loginuid value is critical to restore */
 	if (kdat.luid == LUID_FULL && tc->has_loginuid &&
@@ -877,7 +914,10 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (collect_zombie_pids(ta) < 0)
 		return -1;
 
-	if (prepare_proc_misc(pid, core->tc))
+	if (collect_inotify_fds(ta) < 0)
+		return -1;
+
+	if (prepare_proc_misc(pid, core->tc, ta))
 		return -1;
 
 	/*
@@ -2353,6 +2393,9 @@ int cr_restore_tasks(void)
 	if (vdso_init_restore())
 		goto err;
 
+	if (tty_init_restore())
+		goto err;
+
 	if (opts.cpu_cap & CPU_CAP_IMAGE) {
 		if (cpu_validate_cpuinfo())
 			goto err;
@@ -2994,6 +3037,8 @@ static void rst_reloc_creds(struct thread_restore_args *thread_args,
 
 	if (args->lsm_profile)
 		args->lsm_profile = rst_mem_remap_ptr(args->mem_lsm_profile_pos, RM_PRIVATE);
+	if (args->lsm_sockcreate)
+		args->lsm_sockcreate = rst_mem_remap_ptr(args->mem_lsm_sockcreate_pos, RM_PRIVATE);
 	if (args->groups)
 		args->groups = rst_mem_remap_ptr(args->mem_groups_pos, RM_PRIVATE);
 
@@ -3057,6 +3102,40 @@ rst_prep_creds_args(CredsEntry *ce, unsigned long *prev_pos)
 	} else {
 		args->lsm_profile = NULL;
 		args->mem_lsm_profile_pos = 0;
+	}
+
+	if (ce->lsm_sockcreate) {
+		char *rendered = NULL;
+		char *profile;
+
+		profile = ce->lsm_sockcreate;
+
+		if (validate_lsm(profile) < 0)
+			return ERR_PTR(-EINVAL);
+
+		if (profile && render_lsm_profile(profile, &rendered)) {
+			return ERR_PTR(-EINVAL);
+		}
+		if (rendered) {
+			size_t lsm_sockcreate_len;
+			char *lsm_sockcreate;
+
+			args->mem_lsm_sockcreate_pos = rst_mem_align_cpos(RM_PRIVATE);
+			lsm_sockcreate_len = strlen(rendered);
+			lsm_sockcreate = rst_mem_alloc(lsm_sockcreate_len + 1, RM_PRIVATE);
+			if (!lsm_sockcreate) {
+				xfree(rendered);
+				return ERR_PTR(-ENOMEM);
+			}
+
+			args = rst_mem_remap_ptr(this_pos, RM_PRIVATE);
+			args->lsm_sockcreate = lsm_sockcreate;
+			strncpy(args->lsm_sockcreate, rendered, lsm_sockcreate_len);
+			xfree(rendered);
+		}
+	} else {
+		args->lsm_sockcreate = NULL;
+		args->mem_lsm_sockcreate_pos = 0;
 	}
 
 	/*
@@ -3189,10 +3268,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	struct thread_restore_args *thread_args;
 	struct restore_mem_zone *mz;
 
-#ifdef CONFIG_VDSO
 	struct vdso_maps vdso_maps_rt;
 	unsigned long vdso_rt_size = 0;
-#endif
 
 	struct vm_area_list self_vmas;
 	struct vm_area_list *vmas = &rsti(current)->vmas;
@@ -3243,7 +3320,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	pr_info("%d threads require %ldK of memory\n",
 			current->nr_threads, KBYTES(task_args->bootstrap_len));
 
-#ifdef CONFIG_VDSO
 	if (core_is_compat(core))
 		vdso_maps_rt = vdso_maps_compat;
 	else
@@ -3255,7 +3331,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	if (vdso_rt_size && vdso_maps_rt.sym.vvar_size)
 		vdso_rt_size += ALIGN(vdso_maps_rt.sym.vvar_size, PAGE_SIZE);
 	task_args->bootstrap_len += vdso_rt_size;
-#endif
 
 	/*
 	 * Restorer is a blob (code + args) that will get mapped in some
@@ -3373,6 +3448,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	RST_MEM_FIXUP_PPTR(task_args->helpers);
 	RST_MEM_FIXUP_PPTR(task_args->zombies);
 	RST_MEM_FIXUP_PPTR(task_args->vma_ios);
+	RST_MEM_FIXUP_PPTR(task_args->inotify_fds);
 
 	task_args->compatible_mode = core_is_compat(core);
 	/*
@@ -3470,7 +3546,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	}
 
-#ifdef CONFIG_VDSO
 	/*
 	 * Restorer needs own copy of vdso parameters. Runtime
 	 * vdso must be kept non intersecting with anything else,
@@ -3482,7 +3557,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	task_args->vdso_maps_rt = vdso_maps_rt;
 	task_args->vdso_rt_size = vdso_rt_size;
 	task_args->can_map_vdso = kdat.can_map_vdso;
-#endif
 
 	new_sp = restorer_stack(task_args->t->mz);
 

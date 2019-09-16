@@ -37,6 +37,7 @@
 #include "page-xfer.h"
 #include "common/lock.h"
 #include "rst-malloc.h"
+#include "tls.h"
 #include "fdstore.h"
 #include "util.h"
 
@@ -1416,7 +1417,7 @@ int cr_lazy_pages(bool daemon)
 	int lazy_sk;
 	int ret;
 
-	if (kerndat_uffd() || !kdat.has_uffd)
+	if (!kdat.has_uffd)
 		return -1;
 
 	if (prepare_dummy_pstree())
@@ -1427,7 +1428,7 @@ int cr_lazy_pages(bool daemon)
 		return -1;
 
 	if (daemon) {
-		ret = cr_daemon(1, 0, &lazy_sk, -1);
+		ret = cr_daemon(1, 0, -1);
 		if (ret == -1) {
 			pr_err("Can't run in the background\n");
 			return -1;
@@ -1468,6 +1469,8 @@ int cr_lazy_pages(bool daemon)
 	}
 
 	ret = handle_requests(epollfd, events, nr_fds);
+
+	tls_terminate_session();
 
 	return ret;
 }

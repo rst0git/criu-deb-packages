@@ -170,7 +170,7 @@ struct early_log_hdr {
 	uint16_t len;
 };
 
-static void flush_early_log_buffer(int fd)
+void flush_early_log_buffer(int fd)
 {
 	unsigned int pos = 0;
 	int ret;
@@ -320,7 +320,7 @@ static void early_vprint(const char *format, unsigned int loglevel, va_list para
 	unsigned int log_size = 0;
 	struct early_log_hdr *hdr;
 
-	if (early_log_buf_off >= EARLY_LOG_BUF_LEN)
+	if ((early_log_buf_off + sizeof(hdr)) >= EARLY_LOG_BUF_LEN)
 		return;
 
 	/* Save loglevel */

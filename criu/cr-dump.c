@@ -108,8 +108,7 @@ void free_mappings(struct vm_area_list *vma_area_list)
 		free(vma_area);
 	}
 
-	INIT_LIST_HEAD(&vma_area_list->h);
-	vma_area_list->nr = 0;
+	vm_area_list_init(vma_area_list);
 }
 
 int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list,
@@ -126,7 +125,7 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list,
 		goto err;
 
 	pr_info("Collected, longest area occupies %lu pages\n",
-			vma_area_list->priv_longest);
+		vma_area_list->nr_priv_pages_longest);
 	pr_info_vma_list(&vma_area_list->h);
 
 	pr_info("----------------------------------------\n");
@@ -726,7 +725,8 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 static int dump_task_core_all(struct parasite_ctl *ctl,
 			      struct pstree_item *item,
 			      const struct proc_pid_stat *stat,
-			      const struct cr_imgset *cr_imgset)
+			      const struct cr_imgset *cr_imgset,
+			      const struct parasite_dump_misc *misc)
 {
 	struct cr_img *img;
 	CoreEntry *core = item->core[0];
@@ -739,6 +739,9 @@ static int dump_task_core_all(struct parasite_ctl *ctl,
 	pr_info("\n");
 	pr_info("Dumping core (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
+
+	core->tc->child_subreaper = misc->child_subreaper;
+	core->tc->has_child_subreaper = true;
 
 	ret = get_task_personality(pid, &core->tc->personality);
 	if (ret < 0)
@@ -1138,8 +1141,7 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	struct parasite_dump_misc misc;
 	struct mem_dump_ctl mdc;
 
-	INIT_LIST_HEAD(&vmas.h);
-	vmas.nr = 0;
+	vm_area_list_init(&vmas);
 
 	pr_info("========================================\n");
 	pr_info("Pre-dumping task (pid: %d)\n", pid);
@@ -1220,8 +1222,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc;
 
-	INIT_LIST_HEAD(&vmas.h);
-	vmas.nr = 0;
+	vm_area_list_init(&vmas);
 
 	pr_info("========================================\n");
 	pr_info("Dumping task (pid: %d)\n", pid);
@@ -1378,7 +1379,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset);
+	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset, &misc);
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;

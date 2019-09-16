@@ -1,10 +1,10 @@
 #!/bin/sh
 set -x -e
 
-TRAVIS_PKGS="protobuf-c-compiler libprotobuf-c0-dev libaio-dev
-		libprotobuf-dev protobuf-compiler libcap-dev
-		libnl-3-dev gcc-multilib gdb bash python-protobuf
-		libnet-dev util-linux asciidoc xmlto libnl-route-3-dev"
+TRAVIS_PKGS="protobuf-c-compiler libprotobuf-c-dev libaio-dev
+		libgnutls28-dev libgnutls30 libprotobuf-dev protobuf-compiler
+		libcap-dev libnl-3-dev gcc-multilib gdb bash python-protobuf
+		libnet-dev util-linux asciidoctor libnl-route-3-dev"
 
 travis_prep () {
 	[ -n "$SKIP_TRAVIS_PREP" ] && return
@@ -100,7 +100,7 @@ umask 0000
 export SKIP_PREP=1
 # The 3.19 kernel (from Ubuntu 14.04) has a bug. When /proc/PID/pagemap
 # is read for a few VMAs in one read call, incorrect data is returned.
-# See https://github.com/xemul/criu/issues/207
+# See https://github.com/checkpoint-restore/criu/issues/207
 # Kernel 4.4 (from Ubuntu 14.04.5 update) fixes this.
 uname -r | grep -q ^3\.19 && export CRIU_PMC_OFF=1
 
@@ -125,6 +125,7 @@ LAZY_TESTS=.*\(maps0\|uffd-events\|lazy-thp\|futex\|fork\).*
 
 ./test/zdtm.py run -p 2 -T $LAZY_TESTS --lazy-pages $LAZY_EXCLUDE $ZDTM_OPTS
 ./test/zdtm.py run -p 2 -T $LAZY_TESTS --remote-lazy-pages $LAZY_EXCLUDE $ZDTM_OPTS
+./test/zdtm.py run -p 2 -T $LAZY_TESTS --remote-lazy-pages --tls $LAZY_EXCLUDE $ZDTM_OPTS
 
 bash ./test/jenkins/criu-fault.sh
 bash ./test/jenkins/criu-fcg.sh
@@ -162,7 +163,9 @@ ip net add test
 
 make -C test/others/shell-job
 
-pip install flake8
+if ! [ -x "$(command -v flake8)" ]; then
+	pip install flake8
+fi
 make lint
 
 # Check that help output fits into 80 columns

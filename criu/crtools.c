@@ -95,8 +95,10 @@ int main(int argc, char *argv[], char *envp[])
 		return cr_service_work(atoi(argv[2]));
 	}
 
-	if (check_options())
+	if (check_options()) {
+		flush_early_log_buffer(STDERR_FILENO);
 		return 1;
+	}
 
 	if (opts.imgs_dir == NULL)
 		SET_CHAR_OPTS(imgs_dir, ".");
@@ -345,7 +347,8 @@ usage:
 "  --irmap-scan-path FILE\n"
 "                        add a path the irmap hints to scan\n"
 "  --manage-cgroups [m]  dump/restore process' cgroups; argument can be one of\n"
-"                        'none', 'props', 'soft' (default), 'full' or 'strict'\n"
+"                        'none', 'props', 'soft' (default), 'full', 'strict'\n"
+"                        or 'ignore'\n"
 "  --cgroup-root [controller:]/newroot\n"
 "                        on dump: change the root for the controller that will\n"
 "                        be dumped. By default, only the paths with tasks in\n"
@@ -424,6 +427,12 @@ usage:
 "  -d|--daemon           run in the background after creating socket\n"
 "  --status-fd FD        write \\0 to the FD and close it once process is ready\n"
 "                        to handle requests\n"
+"  --tls-cacert FILE     trust certificates signed only by this CA\n"
+"  --tls-cacrl FILE      path to CA certificate revocation list file\n"
+"  --tls-cert FILE       path to TLS certificate file\n"
+"  --tls-key FILE        path to TLS private key file\n"
+"  --tls                 use TLS to secure remote connection\n"
+"  --tls-no-cn-verify    do not verify common name in server certificate\n"
 "\n"
 "Configuration file options:\n"
 "  --config FILEPATH     pass a specific configuration file\n"

@@ -29,7 +29,7 @@
 struct sk_packet {
 	struct list_head	list;
 	SkPacketEntry		*entry;
-	char        		*data;
+	char			*data;
 	unsigned		scm_len;
 	int			*scm;
 };
@@ -273,6 +273,8 @@ err_set_sock:
 		pr_perror("setsockopt failed on restore");
 		ret = -1;
 	}
+	if (pe.scm)
+		release_cmsg(&pe);
 err_brk:
 	xfree(data);
 	return ret;

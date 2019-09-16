@@ -30,6 +30,7 @@ TST_NOFILE	:=				\
 		socket_listen6			\
 		socket_listen4v6		\
 		socket_udp			\
+		socket_udp-broadcast		\
 		socket_udp-corked		\
 		socket6_udp			\
 		socket_udp_shutdown		\
@@ -211,6 +212,11 @@ TST_NOFILE	:=				\
 		thp_disable			\
 		pid_file			\
 		selinux00			\
+		selinux01			\
+		selinux02			\
+		child_subreaper			\
+		child_subreaper_existing_child	\
+		child_subreaper_and_reparent	\
 #		jobctl00			\
 
 ifneq ($(SRCARCH),arm)
@@ -305,6 +311,7 @@ TST_DIR		=				\
 		inotify00			\
 		inotify01			\
 		inotify02			\
+		inotify04			\
 		cgroup00			\
 		rmdir_open			\
 		cgroup01			\
@@ -513,6 +520,7 @@ unlink_fstat041:		CFLAGS += -DUNLINK_FSTAT041 -DUNLINK_FSTAT04
 ghost_holes01:		CFLAGS += -DTAIL_HOLE
 ghost_holes02:		CFLAGS += -DHEAD_HOLE
 sk-freebind-false:	CFLAGS += -DZDTM_FREEBIND_FALSE
+selinux02:		CFLAGS += -DUSING_SOCKCREATE
 stopped01:		CFLAGS += -DZDTM_STOPPED_KILL
 stopped02:		CFLAGS += -DZDTM_STOPPED_TKILL
 stopped12:		CFLAGS += -DZDTM_STOPPED_KILL -DZDTM_STOPPED_TKILL

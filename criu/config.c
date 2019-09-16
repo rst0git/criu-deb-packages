@@ -368,6 +368,8 @@ static int parse_manage_cgroups(struct cr_options *opts, const char *optarg)
 		opts->manage_cgroups = CG_MODE_FULL;
 	} else if (!strcmp(optarg, "strict")) {
 		opts->manage_cgroups = CG_MODE_STRICT;
+	} else if (!strcmp(optarg, "ignore")) {
+		opts->manage_cgroups = CG_MODE_IGNORE;
 	} else
 		goto Esyntax;
 
@@ -508,6 +510,12 @@ int parse_options(int argc, char **argv, bool *usage_error,
 		{ "ps-socket",			required_argument,	0, 1091},
 		{ "config",			required_argument,	0, 1089},
 		{ "no-default-config",		no_argument,		0, 1090},
+		{ "tls-cacert",			required_argument,	0, 1092},
+		{ "tls-cacrl",			required_argument,	0, 1093},
+		{ "tls-cert",			required_argument,	0, 1094},
+		{ "tls-key",			required_argument,	0, 1095},
+		BOOL_OPT("tls", &opts.tls),
+		{"tls-no-cn-verify",		no_argument,		&opts.tls_no_cn_verify, true},
 		{ },
 	};
 
@@ -794,6 +802,18 @@ int parse_options(int argc, char **argv, bool *usage_error,
 		case 1091:
 			opts.ps_socket = atoi(optarg);
 			break;
+		case 1092:
+			SET_CHAR_OPTS(tls_cacert, optarg);
+			break;
+		case 1093:
+			SET_CHAR_OPTS(tls_cacrl, optarg);
+			break;
+		case 1094:
+			SET_CHAR_OPTS(tls_cert, optarg);
+			break;
+		case 1095:
+			SET_CHAR_OPTS(tls_key, optarg);
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -844,9 +864,23 @@ int check_options()
 		return 1;
 	}
 
-	if (opts.ps_socket != -1 && (opts.addr || opts.port))
-		pr_warn("Using --address or --port in "
-			"combination with --ps-socket is obsolete\n");
+	if (opts.ps_socket != -1) {
+		if (opts.addr || opts.port)
+			pr_warn("Using --address or --port in "
+				"combination with --ps-socket is obsolete\n");
+		if (opts.ps_socket <= STDERR_FILENO && opts.daemon_mode) {
+			pr_err("Standard file descriptors will be closed"
+				" in daemon mode\n");
+			return 1;
+		}
+	}
+
+#ifndef CONFIG_GNUTLS
+	if (opts.tls) {
+		pr_err("CRIU was built without TLS support\n");
+		return 1;
+	}
+#endif
 
 	if (check_namespace_opts()) {
 		pr_err("Error: namespace flags conflict\n");

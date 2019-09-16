@@ -41,10 +41,10 @@ void criu_free_service(criu_opts *opts)
 		case CRIU_COMM_SK:
 			free((void*)(opts->service_address));
 			break;
-        case CRIU_COMM_BIN:
+	case CRIU_COMM_BIN:
 			free((void*)(opts->service_binary));
 			break;
-        default:
+	default:
 			break;
 	}
 }
@@ -252,6 +252,7 @@ int criu_local_init_opts(criu_opts **o)
 	if (opts == NULL) {
 		perror("Can't allocate memory for criu opts");
 		criu_local_free_opts(opts);
+		free(rpc);
 		return -1;
 	}
 
@@ -865,8 +866,6 @@ int criu_local_add_enable_fs(criu_opts *opts, const char *fs)
 err:
 	if (str)
 		free(str);
-	if (ptr)
-		free(ptr);
 
 	return -ENOMEM;
 }
@@ -902,8 +901,6 @@ int criu_local_add_skip_mnt(criu_opts *opts, const char *mnt)
 err:
 	if (str)
 		free(str);
-	if (ptr)
-		free(ptr);
 
 	return -ENOMEM;
 }

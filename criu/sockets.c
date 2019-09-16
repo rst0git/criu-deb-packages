@@ -22,6 +22,7 @@
 #include "util-pie.h"
 #include "sk-packet.h"
 #include "namespaces.h"
+#include "lsm.h"
 #include "net.h"
 #include "xmalloc.h"
 #include "fs-magic.h"
@@ -565,6 +566,11 @@ int restore_socket_opts(int sk, SkOptsEntry *soe)
 		pr_debug("\tset no_check for socket\n");
 		ret |= restore_opt(sk, SOL_SOCKET, SO_NO_CHECK, &val);
 	}
+	if (soe->has_so_broadcast && soe->so_broadcast) {
+		val = 1;
+		pr_debug("\tset broadcast for socket\n");
+		ret |= restore_opt(sk, SOL_SOCKET, SO_BROADCAST, &val);
+	}
 
 	tv.tv_sec = soe->so_snd_tmo_sec;
 	tv.tv_usec = soe->so_snd_tmo_usec;
@@ -646,6 +652,10 @@ int dump_socket_opts(int sk, SkOptsEntry *soe)
 	soe->has_so_no_check = true;
 	soe->so_no_check = val ? true : false;
 
+	ret |= dump_opt(sk, SOL_SOCKET, SO_BROADCAST, &val);
+	soe->has_so_broadcast = true;
+	soe->so_broadcast = val ? true : false;
+
 	ret |= dump_bound_dev(sk, soe);
 	ret |= dump_socket_filter(sk, soe);
 
@@ -662,6 +672,9 @@ int dump_socket(struct fd_parms *p, int lfd, FdinfoEntry *e)
 {
 	int family;
 	const struct fdtype_ops *ops;
+
+	if (dump_xattr_security_selinux(lfd, e))
+		return -1;
 
 	if (dump_opt(lfd, SOL_SOCKET, SO_DOMAIN, &family))
 		return -1;

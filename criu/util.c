@@ -230,19 +230,19 @@ int reopen_fd_as_safe(char *file, int line, int new_fd, int old_fd, bool allow_r
 	int tmp;
 
 	if (old_fd != new_fd) {
-		if (!allow_reuse_fd) {
-			if (fcntl(new_fd, F_GETFD) != -1 || errno != EBADF) {
-				pr_err("fd %d already in use (called at %s:%d)\n",
-					new_fd, file, line);
-				return -1;
-			}
-		}
-
-		tmp = dup2(old_fd, new_fd);
+		if (!allow_reuse_fd)
+			tmp = fcntl(old_fd, F_DUPFD, new_fd);
+		else
+			tmp = dup2(old_fd, new_fd);
 		if (tmp < 0) {
 			pr_perror("Dup %d -> %d failed (called at %s:%d)",
 				  old_fd, new_fd, file, line);
 			return tmp;
+		} else if (tmp != new_fd) {
+			close(tmp);
+			pr_err("fd %d already in use (called at %s:%d)\n",
+				new_fd, file, line);
+			return -1;
 		}
 
 		/* Just to have error message if failed */
@@ -500,8 +500,10 @@ static int close_fds(int minfd)
 	int fd, ret, dfd;
 
 	dir = opendir("/proc/self/fd");
-	if (dir == NULL)
+	if (dir == NULL) {
 		pr_perror("Can't open /proc/self/fd");
+		return -1;
+	}
 	dfd = dirfd(dir);
 
 	while ((de = readdir(dir))) {
@@ -643,7 +645,7 @@ int close_status_fd(void)
 	return close_safe(&opts.status_fd);
 }
 
-int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd)
+int cr_daemon(int nochdir, int noclose, int close_fd)
 {
 	int pid;
 
@@ -665,16 +667,6 @@ int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd)
 
 		if (close_fd != -1)
 			close(close_fd);
-
-		if ((*keep_fd != -1) && (*keep_fd != 3)) {
-			fd = dup2(*keep_fd, 3);
-			if (fd < 0) {
-				pr_perror("Dup2 failed");
-				return -1;
-			}
-			close(*keep_fd);
-			*keep_fd = fd;
-		}
 
 		fd = open("/dev/null", O_RDWR);
 		if (fd < 0) {
@@ -864,6 +856,12 @@ void split(char *str, char token, char ***out, int *n)
 		cur++;
 	}
 
+	if (*n == 0) {
+		/* This can only happen if str == NULL */
+		*out = NULL;
+		*n = -1;
+		return;
+	}
 
 	*out = xmalloc((*n) * sizeof(char *));
 	if (!*out) {
@@ -1144,10 +1142,10 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 	socklen_t clen = sizeof(caddr);
 
 	if (daemon_mode) {
-		ret = cr_daemon(1, 0, ask, cfd);
+		ret = cr_daemon(1, 0, cfd);
 		if (ret == -1) {
 			pr_err("Can't run in the background\n");
-			goto out;
+			goto err;
 		}
 		if (ret > 0) { /* parent task, daemon started */
 			close_safe(&sk);
@@ -1168,10 +1166,11 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 		return -1;
 
 	if (sk >= 0) {
-		ret = *ask = accept(sk, (struct sockaddr *)&caddr, &clen);
-		if (*ask < 0)
+		*ask = accept(sk, (struct sockaddr *)&caddr, &clen);
+		if (*ask < 0) {
 			pr_perror("Can't accept connection to server");
-		else
+			goto err;
+		} else
 			pr_info("Accepted connection from %s:%u\n",
 					inet_ntoa(caddr.sin_addr),
 					(int)ntohs(caddr.sin_port));
@@ -1179,7 +1178,7 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 	}
 
 	return 0;
-out:
+err:
 	close(sk);
 	return -1;
 }

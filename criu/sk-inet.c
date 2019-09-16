@@ -23,12 +23,17 @@
 #include "files.h"
 #include "image.h"
 #include "log.h"
+#include "lsm.h"
+#include "kerndat.h"
+#include "pstree.h"
 #include "rst-malloc.h"
 #include "sockets.h"
 #include "sk-inet.h"
 #include "protobuf.h"
 #include "util.h"
 #include "namespaces.h"
+
+#include "images/inventory.pb-c.h"
 
 #undef  LOG_PREFIX
 #define LOG_PREFIX "inet: "
@@ -568,12 +573,13 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 		ie.ip_opts->raw = NULL;
 
 	if (pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE))
-		goto err;
+		err = -1;
 err:
 	ip_raw_opts_free(&ipopts_raw);
 	release_skopts(&skopts);
 	xfree(ie.src_addr);
 	xfree(ie.dst_addr);
+	xfree(ie.ifname);
 	return err;
 }
 
@@ -737,6 +743,10 @@ static int post_open_inet_sk(struct file_desc *d, int sk)
 	if (!val && restore_opt(sk, SOL_SOCKET, SO_REUSEPORT, &val))
 		return -1;
 
+	val = ii->ie->opts->so_broadcast;
+	if (!val && restore_opt(sk, SOL_SOCKET, SO_BROADCAST, &val))
+		return -1;
+
 	return 0;
 }
 
@@ -804,11 +814,17 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	if (set_netns(ie->ns_id))
 		return -1;
 
+	if (run_setsockcreatecon(fle->fe))
+		return -1;
+
 	sk = socket(ie->family, ie->type, ie->proto);
 	if (sk < 0) {
 		pr_perror("Can't create inet socket");
 		return -1;
 	}
+
+	if (reset_setsockcreatecon())
+		goto err;
 
 	if (ie->v6only) {
 		if (restore_opt(sk, SOL_IPV6, IPV6_V6ONLY, &yes) == -1)
@@ -883,13 +899,19 @@ done:
 	    (ie->proto == IPPROTO_UDP ||
 	     ie->proto == IPPROTO_UDPLITE)) {
 		if (shutdown(sk, sk_decode_shutdown(ie->shutdown))) {
-			pr_perror("Can't shutdown socket into %d",
-				  sk_decode_shutdown(ie->shutdown));
-			goto err;
+			if (ie->state != TCP_CLOSE && errno != ENOTCONN) {
+				pr_perror("Can't shutdown socket into %d",
+					  sk_decode_shutdown(ie->shutdown));
+				goto err;
+			} else {
+				pr_debug("Called shutdown on closed socket, "
+					 "proto %d ino %x", ie->proto, ie->ino);
+			}
 		}
 	}
 
 	*new_fd = sk;
+
 	return 1;
 err:
 	close(sk);

@@ -1,5 +1,5 @@
 CFLAGS		:= $(filter-out -pg $(CFLAGS-GCOV) $(CFLAGS-ASAN),$(CFLAGS))
-CFLAGS		+= -DCR_NOGLIBC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+CFLAGS		+= -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
 CFLAGS		+= -Wp,-U_FORTIFY_SOURCE -Wp,-D_FORTIFY_SOURCE=0
 
 PLUGIN_ARCH_DIR		:= compel/arch/$(ARCH)/plugins
@@ -29,7 +29,7 @@ asflags-y		+= -iquote $(PLUGIN_ARCH_DIR)
 
 # General flags for assembly
 asflags-y		+= -fpie -Wstrict-prototypes
-asflags-y		+= -D__ASSEMBLY__ -nostdlib -fomit-frame-pointer
+asflags-y		+= -nostdlib -fomit-frame-pointer
 asflags-y		+= -fno-stack-protector
 ldflags-y		+= -z noexecstack
 
