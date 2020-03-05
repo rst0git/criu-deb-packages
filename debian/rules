@@ -6,10 +6,10 @@ PACKAGE = $(firstword $(shell dh_listpackages))
 TMP     = $(CURDIR)/debian/$(PACKAGE)
 
 %:
-	dh ${@} --with python2
+	dh ${@} --with python3
 
 override_dh_auto_install:
-	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr" LIBEXECDIR="/usr/lib"
+	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr" LIBEXECDIR="/usr/lib" PYTHON="python3"
 
 override_dh_auto_test:
 	# disabled: doesn't work yet
