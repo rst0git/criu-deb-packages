@@ -45,8 +45,6 @@
 #include "infect-rpc.h"
 #include "pie/parasite-blob.h"
 
-#include <compel/compel.h>
-
 unsigned long get_exec_start(struct vm_area_list *vmas)
 {
 	struct vma_area *vma_area;
@@ -565,7 +563,8 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	parasite_ensure_args_size(aio_rings_args_size(vma_area_list));
 
 	if (compel_infect(ctl, item->nr_threads, parasite_args_size) < 0) {
-		compel_cure(ctl);
+		if (compel_cure(ctl))
+			pr_warn("Can't cure failed infection\n");
 		return NULL;
 	}
 

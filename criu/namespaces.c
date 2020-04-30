@@ -20,6 +20,7 @@
 #include "imgset.h"
 #include "uts_ns.h"
 #include "ipc_ns.h"
+#include "timens.h"
 #include "mount.h"
 #include "pstree.h"
 #include "namespaces.h"
@@ -39,6 +40,7 @@ static struct ns_desc *ns_desc_array[] = {
 	&pid_ns_desc,
 	&user_ns_desc,
 	&mnt_ns_desc,
+	&time_ns_desc,
 	&cgroup_ns_desc,
 };
 
@@ -157,6 +159,9 @@ int join_ns_add(const char *type, char *ns_file, char *extra_opts)
 	} else if (!strncmp(type, "uts", 4)) {
 		jn->nd = &uts_ns_desc;
 		join_ns_flags |= CLONE_NEWUTS;
+	} else if (!strncmp(type, "time", 5)) {
+		jn->nd = &time_ns_desc;
+		join_ns_flags |= CLONE_NEWTIME;
 	} else if (!strncmp(type, "ipc", 4)) {
 		jn->nd = &ipc_ns_desc;
 		join_ns_flags |= CLONE_NEWIPC;
@@ -290,7 +295,7 @@ static void nsid_add(struct ns_id *ns, struct ns_desc *nd, unsigned int id, pid_
 	pr_info("Add %s ns %d pid %d\n", nd->str, ns->id, ns->ns_pid);
 }
 
-struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid,
+static struct ns_id *rst_new_ns_id(unsigned int id, pid_t pid,
 		struct ns_desc *nd, enum ns_type type)
 {
 	struct ns_id *nsid;
@@ -336,7 +341,7 @@ struct ns_id *lookup_ns_by_kid(unsigned int kid, struct ns_desc *nd)
 	struct ns_id *nsid;
 
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next)
-		if (nsid->kid == kid && nsid->nd == nd)
+		if (nsid->kid == kid && nsid->nd->cflag == nd->cflag)
 			return nsid;
 
 	return NULL;
@@ -442,7 +447,7 @@ static unsigned int __get_ns_id(int pid, struct ns_desc *nd, protobuf_c_boolean 
 {
 	int proc_dir;
 	unsigned int kid;
-	char ns_path[10];
+	char ns_path[32];
 	struct stat st;
 
 	proc_dir = open_pid_proc(pid);
@@ -568,6 +573,10 @@ static int open_ns_fd(struct file_desc *d, int *new_fd)
 			item = t;
 			nd = &cgroup_ns_desc;
 			break;
+		} else if (ids->time_ns_id == nfi->nfe->ns_id) {
+			item = t;
+			nd = &time_ns_desc;
+			break;
 		}
 	}
 
@@ -669,6 +678,25 @@ int dump_task_ns_ids(struct pstree_item *item)
 	if (!ids->uts_ns_id) {
 		pr_err("Can't make utsns id\n");
 		return -1;
+	}
+
+	ids->time_ns_id = get_ns_id(pid, &time_ns_desc, &ids->has_time_ns_id);
+	if (!ids->time_ns_id) {
+		pr_err("Can't make timens id\n");
+		return -1;
+	}
+	if (ids->has_time_ns_id) {
+		unsigned int id;
+		protobuf_c_boolean supported;
+		id = get_ns_id(pid, &time_for_children_ns_desc, &supported);
+		if (!supported || !id) {
+			pr_err("Can't make timens id\n");
+			return -1;
+		}
+		if (id != ids->time_ns_id) {
+			pr_err("Can't dump nested time namespace for %d\n", pid);
+			return -1;
+		}
 	}
 
 	ids->has_mnt_ns_id = true;
@@ -914,6 +942,9 @@ static int check_user_ns(int pid)
 		if ((root_ns_mask & CLONE_NEWUTS) &&
 		    switch_ns(pid, &uts_ns_desc, NULL))
 			exit(1);
+		if ((root_ns_mask & CLONE_NEWTIME) &&
+		    switch_ns(pid, &time_ns_desc, NULL))
+			exit(1);
 		if ((root_ns_mask & CLONE_NEWIPC) &&
 		    switch_ns(pid, &ipc_ns_desc, NULL))
 			exit(1);
@@ -938,9 +969,9 @@ static int check_user_ns(int pid)
 
 int dump_user_ns(pid_t pid, int ns_id)
 {
-	int ret, exit_code = -1;
 	UsernsEntry *e = &userns_entry;
 	struct cr_img *img;
+	int ret;
 
 	ret = parse_id_map(pid, "uid_map", &e->uid_map);
 	if (ret < 0)
@@ -953,7 +984,7 @@ int dump_user_ns(pid_t pid, int ns_id)
 	e->n_gid_map = ret;
 
 	if (check_user_ns(pid))
-		return -1;
+		goto err;
 
 	img = open_image(CR_FD_USERNS, O_DUMP, ns_id);
 	if (!img)
@@ -973,10 +1004,10 @@ err:
 		xfree(e->gid_map[0]);
 		xfree(e->gid_map);
 	}
-	return exit_code;
+	return -1;
 }
 
-void free_userns_maps()
+void free_userns_maps(void)
 {
 	if (userns_entry.n_uid_map > 0) {
 		xfree(userns_entry.uid_map[0]);
@@ -1001,6 +1032,11 @@ static int do_dump_namespaces(struct ns_id *ns)
 		pr_info("Dump UTS namespace %d via %d\n",
 				ns->id, ns->ns_pid);
 		ret = dump_uts_ns(ns->id);
+		break;
+	case CLONE_NEWTIME:
+		pr_info("Dump TIME namespace %d via %d\n",
+				ns->id, ns->ns_pid);
+		ret = dump_time_ns(ns->id);
 		break;
 	case CLONE_NEWIPC:
 		pr_info("Dump IPC namespace %d via %d\n",

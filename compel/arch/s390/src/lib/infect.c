@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 #include <elf.h>
 #include <compel/plugins/std/syscall-codes.h>
@@ -453,8 +454,10 @@ void *remote_mmap(struct parasite_ctl *ctl,
 	if (ptrace_poke_area(pid, &arg_struct, where, sizeof(arg_struct))) {
 		pr_err("Can't restore mmap args (pid: %d)\n", pid);
 		if (map != 0) {
-			compel_syscall(ctl, __NR_munmap, NULL, map,
+			err = compel_syscall(ctl, __NR_munmap, NULL, map,
 					     length, 0, 0, 0, 0);
+			if (err)
+				pr_err("Can't munmap %d\n", err);
 			map = 0;
 		}
 	}

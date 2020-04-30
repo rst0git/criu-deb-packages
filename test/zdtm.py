@@ -1,30 +1,32 @@
 #!/usr/bin/env python
 # vim: noet ts=8 sw=8 sts=8
 from __future__ import absolute_import, division, print_function, unicode_literals
-from builtins import (str, open, range, zip, int, input)
 
 import argparse
-import glob
-import os
-import subprocess
-import time
-import tempfile
-import shutil
-import re
-import stat
-import signal
 import atexit
-import sys
-import linecache
-import random
-import string
-import fcntl
-import errno
 import datetime
-import yaml
-import struct
+import errno
+import fcntl
+import glob
+import linecache
 import mmap
+import os
+import random
+import re
+import shutil
+import signal
+import stat
+import string
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from builtins import (input, int, open, range, str, zip)
+
 import pycriu as crpc
+
+import yaml
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -62,6 +64,7 @@ tests_root = None
 def clean_tests_root():
     global tests_root
     if tests_root and tests_root[0] == os.getpid():
+        os.rmdir(os.path.join(tests_root[1], "root"))
         os.rmdir(tests_root[1])
 
 
@@ -70,7 +73,9 @@ def make_tests_root():
     if not tests_root:
         tests_root = (os.getpid(), tempfile.mkdtemp("", "criu-root-", "/tmp"))
         atexit.register(clean_tests_root)
-    return tests_root[1]
+        os.mkdir(os.path.join(tests_root[1], "root"))
+    os.chmod(tests_root[1], 0o777)
+    return os.path.join(tests_root[1], "root")
 
 
 # Report generation
@@ -483,6 +488,13 @@ class zdtm_test:
             # move into some semi-random state
             time.sleep(random.random())
 
+        if self.__flavor.ns:
+            # In the case of runc the path specified with the opts.root
+            # option is created in /run/runc/ which is inaccessible to
+            # unprivileged users. The permissions here are set to test
+            # this use case.
+            os.chmod(os.path.dirname(self.__flavor.root), 0o700)
+
     def kill(self, sig=signal.SIGKILL):
         self.__freezer.thaw()
         if self.__pid:
@@ -679,9 +691,17 @@ class inhfd_test:
             i = 0
             for _, peer_file in self.__files:
                 msg = self.__get_message(i)
-                my_file.close()
                 try:
-                    data = peer_file.read(16)
+                    # File pairs naturally block on read() until the write()
+                    # happen (or the writer is closed). This is not the case for
+                    # regular files, so we loop.
+                    data = b''
+                    while not data:
+                        # In python 2.7, peer_file.read() doesn't call the read
+                        # system call if it's read file to the end once. The
+                        # next seek allows to workaround this problem.
+                        data = os.read(peer_file.fileno(), 16)
+                        time.sleep(0.1)
                 except Exception as e:
                     print("Unable to read a peer file: %s" % e)
                     sys.exit(1)
@@ -747,6 +767,11 @@ class inhfd_test:
             fcntl.fcntl(fd, fcntl.F_SETFD, fdflags)
             peer_file_name = self.__peer_file_names[i]
             ropts.extend(["--inherit-fd", "fd[%d]:%s" % (fd, peer_file_name)])
+        self.__peer_file_names = []
+        self.__dump_opts = []
+        for _, peer_file in self.__files:
+            self.__peer_file_names.append(self.__fdtyp.filename(peer_file))
+            self.__dump_opts += self.__fdtyp.dump_opts(peer_file)
         return ropts
 
     def print_output(self):
@@ -867,69 +892,57 @@ class criu_rpc:
     def __set_opts(criu, args, ctx):
         while len(args) != 0:
             arg = args.pop(0)
-            if arg == '-v4':
+            if "-v4" == arg:
                 criu.opts.log_level = 4
-                continue
-            if arg == '-o':
+            elif "-o" == arg:
                 criu.opts.log_file = args.pop(0)
-                continue
-            if arg == '-D':
+            elif "-D" == arg:
                 criu.opts.images_dir_fd = os.open(args.pop(0), os.O_DIRECTORY)
                 ctx['imgd'] = criu.opts.images_dir_fd
-                continue
-            if arg == '-t':
+            elif "-t" == arg:
                 criu.opts.pid = int(args.pop(0))
-                continue
-            if arg == '--pidfile':
+            elif "--pidfile" == arg:
                 ctx['pidf'] = args.pop(0)
-                continue
-            if arg == '--timeout':
+            elif "--timeout" == arg:
                 criu.opts.timeout = int(args.pop(0))
-                continue
-            if arg == '--restore-detached':
-                # Set by service by default
-                ctx['rd'] = True
-                continue
-            if arg == '--root':
+            elif "--restore-detached" == arg:
+                ctx['rd'] = True  # Set by service by default
+            elif "--root" == arg:
                 criu.opts.root = args.pop(0)
-                continue
-            if arg == '--external':
+            elif "--external" == arg:
                 criu.opts.external.append(args.pop(0))
-                continue
-            if arg == '--status-fd':
+            elif "--status-fd" == arg:
                 fd = int(args.pop(0))
                 os.write(fd, b"\0")
                 fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
-                continue
-            if arg == '--port':
+            elif "--port" == arg:
                 criu.opts.ps.port = int(args.pop(0))
-                continue
-            if arg == '--address':
+            elif "--address" == arg:
                 criu.opts.ps.address = args.pop(0)
+            elif "--page-server" == arg:
                 continue
-            if arg == '--page-server':
-                continue
-            if arg == '--prev-images-dir':
+            elif "--prev-images-dir" == arg:
                 criu.opts.parent_img = args.pop(0)
-                continue
-            if arg == '--track-mem':
+            elif "--pre-dump-mode" == arg:
+                key = args.pop(0)
+                mode = crpc.rpc.VM_READ
+                if key == "splice":
+                    mode = crpc.rpc.SPLICE
+                criu.opts.pre_dump_mode = mode
+            elif "--track-mem" == arg:
                 criu.opts.track_mem = True
-                continue
-            if arg == '--tcp-established':
+            elif "--tcp-established" == arg:
                 criu.opts.tcp_established = True
-                continue
-            if arg == '--restore-sibling':
+            elif "--restore-sibling" == arg:
                 criu.opts.rst_sibling = True
-                continue
-            if arg == "--inherit-fd":
+            elif "--inherit-fd" == arg:
                 inhfd = criu.opts.inherit_fd.add()
                 key = args.pop(0)
                 fd, key = key.split(":", 1)
                 inhfd.fd = int(fd[3:-1])
                 inhfd.key = key
-                continue
-
-            raise test_fail_exc('RPC for %s required' % arg)
+            else:
+                raise test_fail_exc('RPC for %s(%s) required' % (arg, args.pop(0)))
 
     @staticmethod
     def run(action,
@@ -1019,6 +1032,7 @@ class criu:
         self.__tls = self.__tls_options() if opts['tls'] else []
         self.__criu_bin = opts['criu_bin']
         self.__crit_bin = opts['crit_bin']
+        self.__pre_dump_mode = opts['pre_dump_mode']
 
     def fini(self):
         if self.__lazy_migrate:
@@ -1249,6 +1263,8 @@ class criu:
             a_opts += ['--leave-stopped']
         if self.__empty_ns:
             a_opts += ['--empty-ns', 'net']
+        if self.__pre_dump_mode:
+            a_opts += ["--pre-dump-mode", "%s" % self.__pre_dump_mode]
 
         nowait = False
         if self.__lazy_migrate and action == "dump":
@@ -1719,6 +1735,8 @@ def do_run_test(tname, tdesc, flavs, opts):
                 t.stop()
                 cr_api.fini()
                 try_run_hook(t, ["--clean"])
+                if t.blocking():
+                    raise test_fail_exc("unexpected success")
         except test_fail_exc as e:
             print_sep("Test %s FAIL at %s" % (tname, e.step), '#')
             t.print_output()
@@ -1835,7 +1853,7 @@ class Launcher:
               'sat', 'script', 'rpc', 'lazy_pages', 'join_ns', 'dedup', 'sbs',
               'freezecg', 'user', 'dry_run', 'noauto_dedup',
               'remote_lazy_pages', 'show_stats', 'lazy_migrate',
-              'tls', 'criu_bin', 'crit_bin')
+              'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode')
         arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
         if self.__use_log:
@@ -1869,7 +1887,7 @@ class Launcher:
                 pid, status = os.waitpid(0, flags)
             except OSError as e:
                 if e.errno == errno.EINTR:
-                    subprocess.Popen(["ps", "axf"]).wait()
+                    subprocess.Popen(["ps", "axf", "--width", "160"]).wait()
                     continue
                 signal.alarm(0)
                 raise e
@@ -2018,7 +2036,7 @@ def print_sep(title, sep="=", width=80):
 
 def print_error(line):
     line = line.rstrip()
-    print(line)
+    print(line.encode('utf-8'))
     if line.endswith('>'):  # combine pie output
         return True
     return False
@@ -2028,7 +2046,7 @@ def grep_errors(fname):
     first = True
     print_next = False
     before = []
-    with open(fname) as fd:
+    with open(fname, errors='replace') as fd:
         for l in fd:
             before.append(l)
             if len(before) > 5:
@@ -2482,6 +2500,10 @@ rp.add_argument("--criu-bin",
 rp.add_argument("--crit-bin",
                 help="Path to crit binary",
                 default='../crit/crit')
+rp.add_argument("--pre-dump-mode",
+                help="Use splice or read mode of pre-dumping",
+                choices=['splice', 'read'],
+                default='splice')
 
 lp = sp.add_parser("list", help="List tests")
 lp.set_defaults(action=list_tests)

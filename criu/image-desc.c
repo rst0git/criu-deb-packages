@@ -66,6 +66,7 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 	FD_ENTRY(FS,		"fs-%u"),
 	FD_ENTRY(REMAP_FPATH,	"remap-fpath"),
 	FD_ENTRY_F(GHOST_FILE,	"ghost-file-%x", O_NOBUF),
+	FD_ENTRY_F(MEMFD_INODE,	"memfd", O_NOBUF),
 	FD_ENTRY(TCP_STREAM,	"tcp-stream-%x"),
 	FD_ENTRY(MNTS,		"mountpoints-%u"),
 	FD_ENTRY(NETDEV,	"netdev-%u"),
@@ -76,6 +77,7 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 	FD_ENTRY_F(RULE,	"rule-%u", O_NOBUF),
 	FD_ENTRY_F(IPTABLES,	"iptables-%u", O_NOBUF),
 	FD_ENTRY_F(IP6TABLES,	"ip6tables-%u", O_NOBUF),
+	FD_ENTRY_F(NFTABLES,	"nftables-%u", O_NOBUF),
 	FD_ENTRY_F(TMPFS_IMG,	"tmpfs-%u.tar.gz", O_NOBUF),
 	FD_ENTRY_F(TMPFS_DEV,	"tmpfs-dev-%u.tar.gz", O_NOBUF),
 	FD_ENTRY_F(AUTOFS,	"autofs-%u", O_NOBUF),
@@ -100,6 +102,7 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 	FD_ENTRY(NETNF_CT,	"netns-ct-%u"),
 	FD_ENTRY(NETNF_EXP,	"netns-exp-%u"),
 	FD_ENTRY(FILES,		"files"),
+	FD_ENTRY(TIMENS,	"timens-%u"),
 
 	[CR_FD_STATS] = {
 		.fmt	= "stats-%s",
@@ -111,10 +114,5 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 		.fmt	= "irmap-cache",
 		.magic	= IRMAP_CACHE_MAGIC,
 		.oflags = O_SERVICE | O_FORCE_LOCAL,
-	},
-
-	[CR_FD_FILE_LOCKS_PID] = {
-		.fmt	= "filelocks-%u.img",
-		.magic	= FILE_LOCKS_MAGIC,
 	},
 };

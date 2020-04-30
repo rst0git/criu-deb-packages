@@ -41,6 +41,7 @@
 #include "timerfd.h"
 #include "path.h"
 #include "fault-injection.h"
+#include "memfd.h"
 
 #include "protobuf.h"
 #include "images/fdinfo.pb-c.h"
@@ -303,6 +304,26 @@ static int vma_get_mapfile_user(const char *fname, struct vma_area *vma,
 	}
 
 	vfi_dev = makedev(vfi->dev_maj, vfi->dev_min);
+
+	if (is_memfd(vfi_dev)) {
+		struct fd_link link;
+		link.len = strlen(fname);
+		strlcpy(link.name, fname, sizeof(link.name));
+		strip_deleted(&link);
+
+		/*
+		 * The error EPERM will be shown in the following pr_perror().
+		 * It comes from the previous open() call.
+		 */
+		pr_perror("Can't open mapped [%s]", link.name);
+
+		/*
+		 * TODO Perhaps we could do better than failing and dump the
+		 * memory like what is being done in shmem.c
+		 */
+		return -1;
+	}
+
 	if (is_anon_shmem_map(vfi_dev)) {
 		if (!(vma->e->flags & MAP_SHARED))
 			return -1;
@@ -563,6 +584,14 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area,
 		vma_area->e->shmid = prev->e->shmid;
 		vma_area->vmst = prev->vmst;
 		vma_area->mnt_id = prev->mnt_id;
+
+		if (!(vma_area->e->status & VMA_AREA_SYSVIPC)) {
+			vma_area->e->status &= ~(VMA_FILE_PRIVATE | VMA_FILE_SHARED);
+			if (vma_area->e->flags & MAP_PRIVATE)
+				vma_area->e->status |= VMA_FILE_PRIVATE;
+			else
+				vma_area->e->status |= VMA_FILE_SHARED;
+		}
 	} else if (*vm_file_fd >= 0) {
 		struct stat *st_buf = vma_area->vmst;
 
@@ -575,25 +604,21 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area,
 			goto err;
 		}
 
-		/*
-		 * /dev/zero stands for anon-shared mapping
-		 * otherwise it's some file mapping.
-		 */
-		if (is_anon_shmem_map(st_buf->st_dev)) {
-			if (!(vma_area->e->flags & MAP_SHARED))
-				goto err_bogus_mapping;
+		if (is_anon_shmem_map(st_buf->st_dev) && !strncmp(file_path, "/SYSV", 5)) {
 			vma_area->e->flags  |= MAP_ANONYMOUS;
 			vma_area->e->status |= VMA_ANON_SHARED;
 			vma_area->e->shmid = st_buf->st_ino;
-
-			if (!strncmp(file_path, "/SYSV", 5)) {
-				pr_info("path: %s\n", file_path);
-				vma_area->e->status |= VMA_AREA_SYSVIPC;
-			} else {
+			if (!(vma_area->e->flags & MAP_SHARED))
+				goto err_bogus_mapping;
+			pr_info("path: %s\n", file_path);
+			vma_area->e->status |= VMA_AREA_SYSVIPC;
+		} else {
+			if (is_anon_shmem_map(st_buf->st_dev)) {
+				vma_area->e->status |= VMA_AREA_MEMFD;
 				if (fault_injected(FI_HUGE_ANON_SHMEM_ID))
 					vma_area->e->shmid += FI_HUGE_ANON_SHMEM_ID_BASE;
 			}
-		} else {
+
 			if (vma_area->e->flags & MAP_PRIVATE)
 				vma_area->e->status |= VMA_FILE_PRIVATE;
 			else
@@ -932,7 +957,7 @@ int prepare_loginuid(unsigned int value, unsigned int loglevel)
 
 	if (write(fd, buf, 11) < 0) {
 		print_on_level(loglevel,
-			"Write %s to /proc/self/loginuid failed: %s",
+			"Write %s to /proc/self/loginuid failed: %s\n",
 			buf, strerror(errno));
 		ret = -1;
 	}
@@ -1447,6 +1472,46 @@ static bool should_skip_mount(const char *mountpoint)
 	return false;
 }
 
+int parse_timens_offsets(struct timespec *boff, struct timespec *moff)
+{
+	int exit_code = -1;
+	FILE *f;
+
+	f = fopen_proc(PROC_SELF, "timens_offsets");
+	if (!f) {
+		pr_perror("Unable to open /proc/self/timens_offsets");
+		goto out;
+	}
+	while (fgets(buf, BUF_SIZE, f)) {
+		int64_t sec, nsec;
+		char clockid[10];
+
+		if (sscanf(buf, "%9s %"PRId64" %"PRId64"\n", clockid, &sec, &nsec) != 3) {
+			pr_err("Unable to parse: %s\n", buf);
+			goto out;
+		}
+		clockid[sizeof(clockid) - 1] = 0;
+		if (strcmp(clockid, "monotonic") == 0 ||
+		    strcmp(clockid, __stringify(CLOCK_MONOTONIC)) == 0) {
+			moff->tv_sec = sec;
+			moff->tv_nsec = nsec;
+			continue;
+		}
+		if (strcmp(clockid, "boottime") == 0 ||
+		    strcmp(clockid, __stringify(CLOCK_BOOTTIME)) == 0) {
+			boff->tv_sec = sec;
+			boff->tv_nsec = nsec;
+			continue;
+		}
+		pr_err("Unknown clockid: %s\n", clockid);
+		goto out;
+	}
+	exit_code = 0;
+out:
+	fclose(f);
+	return exit_code;
+}
+
 struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 {
 	struct mount_info *list = NULL;
@@ -1669,8 +1734,18 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 		if (fdinfo_field(str, "lock")) {
 			struct file_lock *fl;
 			struct fdinfo_common *fdinfo = arg;
+			char *flock_status = str+sizeof("lock:\t")-1;
 
 			if (type != FD_TYPES__UND)
+				continue;
+
+			/*
+			 * The lock status can be empty when the owner of the
+			 * lock is invisible from our PID namespace.
+			 * This unfortunate behavior is fixed in kernels v4.19
+			 * and up (see commit 1cf8e5de40).
+			 */
+			if (flock_status[0] == '\0')
 				continue;
 
 			fl = alloc_file_lock();
@@ -1679,7 +1754,7 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 				goto out;
 			}
 
-			if (parse_file_lock_buf(str + 6, fl, 0)) {
+			if (parse_file_lock_buf(flock_status, fl, 0)) {
 				xfree(fl);
 				goto parse_err;
 			}
@@ -2488,6 +2563,12 @@ int collect_controllers(struct list_head *cgroups, unsigned int *n_cgroups)
 			goto err;
 		}
 		*off = '\0';
+
+		if (cgp_should_skip_controller(controllers)) {
+			pr_debug("cg-prop: Skipping controller %s\n", controllers);
+			continue;
+		}
+
 		while (1) {
 			off = strchr(controllers, ',');
 			if (off)

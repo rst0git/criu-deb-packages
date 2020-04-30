@@ -1,5 +1,5 @@
 #include "compel/asm/fpu.h"
-#include "compel/compel.h"
+#include "compel/infect.h"
 #include "compel/plugins/std/syscall-codes.h"
 #include "cpu.h"
 #include "cr_options.h"
@@ -590,8 +590,7 @@ static int get_robust_list32(pid_t pid, uintptr_t head, uintptr_t len)
 		.arg2	= (uint32_t)len,
 	};
 
-	do_full_int80(&s);
-	return (int)s.nr;
+	return do_full_int80(&s);
 }
 
 static int set_robust_list32(uint32_t head, uint32_t len)
@@ -602,8 +601,7 @@ static int set_robust_list32(uint32_t head, uint32_t len)
 		.arg1	= len,
 	};
 
-	do_full_int80(&s);
-	return (int)s.nr;
+	return do_full_int80(&s);
 }
 
 int get_task_futex_robust_list_compat(pid_t pid, ThreadCoreEntry *info)

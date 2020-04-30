@@ -244,7 +244,7 @@ class ghost_file_handler:
             while True:
                 gc = pb.ghost_chunk_entry()
                 buf = f.read(4)
-                if buf == '':
+                if len(buf) == 0:
                     break
                 size, = struct.unpack('i', buf)
                 gc.ParseFromString(f.read(size))
@@ -252,13 +252,13 @@ class ghost_file_handler:
                 if no_payload:
                     f.seek(gc.len, os.SEEK_CUR)
                 else:
-                    entry['extra'] = base64.encodebytes(f.read(gc.len))
+                    entry['extra'] = base64.encodebytes(f.read(gc.len)).decode('utf-8')
                 entries.append(entry)
         else:
             if no_payload:
                 f.seek(0, os.SEEK_END)
             else:
-                g_entry['extra'] = base64.encodebytes(f.read())
+                g_entry['extra'] = base64.encodebytes(f.read()).decode('utf-8')
             entries.append(g_entry)
 
         return entries
@@ -466,6 +466,7 @@ handlers = {
     'IDS': entry_handler(pb.task_kobj_ids_entry),
     'CREDS': entry_handler(pb.creds_entry),
     'UTSNS': entry_handler(pb.utsns_entry),
+    'TIMENS': entry_handler(pb.timens_entry),
     'IPC_VAR': entry_handler(pb.ipc_var_entry),
     'FS': entry_handler(pb.fs_entry),
     'GHOST_FILE': ghost_file_handler(),
@@ -522,6 +523,8 @@ handlers = {
     'AUTOFS': entry_handler(pb.autofs_entry),
     'FILES': entry_handler(pb.file_entry),
     'CPUINFO': entry_handler(pb.cpuinfo_entry),
+    'MEMFD_FILE': entry_handler(pb.memfd_file_entry),
+    'MEMFD_INODE': entry_handler(pb.memfd_inode_entry),
 }
 
 

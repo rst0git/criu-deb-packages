@@ -33,7 +33,6 @@
 #include "net.h"
 #include "tun.h"
 #include <compel/plugins/std/syscall-codes.h>
-#include <compel/compel.h>
 #include "netfilter.h"
 #include "fsnotify.h"
 #include "linux/userfaultfd.h"
@@ -41,6 +40,8 @@
 #include "uffd.h"
 #include "vdso.h"
 #include "kcmp.h"
+#include "sched.h"
+#include "memfd.h"
 
 struct kerndat_s kdat = {
 };
@@ -364,7 +365,7 @@ no_dt:
 }
 
 /* The page frame number (PFN) is constant for the zero page */
-static int init_zero_page_pfn()
+static int init_zero_page_pfn(void)
 {
 	void *addr;
 	int ret = 0;
@@ -408,7 +409,7 @@ static bool kerndat_has_memfd_create(void)
 {
 	int ret;
 
-	ret = syscall(SYS_memfd_create, NULL, 0);
+	ret = memfd_create(NULL, 0);
 
 	if (ret == -1 && errno == ENOSYS)
 		kdat.has_memfd = false;
@@ -429,7 +430,7 @@ static int get_task_size(void)
 	return 0;
 }
 
-static int kerndat_fdinfo_has_lock()
+static int kerndat_fdinfo_has_lock(void)
 {
 	int fd, pfd = -1, exit_code = -1, len;
 	char buf[PAGE_SIZE];
@@ -464,7 +465,7 @@ out:
 	return exit_code;
 }
 
-static int get_ipv6()
+static int get_ipv6(void)
 {
 	if (access("/proc/sys/net/ipv6", F_OK) < 0) {
 		if (errno == ENOENT) {
@@ -723,6 +724,20 @@ static int kerndat_has_inotify_setnextwd(void)
 	return ret;
 }
 
+static int kerndat_has_fsopen(void)
+{
+	if (syscall(__NR_fsopen, NULL, -1) != -1) {
+		pr_err("fsopen should fail\n");
+		return -1;
+	}
+	if (errno == ENOSYS)
+		pr_info("The new mount API (fsopen, fsmount) isn't supported\n");
+	else
+		kdat.has_fsopen = true;
+
+	return 0;
+}
+
 static int has_kcmp_epoll_tfd(void)
 {
 	kcmp_epoll_slot_t slot = { };
@@ -766,6 +781,21 @@ out:
 	close(pipefd[1]);
 	close(efd);
 	return ret;
+}
+
+static int has_time_namespace(void)
+{
+	if (access("/proc/self/timens_offsets", F_OK) < 0) {
+		if (errno == ENOENT) {
+			pr_debug("Time namespaces are not supported.\n");
+			kdat.has_timens = false;
+			return 0;
+		}
+		pr_perror("Unable to access /proc/self/timens_offsets");
+		return -1;
+	}
+	kdat.has_timens = true;
+	return 0;
 }
 
 int __attribute__((weak)) kdat_x86_has_ptrace_fpu_xsave_bug(void)
@@ -972,6 +1002,35 @@ static int kerndat_tun_netns(void)
 	return check_tun_netns_cr(&kdat.tun_ns);
 }
 
+static bool kerndat_has_clone3_set_tid(void)
+{
+	pid_t pid;
+	struct _clone_args args = {};
+
+	args.set_tid = -1;
+	/*
+	 * On a system without clone3() this will return ENOSYS.
+	 * On a system with clone3() but without set_tid this
+	 * will return E2BIG.
+	 * On a system with clone3() and set_tid it will return
+	 * EINVAL.
+	 */
+	pid = syscall(__NR_clone3, &args, sizeof(args));
+
+	if (pid == -1 && (errno == ENOSYS || errno == E2BIG)) {
+		kdat.has_clone3_set_tid = false;
+		return 0;
+	}
+	if (pid == -1 && errno == EINVAL) {
+		kdat.has_clone3_set_tid = true;
+	} else {
+		pr_perror("Unexpected error from clone3\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 int kerndat_init(void)
 {
 	int ret;
@@ -1010,8 +1069,6 @@ int kerndat_init(void)
 	if (!ret)
 		ret = kerndat_compat_restore();
 	if (!ret)
-		ret = kerndat_socket_netns();
-	if (!ret)
 		ret = kerndat_tun_netns();
 	if (!ret)
 		ret = kerndat_socket_unix_file();
@@ -1036,13 +1093,17 @@ int kerndat_init(void)
 	if (!ret)
 		ret = kerndat_socket_netns();
 	if (!ret)
-		ret = kerndat_nsid();
-	if (!ret)
 		ret = kerndat_x86_has_ptrace_fpu_xsave_bug();
 	if (!ret)
 		ret = kerndat_has_inotify_setnextwd();
 	if (!ret)
 		ret = has_kcmp_epoll_tfd();
+	if (!ret)
+		ret = kerndat_has_fsopen();
+	if (!ret)
+		ret = kerndat_has_clone3_set_tid();
+	if (!ret)
+		ret = has_time_namespace();
 
 	kerndat_lsm();
 	kerndat_mmap_min_addr();
