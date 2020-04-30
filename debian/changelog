@@ -1,3 +1,9 @@
+criu (3.14-1ppa1.18.04) bionic; urgency=medium
+
+  * New upstream version 3.14
+
+ -- Adrian Reber <adrian@lisas.de>  Thu, 30 Apr 2020 16:43:48 +0100
+
 criu (3.13-2ppa1.18.04) bionic; urgency=medium
 
   * New upstream version 3.13
