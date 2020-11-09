@@ -472,7 +472,7 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 			 * to check both ends on read()/write(). Thus mismatched sockets behave
 			 * the same way as matched.
 			 */
-			pr_warn("Shutdown mismatch %d:%d -> %d:%d\n",
+			pr_warn("Shutdown mismatch %u:%d -> %u:%d\n",
 					ue->ino, ue->shutdown, peer->sd.ino, peer->shutdown);
 		}
 	} else if (ue->state == TCP_ESTABLISHED) {
@@ -903,6 +903,7 @@ struct unix_sk_info {
 	struct unix_sk_info	*peer;
 	struct pprep_head	peer_resolve; /* XXX : union with the above? */
 	struct file_desc	d;
+	struct hlist_node	hash; /* To lookup socket by ino */
 	struct list_head	connected; /* List of sockets, connected to me */
 	struct list_head	node; /* To link in peer's connected list  */
 	struct list_head	scm_fles;
@@ -934,11 +935,25 @@ struct scm_fle {
 #define USK_PAIR_SLAVE		0x2
 #define USK_GHOST_FDSTORE	0x4	/* bound but removed address */
 
-static struct unix_sk_info *find_unix_sk_by_ino(int ino)
+#define SK_INFO_HASH_SIZE	32
+
+static struct hlist_head sk_info_hash[SK_INFO_HASH_SIZE];
+
+void init_sk_info_hash(void)
+{
+	int i;
+
+	for (i = 0; i < SK_INFO_HASH_SIZE; i++)
+		INIT_HLIST_HEAD(&sk_info_hash[i]);
+}
+
+static struct unix_sk_info *find_unix_sk_by_ino(unsigned int ino)
 {
 	struct unix_sk_info *ui;
+	struct hlist_head *chain;
 
-	list_for_each_entry(ui, &unix_sockets, list) {
+	chain = &sk_info_hash[ino % SK_INFO_HASH_SIZE];
+	hlist_for_each_entry(ui, chain, hash) {
 		if (ui->ue->ino == ino)
 			return ui;
 	}
@@ -1130,7 +1145,7 @@ static int shutdown_unix_sk(int sk, struct unix_sk_info *ui)
 		return -1;
 	}
 
-	pr_debug("Socket %d is shut down %d\n", ue->ino, how);
+	pr_debug("Socket %u is shut down %d\n", ue->ino, how);
 	return 0;
 }
 
@@ -1810,13 +1825,13 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 		int ret, sks[2];
 
 		if (ui->ue->type != SOCK_STREAM) {
-			pr_err("Non-stream socket %d in established state\n",
+			pr_err("Non-stream socket %u in established state\n",
 					ui->ue->ino);
 			return -1;
 		}
 
 		if (ui->ue->shutdown != SK_SHUTDOWN__BOTH) {
-			pr_err("Wrong shutdown/peer state for %d\n",
+			pr_err("Wrong shutdown/peer state for %u\n",
 					ui->ue->ino);
 			return -1;
 		}
@@ -1894,7 +1909,7 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 	}
 
 	if (ui->ue->state == TCP_LISTEN) {
-		pr_info("\tPutting %d into listen state\n", ui->ue->ino);
+		pr_info("\tPutting %u into listen state\n", ui->ue->ino);
 		if (listen(sk, ui->ue->backlog) < 0) {
 			pr_perror("Can't make usk listen");
 			close(sk);
@@ -2044,6 +2059,7 @@ static int init_unix_sk_info(struct unix_sk_info *ui, UnixSkEntry *ue)
 	INIT_LIST_HEAD(&ui->node);
 	INIT_LIST_HEAD(&ui->scm_fles);
 	INIT_LIST_HEAD(&ui->ghost_node);
+	INIT_HLIST_NODE(&ui->hash);
 
 	return 0;
 }
@@ -2135,6 +2151,7 @@ static int collect_one_unixsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 		list_add_tail(&ui->ghost_node, &unix_ghost_addr);
 	}
 
+	hlist_add_head(&ui->hash, &sk_info_hash[ui->ue->ino % SK_INFO_HASH_SIZE]);
 	list_add_tail(&ui->list, &unix_sockets);
 	return file_desc_add(&ui->d, ui->ue->id, &unix_desc_ops);
 }
@@ -2250,7 +2267,7 @@ static int fixup_unix_peer(struct unix_sk_info *ui)
 	struct unix_sk_info *peer = ui->peer;
 
 	if (!peer) {
-		pr_err("FATAL: Peer %d unresolved for %d\n",
+		pr_err("FATAL: Peer %u unresolved for %u\n",
 				ui->ue->peer, ui->ue->ino);
 		return -1;
 	}

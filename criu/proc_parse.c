@@ -944,7 +944,7 @@ err:
 	return -1;
 }
 
-int prepare_loginuid(unsigned int value, unsigned int loglevel)
+int prepare_loginuid(unsigned int value)
 {
 	int fd, ret = 0;
 	char buf[11]; /* 4294967295 is maximum for u32 */
@@ -956,8 +956,7 @@ int prepare_loginuid(unsigned int value, unsigned int loglevel)
 	snprintf(buf, 11, "%u", value);
 
 	if (write(fd, buf, 11) < 0) {
-		print_on_level(loglevel,
-			"Write %s to /proc/self/loginuid failed: %s\n",
+		pr_warn("Write %s to /proc/self/loginuid failed: %s\n",
 			buf, strerror(errno));
 		ret = -1;
 	}
@@ -1373,6 +1372,10 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new, char **fsname)
 	cure_path(new->root);
 
 	root_link.len = strlen(new->root);
+	if (root_link.len >= sizeof(root_link.name) - 1) {
+		pr_err("new root path (%s) exceeds %zu\n", new->root, sizeof(root_link.name));
+		goto err;
+	}
 	strcpy(root_link.name, new->root);
 	if (strip_deleted(&root_link)) {
 		strcpy(new->root, root_link.name);
@@ -1480,7 +1483,7 @@ int parse_timens_offsets(struct timespec *boff, struct timespec *moff)
 	f = fopen_proc(PROC_SELF, "timens_offsets");
 	if (!f) {
 		pr_perror("Unable to open /proc/self/timens_offsets");
-		goto out;
+		return exit_code;
 	}
 	while (fgets(buf, BUF_SIZE, f)) {
 		int64_t sec, nsec;
@@ -1681,6 +1684,57 @@ parse_err:
 nodata:
 	pr_err("No data left in proc file while parsing timerfd\n");
 	goto parse_err;
+}
+
+typedef struct bpfmap_fmt {
+	char *fmt;
+	void *value;
+} bpfmap_fmt;
+
+static int parse_bpfmap(struct bfd *f, char *str, BpfmapFileEntry *bpf)
+{
+	/*
+	 * Format is:
+	 * 
+	 * uint32_t map_type
+	 * uint32_t key_size
+	 * uint32_t value_size
+	 * uint32_t max_entries
+	 * uint32_t map_flags
+	 * uint64_t memlock
+	 * uint32_t map_id
+	 * boolean frozen
+	 */
+
+	bpfmap_fmt map[] = {
+		{"map_type: %u", &bpf->map_type },
+		{"key_size: %u", &bpf->key_size },
+		{"value_size: %u", &bpf->value_size },
+		{"max_entries: %u", &bpf->max_entries },
+		{"map_flags: %"PRIx32"", &bpf->map_flags },
+		{"memlock: %"PRIu64"", &bpf->memlock },
+		{"map_id: %u", &bpf->map_id },
+		{"frozen: %d", &bpf->frozen },
+	};
+
+	size_t n = sizeof(map) / sizeof(bpfmap_fmt);
+	int i;
+	
+	for (i = 0; i < n; i++) {
+		if (sscanf(str, map[i].fmt, map[i].value) != 1)
+			return -1;
+
+		if (i == n - 1)
+			break;
+
+		str = breadline(f);
+		if (IS_ERR_OR_NULL(str)) {
+			pr_err("No data left in proc file while parsing bpfmap\n");
+			return -1;
+		}
+	}
+
+	return 0;
 }
 
 #define fdinfo_field(str, field)	!strncmp(str, field":", sizeof(field))
@@ -2012,6 +2066,18 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 			}
 
 			ie->wd[i] = ify;
+			entry_met = true;
+			continue;
+		}
+		if (fdinfo_field(str, "map_type")) {
+			BpfmapFileEntry *bpf = arg;
+			if (type != FD_TYPES__BPFMAP)
+				goto parse_err;
+
+			ret = parse_bpfmap(&f, str, bpf);
+			if (ret)
+				goto parse_err;
+
 			entry_met = true;
 			continue;
 		}
@@ -2374,20 +2440,13 @@ int parse_cgroup_file(FILE *f, struct list_head *retl, unsigned int *n)
 		 * 2:name=systemd:/user.slice/user-1000.slice/session-1.scope
 		 */
 		name = strchr(buf, ':');
-		if (name) {
-			path = strchr(++name, ':');
-			if (*name == ':') {
-				/*
-				 * It's unified hierarchy. On kernels with legacy
-				 * tree this item is added automatically, so we
-				 * can just skip one. For those with full unified
-				 * support is on ... we need to write new code.
-				 */
-				xfree(ncc);
-				continue;
-			}
+		if (!name) {
+			pr_err("Failed parsing cgroup %s\n", buf);
+			xfree(ncc);
+			goto err;
 		}
-		if (!name || !path) {
+			path = strchr(++name, ':');
+		if (!path) {
 			pr_err("Failed parsing cgroup %s\n", buf);
 			xfree(ncc);
 			goto err;
@@ -2549,13 +2608,6 @@ int collect_controllers(struct list_head *cgroups, unsigned int *n_cgroups)
 			goto err;
 		}
 		controllers++;
-
-		if (*controllers == ':')
-			/*
-			 * Unified hier. See comment in parse_cgroup_file
-			 * for more details.
-			 */
-			continue;
 
 		off = strchr(controllers, ':');
 		if (!off) {

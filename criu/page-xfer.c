@@ -382,6 +382,10 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		int pfd;
 		int pr_flags = (fd_type == CR_FD_PAGEMAP) ? PR_TASK : PR_SHMEM;
 
+		/* Image streaming lacks support for incremental images */
+		if (opts.stream)
+			goto out;
+
 		pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
 		if (pfd < 0 && errno == ENOENT)
 			goto out;
@@ -928,6 +932,10 @@ int check_parent_local_xfer(int fd_type, unsigned long img_id)
 	struct stat st;
 	int ret, pfd;
 
+	/* Image streaming lacks support for incremental images */
+	if (opts.stream)
+		return 0;
+
 	pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
 	if (pfd < 0 && errno == ENOENT)
 		return 0;
@@ -1449,7 +1457,7 @@ no_server:
 		return ret > 0 ? 0 : -1;
 
 	if (tls_x509_init(ask, true)) {
-		close(sk);
+		close_safe(&sk);
 		return -1;
 	}
 

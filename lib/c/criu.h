@@ -72,6 +72,7 @@ void criu_set_tcp_close(bool tcp_close);
 void criu_set_weak_sysctls(bool val);
 void criu_set_evasive_devices(bool evasive_devices);
 void criu_set_shell_job(bool shell_job);
+void criu_set_orphan_pts_master(bool orphan_pts_master);
 void criu_set_file_locks(bool file_locks);
 void criu_set_track_mem(bool track_mem);
 void criu_set_auto_dedup(bool auto_dedup);
@@ -116,6 +117,17 @@ void criu_set_notify_cb(int (*cb)(char *action, criu_notify_arg_t na));
 /* Get pid of root task. 0 if not available */
 int criu_notify_pid(criu_notify_arg_t na);
 
+/*
+ * If CRIU sends and FD in the case of 'orphan-pts-master',
+ * this FD can be retrieved with criu_get_orphan_pts_master_fd().
+ *
+ * If no FD has been received this will return -1.
+ *
+ * To make sure the FD returned is valid this function has to be
+ * called after the callback with the 'action' 'orphan-pts-master'.
+ */
+int criu_get_orphan_pts_master_fd(void);
+
 /* Here is a table of return values and errno's of functions
  * from the list down below.
  *
@@ -158,6 +170,35 @@ typedef void *criu_predump_info;
 int criu_dump_iters(int (*more)(criu_predump_info pi));
 
 /*
+ * Get the version of the actual binary used for RPC.
+ *
+ * As this library is just forwarding all tasks to an
+ * independent (of this library) CRIU binary, the actual
+ * version of the CRIU binary can be different then the
+ * hardcoded values in the libary (version.h).
+ * To be able to easily check the version of the CRIU binary
+ * the function criu_get_version() returns the version
+ * in the following format:
+ *
+ * (major * 10000) + (minor * 100) + sublevel
+ *
+ * If the CRIU binary has been built from a git checkout
+ * minor will increased by one.
+ */
+int criu_get_version(void);
+
+/*
+ * Check if the version of the CRIU binary is at least
+ * 'minimum'. Version has to be in the same format as
+ * described for criu_get_version().
+ *
+ * Returns 1 if CRIU is at least 'minimum'.
+ * Returns 0 if CRIU is too old.
+ * Returns < 0 if there was an error.
+ */
+int criu_check_version(int minimum);
+
+/*
  * Same as the list above, but lets you have your very own options
  * structure and lets you set individual options in it.
  */
@@ -185,6 +226,7 @@ void criu_local_set_tcp_close(criu_opts *opts, bool tcp_close);
 void criu_local_set_weak_sysctls(criu_opts *opts, bool val);
 void criu_local_set_evasive_devices(criu_opts *opts, bool evasive_devices);
 void criu_local_set_shell_job(criu_opts *opts, bool shell_job);
+void criu_local_set_orphan_pts_master(criu_opts *opts, bool orphan_pts_master);
 void criu_local_set_file_locks(criu_opts *opts, bool file_locks);
 void criu_local_set_track_mem(criu_opts *opts, bool track_mem);
 void criu_local_set_auto_dedup(criu_opts *opts, bool auto_dedup);
@@ -226,6 +268,9 @@ int criu_local_dump(criu_opts *opts);
 int criu_local_restore(criu_opts *opts);
 int criu_local_restore_child(criu_opts *opts);
 int criu_local_dump_iters(criu_opts *opts, int (*more)(criu_predump_info pi));
+
+int criu_local_get_version(criu_opts *opts);
+int criu_local_check_version(criu_opts *opts, int minimum);
 
 #ifdef __GNUG__
 }

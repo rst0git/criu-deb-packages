@@ -1,7 +1,10 @@
 #!/bin/bash
+
+# shellcheck disable=SC1091,SC2015
+
 set -x -e -o pipefail
 
-apt-get install -qq \
+./apt-install \
     apt-transport-https \
     ca-certificates \
     curl \
@@ -14,10 +17,7 @@ add-apt-repository \
    $(lsb_release -cs) \
    stable test"
 
-
-apt-get update -qq
-
-apt-get install -qq docker-ce
+./apt-install docker-ce
 
 . /etc/lsb-release
 
@@ -44,21 +44,22 @@ docker info
 
 criu --version
 
+# shellcheck disable=SC2016
 docker run --tmpfs /tmp --tmpfs /run --read-only --security-opt seccomp=unconfined --name cr -d alpine /bin/sh -c 'i=0; while true; do echo $i; i=$(expr $i + 1); sleep 1; done'
 
 sleep 1
-for i in `seq 50`; do
+for i in $(seq 50); do
 	# docker start returns 0 silently if a container is already started
 	# docker checkpoint doesn't wait when docker updates a container state
 	# Due to both these points, we need to sleep after docker checkpoint to
 	# avoid races with docker start.
 	docker exec cr ps axf &&
-	docker checkpoint create cr checkpoint$i &&
+	docker checkpoint create cr checkpoint"$i" &&
 	sleep 1 &&
 	docker ps &&
 	(docker exec cr true && exit 1 || exit 0) &&
-	docker start --checkpoint checkpoint$i cr 2>&1 | tee log || {
-		cat "`cat log | grep 'log file:' | sed 's/log file:\s*//'`" || true
+	docker start --checkpoint checkpoint"$i" cr 2>&1 | tee log || {
+	cat "$(grep log 'log file:' | sed 's/log file:\s*//')" || true
 		docker logs cr || true
 		cat /tmp/zdtm-core-* || true
 		dmesg

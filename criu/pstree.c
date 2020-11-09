@@ -494,6 +494,10 @@ static int read_pstree_ids(struct pstree_item *pi)
 		if (rst_add_ns_id(pi->ids->net_ns_id, pi, &net_ns_desc))
 			return -1;
 	}
+	if (pi->ids->has_pid_ns_id) {
+		if (rst_add_ns_id(pi->ids->pid_ns_id, pi, &pid_ns_desc))
+			return -1;
+	}
 
 	return 0;
 }
@@ -993,7 +997,7 @@ int prepare_dummy_pstree(void)
 {
 	pid_t dummy = 0;
 
-	if (check_img_inventory() == -1)
+	if (check_img_inventory(/* restore = */ false) == -1)
 		return -1;
 
 	if (prepare_task_entries() == -1)

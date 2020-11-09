@@ -44,7 +44,8 @@ TST_NOFILE	:=				\
 		packet_sock			\
 		packet_sock_mmap		\
 		packet_sock_spkt		\
-		sock_filter			\
+		sock_filter00			\
+		sock_filter01			\
 		msgque				\
 		inotify_system			\
 		inotify_system_nodel		\
@@ -69,6 +70,7 @@ TST_NOFILE	:=				\
 		socket_queues			\
 		socket-raw			\
 		socket-tcp			\
+		socket-tcp-listen		\
 		socket-tcp-reseted		\
 		socket-tcp6			\
 		socket-tcp4v6			\
@@ -102,11 +104,13 @@ TST_NOFILE	:=				\
 		socket-tcp4v6-closed		\
 		socket-tcp-close0 		\
 		socket-tcp-close1 		\
+		socket-dump-tcp-close 		\
 		socket-tcp-unconn		\
 		socket-tcp6-unconn		\
 		socket-tcp-syn-sent		\
 		socket-tcp-skip-in-flight	\
 		socket-tcp-keepalive		\
+		socket-linger			\
 		sock_opts00			\
 		sock_opts01			\
 		sk-unix-unconn			\
@@ -126,6 +130,7 @@ TST_NOFILE	:=				\
 		proc-self			\
 		eventfs00			\
 		epoll				\
+		epoll01				\
 		signalfd00			\
 		inotify_irmap			\
 		fanotify00			\
@@ -229,7 +234,15 @@ TST_NOFILE	:=				\
 		time				\
 		timens_nested			\
 		timens_for_kids			\
+		zombie_leader			\
 #		jobctl00			\
+
+pkg-config-check = $(shell sh -c 'pkg-config $(1) && echo y')
+ifeq ($(call pkg-config-check,libbpf),y)
+TST_NOFILE	+=				\
+		bpf_hash			\
+		bpf_array			
+endif
 
 ifneq ($(ARCH),arm)
 ifneq ($(COMPAT_TEST),y)
@@ -371,6 +384,7 @@ TST_DIR		=				\
 		opath_file			\
 		symlink				\
 		symlink01			\
+		unbindable			\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -502,6 +516,7 @@ msgque:			CFLAGS += -DNEW_IPC_NS
 sem:			CFLAGS += -DNEW_IPC_NS
 posix_timers:		LDLIBS += -lrt -pthread
 remap_dead_pid_root:	CFLAGS += -DREMAP_PID_ROOT
+sock_filter01:		CFLAGS += -DSOCK_FILTER01
 socket-tcp6:		CFLAGS += -D ZDTM_IPV6
 socket-tcp4v6:		CFLAGS += -D ZDTM_IPV4V6
 socket-tcpbuf6:		CFLAGS += -D ZDTM_IPV6
@@ -572,6 +587,9 @@ s390x_regs_check:	LDFLAGS += -pthread
 s390x_gs_threads:	LDFLAGS += -pthread
 
 thread_different_uid_gid:	LDLIBS += -pthread -lcap
+
+bpf_hash:		LDLIBS += -lbpf
+bpf_array:		LDLIBS += -lbpf
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)

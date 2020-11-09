@@ -612,7 +612,7 @@ static int parasite_init_daemon(struct parasite_ctl *ctl)
 	user_regs_struct_t regs;
 	struct ctl_msg m = { };
 
-	*ctl->addr_cmd = PARASITE_CMD_INIT_DAEMON;
+	*ctl->cmd = PARASITE_CMD_INIT_DAEMON;
 
 	args = compel_parasite_args(ctl, struct parasite_init_args);
 
@@ -814,21 +814,34 @@ err_cure:
 	return -1;
 }
 
-void compel_relocs_apply(void *mem, void *vbase, size_t size, compel_reloc_t *elf_relocs, size_t nr_relocs)
+void compel_relocs_apply(void *mem, void *vbase, struct parasite_blob_desc *pbd)
 {
-	size_t i, j;
+	compel_reloc_t *elf_relocs = pbd->hdr.relocs;
+	size_t nr_relocs = pbd->hdr.nr_relocs;
 
+	size_t i, j;
+	void **got = mem + pbd->hdr.got_off;
+
+	/*
+	 * parasite_service() reads the value of __export_parasite_service_args_ptr.
+	 * The reason it is set here is that semantically, we are doing a symbol
+	 * resolution on parasite_service_args, and it turns out to be relocatable.
+	 */
+	*(void **)(mem + pbd->hdr.args_ptr_off) = vbase + pbd->hdr.args_off;
+
+#ifdef CONFIG_MIPS
+	compel_relocs_apply_mips(mem, vbase, pbd);
+#else
 	for (i = 0, j = 0; i < nr_relocs; i++) {
 		if (elf_relocs[i].type & COMPEL_TYPE_LONG) {
 			long *where = mem + elf_relocs[i].offset;
-			long *p = mem + size;
 
 			if (elf_relocs[i].type & COMPEL_TYPE_GOTPCREL) {
 				int *value = (int *)where;
 				int rel;
 
-				p[j] = (long)vbase + elf_relocs[i].value;
-				rel = (unsigned)((void *)&p[j] - (void *)mem) - elf_relocs[i].offset + elf_relocs[i].addend;
+				got[j] = vbase + elf_relocs[i].value;
+				rel = (unsigned)((void *)&got[j] - (void *)mem) - elf_relocs[i].offset + elf_relocs[i].addend;
 
 				*value = rel;
 				j++;
@@ -840,6 +853,7 @@ void compel_relocs_apply(void *mem, void *vbase, size_t size, compel_reloc_t *el
 		} else
 			BUG();
 	}
+#endif
 }
 
 static int compel_map_exchange(struct parasite_ctl *ctl, unsigned long size)
@@ -852,11 +866,6 @@ static int compel_map_exchange(struct parasite_ctl *ctl, unsigned long size)
 		ret = parasite_mmap_exchange(ctl, size);
 	}
 	return ret;
-}
-
-static inline unsigned long total_pie_size(size_t blob_size)
-{
-	return round_up(blob_size, page_size());
 }
 
 int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned long args_size)
@@ -880,10 +889,38 @@ int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned l
 	 * without using ptrace at all.
 	 */
 
-	parasite_size = total_pie_size(ctl->pblob.hdr.bsize);
+	/*
+	 * The parasite memory layout is the following:
+	 * Low address start first.
+	 * The number in parenthesis denotes the size of the section.
+	 * The arrow on the right shows the different variables that
+	 * corresponds to a given offset.
+	 * +------------------------------------------------------+ <--- 0
+	 * |   Parasite blob (sizeof(parasite_blob))              |
+	 * +------------------------------------------------------+ <--- hdr.bsize
+	 *                         align 8
+	 * +------------------------------------------------------+ <--- hdr.got_off
+	 * |   GOT Table (nr_gotpcrel * sizeof(long))             |
+	 * +------------------------------------------------------+ <--- hdr.args_off
+	 * |   Args area (args_size)                              |
+	 * +------------------------------------------------------+
+	 *                         align 64
+	 * +------------------------------------------------------+ <--- ctl->rsigframe
+	 * |   sigframe (RESTORE_STACK_SIGFRAME)                  |      ctl->sigframe
+	 * +------------------------------------------------------+
+	 * |   main stack (PARASITE_STACK_SIZE)                   |
+	 * +------------------------------------------------------+ <--- ctl->rstack
+	 * |   compel_run_in_thread stack (PARASITE_STACK_SIZE)   |
+	 * +------------------------------------------------------+ <--- ctl->r_thread_stack
+	 *                                                               map_exchange_size
+	 */
+	parasite_size = ctl->pblob.hdr.args_off;
 
-	ctl->args_size = round_up(args_size, PAGE_SIZE);
+	ctl->args_size = args_size;
 	parasite_size += ctl->args_size;
+
+	/* RESTORE_STACK_SIGFRAME needs a 64 bytes alignement */
+	parasite_size = round_up(parasite_size, 64);
 
 	map_exchange_size = parasite_size;
 	map_exchange_size += RESTORE_STACK_SIGFRAME + PARASITE_STACK_SIZE;
@@ -897,13 +934,21 @@ int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned l
 	pr_info("Putting parasite blob into %p->%p\n", ctl->local_map, ctl->remote_map);
 
 	ctl->parasite_ip = (unsigned long)(ctl->remote_map + ctl->pblob.hdr.parasite_ip_off);
-	ctl->addr_cmd = ctl->local_map + ctl->pblob.hdr.addr_cmd_off;
-	ctl->addr_args = ctl->local_map + ctl->pblob.hdr.addr_arg_off;
+	ctl->cmd = ctl->local_map + ctl->pblob.hdr.cmd_off;
+	ctl->args = ctl->local_map + ctl->pblob.hdr.args_off;
+
+	/*
+	 * args must be 4 bytes aligned as we use futexes() on them. It is
+	 * already the case, as args follows the GOT table, which is 8 bytes
+	 * aligned.
+	 */
+	if ((unsigned long)ctl->args & (4-1)) {
+		pr_err("BUG: args are not 4 bytes aligned: %p\n", ctl->args);
+		goto err;
+	}
 
 	memcpy(ctl->local_map, ctl->pblob.hdr.mem, ctl->pblob.hdr.bsize);
-	if (ctl->pblob.hdr.nr_relocs)
-		compel_relocs_apply(ctl->local_map, ctl->remote_map, ctl->pblob.hdr.bsize,
-				    ctl->pblob.hdr.relocs, ctl->pblob.hdr.nr_relocs);
+	compel_relocs_apply(ctl->local_map, ctl->remote_map, &ctl->pblob);
 
 	p = parasite_size;
 
@@ -913,6 +958,17 @@ int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned l
 	p += RESTORE_STACK_SIGFRAME;
 	p += PARASITE_STACK_SIZE;
 	ctl->rstack = ctl->remote_map + p;
+
+	/*
+	 * x86-64 ABI requires a 16 bytes aligned stack.
+	 * It is already the case as RESTORE_STACK_SIGFRAME is a multiple of
+	 * 64, and PARASITE_STACK_SIZE is 0x4000.
+	 */
+	if ((unsigned long)ctl->rstack & (16-1)) {
+		pr_err("BUG: stack is not 16 bytes aligned: %p\n", ctl->rstack);
+		goto err;
+	}
+
 
 	if (nr_threads > 1) {
 		p += PARASITE_STACK_SIZE;
@@ -1358,7 +1414,7 @@ int compel_cure(struct parasite_ctl *ctl)
 
 void *compel_parasite_args_p(struct parasite_ctl *ctl)
 {
-	return ctl->addr_args;
+	return ctl->args;
 }
 
 void *compel_parasite_args_s(struct parasite_ctl *ctl, unsigned long args_size)
@@ -1376,7 +1432,7 @@ int compel_run_in_thread(struct parasite_thread_ctl *tctl, unsigned int cmd)
 	user_regs_struct_t regs = octx->regs;
 	int ret;
 
-	*ctl->addr_cmd = cmd;
+	*ctl->cmd = cmd;
 
 	ret = parasite_run(pid, PTRACE_CONT, ctl->parasite_ip, stack, &regs, octx);
 	if (ret == 0)

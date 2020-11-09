@@ -48,6 +48,7 @@
 #include "string.h"
 #include "kerndat.h"
 #include "fdstore.h"
+#include "bpfmap.h"
 
 #include "protobuf.h"
 #include "util.h"
@@ -539,6 +540,10 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			ops = &signalfd_dump_ops;
 		else if (is_timerfd_link(link))
 			ops = &timerfd_dump_ops;
+#ifdef CONFIG_HAS_LIBBPF
+		else if (is_bpfmap_link(link))
+			ops = &bpfmap_dump_ops;
+#endif
 		else
 			return dump_unsupp_fd(&p, lfd, "anon", link, e);
 
@@ -1733,6 +1738,11 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
 	case FD_TYPES__MEMFD:
 		ret = collect_one_file_entry(fe, fe->memfd->id, &fe->memfd->base, &memfd_cinfo);
 		break;
+#ifdef CONFIG_HAS_LIBBPF
+	case FD_TYPES__BPFMAP:
+		ret = collect_one_file_entry(fe, fe->bpf->id, &fe->bpf->base, &bpfmap_cinfo);
+		break;
+#endif
 	}
 
 	return ret;
@@ -1749,5 +1759,6 @@ struct collect_image_info files_cinfo = {
 int prepare_files(void)
 {
 	init_fdesc_hash();
+	init_sk_info_hash();
 	return collect_image(&files_cinfo);
 }

@@ -9,9 +9,6 @@
 #include <errno.h>
 #include <stdarg.h>
 
-extern void vprint_on_level(unsigned int loglevel, const char *format,
-		va_list params);
-
 #endif /* CR_NOGLIBC */
 
 #define LOG_UNSET	(-1)
@@ -23,6 +20,10 @@ extern void vprint_on_level(unsigned int loglevel, const char *format,
 
 #define DEFAULT_LOGLEVEL	LOG_WARN
 
+/*
+ * This is low-level printing helper, try hard not to use it directly
+ * and use the pr_foo() helpers below.
+ */
 extern void print_on_level(unsigned int loglevel, const char *format, ...)
 	__attribute__ ((__format__ (__printf__, 2, 3)));
 
