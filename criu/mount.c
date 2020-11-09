@@ -48,6 +48,8 @@
 /* A helper mount_info entry for the roots yard */
 static struct mount_info *root_yard_mp = NULL;
 
+static LIST_HEAD(delayed_unbindable);
+
 int ext_mount_add(char *key, char *val)
 {
 	char *e_str;
@@ -1482,7 +1484,7 @@ static __maybe_unused int add_cr_time_mount(struct mount_info *root, char *fsnam
 
 	mi->mountpoint = xmalloc(len + strlen(path) + 1);
 	if (!mi->mountpoint)
-		return -1;
+		goto err;
 	mi->ns_mountpoint = mi->mountpoint;
 	if (!add_slash)
 		sprintf(mi->mountpoint, "%s%s", root->mountpoint, path);
@@ -1495,7 +1497,7 @@ static __maybe_unused int add_cr_time_mount(struct mount_info *root, char *fsnam
 	mi->source = xstrdup(fsname);
 	mi->options = xstrdup("");
 	if (!mi->root || !mi->fsname || !mi->source || !mi->options)
-		return -1;
+		goto err;
 	mi->fstype = find_fstype_by_name(fsname);
 
 	mi->s_dev = mi->s_dev_rt = s_dev;
@@ -1521,6 +1523,10 @@ static __maybe_unused int add_cr_time_mount(struct mount_info *root, char *fsnam
 	pr_info("Add cr-time mountpoint %s with parent %s(%u)\n",
 		mi->mountpoint, parent->mountpoint, parent->mnt_id);
 	return 0;
+
+err:
+	mnt_entry_free(mi);
+	return -1;
 }
 
 /* Returns 1 in case of success, -errno in case of mount fail, and 0 on other errors */
@@ -1844,22 +1850,37 @@ static int restore_shared_options(struct mount_info *mi, bool private, bool shar
 			mi->mnt_id, mi->mountpoint, private, shared, slave);
 
 	if (mi->flags & MS_UNBINDABLE) {
-		if (shared || slave)
+		if (shared || slave) {
 			pr_warn("%s has both unbindable and sharing, ignoring unbindable\n", mi->mountpoint);
-		else
-			return mount(NULL, mi->mountpoint, NULL, MS_UNBINDABLE, NULL);
+		} else {
+			if (!mnt_is_overmounted(mi)) {
+				/* Someone may still want to bind from us, let them do it. */
+				pr_debug("Temporary leave unbindable mount %s as private\n", mi->mountpoint);
+				if (mount(NULL, mi->mountpoint, NULL, MS_PRIVATE, NULL)) {
+					pr_perror("Unable to make %d private", mi->mnt_id);
+					return -1;
+				}
+				list_add(&mi->mnt_unbindable, &delayed_unbindable);
+				return 0;
+			}
+			if (mount(NULL, mi->mountpoint, NULL, MS_UNBINDABLE, NULL)) {
+				pr_perror("Unable to make %d unbindable", mi->mnt_id);
+				return -1;
+			}
+			return 0;
+		}
 	}
 
 	if (private && mount(NULL, mi->mountpoint, NULL, MS_PRIVATE, NULL)) {
-		pr_perror("Unable to make %s private", mi->mountpoint);
+		pr_perror("Unable to make %d private", mi->mnt_id);
 		return -1;
 	}
 	if (slave && mount(NULL, mi->mountpoint, NULL, MS_SLAVE, NULL)) {
-		pr_perror("Unable to make %s slave", mi->mountpoint);
+		pr_perror("Unable to make %d slave", mi->mnt_id);
 		return -1;
 	}
 	if (shared && mount(NULL, mi->mountpoint, NULL, MS_SHARED, NULL)) {
-		pr_perror("Unable to make %s shared", mi->mountpoint);
+		pr_perror("Unable to make %d shared", mi->mnt_id);
 		return -1;
 	}
 
@@ -2477,6 +2498,16 @@ static int do_close_one(struct mount_info *mi)
 	return 0;
 }
 
+static int set_unbindable(struct mount_info *mi)
+{
+	if (mount(NULL, mi->mountpoint, NULL, MS_UNBINDABLE, NULL)) {
+		pr_perror("Failed setting unbindable flag on %d", mi->mnt_id);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int do_mount_one(struct mount_info *mi)
 {
 	int ret;
@@ -2776,6 +2807,7 @@ struct mount_info *mnt_entry_alloc()
 		INIT_LIST_HEAD(&new->mnt_bind);
 		INIT_LIST_HEAD(&new->mnt_propagate);
 		INIT_LIST_HEAD(&new->mnt_notprop);
+		INIT_LIST_HEAD(&new->mnt_unbindable);
 		INIT_LIST_HEAD(&new->postpone);
 	}
 	return new;
@@ -3094,19 +3126,19 @@ int restore_task_mnt_ns(struct pstree_item *current)
 		return 0;
 
 	if (current->ids && current->ids->has_mnt_ns_id) {
+		struct pstree_item *parent = current->parent;
 		unsigned int id = current->ids->mnt_ns_id;
 		struct ns_id *nsid;
 
-		/*
-		 * Regardless of the namespace a task wants to
-		 * live in, by that point they all will live in
-		 * root's one (see prepare_pstree_kobj_ids() +
-		 * get_clone_mask()). So if the current task's
-		 * target namespace is the root's one -- it's
-		 * already there, otherwise it will have to do
-		 * setns().
+		/* Zombies and helpers can have ids == 0 so we skip them */
+		while (parent && !parent->ids)
+			parent = parent->parent;
+
+		/**
+		 * Our parent had restored the mount namespace before forking
+		 * us and if we have the same mntns we just stay there.
 		 */
-		if (current->parent && id == current->parent->ids->mnt_ns_id)
+		if (parent && id == parent->ids->mnt_ns_id)
 			return 0;
 
 		nsid = lookup_ns_by_id(id, &mnt_ns_desc);
@@ -3251,6 +3283,19 @@ static int populate_mnt_ns(void)
 
 	ret = mnt_tree_for_each(root_yard_mp, do_mount_one);
 	mnt_tree_for_each(root_yard_mp, do_close_one);
+
+	if (ret == 0) {
+		struct mount_info *mi;
+
+		/*
+		 * Mounts in delayed_unbindable list were temporary mounted as
+		 * private instead of unbindable so that do_mount_one can bind
+		 * from them, now we are ready to fix it.
+		 */
+		list_for_each_entry(mi, &delayed_unbindable, mnt_unbindable)
+			if (set_unbindable(mi))
+				return -1;
+	}
 
 	if (ret == 0 && fixup_remap_mounts())
 		return -1;
@@ -3540,6 +3585,10 @@ int mntns_get_root_fd(struct ns_id *mntns)
 {
 	if (!(root_ns_mask & CLONE_NEWNS))
 		return __mntns_get_root_fd(0);
+
+	if (!mntns)
+		return -1;
+
 	/*
 	 * All namespaces are restored from the root task and during the
 	 * CR_STATE_FORKING stage the root task has two file descriptors for

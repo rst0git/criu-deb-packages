@@ -16,8 +16,9 @@
 #include "piegen.h"
 #include "log.h"
 
-piegen_opt_t opts = {};
-
+#ifdef CONFIG_MIPS
+#include "ldsodefs.h"
+#endif
 /* Check if pointer is out-of-bound */
 static bool __ptr_oob(const uintptr_t ptr, const uintptr_t start, const size_t size)
 {
@@ -199,6 +200,27 @@ int __handle_elf(void *mem, size_t size)
 		}
 #endif
 	}
+        
+	/* Calculate section addresses with proper alignment.
+	 * Note: some but not all linkers precalculate this information.
+	 */
+	for (i = 0, k = 0; i < hdr->e_shnum; i++) {
+		Elf_Shdr *sh = sec_hdrs[i];
+		if (!(sh->sh_flags & SHF_ALLOC))
+			continue;
+		if (sh->sh_addralign > 0 && k % sh->sh_addralign != 0) {
+			k += sh->sh_addralign - k % sh->sh_addralign;
+		}
+		if (sh->sh_addr && sh->sh_addr != k) {
+			pr_err("Unexpected precalculated address of section (section %s addr 0x%lx expected 0x%lx)\n",
+				   &secstrings[sh->sh_name],
+				   (unsigned long) sh->sh_addr,
+				   (unsigned long) k);
+			goto err;
+		}
+		sh->sh_addr = k;
+		k += sh->sh_size;
+	}
 
 	if (!symtab_hdr) {
 		pr_err("No symbol table present\n");
@@ -333,6 +355,15 @@ int __handle_elf(void *mem, size_t size)
 				pr_err("Unexpected undefined symbol: `%s'. External symbol in PIE?\n", name);
 				goto err;
 #endif
+			} else if (sym->st_shndx == SHN_COMMON) {
+				/*
+				 * To support COMMON symbols, we could
+				 * allocate these variables somewhere,
+				 * perhaps somewhere near the GOT table.
+				 * For now, we punt.
+				 */
+				pr_err("Unsupported COMMON symbol: `%s'. Try initializing the variable\n", name);
+				goto err;
 			}
 
 			if (sh->sh_type == SHT_REL) {
@@ -403,6 +434,66 @@ int __handle_elf(void *mem, size_t size)
 #endif
 
 			switch (ELF_R_TYPE(r->rel.r_info)) {
+#ifdef CONFIG_MIPS
+			case R_MIPS_PC16:
+			      /* s+a-p relative */
+			    *((int32_t *)where) = *((int32_t *)where) | ((value32 + addend32 - place)>>2);
+			    break;
+
+			case R_MIPS_26:
+			      /*  local    : (((A << 2) | (P & 0xf0000000) + S) >> 2
+			       *  external : (sign–extend(A < 2) + S) >> 2
+                              */
+
+			    if (((unsigned)ELF_ST_BIND(sym->st_info) == 0x1)
+				 || ((unsigned)ELF_ST_BIND(sym->st_info) == 0x2)){
+				  /* bind type local is 0x0 ,global is 0x1,WEAK is 0x2 */
+				addend32 = value32;
+			    }
+			    pr_out("	{ .offset = 0x%-8x, .type = COMPEL_TYPE_MIPS_26,  "
+			    	       ".addend = %-8d, .value = 0x%-16x, }, /* R_MIPS_26 */\n",
+			    	       (unsigned int)place, addend32, value32);
+			    break;
+
+			case R_MIPS_32:
+			    /* S+A */
+			    break;
+
+			case R_MIPS_64:
+				pr_out("	{ .offset = 0x%-8x, .type = COMPEL_TYPE_MIPS_64, "
+				       ".addend = %-8ld, .value = 0x%-16lx, }, /* R_MIPS_64 */\n",
+				       (unsigned int)place, (long)addend64, (long)value64);
+				break;
+
+			case R_MIPS_HIGHEST:
+			    pr_out("	{ .offset = 0x%-8x, .type = COMPEL_TYPE_MIPS_HIGHEST,  "
+			    	       ".addend = %-8d, .value = 0x%-16x, }, /* R_MIPS_HIGHEST */\n",
+			    	       (unsigned int)place, addend32, value32);
+			    break;
+
+			case R_MIPS_HIGHER:
+			    pr_out("	{ .offset = 0x%-8x, .type = COMPEL_TYPE_MIPS_HIGHER,  "
+			    	       ".addend = %-8d, .value = 0x%-16x, }, /* R_MIPS_HIGHER */\n",
+			    	       (unsigned int)place, addend32, value32);
+			    break;
+
+			case R_MIPS_HI16:
+			    pr_out("	{ .offset = 0x%-8x, .type = COMPEL_TYPE_MIPS_HI16,  "
+			    	       ".addend = %-8d, .value = 0x%-16x, }, /* R_MIPS_HI16 */\n",
+			    	       (unsigned int)place, addend32, value32);
+			    break;
+
+			case R_MIPS_LO16:
+			    if((unsigned)ELF_ST_BIND(sym->st_info) == 0x1){
+				  /* bind type local is 0x0 ,global is 0x1 */
+				addend32 = value32;
+			    }
+			    pr_out("	{ .offset = 0x%-8x, .type = COMPEL_TYPE_MIPS_LO16,  "
+			    	       ".addend = %-8d, .value = 0x%-16x, }, /* R_MIPS_LO16 */\n",
+			    	       (unsigned int)place, addend32, value32);
+			    break;
+
+#endif
 #ifdef ELF_PPC64
 			case R_PPC64_REL24:
 				/* Update PC relative offset, linker has not done this yet */
@@ -578,7 +669,6 @@ int __handle_elf(void *mem, size_t size)
 	}
 #endif /* !NO_RELOCS */
 	pr_out("};\n");
-	pr_out("static __maybe_unused size_t %s_nr_gotpcrel = %zd;\n", opts.prefix, nr_gotpcrel);
 
 	pr_out("static __maybe_unused const char %s_blob[] = {\n\t", opts.prefix);
 
@@ -611,20 +701,16 @@ int __handle_elf(void *mem, size_t size)
 	}
 	pr_out("};\n");
 	pr_out("\n");
-	pr_out("static void __maybe_unused %s_setup_c_header(struct parasite_ctl *ctl)\n",
+	pr_out("static void __maybe_unused %s_setup_c_header_desc(struct parasite_blob_desc *pbd, bool native)\n",
 			opts.prefix);
 	pr_out(
 "{\n"
-"	struct parasite_blob_desc *pbd;\n"
-"\n"
-"	pbd = compel_parasite_blob_desc(ctl);\n"
 "	pbd->parasite_type	= COMPEL_BLOB_CHEADER;\n"
 );
 	pr_out("\tpbd->hdr.mem		= %s_blob;\n", opts.prefix);
 	pr_out("\tpbd->hdr.bsize		= sizeof(%s_blob);\n",
 			opts.prefix);
-	pr_out("\tpbd->hdr.nr_gotpcrel	= %s_nr_gotpcrel;\n", opts.prefix);
-	pr_out("\tif (compel_mode_native(ctl))\n");
+	pr_out("\tif (native)\n");
 	pr_out("\t\tpbd->hdr.parasite_ip_off	= "
 		"%s_sym__export_parasite_head_start;\n", opts.prefix);
 	pr_out("#ifdef CONFIG_COMPAT\n");
@@ -632,15 +718,22 @@ int __handle_elf(void *mem, size_t size)
 	pr_out("\t\tpbd->hdr.parasite_ip_off	= "
 		"%s_sym__export_parasite_head_start_compat;\n", opts.prefix);
 	pr_out("#endif /* CONFIG_COMPAT */\n");
-	pr_out("\tpbd->hdr.addr_cmd_off	= "
-			"%s_sym__export_parasite_cmd;\n", opts.prefix);
-	pr_out("\tpbd->hdr.addr_arg_off	= "
-			"%s_sym__export_parasite_args;\n", opts.prefix);
+	pr_out("\tpbd->hdr.cmd_off	= %s_sym__export_parasite_service_cmd;\n", opts.prefix);
+	pr_out("\tpbd->hdr.args_ptr_off	= %s_sym__export_parasite_service_args_ptr;\n", opts.prefix);
+	pr_out("\tpbd->hdr.got_off	= round_up(pbd->hdr.bsize, sizeof(long));\n");
+	pr_out("\tpbd->hdr.args_off	= pbd->hdr.got_off + %zd*sizeof(long);\n", nr_gotpcrel);
 	pr_out("\tpbd->hdr.relocs		= %s_relocs;\n", opts.prefix);
 	pr_out("\tpbd->hdr.nr_relocs	= "
 			"sizeof(%s_relocs) / sizeof(%s_relocs[0]);\n",
 			opts.prefix, opts.prefix);
 	pr_out("}\n");
+	pr_out("\n");
+	pr_out("static void __maybe_unused %s_setup_c_header(struct parasite_ctl *ctl)\n",
+			opts.prefix);
+	pr_out("{\n");
+	pr_out("\t%s_setup_c_header_desc(compel_parasite_blob_desc(ctl), compel_mode_native(ctl));\n", opts.prefix);
+	pr_out("}\n");
+
 	ret = 0;
 err:
 	free(sec_hdrs);

@@ -343,7 +343,14 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->parent_img)
 		SET_CHAR_OPTS(img_parent, req->parent_img);
 
-	if (open_image_dir(images_dir_path) < 0) {
+	/*
+	 * Image streaming is not supported with CRIU's service feature as
+	 * the streamer must be started for each dump/restore operation.
+	 * It is unclear how to do that with RPC, so we punt for now.
+	 * This explains why we provide the argument mode=-1 instead of
+	 * O_RSTR or O_DUMP.
+	 */
+	if (open_image_dir(images_dir_path, -1) < 0) {
 		pr_perror("Can't open images directory");
 		goto err;
 	}
@@ -398,7 +405,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	}
 
 	if (req->config_file) {
-		pr_debug("Overwriting RPC settings with values from %s\n", req->config_file);
+		pr_debug("Would overwrite RPC settings with values from %s\n", req->config_file);
 	}
 
 	if (kerndat_init())
@@ -671,10 +678,14 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	}
 
 	if (req->has_status_fd) {
+		pr_warn("status_fd is obsoleted; use status-ready notification instead\n");
+
 		sprintf(status_fd, "/proc/%d/fd/%d", ids.pid, req->status_fd);
 		opts.status_fd = open(status_fd, O_WRONLY);
-		if (opts.status_fd < 0)
+		if (opts.status_fd < 0) {
+			pr_perror("Can't reopen status fd %s", status_fd);
 			goto err;
+		}
 	}
 
 	if (req->orphan_pts_master)
@@ -1385,7 +1396,7 @@ int cr_service(bool daemon_mode)
 	if (setup_sigchld_handler())
 		goto err;
 
-	if (close_status_fd())
+	if (status_ready())
 		goto err;
 
 	while (1) {

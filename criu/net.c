@@ -1915,7 +1915,12 @@ static inline int dump_nftables(struct cr_imgset *fds)
 		return -1;
 
 	img = img_from_set(fds, CR_FD_NFTABLES);
-	img_fd = dup(img_raw_fd(img));
+	img_fd = img_raw_fd(img);
+	if (img_fd < 0) {
+		pr_err("Getting raw FD failed\n");
+		goto nft_ctx_free_out;
+	}
+	img_fd = dup(img_fd);
 	if (img_fd < 0) {
 		pr_perror("dup() failed");
 		goto nft_ctx_free_out;
@@ -2068,17 +2073,49 @@ out:
 
 static int restore_ip_dump(int type, int pid, char *cmd)
 {
-	int ret = -1;
+	int ret = -1, sockfd, n, written;
+	FILE *tmp_file;
 	struct cr_img *img;
+	char buf[1024];
 
 	img = open_image(type, O_RSTR, pid);
 	if (empty_image(img)) {
 		close_image(img);
 		return 0;
 	}
+	sockfd = img_raw_fd(img);
+	if (sockfd < 0) {
+		pr_err("Getting raw FD failed\n");
+		return -1;
+	}
+	tmp_file = tmpfile();
+	if (!tmp_file) {
+		pr_perror("Failed to open tmpfile");
+		return -1;
+	}
+
+	while ((n = read(sockfd, buf, 1024)) > 0) {
+		written = fwrite(buf, sizeof(char), n, tmp_file);
+		if (written < n) {
+			pr_perror("Failed to write to tmpfile "
+				  "[written: %d; total: %d]", written, n);
+			goto close;
+		}
+	}
+
+	if (fseek(tmp_file, 0, SEEK_SET)) {
+		pr_perror("Failed to set file position to beginning of tmpfile");
+		goto close;
+	}
+
 	if (img) {
-		ret = run_ip_tool(cmd, "restore", NULL, NULL, img_raw_fd(img), -1, 0);
+		ret = run_ip_tool(cmd, "restore", NULL, NULL, fileno(tmp_file), -1, 0);
 		close_image(img);
+	}
+
+close:
+	if(fclose(tmp_file)) {
+		pr_perror("Failed to close tmpfile");
 	}
 
 	return ret;
@@ -2181,6 +2218,7 @@ static inline int restore_iptables(int pid)
 		return -1;
 	if (empty_image(img)) {
 		ret = 0;
+		close_image(img);
 		goto ipt6;
 	}
 
@@ -2477,7 +2515,7 @@ int dump_net_ns(struct ns_id *ns)
 		if (!ret)
 			ret = dump_links(sk, ns, fds);
 
-		close(sk);
+		close_safe(&sk);
 
 		if (!ret)
 			ret = dump_ifaddr(fds);
@@ -2933,7 +2971,7 @@ static int prep_ns_sockets(struct ns_id *ns, bool for_dump)
 {
 	int nsret = -1, ret;
 #ifdef CONFIG_HAS_SELINUX
-	security_context_t ctx;
+	char *ctx;
 #endif
 
 	if (ns->type != NS_CRIU) {
@@ -3455,11 +3493,15 @@ int kerndat_link_nsid(void)
 		}
 
 		has_link_nsid = false;
-		if (check_link_nsid(sk, &has_link_nsid))
+		if (check_link_nsid(sk, &has_link_nsid)) {
+			pr_err("check_link_nsid failed\n");
 			exit(1);
+		}
 
-		if (!has_link_nsid)
+		if (!has_link_nsid) {
+			pr_err("check_link_nsid succeeded but has_link_nsid is false\n");
 			exit(5);
+		}
 
 		close(sk);
 

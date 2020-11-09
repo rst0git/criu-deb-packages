@@ -126,6 +126,8 @@ static char ** parse_config(char *filepath)
 	if (!configfile)
 		return NULL;
 
+	pr_debug("Parsing config file %s\n", filepath);
+
 	configuration = xmalloc(config_size * sizeof(char *));
 	if (configuration == NULL) {
 		fclose(configfile);
@@ -278,6 +280,7 @@ void init_opts(void)
 	opts.status_fd = -1;
 	opts.log_level = DEFAULT_LOGLEVEL;
 	opts.pre_dump_mode = PRE_DUMP_SPLICE;
+	opts.file_validation_method = FILE_VALIDATION_DEFAULT;
 }
 
 bool deprecated_ok(char *what)
@@ -418,6 +421,22 @@ static int parse_join_ns(const char *ptr)
 	return 0;
 }
 
+static int parse_file_validation_method(struct cr_options *opts, const char *optarg)
+{
+	if (!strcmp(optarg, "filesize"))
+		opts->file_validation_method = FILE_VALIDATION_FILE_SIZE;
+	else if (!strcmp(optarg, "buildid"))
+		opts->file_validation_method = FILE_VALIDATION_BUILD_ID;
+	else
+		goto Esyntax;
+
+	return 0;
+
+Esyntax:
+	pr_err("Unknown file validation method `%s' selected\n", optarg);
+	return -1;
+}
+
 /*
  * parse_options() is the point where the getopt parsing happens. The CLI
  * parsing as well as the configuration file parsing happens here.
@@ -510,6 +529,7 @@ int parse_options(int argc, char **argv, bool *usage_error,
 		BOOL_OPT(SK_CLOSE_PARAM, &opts.tcp_close),
 		{ "verbosity",			optional_argument,	0, 'v'	},
 		{ "ps-socket",			required_argument,	0, 1091},
+		BOOL_OPT("stream", &opts.stream),
 		{ "config",			required_argument,	0, 1089},
 		{ "no-default-config",		no_argument,		0, 1090},
 		{ "tls-cacert",			required_argument,	0, 1092},
@@ -520,6 +540,7 @@ int parse_options(int argc, char **argv, bool *usage_error,
 		{"tls-no-cn-verify",		no_argument,		&opts.tls_no_cn_verify, true},
 		{ "cgroup-yard",		required_argument,	0, 1096 },
 		{ "pre-dump-mode",		required_argument,	0, 1097},
+		{ "file-validation",		required_argument,	0, 1098	},
 		{ },
 	};
 
@@ -584,8 +605,10 @@ int parse_options(int argc, char **argv, bool *usage_error,
 			opts.final_state = TASK_ALIVE;
 			break;
 		case 'x':
-			if (optarg && unix_sk_ids_parse(optarg) < 0)
+			if (optarg && unix_sk_ids_parse(optarg) < 0) {
+				pr_err("Failed to parse unix socket inode from optarg: %s\n", optarg);
 				return 1;
+			}
 			opts.ext_unix_sk = true;
 			break;
 		case 't':
@@ -645,13 +668,17 @@ int parse_options(int argc, char **argv, bool *usage_error,
 					goto bad_arg;
 
 				*aux = '\0';
-				if (veth_pair_add(optarg, aux + 1))
+				if (veth_pair_add(optarg, aux + 1)) {
+					pr_err("Failed to add veth pair: %s, %s.\n", optarg, aux + 1);
 					return 1;
+				}
 			}
 			break;
 		case 1049:
-			if (add_script(optarg))
+			if (add_script(optarg)) {
+				pr_err("Failed to add action-script: %s.\n", optarg);
 				return 1;
+			}
 			break;
 		case 1051:
 			SET_CHAR_OPTS(addr, optarg);
@@ -721,12 +748,16 @@ int parse_options(int argc, char **argv, bool *usage_error,
 				return 0;
 			break;
 		case 1064:
-			if (!add_skip_mount(optarg))
+			if (!add_skip_mount(optarg)) {
+				pr_err("Failed to add skip-mnt: %s\n", optarg);
 				return 1;
+			}
 			break;
 		case 1065:
-			if (!add_fsname_auto(optarg))
+			if (!add_fsname_auto(optarg)) {
+				pr_err("Failed while parsing --enable-fs option: %s", optarg);
 				return 1;
+			}
 			break;
 		case 1068:
 			SET_CHAR_OPTS(freeze_cgroup, optarg);
@@ -735,8 +766,10 @@ int parse_options(int argc, char **argv, bool *usage_error,
 			opts.ghost_limit = parse_size(optarg);
 			break;
 		case 1070:
-			if (irmap_scan_path_add(optarg))
+			if (irmap_scan_path_add(optarg)) {
+				pr_err("Failed while parsing --irmap-scan-path option: %s", optarg);
 				return -1;
+			}
 			break;
 		case 1071:
 			SET_CHAR_OPTS(lsm_profile, optarg);
@@ -762,13 +795,17 @@ int parse_options(int argc, char **argv, bool *usage_error,
 					goto bad_arg;
 
 				*aux = '\0';
-				if (ext_mount_add(optarg, aux + 1))
+				if (ext_mount_add(optarg, aux + 1)) {
+					pr_err("Could not add external mount when initializing config: %s, %s\n", optarg, aux + 1);
 					return 1;
+				}
 			}
 			break;
 		case 1073:
-			if (add_external(optarg))
+			if (add_external(optarg)) {
+				pr_err("Could not add external resource when initializing config: %s\n", optarg);
 				return 1;
+			}
 			break;
 		case 1074:
 			if (!strcmp("net", optarg))
@@ -829,6 +866,10 @@ int parse_options(int argc, char **argv, bool *usage_error,
 				return 1;
 			}
 			break;
+		case 1098:
+			if (parse_file_validation_method(&opts, optarg))
+				return 2;
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -875,7 +916,7 @@ int check_options(void)
 	}
 
 	if (!opts.restore_detach && opts.restore_sibling) {
-		pr_err("--restore-sibling only makes sense with --restore-detach\n");
+		pr_err("--restore-sibling only makes sense with --restore-detached\n");
 		return 1;
 	}
 

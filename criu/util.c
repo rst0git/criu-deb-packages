@@ -26,7 +26,6 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sched.h>
-#include <ctype.h>
 
 #include "linux/mount.h"
 
@@ -46,6 +45,7 @@
 #include "pstree.h"
 
 #include "cr-errno.h"
+#include "action-scripts.h"
 
 #define VMA_OPT_LEN	128
 
@@ -191,7 +191,7 @@ static void vma_opt_str(const struct vma_area *v, char *opt)
 #undef opt2s
 }
 
-void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
+void pr_vma(const struct vma_area *vma_area)
 {
 	char opt[VMA_OPT_LEN];
 	memset(opt, 0, VMA_OPT_LEN);
@@ -200,7 +200,7 @@ void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
 		return;
 
 	vma_opt_str(vma_area, opt);
-	print_on_level(loglevel, "%#"PRIx64"-%#"PRIx64" (%"PRIi64"K) prot %#x flags %#x fdflags %#o st %#x off %#"PRIx64" "
+	pr_info("%#"PRIx64"-%#"PRIx64" (%"PRIi64"K) prot %#x flags %#x fdflags %#o st %#x off %#"PRIx64" "
 			"%s shmid: %#"PRIx64"\n",
 			vma_area->e->start, vma_area->e->end,
 			KBYTES(vma_area_len(vma_area)),
@@ -334,7 +334,14 @@ void close_proc(void)
 
 int set_proc_fd(int fd)
 {
-	if (install_service_fd(PROC_FD_OFF, dup(fd)) < 0)
+	int _fd;
+
+	_fd = dup(fd);
+	if (_fd < 0) {
+		pr_perror("dup() failed");
+		return -1;
+	}
+	if (install_service_fd(PROC_FD_OFF, _fd) < 0)
 		return -1;
 	return 0;
 }
@@ -423,13 +430,19 @@ int copy_file(int fd_in, int fd_out, size_t bytes)
 {
 	ssize_t written = 0;
 	size_t chunk = bytes ? bytes : 4096;
+	ssize_t ret;
 
 	while (1) {
-		ssize_t ret;
-
-		ret = sendfile(fd_out, fd_in, NULL, chunk);
+		/*
+		 * When fd_out is a pipe, sendfile() returns -EINVAL, so we
+		 * fallback to splice(). Not sure why.
+		 */
+		if (opts.stream)
+			ret = splice(fd_in, NULL, fd_out, NULL, chunk, SPLICE_F_MOVE);
+		else
+			ret = sendfile(fd_out, fd_in, NULL, chunk);
 		if (ret < 0) {
-			pr_perror("Can't send data to ghost file");
+			pr_perror("Can't transfer data to ghost file from image");
 			return -1;
 		}
 
@@ -638,9 +651,12 @@ out:
 	return ret;
 }
 
-int close_status_fd(void)
+int status_ready(void)
 {
 	char c = 0;
+
+	if (run_scripts(ACT_STATUS_READY))
+		return -1;
 
 	if (opts.status_fd < 0)
 		return 0;
@@ -700,6 +716,10 @@ int is_root_user(void)
 	return 1;
 }
 
+/*
+ * is_empty_dir will always close the FD dirfd: either implicitly
+ * via closedir or explicitly in case fdopendir had failed
+ */
 int is_empty_dir(int dirfd)
 {
 	int ret = 0;
@@ -707,8 +727,10 @@ int is_empty_dir(int dirfd)
 	struct dirent *de;
 
 	fdir = fdopendir(dirfd);
-	if (!fdir)
+	if (!fdir) {
+		close_safe(&dirfd);
 		return -1;
+	}
 
 	while ((de = readdir(fdir))) {
 		if (dir_dots(de))
@@ -988,85 +1010,13 @@ void tcp_nodelay(int sk, bool on)
 		pr_perror("Unable to restore TCP_NODELAY (%d)", val);
 }
 
-static inline void pr_xsym(unsigned char *data, size_t len, int pos)
-{
-	char sym;
-
-	if (pos < len)
-		sym = data[pos];
-	else
-		sym = ' ';
-
-	pr_msg("%c", isprint(sym) ? sym : '.');
-}
-
-static inline void pr_xdigi(unsigned char *data, size_t len, int pos)
-{
-	if (pos < len)
-		pr_msg("%02x ", data[pos]);
-	else
-		pr_msg("   ");
-}
-
-static int nice_width_for(unsigned long addr)
-{
-	int ret = 3;
-
-	while (addr) {
-		addr >>= 4;
-		ret++;
-	}
-
-	return ret;
-}
-
-void print_data(unsigned long addr, unsigned char *data, size_t size)
-{
-	int i, j, addr_len;
-	unsigned zero_line = 0;
-
-	addr_len = nice_width_for(addr + size);
-
-	for (i = 0; i < size; i += 16) {
-		if (*(u64 *)(data + i) == 0 && *(u64 *)(data + i + 8) == 0) {
-			if (zero_line == 0)
-				zero_line = 1;
-			else {
-				if (zero_line == 1) {
-					pr_msg("*\n");
-					zero_line = 2;
-				}
-
-				continue;
-			}
-		} else
-			zero_line = 0;
-
-		pr_msg("%#0*lx: ", addr_len, addr + i);
-		for (j = 0; j < 8; j++)
-			pr_xdigi(data, size, i + j);
-		pr_msg(" ");
-		for (j = 8; j < 16; j++)
-			pr_xdigi(data, size, i + j);
-
-		pr_msg(" |");
-		for (j = 0; j < 8; j++)
-			pr_xsym(data, size, i + j);
-		pr_msg(" ");
-		for (j = 8; j < 16; j++)
-			pr_xsym(data, size, i + j);
-
-		pr_msg("|\n");
-	}
-}
-
 static int get_sockaddr_in(struct sockaddr_storage *addr, char *host,
 			unsigned short port)
 {
 	memset(addr, 0, sizeof(*addr));
 
 	if (!host) {
- 		((struct sockaddr_in *)addr)->sin_addr.s_addr = INADDR_ANY;
+		((struct sockaddr_in *)addr)->sin_addr.s_addr = INADDR_ANY;
 		addr->ss_family = AF_INET;
 	} else if (inet_pton(AF_INET, host, &((struct sockaddr_in *)addr)->sin_addr)) {
 		addr->ss_family = AF_INET;
@@ -1131,9 +1081,9 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 		}
 
 		if (saddr.ss_family == AF_INET6) {
-			(*port) = ntohs(((struct sockaddr_in *)&saddr)->sin_port);
-		} else if (saddr.ss_family == AF_INET) {
 			(*port) = ntohs(((struct sockaddr_in6 *)&saddr)->sin6_port);
+		} else if (saddr.ss_family == AF_INET) {
+			(*port) = ntohs(((struct sockaddr_in *)&saddr)->sin_port);
 		}
 
 		pr_info("Using %u port\n", (*port));
@@ -1172,7 +1122,7 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 		}
 	}
 
-	if (close_status_fd())
+	if (status_ready())
 		return -1;
 
 	if (sk >= 0) {
@@ -1189,7 +1139,7 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 
 	return 0;
 err:
-	close(sk);
+	close_safe(&sk);
 	return -1;
 }
 
@@ -1352,7 +1302,7 @@ int epoll_prepare(int nr_fds, struct epoll_event **events)
 		return -1;
 
 	epollfd = epoll_create(nr_fds);
-	if (epollfd == -1) {
+	if (epollfd < 0) {
 		pr_perror("epoll_create failed");
 		goto free_events;
 	}
