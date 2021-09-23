@@ -14,6 +14,7 @@ TST_NOFILE	:=				\
 		fpu00				\
 		fpu01				\
 		fpu02				\
+		fpu03				\
 		arm-neon00			\
 		futex				\
 		futex-rl			\
@@ -58,6 +59,8 @@ TST_NOFILE	:=				\
 		pthread00			\
 		pthread01			\
 		pthread02			\
+		pthread_timers			\
+		pthread_timers_h		\
 		vdso00				\
 		vdso01				\
 		vdso02				\
@@ -190,6 +193,7 @@ TST_NOFILE	:=				\
 		fd				\
 		fd01				\
 		apparmor				\
+		apparmor_stacking				\
 		seccomp_strict			\
 		seccomp_filter			\
 		seccomp_filter_tsync			\
@@ -207,11 +211,18 @@ TST_NOFILE	:=				\
 		macvlan			\
 		sit				\
 		cr_veth				\
+		cr_veth02			\
 		sock_peercred			\
 		s390x_mmap_high			\
 		uffd-events			\
 		thread_different_uid_gid	\
 		pipe03				\
+		netns_lock_iptables			\
+		netns_lock_nftables			\
+		net_lock_socket_iptables		\
+		net_lock_socket_iptables6		\
+		net_lock_socket_nftables		\
+		net_lock_socket_nftables6		\
 		netns_sub			\
 		netns_sub_veth			\
 		netns_sub_sysctl	\
@@ -235,9 +246,13 @@ TST_NOFILE	:=				\
 		timens_nested			\
 		timens_for_kids			\
 		zombie_leader			\
+		sigtrap				\
+		sigtrap01			\
+		change_mnt_context		\
 #		jobctl00			\
 
-pkg-config-check = $(shell sh -c 'pkg-config $(1) && echo y')
+PKG_CONFIG ?= pkg-config
+pkg-config-check = $(shell sh -c '$(PKG_CONFIG) $(1) && echo y')
 ifeq ($(call pkg-config-check,libbpf),y)
 TST_NOFILE	+=				\
 		bpf_hash			\
@@ -302,6 +317,7 @@ TST_FILE	=				\
 		file_lease03			\
 		file_lease04			\
 		file_locks00			\
+		file_locks00_fail		\
 		file_locks01			\
 		file_locks02			\
 		file_locks03			\
@@ -311,9 +327,12 @@ TST_FILE	=				\
 		file_locks07			\
 		file_locks08			\
 		netns-nf			\
-		netns-nft				\
+		netns-nft			\
+		netns-nft-ipt			\
 		maps_file_prot			\
 		socket_close_data01		\
+		fifo_upon_unix_socket00		\
+		fifo_upon_unix_socket01		\
 
 TST_DIR		=				\
 		cwd00				\
@@ -375,6 +394,7 @@ TST_DIR		=				\
 		del_standalone_un		\
 		sk-unix-mntns			\
 		sk-unix01			\
+		sk-unix-dgram-ghost		\
 		unsupported_children_collision  \
 		shared_slave_mount_children	\
 		non_uniform_share_propagation	\
@@ -481,8 +501,8 @@ WAIT_TIME=240
 	[ $$i -lt $(WAIT_TIME) ]
 
 wait_stop:
-		i=0; \
-		while [ $$i -lt $(WAIT_TIME) ] ; do \
+	i=0; \
+	while [ $$i -lt $(WAIT_TIME) ] ; do \
 		kill -0 `awk '{print}' *.pid 2>/dev/null` 2>/dev/null || break; \
 		sleep 1; \
 		i=`expr $$i + 1`; \
@@ -493,6 +513,8 @@ $(TST):	| $(LIB)
 aio00:			LDLIBS += -laio
 different_creds:	LDLIBS += -lcap
 file_locks06 file_locks07 file_locks08:	ofd_file_locks.o
+fpu03:			CFLAGS += -pthread -D ZDTM_FPU00_RUN_IN_THREAD
+fpu03:			LDFLAGS += -pthread
 futex:			CFLAGS += -pthread
 futex:			LDFLAGS += -pthread
 futex-rl:		CFLAGS += -pthread
@@ -506,6 +528,8 @@ inotify_system_nodel:	CFLAGS += -DNODEL
 pthread00:		LDLIBS += -pthread
 pthread01:		LDLIBS += -pthread
 pthread02:		LDLIBS += -pthread
+pthread_timers:		LDLIBS += -lrt -pthread
+pthread_timers_h:	LDLIBS += -lrt -pthread
 different_creds:	LDLIBS += -pthread
 sigpending:		LDLIBS += -pthread
 sigaltstack:		LDLIBS += -pthread
@@ -561,6 +585,8 @@ clone_fs:		LDLIBS += -pthread
 # we have to explicitly specify both .o and .d for this case:
 netns_sub_veth.o netns_sub_veth.d: CPPFLAGS += $(call pkg-cflags, libnl-3.0)
 netns_sub_veth:		LDLIBS += $(call pkg-libs, libnl-route-3.0 libnl-3.0)
+net_lock_socket_iptables6:	CFLAGS += -D ZDTM_IPV6
+net_lock_socket_nftables6:	CFLAGS += -D ZDTM_IPV6
 symlink01:		CFLAGS += -DZDTM_UNLINK_SYMLINK
 
 socket-tcp-fin-wait1:	CFLAGS += -D ZDTM_TCP_FIN_WAIT1
@@ -590,6 +616,8 @@ thread_different_uid_gid:	LDLIBS += -pthread -lcap
 
 bpf_hash:		LDLIBS += -lbpf
 bpf_array:		LDLIBS += -lbpf
+
+fifo_upon_unix_socket01:	CFLAGS += -DFIFO_UPON_UNIX01
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)

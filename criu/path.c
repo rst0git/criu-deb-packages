@@ -38,8 +38,7 @@ out:
 	return path;
 }
 
-char *mnt_get_sibling_path(struct mount_info *m,
-			   struct mount_info *p, char *buf, int len)
+char *mnt_get_sibling_path(struct mount_info *m, struct mount_info *p, char *buf, int len)
 {
 	struct mount_info *pa = m->parent;
 	char *rpath, *cut_root, *path = buf;
@@ -88,11 +87,11 @@ char *mnt_get_sibling_path(struct mount_info *m,
 		len -= off;
 		path += off;
 	} else {
-		int len = strlen(cut_root);
-		if (strncmp(rpath, cut_root, len))
+		int length = strlen(cut_root);
+		if (strncmp(rpath, cut_root, length))
 			return NULL;
 		rpath += strlen(cut_root);
-		if (len > 0 && (rpath[0] && rpath[0] != '/'))
+		if (length > 0 && (rpath[0] && rpath[0] != '/'))
 			return NULL;
 	}
 	if (rpath[0] == '/')
