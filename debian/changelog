@@ -1,3 +1,9 @@
+criu (3.16-1) bullseye; urgency=medium
+
+  * New upstream version 3.16
+
+ -- Adrian Reber <adrian@lisas.de>  Thu, 23 Sep 2021 15:43:48 +0100
+
 criu (3.15-1) buster; urgency=medium
 
   * Fix build failures seen on s390x and arm/aarch64
