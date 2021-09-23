@@ -7,8 +7,8 @@
 #include "zdtmtst.h"
 #include "lock.h"
 
-const char *test_doc	= "Check that property is restored for existing children";
-const char *test_author	= "Michał Cłapiński <mclapinski@google.com>";
+const char *test_doc = "Check that property is restored for existing children";
+const char *test_author = "Michał Cłapiński <mclapinski@google.com>";
 
 enum {
 	TEST_FORK,
@@ -21,8 +21,7 @@ enum {
 struct shared {
 	futex_t fstate;
 	int ppid_after_reparent;
-} *sh;
-
+} * sh;
 
 int orphan(void)
 {
@@ -76,18 +75,18 @@ int subreaper(void)
 		pr_perror("Wrong exit status for HELPER: %d", status);
 		return 1;
 	}
-	
+
 	/* Give control to ORPHAN so it can check its parent */
 	futex_set_and_wake(&sh->fstate, TEST_CHECK);
 	futex_wait_until(&sh->fstate, TEST_EXIT);
-	
+
 	/* Cleanup: reap the ORPHAN */
 	wait(&status);
 	if (!WIFEXITED(status) || WEXITSTATUS(status)) {
 		pr_perror("Wrong exit status for ORPHAN: %d", status);
 		return 1;
 	}
-	
+
 	return 0;
 }
 

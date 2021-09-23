@@ -10,10 +10,14 @@
 #include <sys/sysmacros.h>
 #include <stdint.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>  /* for sockaddr_in and inet_ntoa() */
+#include <arpa/inet.h> /* for sockaddr_in and inet_ntoa() */
 #include <sys/prctl.h>
 #include <sys/inotify.h>
+#include <sched.h>
 
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+#include <nftables/libnftables.h>
+#endif
 
 #include "common/config.h"
 #include "int.h"
@@ -43,8 +47,7 @@
 #include "sched.h"
 #include "memfd.h"
 
-struct kerndat_s kdat = {
-};
+struct kerndat_s kdat = {};
 
 static int check_pagemap(void)
 {
@@ -54,7 +57,7 @@ static int check_pagemap(void)
 	fd = __open_proc(PROC_SELF, EPERM, O_RDONLY, "pagemap");
 	if (fd < 0) {
 		if (errno == EPERM) {
-			pr_info("Pagemap disabled");
+			pr_info("Pagemap disabled\n");
 			kdat.pmap = PM_DISABLED;
 			return 0;
 		}
@@ -133,29 +136,26 @@ static void kerndat_mmap_min_addr(void)
 
 	struct sysctl_req req[] = {
 		{
-			.name	= "vm/mmap_min_addr",
-			.arg	= &value,
-			.type	= CTL_U64,
+			.name = "vm/mmap_min_addr",
+			.arg = &value,
+			.type = CTL_U64,
 		},
 	};
 
 	if (sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0)) {
-		pr_warn("Can't fetch %s value, use default %#lx\n",
-			req[0].name, (unsigned long)default_mmap_min_addr);
+		pr_warn("Can't fetch %s value, use default %#lx\n", req[0].name, (unsigned long)default_mmap_min_addr);
 		kdat.mmap_min_addr = default_mmap_min_addr;
 		return;
 	}
 
 	if (value < default_mmap_min_addr) {
-		pr_debug("Adjust mmap_min_addr %#lx -> %#lx\n",
-			 (unsigned long)value,
+		pr_debug("Adjust mmap_min_addr %#lx -> %#lx\n", (unsigned long)value,
 			 (unsigned long)default_mmap_min_addr);
 		kdat.mmap_min_addr = default_mmap_min_addr;
 	} else
 		kdat.mmap_min_addr = value;
 
-	pr_debug("Found mmap_min_addr %#lx\n",
-		 (unsigned long)kdat.mmap_min_addr);
+	pr_debug("Found mmap_min_addr %#lx\n", (unsigned long)kdat.mmap_min_addr);
 }
 
 static int kerndat_files_stat(void)
@@ -165,9 +165,9 @@ static int kerndat_files_stat(void)
 
 	struct sysctl_req req[] = {
 		{
-			.name	= "fs/nr_open",
-			.arg	= &nr_open,
-			.type	= CTL_U32,
+			.name = "fs/nr_open",
+			.arg = &nr_open,
+			.type = CTL_U32,
 		},
 	};
 
@@ -178,8 +178,7 @@ static int kerndat_files_stat(void)
 
 	kdat.sysctl_nr_open = nr_open;
 
-	pr_debug("files stat: %s %u\n",
-		 req[0].name, kdat.sysctl_nr_open);
+	pr_debug("files stat: %s %u\n", req[0].name, kdat.sysctl_nr_open);
 
 	return 0;
 }
@@ -191,15 +190,13 @@ static int kerndat_get_shmemdev(void)
 	struct stat buf;
 	dev_t dev;
 
-	map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
-			MAP_SHARED | MAP_ANONYMOUS, 0, 0);
+	map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, 0, 0);
 	if (map == MAP_FAILED) {
 		pr_perror("Can't mmap memory for shmemdev test");
 		return -1;
 	}
 
-	sprintf(maps, "/proc/self/map_files/%lx-%lx",
-			(unsigned long)map, (unsigned long)map + page_size());
+	sprintf(maps, "/proc/self/map_files/%lx-%lx", (unsigned long)map, (unsigned long)map + page_size());
 	if (stat(maps, &buf) < 0) {
 		int e = errno;
 		if (errno == EPERM) {
@@ -221,7 +218,7 @@ static int kerndat_get_shmemdev(void)
 
 	munmap(map, PAGE_SIZE);
 	kdat.shmem_dev = dev;
-	pr_info("Found anon-shmem device at %"PRIx64"\n", kdat.shmem_dev);
+	pr_info("Found anon-shmem device at %" PRIx64 "\n", kdat.shmem_dev);
 	return 0;
 
 err:
@@ -232,10 +229,10 @@ err:
 static dev_t get_host_dev(unsigned int which)
 {
 	static struct kst {
-		const char	*name;
-		const char	*path;
-		unsigned int	magic;
-		dev_t		fs_dev;
+		const char *name;
+		const char *path;
+		unsigned int magic;
+		dev_t fs_dev;
 	} kstat[KERNDAT_FS_STAT_MAX] = {
 		[KERNDAT_FS_STAT_DEVPTS] = {
 			.name	= "devpts",
@@ -314,8 +311,7 @@ static int kerndat_get_dirty_track(void)
 	u64 pmap = 0;
 	int ret = -1;
 
-	map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
-			MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	if (map == MAP_FAILED) {
 		pr_perror("Can't mmap memory for pagemap test");
 		return ret;
@@ -353,7 +349,7 @@ static int kerndat_get_dirty_track(void)
 		pr_info("Dirty track supported on kernel\n");
 		kdat.has_dirty_track = true;
 	} else {
-no_dt:
+	no_dt:
 		pr_info("Dirty tracking support is OFF\n");
 		if (opts.track_mem) {
 			pr_err("Tracking memory is not available\n");
@@ -382,7 +378,7 @@ static int init_zero_page_pfn(void)
 		return 0;
 	}
 
-	if (*((int *) addr) != 0) {
+	if (*((int *)addr) != 0) {
 		BUG();
 		return -1;
 	}
@@ -417,7 +413,7 @@ static bool kerndat_has_memfd_create(void)
 	else if (ret == -1 && errno == EFAULT)
 		kdat.has_memfd = true;
 	else {
-		pr_err("Unexpected error from memfd_create(NULL, 0): %m\n");
+		pr_perror("Unexpected error from memfd_create(NULL, 0)");
 		return -1;
 	}
 
@@ -535,7 +531,7 @@ int kerndat_tcp_repair(void)
 	struct sockaddr_in addr;
 	socklen_t aux;
 
-	memset(&addr,0,sizeof(addr));
+	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	inet_pton(AF_INET, "127.0.0.1", &(addr.sin_addr));
 	addr.sin_port = 0;
@@ -545,13 +541,13 @@ int kerndat_tcp_repair(void)
 		return -1;
 	}
 
-	if (bind(sock, (struct sockaddr *) &addr, sizeof(addr))) {
+	if (bind(sock, (struct sockaddr *)&addr, sizeof(addr))) {
 		pr_perror("Unable to bind a socket");
 		goto err;
 	}
 
 	aux = sizeof(addr);
-	if (getsockname(sock, (struct sockaddr *) &addr, &aux)) {
+	if (getsockname(sock, (struct sockaddr *)&addr, &aux)) {
 		pr_perror("Unable to get a socket name");
 		goto err;
 	}
@@ -567,7 +563,7 @@ int kerndat_tcp_repair(void)
 		goto err;
 	}
 
-	if (connect(clnt, (struct sockaddr *) &addr, sizeof(addr))) {
+	if (connect(clnt, (struct sockaddr *)&addr, sizeof(addr))) {
 		pr_perror("Unable to connect a socket");
 		goto err;
 	}
@@ -641,8 +637,7 @@ static int kerndat_detect_stack_guard_gap(void)
 	FILE *maps;
 	void *mem;
 
-	mem = mmap(NULL, (3ul << 20), PROT_READ | PROT_WRITE,
-		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
+	mem = mmap(NULL, (3ul << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
 	if (mem == MAP_FAILED) {
 		pr_perror("Can't mmap stack area");
 		return -1;
@@ -664,8 +659,7 @@ static int kerndat_detect_stack_guard_gap(void)
 	}
 
 	while (fgets(buf, sizeof(buf), maps)) {
-		num = sscanf(buf, "%lx-%lx %c%c%c%c",
-			     &start, &end, &r, &w, &x, &s);
+		num = sscanf(buf, "%lx-%lx %c%c%c%c", &start, &end, &r, &w, &x, &s);
 		if (num < 6) {
 			pr_err("Can't parse: %s\n", buf);
 			goto err;
@@ -746,7 +740,7 @@ static int kerndat_has_fsopen(void)
 
 static int has_kcmp_epoll_tfd(void)
 {
-	kcmp_epoll_slot_t slot = { };
+	kcmp_epoll_slot_t slot = {};
 	int ret = -1, efd, tfd;
 	pid_t pid = getpid();
 	struct epoll_event ev;
@@ -822,8 +816,8 @@ static int kerndat_x86_has_ptrace_fpu_xsave_bug(void)
 	return 0;
 }
 
-#define KERNDAT_CACHE_FILE	KDAT_RUNDIR"/criu.kdat"
-#define KERNDAT_CACHE_FILE_TMP	KDAT_RUNDIR"/.criu.kdat"
+#define KERNDAT_CACHE_FILE     KDAT_RUNDIR "/criu.kdat"
+#define KERNDAT_CACHE_FILE_TMP KDAT_RUNDIR "/.criu.kdat"
 
 static int kerndat_try_load_cache(void)
 {
@@ -831,7 +825,7 @@ static int kerndat_try_load_cache(void)
 
 	fd = open(KERNDAT_CACHE_FILE, O_RDONLY);
 	if (fd < 0) {
-		if(ENOENT == errno)
+		if (ENOENT == errno)
 			pr_debug("File %s does not exist\n", KERNDAT_CACHE_FILE);
 		else
 			pr_warn("Can't load %s\n", KERNDAT_CACHE_FILE);
@@ -847,9 +841,7 @@ static int kerndat_try_load_cache(void)
 
 	close(fd);
 
-	if (ret != sizeof(kdat) ||
-			kdat.magic1 != KDAT_MAGIC ||
-			kdat.magic2 != KDAT_MAGIC_2) {
+	if (ret != sizeof(kdat) || kdat.magic1 != KDAT_MAGIC || kdat.magic2 != KDAT_MAGIC_2) {
 		pr_warn("Stale %s file\n", KERNDAT_CACHE_FILE);
 		unlink(KERNDAT_CACHE_FILE);
 		return 1;
@@ -898,28 +890,33 @@ static void kerndat_save_cache(void)
 
 	if (ret < 0) {
 		pr_perror("Couldn't save %s", KERNDAT_CACHE_FILE);
-unl:
+	unl:
 		unlink(KERNDAT_CACHE_FILE_TMP);
 	}
 }
 
 static int kerndat_uffd(void)
 {
-	int uffd;
+	int uffd, err = 0;
 
 	kdat.uffd_features = 0;
-	uffd = uffd_open(0, &kdat.uffd_features);
+	uffd = uffd_open(0, &kdat.uffd_features, &err);
 
 	/*
-	 * uffd == -ENOSYS means userfaultfd is not supported on this
-	 * system and we just happily return with kdat.has_uffd = false.
-	 * Error other than -ENOSYS would mean "Houston, Houston, we
+	 * err == ENOSYS means userfaultfd is not supported on this system and
+	 * we just happily return with kdat.has_uffd = false.
+	 * err == EPERM means that userfaultfd is not allowed as we are
+	 * non-root user, so we also return with kdat.has_uffd = false.
+	 * Errors other than ENOSYS and EPERM would mean "Houston, Houston, we
 	 * have a problem!"
 	 */
 	if (uffd < 0) {
-		if (uffd == -ENOSYS)
+		if (err == ENOSYS)
 			return 0;
-
+		if (err == EPERM) {
+			pr_info("Lazy pages are not permited\n");
+			return 0;
+		}
 		pr_err("Lazy pages are not available\n");
 		return -1;
 	}
@@ -952,8 +949,7 @@ int kerndat_has_thp_disable(void)
 		return 0;
 	}
 
-	addr = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
-		    MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	addr = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	if (addr == MAP_FAILED) {
 		pr_perror("Can't mmap memory for THP disable test");
 		return -1;
@@ -1045,11 +1041,171 @@ static bool kerndat_has_clone3_set_tid(void)
 	if (pid == -1 && errno == EINVAL) {
 		kdat.has_clone3_set_tid = true;
 	} else {
-		pr_perror("Unexpected error from clone3\n");
+		pr_perror("Unexpected error from clone3");
 		return -1;
 	}
 
 	return 0;
+}
+
+static void kerndat_has_pidfd_open(void)
+{
+	int pidfd;
+
+	pidfd = syscall(SYS_pidfd_open, getpid(), 0);
+	if (pidfd == -1)
+		kdat.has_pidfd_open = false;
+	else
+		kdat.has_pidfd_open = true;
+
+	close_safe(&pidfd);
+}
+
+static int kerndat_has_pidfd_getfd(void)
+{
+	int ret;
+	int fds[2];
+	int val_a, val_b;
+	int pidfd, stolen_fd;
+
+	ret = 0;
+
+	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, fds)) {
+		pr_perror("Can't open unix socket pair");
+		ret = -1;
+		goto out;
+	}
+
+	val_a = 1984;
+	if (write(fds[0], &val_a, sizeof(val_a)) != sizeof(val_a)) {
+		pr_perror("Can't write to socket");
+		ret = -1;
+		goto close_pair;
+	}
+
+	pidfd = syscall(SYS_pidfd_open, getpid(), 0);
+	if (pidfd == -1) {
+		pr_warn("Can't get pidfd\n");
+		/*
+		 * If pidfd_open is not supported then pidfd_getfd
+		 * will not be supported as well.
+		 */
+		kdat.has_pidfd_getfd = false;
+		goto close_pair;
+	}
+
+	stolen_fd = syscall(SYS_pidfd_getfd, pidfd, fds[1], 0);
+	if (stolen_fd == -1) {
+		kdat.has_pidfd_getfd = false;
+		goto close_all;
+	}
+
+	if (read(fds[1], &val_b, sizeof(val_b)) != sizeof(val_b)) {
+		pr_perror("Can't read from socket");
+		ret = -1;
+		goto close_all;
+	}
+
+	if (val_b == val_a) {
+		kdat.has_pidfd_getfd = true;
+	} else {
+		/* If val_b != val_a then something unexpected happend. */
+		pr_err("Unexpected value read from socket\n");
+		ret = -1;
+	}
+
+close_all:
+	close_safe(&stolen_fd);
+	close_safe(&pidfd);
+close_pair:
+	close(fds[0]);
+	close(fds[1]);
+out:
+	return ret;
+}
+
+int kerndat_has_nspid(void)
+{
+	struct bfd f;
+	int ret = -1;
+	char *str;
+
+	f.fd = open("/proc/self/status", O_RDONLY);
+	if (f.fd < 0) {
+		pr_perror("Can't open /proc/self/status");
+		return -1;
+	}
+	if (bfdopenr(&f))
+		return -1;
+	while ((str = breadline(&f)) != NULL) {
+		if (IS_ERR(str))
+			goto close;
+		if (!strncmp(str, "NSpid:", 6)) {
+			kdat.has_nspid = true;
+			break;
+		}
+	}
+	ret = 0;
+close:
+	bclose(&f);
+	return ret;
+}
+
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+static int __has_nftables_concat(void *arg)
+{
+	bool *has = (bool *)arg;
+	struct nft_ctx *nft;
+	int ret = 1;
+
+	/*
+	 * Create a separate network namespace to avoid
+	 * collisions between two CRIU instances.
+	 */
+	if (unshare(CLONE_NEWNET)) {
+		pr_perror("Unable create a network namespace");
+		return 1;
+	}
+
+	nft = nft_ctx_new(NFT_CTX_DEFAULT);
+	if (!nft)
+		return 1;
+
+	if (NFT_RUN_CMD(nft, "create table inet CRIU")) {
+		pr_err("Can't create nftables table\n");
+		goto nft_ctx_free_out;
+	}
+
+	if (NFT_RUN_CMD(nft, "add set inet CRIU conn { type ipv4_addr . inet_service ;}"))
+		*has = false; /* kdat.has_nftables_concat = false */
+	else
+		*has = true; /* kdat.has_nftables_concat = true */
+
+	/* Clean up */
+	NFT_RUN_CMD(nft, "delete table inet CRIU");
+
+	ret = 0;
+nft_ctx_free_out:
+	nft_ctx_free(nft);
+	return ret;
+}
+#endif
+
+static int kerndat_has_nftables_concat(void)
+{
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	bool has;
+
+	if (call_in_child_process(__has_nftables_concat, (void *)&has))
+		return -1;
+
+	kdat.has_nftables_concat = has;
+	return 0;
+#else
+	pr_warn("CRIU was built without libnftables support\n");
+	kdat.has_nftables_concat = false;
+	return 0;
+#endif
 }
 
 int kerndat_init(void)
@@ -1183,6 +1339,24 @@ int kerndat_init(void)
 	}
 	if (!ret && has_time_namespace()) {
 		pr_err("has_time_namespace failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_newifindex()) {
+		pr_err("kerndat_has_newifindex failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_pidfd_getfd()) {
+		pr_err("kerndat_has_pidfd_getfd failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret)
+		kerndat_has_pidfd_open();
+	if (!ret && kerndat_has_nspid()) {
+		pr_err("kerndat_has_nspid failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_nftables_concat()) {
+		pr_err("kerndat_has_nftables_concat failed when initializing kerndat.\n");
 		ret = -1;
 	}
 
