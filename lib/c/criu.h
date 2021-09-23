@@ -22,16 +22,13 @@
 #include <stdbool.h>
 
 #include "version.h"
+#include "rpc.pb-c.h"
 
 #ifdef __GNUG__
-	extern "C" {
+extern "C" {
 #endif
 
-enum criu_service_comm {
-	CRIU_COMM_SK,
-	CRIU_COMM_FD,
-	CRIU_COMM_BIN
-};
+enum criu_service_comm { CRIU_COMM_SK, CRIU_COMM_FD, CRIU_COMM_BIN };
 
 enum criu_cg_mode {
 	CRIU_CG_MODE_IGNORE,
@@ -43,10 +40,12 @@ enum criu_cg_mode {
 	CRIU_CG_MODE_DEFAULT,
 };
 
-enum criu_pre_dump_mode {
-	CRIU_PRE_DUMP_SPLICE =	1,
-	CRIU_PRE_DUMP_READ =	2
+enum criu_network_lock_method {
+	CRIU_NETWORK_LOCK_IPTABLES = 1,
+	CRIU_NETWORK_LOCK_NFTABLES = 2,
 };
+
+enum criu_pre_dump_mode { CRIU_PRE_DUMP_SPLICE = 1, CRIU_PRE_DUMP_READ = 2 };
 
 int criu_set_service_address(const char *path);
 void criu_set_service_fd(int fd);
@@ -102,6 +101,8 @@ int criu_add_inherit_fd(int fd, const char *key);
 int criu_add_external(const char *key);
 int criu_set_page_server_address_port(const char *address, int port);
 int criu_set_pre_dump_mode(enum criu_pre_dump_mode mode);
+void criu_set_pidfd_store_sk(int sk);
+int criu_set_network_lock(enum criu_network_lock_method method);
 
 /*
  * The criu_notify_arg_t na argument is an opaque
@@ -111,7 +112,7 @@ int criu_set_pre_dump_mode(enum criu_pre_dump_mode mode);
  * some non-existing one is reported.
  */
 
-typedef struct _CriuNotify *criu_notify_arg_t;
+typedef CriuNotify *criu_notify_arg_t;
 void criu_set_notify_cb(int (*cb)(char *action, criu_notify_arg_t na));
 
 /* Get pid of root task. 0 if not available */
@@ -260,6 +261,8 @@ int criu_local_add_inherit_fd(criu_opts *opts, int fd, const char *key);
 int criu_local_add_external(criu_opts *opts, const char *key);
 int criu_local_set_page_server_address_port(criu_opts *opts, const char *address, int port);
 int criu_local_set_pre_dump_mode(criu_opts *opts, enum criu_pre_dump_mode mode);
+void criu_local_set_pidfd_store_sk(criu_opts *opts, int sk);
+int criu_local_set_network_lock(criu_opts *opts, enum criu_network_lock_method method);
 
 void criu_local_set_notify_cb(criu_opts *opts, int (*cb)(char *action, criu_notify_arg_t na));
 
