@@ -1,3 +1,9 @@
+criu (3.16-2) bullseye; urgency=medium
+
+  * Fix unversioned python
+
+ -- Adrian Reber <adrian@lisas.de>  Mon, 27 Sep 2021 15:43:48 +0100
+
 criu (3.16-1) bullseye; urgency=medium
 
   * New upstream version 3.16
