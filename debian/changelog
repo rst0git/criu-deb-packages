@@ -1,3 +1,9 @@
+criu (3.16-1ppa2.18.04) bionic; urgency=medium
+
+  * Fix unversioned python shebang
+
+ -- Adrian Reber <adrian@lisas.de>  Mon, 27 Sep 2021 15:43:48 +0100
+
 criu (3.16-1ppa1.18.04) bionic; urgency=medium
 
   * New upstream version 3.16
