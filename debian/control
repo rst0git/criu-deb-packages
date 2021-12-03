@@ -6,7 +6,11 @@ Build-Depends:
  asciidoctor,
  debhelper (>= 11),
  dh-python,
+ git,
+ libbsd-dev,
  libcap-dev,
+ libgnutls28-dev,
+ libgnutls30,
  libnet1-dev,
  libnl-3-dev,
  libprotobuf-c-dev,
@@ -24,6 +28,7 @@ Rules-Requires-Root: no
 Package: criu
 Architecture: amd64 arm64 armhf ppc64el s390x
 Depends:
+ libgnutls30,
  python3-protobuf,
  ${misc:Depends},
  ${python3:Depends},
