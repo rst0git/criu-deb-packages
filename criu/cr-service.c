@@ -169,11 +169,11 @@ int send_criu_dump_resp(int socket_fd, bool success, bool restored)
 	return send_criu_msg(socket_fd, &msg);
 }
 
-static int send_criu_pre_dump_resp(int socket_fd, bool success)
+static int send_criu_pre_dump_resp(int socket_fd, bool success, bool single)
 {
 	CriuResp msg = CRIU_RESP__INIT;
 
-	msg.type = CRIU_REQ_TYPE__PRE_DUMP;
+	msg.type = single ? CRIU_REQ_TYPE__SINGLE_PRE_DUMP : CRIU_REQ_TYPE__PRE_DUMP;
 	msg.success = success;
 	set_resp_err(&msg);
 
@@ -719,6 +719,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 			goto err;
 	}
 
+	if (req->mntns_compat_mode)
+		opts.mntns_compat_mode = true;
+
 	log_set_loglevel(opts.log_level);
 	if (check_options())
 		goto err;
@@ -735,6 +738,7 @@ static int dump_using_req(int sk, CriuOpts *req)
 	bool success = false;
 	bool self_dump = !req->pid;
 
+	opts.mode = CR_DUMP;
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
@@ -777,6 +781,7 @@ static int restore_using_req(int sk, CriuOpts *req)
 
 	opts.restore_detach = true;
 
+	opts.mode = CR_RESTORE;
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
@@ -828,6 +833,7 @@ static int check(int sk, CriuOpts *req)
 	if (pid == 0) {
 		setproctitle("check --rpc");
 
+		opts.mode = CR_CHECK;
 		if (setup_opts_from_req(sk, req))
 			exit(1);
 
@@ -845,7 +851,7 @@ out:
 	return send_criu_msg(sk, &resp);
 }
 
-static int pre_dump_using_req(int sk, CriuOpts *req)
+static int pre_dump_using_req(int sk, CriuOpts *req, bool single)
 {
 	int pid, status;
 	bool success = false;
@@ -859,6 +865,7 @@ static int pre_dump_using_req(int sk, CriuOpts *req)
 	if (pid == 0) {
 		int ret = 1;
 
+		opts.mode = CR_PRE_DUMP;
 		if (setup_opts_from_req(sk, req))
 			goto cout;
 
@@ -886,7 +893,7 @@ static int pre_dump_using_req(int sk, CriuOpts *req)
 
 	success = true;
 out:
-	if (send_criu_pre_dump_resp(sk, success) == -1) {
+	if (send_criu_pre_dump_resp(sk, success, single) == -1) {
 		pr_perror("Can't send pre-dump resp");
 		success = false;
 	}
@@ -899,7 +906,7 @@ static int pre_dump_loop(int sk, CriuReq *msg)
 	int ret;
 
 	do {
-		ret = pre_dump_using_req(sk, msg->opts);
+		ret = pre_dump_using_req(sk, msg->opts, false);
 		if (ret < 0)
 			return ret;
 
@@ -936,6 +943,7 @@ static int start_page_server_req(int sk, CriuOpts *req, bool daemon_mode)
 	if (pid == 0) {
 		close(start_pipe[0]);
 
+		opts.mode = CR_PAGE_SERVER;
 		if (setup_opts_from_req(sk, req))
 			goto out_ch;
 
@@ -1182,6 +1190,7 @@ static int handle_cpuinfo(int sk, CriuReq *msg)
 	if (pid == 0) {
 		int ret = 1;
 
+		opts.mode = CR_CPUINFO;
 		if (setup_opts_from_req(sk, msg->opts))
 			goto cout;
 
@@ -1231,6 +1240,8 @@ int cr_service_work(int sk)
 	CriuReq *msg = 0;
 
 more:
+	opts.mode = CR_SWRK;
+
 	if (recv_criu_msg(sk, &msg) != 0) {
 		pr_perror("Can't recv request");
 		goto err;
@@ -1270,6 +1281,9 @@ more:
 		break;
 	case CRIU_REQ_TYPE__VERSION:
 		ret = handle_version(sk, msg);
+		break;
+	case CRIU_REQ_TYPE__SINGLE_PRE_DUMP:
+		ret = pre_dump_using_req(sk, msg->opts, true);
 		break;
 
 	default:

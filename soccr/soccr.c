@@ -216,7 +216,7 @@ static int refresh_sk(struct libsoccr_sk *sk, struct libsoccr_sk_data *data, str
 	data->unsq_len = size;
 
 	if (data->state == TCP_CLOSE) {
-		/* A connection could be reseted. In thise case a sent queue
+		/* A connection could be reset. In this case a sent queue
 		 * may contain some data. A user can't read this data, so let's
 		 * ignore them. Otherwise we will need to add a logic whether
 		 * the send queue contains a fin packet or not and decide whether
@@ -227,7 +227,7 @@ static int refresh_sk(struct libsoccr_sk *sk, struct libsoccr_sk_data *data, str
 		data->outq_len = 0;
 	}
 
-	/* Don't account the fin packet. It doesn't countain real data. */
+	/* Don't account the fin packet. It doesn't contain real data. */
 	if ((1 << data->state) & (SNDQ_FIRST_FIN | SNDQ_SECOND_FIN)) {
 		if (data->outq_len)
 			data->outq_len--;
@@ -441,7 +441,7 @@ union libsoccr_addr *libsoccr_get_addr(struct libsoccr_sk *sk, int self, unsigne
 	if (flags & ~GET_SA_FLAGS)
 		return NULL;
 
-	/* FIXME -- implemeted in CRIU, makes sence to have it here too */
+	/* FIXME -- implemented in CRIU, makes sense to have it here too */
 	return NULL;
 }
 
@@ -503,7 +503,7 @@ static int libsoccr_set_sk_data_noq(struct libsoccr_sk *sk, struct libsoccr_sk_d
 	if (mstate & (RCVQ_FIRST_FIN | RCVQ_SECOND_FIN))
 		data->inq_seq--;
 
-	/* outq_seq is adjusted due to not accointing the fin packet */
+	/* outq_seq is adjusted due to not accounting the fin packet */
 	if (mstate & (SNDQ_FIRST_FIN | SNDQ_SECOND_FIN))
 		data->outq_seq--;
 
@@ -609,8 +609,8 @@ static int send_fin(struct libsoccr_sk *sk, struct libsoccr_sk_data *data, unsig
 		libnet_type = LIBNET_RAW4;
 
 	l = libnet_init(libnet_type, /* injection type */
-			NULL, /* network interface */
-			errbuf); /* errbuf */
+			NULL,	     /* network interface */
+			errbuf);     /* errbuf */
 	if (l == NULL) {
 		loge("libnet_init failed (%s)\n", errbuf);
 		return -1;
@@ -623,17 +623,17 @@ static int send_fin(struct libsoccr_sk *sk, struct libsoccr_sk_data *data, unsig
 
 	ret = libnet_build_tcp(ntohs(sk->dst_addr->v4.sin_port), /* source port */
 			       ntohs(sk->src_addr->v4.sin_port), /* destination port */
-			       data->inq_seq, /* sequence number */
-			       data->outq_seq - data->outq_len, /* acknowledgement num */
-			       flags, /* control flags */
-			       data->rcv_wnd, /* window size */
-			       0, /* checksum */
-			       10, /* urgent pointer */
-			       LIBNET_TCP_H + 20, /* TCP packet size */
-			       NULL, /* payload */
-			       0, /* payload size */
-			       l, /* libnet handle */
-			       0); /* libnet id */
+			       data->inq_seq,			 /* sequence number */
+			       data->outq_seq - data->outq_len,	 /* acknowledgement num */
+			       flags,				 /* control flags */
+			       data->rcv_wnd,			 /* window size */
+			       0,				 /* checksum */
+			       10,				 /* urgent pointer */
+			       LIBNET_TCP_H + 20,		 /* TCP packet size */
+			       NULL,				 /* payload */
+			       0,				 /* payload size */
+			       l,				 /* libnet handle */
+			       0);				 /* libnet id */
 	if (ret == -1) {
 		loge("Can't build TCP header: %s\n", libnet_geterror(l));
 		goto err;
@@ -646,28 +646,28 @@ static int send_fin(struct libsoccr_sk *sk, struct libsoccr_sk_data *data, unsig
 		memcpy(&src, &sk->src_addr->v6.sin6_addr, sizeof(src));
 
 		ret = libnet_build_ipv6(0, 0, LIBNET_TCP_H, /* length */
-					IPPROTO_TCP, /* protocol */
-					64, /* hop limit */
-					dst, /* source IP */
-					src, /* destination IP */
-					NULL, /* payload */
-					0, /* payload size */
-					l, /* libnet handle */
-					0); /* libnet id */
+					IPPROTO_TCP,	    /* protocol */
+					64,		    /* hop limit */
+					dst,		    /* source IP */
+					src,		    /* destination IP */
+					NULL,		    /* payload */
+					0,		    /* payload size */
+					l,		    /* libnet handle */
+					0);		    /* libnet id */
 	} else if (family == AF_INET)
 		ret = libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H + 20, /* length */
-					0, /* TOS */
-					242, /* IP ID */
-					0, /* IP Frag */
-					64, /* TTL */
-					IPPROTO_TCP, /* protocol */
-					0, /* checksum */
-					dst_v4, /* source IP */
-					src_v4, /* destination IP */
-					NULL, /* payload */
-					0, /* payload size */
-					l, /* libnet handle */
-					0); /* libnet id */
+					0,				   /* TOS */
+					242,				   /* IP ID */
+					0,				   /* IP Frag */
+					64,				   /* TTL */
+					IPPROTO_TCP,			   /* protocol */
+					0,				   /* checksum */
+					dst_v4,				   /* source IP */
+					src_v4,				   /* destination IP */
+					NULL,				   /* payload */
+					0,				   /* payload size */
+					l,				   /* libnet handle */
+					0);				   /* libnet id */
 	else {
 		loge("Unknown socket family\n");
 		goto err;

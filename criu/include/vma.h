@@ -10,14 +10,14 @@
 #include <string.h>
 
 struct vm_area_list {
-	struct list_head h; /* list of VMAs */
-	unsigned nr; /* nr of all VMAs in the list */
+	struct list_head h;   /* list of VMAs */
+	unsigned nr;	      /* nr of all VMAs in the list */
 	unsigned int nr_aios; /* nr of AIOs VMAs in the list */
 	union {
 		unsigned long nr_priv_pages; /* dmp: nr of pages in private VMAs */
 		unsigned long rst_priv_size; /* rst: size of private VMAs */
 	};
-	unsigned long nr_priv_pages_longest; /* nr of pages in longest private VMA */
+	unsigned long nr_priv_pages_longest;   /* nr of pages in longest private VMA */
 	unsigned long nr_shared_pages_longest; /* nr of pages in longest shared VMA */
 };
 
@@ -53,8 +53,8 @@ struct vma_area {
 		struct /* for restore */ {
 			int (*vm_open)(int pid, struct vma_area *vma);
 			struct file_desc *vmfd;
-			struct vma_area *pvma; /* parent for inherited VMAs */
-			unsigned long *page_bitmap; /* existent pages */
+			struct vma_area *pvma;	      /* parent for inherited VMAs */
+			unsigned long *page_bitmap;   /* existent pages */
 			unsigned long premmaped_addr; /* restore only */
 
 			/*
@@ -122,7 +122,8 @@ static inline struct vma_area *vma_next(struct vma_area *vma)
 static inline bool vma_entry_can_be_lazy(VmaEntry *e)
 {
 	return ((e->flags & MAP_ANONYMOUS) && (e->flags & MAP_PRIVATE) && !(e->flags & MAP_LOCKED) &&
-		!(vma_entry_is(e, VMA_AREA_VDSO)) && !(vma_entry_is(e, VMA_AREA_VSYSCALL)));
+		!(vma_entry_is(e, VMA_AREA_VDSO)) && !(vma_entry_is(e, VMA_AREA_VSYSCALL)) &&
+		!(e->flags & MAP_HUGETLB));
 }
 
 #endif /* __CR_VMA_H__ */

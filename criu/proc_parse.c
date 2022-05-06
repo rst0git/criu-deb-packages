@@ -41,10 +41,12 @@
 #include "path.h"
 #include "fault-injection.h"
 #include "memfd.h"
+#include "hugetlb.h"
 
 #include "protobuf.h"
 #include "images/fdinfo.pb-c.h"
 #include "images/mnt.pb-c.h"
+#include "plugin.h"
 
 #include <stdlib.h>
 
@@ -101,6 +103,19 @@ static bool __is_vma_range_fmt(char *line)
 bool is_vma_range_fmt(char *line)
 {
 	return __is_vma_range_fmt(line);
+}
+
+bool handle_vma_plugin(int *fd, struct stat *stat)
+{
+	int ret;
+
+	ret = run_plugins(HANDLE_DEVICE_VMA, *fd, stat);
+	if (ret < 0) {
+		pr_perror("handle_device_vma plugin failed");
+		return false;
+	}
+
+	return true;
 }
 
 static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf)
@@ -259,7 +274,7 @@ static int vma_stat(struct vma_area *vma, int fd)
 static int vma_get_mapfile_user(const char *fname, struct vma_area *vma, struct vma_file_info *vfi, int *vm_file_fd,
 				const char *path)
 {
-	int fd;
+	int fd, hugetlb_flag = 0;
 	dev_t vfi_dev;
 
 	/*
@@ -316,17 +331,19 @@ static int vma_get_mapfile_user(const char *fname, struct vma_area *vma, struct 
 		return -1;
 	}
 
-	if (is_anon_shmem_map(vfi_dev)) {
+	if (is_hugetlb_dev(vfi_dev, &hugetlb_flag) || is_anon_shmem_map(vfi_dev)) {
 		if (!(vma->e->flags & MAP_SHARED))
-			return -1;
+			vma->e->status |= VMA_ANON_PRIVATE;
+		else
+			vma->e->status |= VMA_ANON_SHARED;
 
 		vma->e->flags |= MAP_ANONYMOUS;
-		vma->e->status |= VMA_ANON_SHARED;
 		vma->e->shmid = vfi->ino;
+		vma->e->flags |= hugetlb_flag;
 
 		if (!strncmp(fname, "/SYSV", 5)) {
 			vma->e->status |= VMA_AREA_SYSVIPC;
-		} else {
+		} else if (vma->e->flags & MAP_SHARED) {
 			if (fault_injected(FI_HUGE_ANON_SHMEM_ID))
 				vma->e->shmid += FI_HUGE_ANON_SHMEM_ID_BASE;
 		}
@@ -576,17 +593,25 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 		}
 	} else if (*vm_file_fd >= 0) {
 		struct stat *st_buf = vma_area->vmst;
+		int hugetlb_flag = 0;
 
-		if (S_ISREG(st_buf->st_mode))
+		if (S_ISREG(st_buf->st_mode)) {
 			/* regular file mapping -- supported */;
-		else if (S_ISCHR(st_buf->st_mode) && (st_buf->st_rdev == DEVZERO))
+			pr_debug("Found regular file mapping, OK\n");
+		} else if (S_ISCHR(st_buf->st_mode) && (st_buf->st_rdev == DEVZERO)) {
 			/* devzero mapping -- also makes sense */;
-		else {
+			pr_debug("Found devzero mapping, OK\n");
+		} else if (handle_vma_plugin(vm_file_fd, st_buf)) {
+			pr_info("Found device file mapping, plugin is available\n");
+			vma_area->e->status |= VMA_EXT_PLUGIN;
+		} else {
+			/* non-regular mapping with no supporting plugin */
 			pr_err("Can't handle non-regular mapping on %d's map %" PRIx64 "\n", pid, vma_area->e->start);
 			goto err;
 		}
 
-		if (is_anon_shmem_map(st_buf->st_dev) && !strncmp(file_path, "/SYSV", 5)) {
+		if ((is_anon_shmem_map(st_buf->st_dev) || is_hugetlb_dev(st_buf->st_dev, NULL)) &&
+		    !strncmp(file_path, "/SYSV", 5)) {
 			vma_area->e->flags |= MAP_ANONYMOUS;
 			vma_area->e->status |= VMA_ANON_SHARED;
 			vma_area->e->shmid = st_buf->st_ino;
@@ -595,10 +620,29 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 			pr_info("path: %s\n", file_path);
 			vma_area->e->status |= VMA_AREA_SYSVIPC;
 		} else {
-			if (is_anon_shmem_map(st_buf->st_dev)) {
+			/* Dump shmem dev, hugetlb dev (private and share) mappings the same way as memfd
+			 * when possible.
+			 */
+			if (is_memfd(st_buf->st_dev) || is_anon_shmem_map(st_buf->st_dev) ||
+			    (kdat.has_memfd_hugetlb && is_hugetlb_dev(st_buf->st_dev, &hugetlb_flag))) {
 				vma_area->e->status |= VMA_AREA_MEMFD;
+				vma_area->e->flags |= hugetlb_flag;
 				if (fault_injected(FI_HUGE_ANON_SHMEM_ID))
 					vma_area->e->shmid += FI_HUGE_ANON_SHMEM_ID_BASE;
+			} else if (is_hugetlb_dev(st_buf->st_dev, &hugetlb_flag)) {
+				/* hugetlb mapping but memfd does not support HUGETLB */
+				vma_area->e->flags |= hugetlb_flag;
+				vma_area->e->flags |= MAP_ANONYMOUS;
+
+				if (vma_area->e->flags & MAP_SHARED) {
+					vma_area->e->status |= VMA_ANON_SHARED;
+					vma_area->e->shmid = st_buf->st_ino;
+				} else {
+					vma_area->e->status |= VMA_ANON_PRIVATE;
+				}
+
+				close_safe(vm_file_fd);
+				return 0;
 			}
 
 			if (vma_area->e->flags & MAP_PRIVATE)
@@ -645,7 +689,17 @@ err_bogus_mapfile:
 static int vma_list_add(struct vma_area *vma_area, struct vm_area_list *vma_area_list, unsigned long *prev_end,
 			struct vma_file_info *vfi, struct vma_file_info *prev_vfi)
 {
-	if (vma_area->e->status & VMA_UNSUPP) {
+	if (vma_area->e->status & VMA_EXT_PLUGIN) {
+		/* Unsupported VMAs that provide special plugins for
+		 * backup can be treated as regular VMAs and criu
+		 * should only save their metadata in the dump files.
+		 * There can be several special backup plugins hooks
+		 * that might run at different stages during checkpoint
+		 * and restore.
+		 */
+		pr_debug("Device file mapping %016" PRIx64 "-%016" PRIx64 " supported via device plugins\n",
+			 vma_area->e->start, vma_area->e->end);
+	} else if (vma_area->e->status & VMA_UNSUPP) {
 		pr_err("Unsupported mapping found %016" PRIx64 "-%016" PRIx64 "\n", vma_area->e->start,
 		       vma_area->e->end);
 		return -1;
@@ -730,17 +784,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 		eof = (str == NULL);
 
 		if (!eof && !__is_vma_range_fmt(str)) {
-			if (!strncmp(str, "Nonlinear", 9)) {
-				BUG_ON(!vma_area);
-				pr_err("Nonlinear mapping found %016" PRIx64 "-%016" PRIx64 "\n", vma_area->e->start,
-				       vma_area->e->end);
-				/*
-				 * VMA is already on list and will be
-				 * freed later as list get destroyed.
-				 */
-				vma_area = NULL;
-				goto err;
-			} else if (!strncmp(str, "VmFlags: ", 9)) {
+			if (!strncmp(str, "VmFlags: ", 9)) {
 				BUG_ON(!vma_area);
 				parse_vma_vmflags(&str[9], vma_area);
 				continue;
@@ -1442,12 +1486,12 @@ bool add_skip_mount(const char *mountpoint)
 	return true;
 }
 
-static bool should_skip_mount(const char *mountpoint)
+static bool should_skip_mount(char *mountpoint)
 {
 	struct str_node *pos;
 
 	list_for_each_entry(pos, &skip_mount_list, node) {
-		if (strcmp(mountpoint, pos->string) == 0)
+		if (is_same_path(mountpoint, pos->string))
 			return true;
 	}
 
@@ -1492,6 +1536,59 @@ out:
 	return exit_code;
 }
 
+static int get_mountinfo_sdev_from_mntid(int mnt_id, unsigned int *sdev)
+{
+	int exit_code = -1;
+	FILE *f;
+
+	f = fopen_proc(PROC_SELF, "mountinfo");
+	if (!f)
+		return -1;
+
+	while (fgets(buf, BUF_SIZE, f)) {
+		unsigned int kmaj, kmin;
+		int id;
+
+		if (sscanf(buf, "%i %*i %u:%u", &id, &kmaj, &kmin) != 3) {
+			pr_err("Failed to parse mountinfo line %s\n", buf);
+			goto err;
+		}
+
+		if (id == mnt_id) {
+			*sdev = MKKDEV(kmaj, kmin);
+			exit_code = 0;
+			break;
+		}
+	}
+err:
+	fclose(f);
+	return exit_code;
+}
+
+/* This works even on btrfs where stat does not show right sdev */
+int get_sdev_from_fd(int fd, unsigned int *sdev, bool parse_mountinfo)
+{
+	struct mount_info *mi;
+	int ret, mnt_id;
+
+	ret = get_fd_mntid(fd, &mnt_id);
+	if (ret < 0)
+		return -1;
+
+	/* Simple case mnt_id is in dumped mntns */
+	mi = lookup_mnt_id(mnt_id);
+	if (mi) {
+		*sdev = mi->s_dev_rt;
+		return 0;
+	}
+
+	if (!parse_mountinfo)
+		return -1;
+
+	/* Complex case mnt_id is in mntns created by criu */
+	return get_mountinfo_sdev_from_mntid(mnt_id, sdev);
+}
+
 struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 {
 	struct mount_info *list = NULL;
@@ -1506,7 +1603,7 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 		int ret = -1;
 		char *fsname = NULL;
 
-		new = mnt_entry_alloc();
+		new = mnt_entry_alloc(false);
 		if (!new)
 			goto end;
 
@@ -1523,27 +1620,27 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 		 * fail loudly at "dump" stage if an opened file or another mnt
 		 * depends on this one.
 		 */
-		if (for_dump && should_skip_mount(new->mountpoint + 1)) {
-			pr_info("\tskip %s @ %s\n", fsname, new->mountpoint);
+		if (for_dump && should_skip_mount(new->ns_mountpoint)) {
+			pr_info("\tskip %s @ %s\n", fsname, new->ns_mountpoint);
 			mnt_entry_free(new);
 			new = NULL;
 			goto end;
 		}
 
 		pr_info("\ttype %s source %s mnt_id %d s_dev %#x %s @ %s flags %#x options %s\n", fsname, new->source,
-			new->mnt_id, new->s_dev, new->root, new->mountpoint, new->flags, new->options);
+			new->mnt_id, new->s_dev, new->root, new->ns_mountpoint, new->flags, new->options);
 
 		if (new->fstype->parse) {
 			ret = new->fstype->parse(new);
 			if (ret < 0) {
-				pr_err("Failed to parse FS specific data on %s\n", new->mountpoint);
+				pr_err("Failed to parse FS specific data on %s\n", service_mountpoint(new));
 				mnt_entry_free(new);
 				new = NULL;
 				goto end;
 			}
 
 			if (ret > 0) {
-				pr_info("\tskipping fs mounted at %s\n", new->mountpoint + 1);
+				pr_info("\tskipping fs mounted at %s\n", service_mountpoint(new) + 1);
 				mnt_entry_free(new);
 				new = NULL;
 				ret = 0;
@@ -1554,10 +1651,8 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 		if (fsname)
 			free(fsname);
 
-		if (new) {
-			new->next = list;
-			list = new;
-		}
+		if (new)
+			mntinfo_add_list_before(&list, new);
 
 		if (ret)
 			goto err;
@@ -1660,6 +1755,12 @@ nodata:
 typedef struct bpfmap_fmt {
 	char *fmt;
 	void *value;
+	/*
+	 * If newer kernels are adding additional entries, these entries need
+	 * to be marked as optional in the protobuf definition and the parsing
+	 * must be able to ignore it if running on an older kernel.
+	 */
+	protobuf_c_boolean *optional;
 } bpfmap_fmt;
 
 static int parse_bpfmap(struct bfd *f, char *str, BpfmapFileEntry *bpf)
@@ -1672,28 +1773,34 @@ static int parse_bpfmap(struct bfd *f, char *str, BpfmapFileEntry *bpf)
 	 * uint32_t value_size
 	 * uint32_t max_entries
 	 * uint32_t map_flags
+	 * uint64_t map_extra
 	 * uint64_t memlock
 	 * uint32_t map_id
 	 * boolean frozen
 	 */
 
+	/* This needs to be in the same order as in the fdinfo entry. */
 	bpfmap_fmt map[] = {
-		{ "map_type: %u", &bpf->map_type },
-		{ "key_size: %u", &bpf->key_size },
-		{ "value_size: %u", &bpf->value_size },
-		{ "max_entries: %u", &bpf->max_entries },
-		{ "map_flags: %" PRIx32 "", &bpf->map_flags },
-		{ "memlock: %" PRIu64 "", &bpf->memlock },
-		{ "map_id: %u", &bpf->map_id },
-		{ "frozen: %d", &bpf->frozen },
+		{ "map_type: %u", &bpf->map_type, NULL },
+		{ "key_size: %u", &bpf->key_size, NULL },
+		{ "value_size: %u", &bpf->value_size, NULL },
+		{ "max_entries: %u", &bpf->max_entries, NULL },
+		{ "map_flags: %" PRIx32 "", &bpf->map_flags, NULL },
+		{ "map_extra: %" PRIx64 "", &bpf->map_extra, &bpf->has_map_extra },
+		{ "memlock: %" PRIu64 "", &bpf->memlock, NULL },
+		{ "map_id: %u", &bpf->map_id, NULL },
+		{ "frozen: %d", &bpf->frozen, NULL },
 	};
 
 	size_t n = sizeof(map) / sizeof(bpfmap_fmt);
 	int i;
 
 	for (i = 0; i < n; i++) {
-		if (sscanf(str, map[i].fmt, map[i].value) != 1)
+		if (sscanf(str, map[i].fmt, map[i].value) != 1) {
+			if (map[i].optional)
+				continue;
 			return -1;
+		}
 
 		if (i == n - 1)
 			break;
@@ -1704,6 +1811,9 @@ static int parse_bpfmap(struct bfd *f, char *str, BpfmapFileEntry *bpf)
 			return -1;
 		}
 	}
+
+	if (bpf->has_map_extra && bpf->map_extra)
+		pr_warn("Non-zero value for fdinfo map_extra entry found. This will not be restored.\n");
 
 	return 0;
 }
@@ -2624,7 +2734,7 @@ int aufs_parse(struct mount_info *new)
 {
 	int ret = 0;
 
-	if (!strcmp(new->mountpoint, "./")) {
+	if (!strcmp(new->ns_mountpoint, "./")) {
 		opts.aufs = true;
 		ret = parse_aufs_branches(new);
 	}

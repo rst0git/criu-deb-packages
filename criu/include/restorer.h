@@ -44,6 +44,12 @@ struct rst_sched_param {
 	int prio;
 };
 
+struct rst_rseq_param {
+	u64 rseq_abi_pointer;
+	u32 rseq_abi_size;
+	u32 signature;
+};
+
 struct restore_posix_timer {
 	struct str_posix_timer spt;
 	struct itimerspec val;
@@ -98,6 +104,7 @@ struct thread_restore_args {
 	struct task_restore_args *ta;
 
 	tls_t tls;
+	struct rst_rseq_param rseq;
 
 	siginfo_t *siginfo;
 	unsigned int siginfo_n;
@@ -138,7 +145,7 @@ struct task_restore_args {
 	bool has_thp_enabled;
 
 	/* threads restoration */
-	int nr_threads; /* number of threads */
+	int nr_threads;				 /* number of threads */
 	thread_restore_fcall_t clone_restore_fn; /* helper address for clone() call */
 	struct thread_restore_args *thread_args; /* array of thread arguments */
 	struct task_entries *task_entries;
@@ -211,7 +218,7 @@ struct task_restore_args {
 	bool can_map_vdso;
 	bool auto_dedup;
 	unsigned long vdso_rt_size;
-	struct vdso_maps vdso_maps_rt; /* runtime vdso symbols */
+	struct vdso_maps vdso_maps_rt;	 /* runtime vdso symbols */
 	unsigned long vdso_rt_parked_at; /* safe place to keep vdso */
 	void **breakpoint;
 
@@ -222,6 +229,12 @@ struct task_restore_args {
 	int lsm_type;
 	int child_subreaper;
 	bool has_clone3_set_tid;
+
+	/*
+	 * info about rseq from libc used to
+	 * unregister it before memory restoration procedure
+	 */
+	struct rst_rseq_param libc_rseq;
 } __aligned(64);
 
 /*

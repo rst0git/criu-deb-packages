@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -364,7 +365,7 @@ static int gen_parasite_saddr(struct sockaddr_un *saddr, int key)
 	int sun_len;
 
 	saddr->sun_family = AF_UNIX;
-	snprintf(saddr->sun_path, UNIX_PATH_MAX, "X/crtools-pr-%d", key);
+	snprintf(saddr->sun_path, UNIX_PATH_MAX, "X/crtools-pr-%d-%" PRIx64, key, compel_run_id);
 
 	sun_len = SUN_LEN(saddr);
 	*saddr->sun_path = '\0';
@@ -455,8 +456,8 @@ static int parasite_run(pid_t pid, int cmd, unsigned long ip, void *stack, user_
 
 	ksigfillset(&block);
 	/*
-	 * FIXME(issues/1429): SIGTRAP can't be blocked, otherwice its hanlder
-	 * will be reseted to the default one.
+	 * FIXME(issues/1429): SIGTRAP can't be blocked, otherwise its handler
+	 * will be reset to the default one.
 	 */
 	ksigdelset(&block, SIGTRAP);
 	if (ptrace(PTRACE_SETSIGMASK, pid, sizeof(k_rtsigset_t), &block)) {
@@ -955,7 +956,7 @@ int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned l
 	ctl->args_size = args_size;
 	parasite_size += ctl->args_size;
 
-	/* RESTORE_STACK_SIGFRAME needs a 64 bytes alignement */
+	/* RESTORE_STACK_SIGFRAME needs a 64 bytes alignment */
 	parasite_size = round_up(parasite_size, 64);
 
 	map_exchange_size = parasite_size;
@@ -1475,7 +1476,7 @@ int compel_run_in_thread(struct parasite_thread_ctl *tctl, unsigned int cmd)
 
 /*
  * compel_unmap() is used for unmapping parasite and restorer blobs.
- * A blob can contain code for unmapping itself, so the porcess is
+ * A blob can contain code for unmapping itself, so the process is
  * trapped on the exit from the munmap syscall.
  */
 int compel_unmap(struct parasite_ctl *ctl, unsigned long addr)
@@ -1685,4 +1686,24 @@ uint64_t compel_get_leader_sp(struct parasite_ctl *ctl)
 uint64_t compel_get_thread_sp(struct parasite_thread_ctl *tctl)
 {
 	return REG_SP(tctl->th.regs);
+}
+
+uint64_t compel_get_leader_ip(struct parasite_ctl *ctl)
+{
+	return REG_IP(ctl->orig.regs);
+}
+
+uint64_t compel_get_thread_ip(struct parasite_thread_ctl *tctl)
+{
+	return REG_IP(tctl->th.regs);
+}
+
+void compel_set_leader_ip(struct parasite_ctl *ctl, uint64_t v)
+{
+	SET_REG_IP(ctl->orig.regs, v);
+}
+
+void compel_set_thread_ip(struct parasite_thread_ctl *tctl, uint64_t v)
+{
+	SET_REG_IP(tctl->th.regs, v);
 }

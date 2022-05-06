@@ -34,12 +34,12 @@
  * Injected syscall instruction
  */
 const char code_syscall[] = {
-	0x0f, 0x05, /* syscall    */
+	0x0f, 0x05,			   /* syscall    */
 	0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc /* int 3, ... */
 };
 
 const char code_int_80[] = {
-	0xcd, 0x80, /* int $0x80  */
+	0xcd, 0x80,			   /* int $0x80  */
 	0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc /* int 3, ... */
 };
 
@@ -254,6 +254,7 @@ static void validate_random_xstate(struct xsave_struct *xsave)
 	/* No unknown or supervisor features may be set */
 	hdr->xstate_bv &= XFEATURE_MASK_USER;
 	hdr->xstate_bv &= ~XFEATURE_MASK_SUPERVISOR;
+	hdr->xstate_bv &= XFEATURE_MASK_FAULTINJ;
 
 	for (i = 0; i < XFEATURE_MAX; i++) {
 		if (!compel_fpu_has_feature(i))
@@ -271,6 +272,17 @@ static void validate_random_xstate(struct xsave_struct *xsave)
 
 	/* No reserved bits may be set */
 	memset(&hdr->reserved, 0, sizeof(hdr->reserved));
+
+	/*
+	 * While using PTRACE_SETREGSET the kernel checks that
+	 * "Reserved bits in MXCSR must be zero."
+	 * if (mxcsr[0] & ~mxcsr_feature_mask)
+	 *	return -EINVAL;
+	 *
+	 * As the mxcsr_feature_mask depends on the CPU the easiest solution for
+	 * this error injection test is to set mxcsr just to zero.
+	 */
+	xsave->i387.mxcsr = 0;
 }
 
 /*
@@ -282,20 +294,20 @@ static int corrupt_extregs(pid_t pid)
 	bool use_xsave = compel_cpu_has_feature(X86_FEATURE_OSXSAVE);
 	user_fpregs_struct_t ext_regs;
 	int *rand_to = (int *)&ext_regs;
-	unsigned int seed;
+	unsigned int seed, init_seed;
 	size_t i;
 
-	seed = time(NULL);
+	init_seed = seed = time(NULL);
 	for (i = 0; i < sizeof(ext_regs) / sizeof(int); i++)
 		*rand_to++ = rand_r(&seed);
 
 	/*
 	 * Error log-level as:
-	 *  - not intended to be used outside of testing,
+	 *  - not intended to be used outside of testing;
 	 *  - zdtm.py will grep it auto-magically from logs
-	 *    (and the seed will be known from an automatical testing)
+	 *    (and the seed will be known from automatic testing).
 	 */
-	pr_err("Corrupting %s for %d, seed %u\n", use_xsave ? "xsave" : "fpuregs", pid, seed);
+	pr_err("Corrupting %s for %d, seed %u\n", use_xsave ? "xsave" : "fpuregs", pid, init_seed);
 
 	if (!use_xsave) {
 		if (ptrace(PTRACE_SETFPREGS, pid, NULL, &ext_regs)) {
@@ -348,7 +360,7 @@ int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct
 
 	/*
 	 * FPU fetched either via fxsave or via xsave,
-	 * thus decode it accrodingly.
+	 * thus decode it accordingly.
 	 */
 
 	pr_info("Dumping GP/FPU registers for %d\n", pid);

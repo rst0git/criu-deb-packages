@@ -20,6 +20,27 @@ task:
     make -C scripts/ci vagrant-fedora-no-vdso
 
 task:
+  name: Vagrant Fedora Rawhide based test
+  environment:
+    HOME: "/root"
+    CIRRUS_WORKING_DIR: "/tmp/criu"
+
+  compute_engine_instance:
+    image_project: cirrus-images
+    image: family/docker-kvm
+    platform: linux
+    cpu: 4
+    memory: 16G
+    nested_virtualization: true
+
+  setup_script: |
+    scripts/ci/apt-install make gcc pkg-config git perl-modules iproute2 kmod wget cpu-checker
+    sudo kvm-ok
+    ln -sf /usr/include/google/protobuf/descriptor.proto images/google/protobuf/descriptor.proto
+  build_script: |
+    make -C scripts/ci vagrant-fedora-rawhide
+
+task:
   name: CentOS 8 based test
   environment:
     HOME: "/root"
@@ -27,7 +48,7 @@ task:
 
   compute_engine_instance:
     image_project: centos-cloud
-    image: family/centos-8
+    image: family/centos-stream-8
     platform: linux
     cpu: 4
     memory: 8G
@@ -36,7 +57,7 @@ task:
     ln -sf /usr/include/google/protobuf/descriptor.proto images/google/protobuf/descriptor.proto
     yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm dnf-plugins-core
     yum config-manager --set-enabled powertools
-    yum install -y --allowerasing asciidoc gcc git gnutls-devel libaio-devel libasan libcap-devel libnet-devel libnl3-devel libselinux-devel make protobuf-c-devel protobuf-devel python3-devel python3-flake8 python3-PyYAML python3-future python3-protobuf xmlto
+    yum install -y --allowerasing asciidoc gcc git gnutls-devel libaio-devel libasan libcap-devel libnet-devel libnl3-devel libbsd-devel libselinux-devel make protobuf-c-devel protobuf-devel python3-devel python3-flake8 python3-PyYAML python3-future python3-protobuf xmlto
     alternatives --set python /usr/bin/python3
     systemctl stop sssd
     # Even with selinux in permissive mode the selinux tests will be executed
@@ -47,7 +68,7 @@ task:
     pip3 install junit_xml
 
   build_script: |
-    make -C scripts/ci local SKIP_CI_PREP=1 CC=gcc CD_TO_TOP=1
+    make -C scripts/ci local SKIP_CI_PREP=1 CC=gcc CD_TO_TOP=1 ZDTM_OPTS="-x zdtm/static/socket-raw"
 
 task:
   name: CentOS 7 based test
@@ -64,7 +85,7 @@ task:
 
   setup_script: |
     ln -sf /usr/include/google/protobuf/descriptor.proto images/google/protobuf/descriptor.proto
-    yum install -y findutils gcc git gnutls-devel iproute iptables libaio-devel libasan libcap-devel libnet-devel libnl3-devel make procps-ng protobuf-c-devel protobuf-devel protobuf-python python python-flake8 python-ipaddress python2-future python2-junit_xml python-yaml python-six sudo tar which e2fsprogs python2-pip rubygem-asciidoctor libselinux-devel
+    yum install -y findutils gcc git gnutls-devel iproute iptables libaio-devel libasan libcap-devel libnet-devel libnl3-devel libbsd-devel make procps-ng protobuf-c-devel protobuf-devel protobuf-python python python-flake8 python-ipaddress python2-future python2-junit_xml python-yaml python-six sudo tar which e2fsprogs python2-pip rubygem-asciidoctor libselinux-devel
     # Even with selinux in permissive mode the selinux tests will be executed
     # The Cirrus CI user runs as a service from selinux point of view and is
     # much more restricted than a normal shell (system_u:system_r:unconfined_service_t:s0)

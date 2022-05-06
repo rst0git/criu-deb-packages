@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# This script is used to run vagrant based tests on Travis.
-# This script is started via sudo from .travis.yml
+# This script is used to run vagrant based tests on Cirrus CI.
+# This script is started via .cirrus.yml
 
 set -e
 set -x
 
-VAGRANT_VERSION=2.2.16
-FEDORA_VERSION=34
-FEDORA_BOX_VERSION=34.20210423.0
+VAGRANT_VERSION=2.2.19
+FEDORA_VERSION=35
+FEDORA_BOX_VERSION=35.20211026.0
 
 setup() {
 	if [ -n "$TRAVIS" ]; then
@@ -37,7 +37,7 @@ setup() {
 	vagrant ssh-config >> /root/.ssh/config
 	ssh default sudo dnf upgrade -y
 	ssh default sudo dnf install -y gcc git gnutls-devel nftables-devel libaio-devel \
-		libasan libcap-devel libnet-devel libnl3-devel make protobuf-c-devel \
+		libasan libcap-devel libnet-devel libnl3-devel libbsd-devel make protobuf-c-devel \
 		protobuf-devel python3-flake8 python3-future python3-protobuf \
 		python3-junit_xml rubygem-asciidoctor iptables libselinux-devel libbpf-devel
 	# Disable sssd to avoid zdtm test failures in pty04 due to sssd socket
@@ -50,12 +50,22 @@ fedora-no-vdso() {
 	vagrant reload
 	ssh default cat /proc/cmdline
 	ssh default 'cd /vagrant; tar xf criu.tar; cd criu; make -j 4'
-	# BPF tests are failing see: https://github.com/checkpoint-restore/criu/issues/1354
-	# Needs to be fixed, skip for now
-	ssh default 'cd /vagrant/criu/test; sudo ./zdtm.py run -a --keep-going -x zdtm/static/bpf_hash -x zdtm/static/bpf_array'
+	ssh default 'cd /vagrant/criu/test; sudo ./zdtm.py run -a --keep-going'
 	# This test (pidfd_store_sk) requires pidfd_getfd syscall which is guaranteed in Fedora 33.
 	# It is also skipped from -a because it runs in RPC mode only
 	ssh default 'cd /vagrant/criu/test; sudo ./zdtm.py run -t zdtm/transition/pidfd_store_sk --rpc --pre 2'
+}
+
+fedora-rawhide() {
+	#
+	# Workaround the problem:
+	# error running container: error from /usr/bin/crun creating container for [...]: sd-bus call: Transport endpoint is not connected
+	# Let's just use runc instead of crun
+	# see also https://github.com/kata-containers/tests/issues/4283
+	#
+	ssh default 'sudo dnf remove -y crun || true'
+	ssh default sudo dnf install -y podman runc
+	ssh default 'cd /vagrant; tar xf criu.tar; cd criu; sudo -E make -C scripts/ci fedora-rawhide CONTAINER_RUNTIME=podman BUILD_OPTIONS="--security-opt seccomp=unconfined"'
 }
 
 $1
