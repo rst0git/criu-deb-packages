@@ -560,7 +560,7 @@ static int do_open_tty_reg(int ns_root_fd, struct reg_file_info *rfi, void *arg)
 		 * them. So simply setup mode from image
 		 * the regular file engine will check
 		 * for this, so if we fail here it
-		 * gonna be catched anyway.
+		 * gonna be caught anyway.
 		 */
 		if (rfi->rfe->has_mode)
 			fchmod(fd, rfi->rfe->mode);
@@ -1977,6 +1977,12 @@ static int dump_one_tty(int lfd, u32 id, const struct fd_parms *p)
 	pr_info("Dumping tty %d with id %#x\n", lfd, id);
 
 	driver = get_tty_driver(p->stat.st_rdev, p->stat.st_dev);
+	if (driver == NULL) {
+		pr_err("Unable to find a tty driver (rdev %#" PRIx64 " dev %#" PRIx64 ")\n", p->stat.st_rdev,
+		       p->stat.st_dev);
+		return -1;
+	}
+
 	if (driver->fd_get_index)
 		index = driver->fd_get_index(lfd, p);
 	else
@@ -2400,9 +2406,9 @@ int devpts_restore(struct mount_info *pm)
 	struct mount_info *bm;
 	int dfd, exit_code = -1;
 
-	dfd = open(pm->mountpoint, O_RDONLY);
+	dfd = open(service_mountpoint(pm), O_RDONLY);
 	if (dfd < 0) {
-		pr_perror("Unable to open %s", pm->mountpoint);
+		pr_perror("Unable to open %s", service_mountpoint(pm));
 		return -1;
 	}
 

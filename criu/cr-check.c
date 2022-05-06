@@ -537,61 +537,6 @@ static int check_sigqueuinfo(void)
 	return 0;
 }
 
-static pid_t fork_and_ptrace_attach(int (*child_setup)(void))
-{
-	pid_t pid;
-	int sk_pair[2], sk;
-	char c = 0;
-
-	if (socketpair(PF_LOCAL, SOCK_SEQPACKET, 0, sk_pair)) {
-		pr_perror("socketpair");
-		return -1;
-	}
-
-	pid = fork();
-	if (pid < 0) {
-		pr_perror("fork");
-		return -1;
-	} else if (pid == 0) {
-		sk = sk_pair[1];
-		close(sk_pair[0]);
-
-		if (child_setup && child_setup() != 0)
-			exit(1);
-
-		if (write(sk, &c, 1) != 1) {
-			pr_perror("write");
-			exit(1);
-		}
-
-		while (1)
-			sleep(1000);
-		exit(1);
-	}
-
-	sk = sk_pair[0];
-	close(sk_pair[1]);
-
-	if (read(sk, &c, 1) != 1) {
-		close(sk);
-		kill(pid, SIGKILL);
-		pr_perror("read");
-		return -1;
-	}
-
-	close(sk);
-
-	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
-		pr_perror("Unable to ptrace the child");
-		kill(pid, SIGKILL);
-		return -1;
-	}
-
-	waitpid(pid, NULL, 0);
-
-	return pid;
-}
-
 static int check_ptrace_peeksiginfo(void)
 {
 	struct ptrace_peeksiginfo_args arg;
@@ -618,6 +563,7 @@ static int check_ptrace_peeksiginfo(void)
 	}
 
 	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
 	return ret;
 }
 
@@ -768,6 +714,7 @@ static int check_special_mapping_mremap(void)
 		/* Probably, we're interrupted with a signal - cleanup */
 		pr_err("Failed to wait for a child %d\n", errno);
 		kill(child, SIGKILL);
+		waitpid(child, NULL, 0);
 		return -1;
 	}
 
@@ -806,6 +753,7 @@ static int check_ptrace_suspend_seccomp(void)
 	}
 
 	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
 	return ret;
 }
 
@@ -846,7 +794,17 @@ static int check_ptrace_dump_seccomp_filters(void)
 	}
 
 	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
 	return ret;
+}
+
+static int check_ptrace_get_rseq_conf(void)
+{
+	if (!kdat.has_ptrace_get_rseq_conf) {
+		pr_warn("ptrace(PTRACE_GET_RSEQ_CONFIGURATION) isn't supported. C/R of processes which are using rseq() won't work.\n");
+		return -1;
+	}
+	return 0;
 }
 
 static int check_mem_dirty_track(void)
@@ -1362,12 +1320,44 @@ static int check_ns_pid(void)
 	return 0;
 }
 
+static int check_memfd_hugetlb(void)
+{
+	if (!kdat.has_memfd_hugetlb)
+		return -1;
+
+	return 0;
+}
+
 static int check_network_lock_nftables(void)
 {
 	if (!kdat.has_nftables_concat) {
 		pr_warn("Nftables based locking requires libnftables and set concatenations support\n");
 		return -1;
 	}
+
+	return 0;
+}
+
+static int check_sockopt_buf_lock(void)
+{
+	if (!kdat.has_sockopt_buf_lock)
+		return -1;
+
+	return 0;
+}
+
+static int check_move_mount_set_group(void)
+{
+	if (!kdat.has_move_mount_set_group)
+		return -1;
+
+	return 0;
+}
+
+static int check_openat2(void)
+{
+	if (!kdat.has_openat2)
+		return -1;
 
 	return 0;
 }
@@ -1490,6 +1480,11 @@ int cr_check(void)
 		ret |= check_ns_pid();
 		ret |= check_apparmor_stacking();
 		ret |= check_network_lock_nftables();
+		ret |= check_sockopt_buf_lock();
+		ret |= check_memfd_hugetlb();
+		ret |= check_move_mount_set_group();
+		ret |= check_openat2();
+		ret |= check_ptrace_get_rseq_conf();
 	}
 
 	/*
@@ -1602,6 +1597,11 @@ static struct feature_list feature_list[] = {
 	{ "ns_pid", check_ns_pid },
 	{ "apparmor_stacking", check_apparmor_stacking },
 	{ "network_lock_nftables", check_network_lock_nftables },
+	{ "sockopt_buf_lock", check_sockopt_buf_lock },
+	{ "memfd_hugetlb", check_memfd_hugetlb },
+	{ "move_mount_set_group", check_move_mount_set_group },
+	{ "openat2", check_openat2 },
+	{ "get_rseq_conf", check_ptrace_get_rseq_conf },
 	{ NULL, NULL },
 };
 
@@ -1621,7 +1621,7 @@ void pr_check_features(const char *offset, const char *sep, int width)
 		}
 		pr_msg("%s", fl->name); // no \n
 		pos += len;
-		if ((fl + 1)->name) { // not the last item
+		if ((fl + 1)->name) {	   // not the last item
 			pr_msg("%s", sep); // no \n
 			pos += sep_len;
 		}

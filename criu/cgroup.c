@@ -81,7 +81,7 @@ static bool cg_set_compare(struct cg_set *set, struct list_head *ctls, int what)
 		if (l2->next != ctls)
 			c2 = list_first_entry(l2, struct cg_ctl, l);
 
-		if (!c1 || !c2) /* Nowhere to move next */
+		if (!c1 || !c2)		   /* Nowhere to move next */
 			return !c1 && !c2; /* Both lists scanned -- match */
 
 		if (strcmp(c1->name, c2->name))
@@ -860,7 +860,7 @@ static int dump_cg_dirs(struct list_head *dirs, size_t n_dirs, CgroupDirEntry **
 		cde->dir_perms->gid = cur->gid;
 
 		cde->dir_name = cur->path + poff;
-		if (poff != 1) /* parent isn't "/" */
+		if (poff != 1)		 /* parent isn't "/" */
 			cde->dir_name++; /* leading / */
 		cde->n_children = cur->n_children;
 		if (cur->n_children > 0)
@@ -1035,7 +1035,7 @@ static int ctrl_dir_and_opt(CgControllerEntry *ctl, char *dir, int ds, char *opt
 		}
 
 		if (n[0] == 0)
-			doff += snprintf(dir + doff, ds - doff, "unified");
+			doff += snprintf(dir + doff, ds - doff, "unified,");
 		else
 			doff += snprintf(dir + doff, ds - doff, "%s,", n);
 		if (opt)
@@ -1217,6 +1217,9 @@ int prepare_task_cgroup(struct pstree_item *me)
 	CgSetEntry *se;
 	u32 current_cgset;
 
+	if (opts.manage_cgroups == CG_MODE_IGNORE)
+		return 0;
+
 	if (!rsti(me)->cg_set)
 		return 0;
 
@@ -1298,6 +1301,9 @@ static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p, char *pat
 {
 	int cg, fd, ret = -1;
 	CgroupPerms *perms = cg_prop_entry_p->perms;
+
+	if (opts.manage_cgroups == CG_MODE_IGNORE)
+		return 0;
 
 	if (!cg_prop_entry_p->value) {
 		pr_err("cg_prop_entry->value was empty when should have had a value\n");

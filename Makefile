@@ -284,15 +284,19 @@ clean mrproper:
 	$(Q) $(MAKE) $(build)=crit $@
 .PHONY: clean mrproper
 
+clean-amdgpu_plugin:
+	$(Q) $(MAKE) -C plugins/amdgpu clean
+.PHONY: clean-amdgpu_plugin
+
 clean-top:
 	$(Q) $(MAKE) -C Documentation clean
 	$(Q) $(MAKE) $(build)=test/compel clean
 	$(Q) $(RM) .gitid
 .PHONY: clean-top
 
-clean: clean-top
+clean: clean-top clean-amdgpu_plugin
 
-mrproper-top: clean-top
+mrproper-top: clean-top clean-amdgpu_plugin
 	$(Q) $(RM) $(CONFIG_HEADER)
 	$(Q) $(RM) $(VERSION_HEADER)
 	$(Q) $(RM) $(COMPEL_VERSION_HEADER)
@@ -319,6 +323,10 @@ zdtm: all
 test: zdtm
 	$(Q) $(MAKE) -C test
 .PHONY: test
+
+amdgpu_plugin: criu
+	$(Q) $(MAKE) -C plugins/amdgpu all
+.PHONY: amdgpu_plugin
 
 #
 # Generating tar requires tag matched CRIU_VERSION.
@@ -400,6 +408,7 @@ help:
 	@echo '      unittest        - Run unit tests'
 	@echo '      lint            - Run code linters'
 	@echo '      indent          - Indent C code'
+	@echo '      amdgpu_plugin   - Make AMD GPU plugin'
 .PHONY: help
 
 lint:
@@ -409,12 +418,15 @@ lint:
 	flake8 --config=scripts/flake8.cfg test/others/rpc/config_file.py
 	flake8 --config=scripts/flake8.cfg lib/py/images/pb2dict.py
 	flake8 --config=scripts/flake8.cfg scripts/criu-ns
+	flake8 --config=scripts/flake8.cfg coredump/
 	shellcheck --version
 	shellcheck scripts/*.sh
 	shellcheck scripts/ci/*.sh scripts/ci/apt-install
 	shellcheck test/others/crit/*.sh
 	shellcheck test/others/libcriu/*.sh
+	shellcheck test/others/crit/*.sh test/others/criu-coredump/*.sh
 	shellcheck test/others/config-file/*.sh
+	codespell
 	# Do not append \n to pr_perror or fail
 	! git --no-pager grep -E '^\s*\<(pr_perror|fail)\>.*\\n"'
 	# Do not use %m with pr_perror or fail
@@ -429,7 +441,9 @@ lint:
 
 codecov: SHELL := $(shell which bash)
 codecov:
-	bash <(curl -s https://codecov.io/bash)
+	curl -Os https://uploader.codecov.io/latest/linux/codecov
+	chmod +x codecov
+	./codecov
 .PHONY: codecov
 
 fetch-clang-format: .FORCE

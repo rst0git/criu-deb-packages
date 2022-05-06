@@ -4,6 +4,8 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
 #include <sys/mman.h>
 #include <errno.h>
 #include <sys/syscall.h>
@@ -14,6 +16,7 @@
 #include <sys/prctl.h>
 #include <sys/inotify.h>
 #include <sched.h>
+#include <sys/mount.h>
 
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 #include <nftables/libnftables.h>
@@ -36,6 +39,7 @@
 #include "sockets.h"
 #include "net.h"
 #include "tun.h"
+#include <compel/ptrace.h>
 #include <compel/plugins/std/syscall-codes.h>
 #include "netfilter.h"
 #include "fsnotify.h"
@@ -46,6 +50,7 @@
 #include "kcmp.h"
 #include "sched.h"
 #include "memfd.h"
+#include "mount-v2.h"
 
 struct kerndat_s kdat = {};
 
@@ -183,20 +188,12 @@ static int kerndat_files_stat(void)
 	return 0;
 }
 
-static int kerndat_get_shmemdev(void)
+static int kerndat_get_dev(dev_t *dev, char *map, size_t size)
 {
-	void *map;
 	char maps[128];
 	struct stat buf;
-	dev_t dev;
 
-	map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, 0, 0);
-	if (map == MAP_FAILED) {
-		pr_perror("Can't mmap memory for shmemdev test");
-		return -1;
-	}
-
-	sprintf(maps, "/proc/self/map_files/%lx-%lx", (unsigned long)map, (unsigned long)map + page_size());
+	sprintf(maps, "/proc/self/map_files/%lx-%lx", (unsigned long)map, (unsigned long)map + size);
 	if (stat(maps, &buf) < 0) {
 		int e = errno;
 		if (errno == EPERM) {
@@ -205,16 +202,34 @@ static int kerndat_get_shmemdev(void)
 			 * OK, let's go the slower route.
 			 */
 
-			if (parse_self_maps((unsigned long)map, &dev) < 0) {
+			if (parse_self_maps((unsigned long)map, dev) < 0) {
 				pr_err("Can't read self maps\n");
-				goto err;
+				return -1;
 			}
 		} else {
 			pr_perror("Can't stat self map_files %d", e);
-			goto err;
+			return -1;
 		}
-	} else
-		dev = buf.st_dev;
+	} else {
+		*dev = buf.st_dev;
+	}
+
+	return 0;
+}
+
+static int kerndat_get_shmemdev(void)
+{
+	void *map;
+	dev_t dev;
+
+	map = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, 0, 0);
+	if (map == MAP_FAILED) {
+		pr_perror("Can't mmap memory for shmemdev test");
+		return -1;
+	}
+
+	if (kerndat_get_dev(&dev, map, PAGE_SIZE))
+		goto err;
 
 	munmap(map, PAGE_SIZE);
 	kdat.shmem_dev = dev;
@@ -224,6 +239,60 @@ static int kerndat_get_shmemdev(void)
 err:
 	munmap(map, PAGE_SIZE);
 	return -1;
+}
+
+/* Return -1 -- error
+ * Return 0 -- successful but can't get any new device's numbers
+ * Return 1 -- successful and get new device's numbers
+ *
+ * At first, all kdat.hugetlb_dev elements are initialized to 0.
+ * When the function finishes,
+ * kdat.hugetlb_dev[i] == -1 -- this hugetlb page size is not supported
+ * kdat.hugetlb_dev[i] == 0  -- this hugetlb page size is supported but can't collect device's number
+ * Otherwise, kdat.hugetlb_dev[i] contains the corresponding device's number
+ *
+ * Next time the function is called, it only tries to collect the device's number of hugetlb page size
+ * that is supported but can't be collected in the previous call (kdat.hugetlb_dev[i] == 0)
+ */
+static int kerndat_get_hugetlb_dev(void)
+{
+	void *map;
+	int i, flag, ret = 0;
+	unsigned long long size;
+	dev_t dev;
+
+	for (i = 0; i < HUGETLB_MAX; i++) {
+		/* Skip if this hugetlb size is not supported or the device's number has been collected */
+		if (kdat.hugetlb_dev[i])
+			continue;
+
+		size = hugetlb_info[i].size;
+		flag = hugetlb_info[i].flag;
+		map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | flag, 0, 0);
+		if (map == MAP_FAILED) {
+			if (errno == EINVAL) {
+				kdat.hugetlb_dev[i] = (dev_t)-1;
+				continue;
+			} else if (errno == ENOMEM) {
+				pr_info("Hugetlb size %llu Mb is supported but cannot get dev's number\n", size >> 20);
+				continue;
+			} else {
+				pr_perror("Unexpected result when get hugetlb dev");
+				return -1;
+			}
+		}
+
+		if (kerndat_get_dev(&dev, map, size)) {
+			munmap(map, size);
+			return -1;
+		}
+
+		munmap(map, size);
+		kdat.hugetlb_dev[i] = dev;
+		ret = 1;
+		pr_info("Found hugetlb device at %" PRIx64 "\n", kdat.hugetlb_dev[i]);
+	}
+	return ret;
 }
 
 static dev_t get_host_dev(unsigned int which)
@@ -414,6 +483,29 @@ static bool kerndat_has_memfd_create(void)
 		kdat.has_memfd = true;
 	else {
 		pr_perror("Unexpected error from memfd_create(NULL, 0)");
+		return -1;
+	}
+
+	return 0;
+}
+
+static bool kerndat_has_memfd_hugetlb(void)
+{
+	int ret;
+
+	if (!kdat.has_memfd) {
+		kdat.has_memfd_hugetlb = false;
+		return 0;
+	}
+
+	ret = memfd_create("", MFD_HUGETLB);
+	if (ret >= 0) {
+		kdat.has_memfd_hugetlb = true;
+		close(ret);
+	} else if (ret == -1 && (errno == EINVAL || errno == ENOENT)) {
+		kdat.has_memfd_hugetlb = false;
+	} else {
+		pr_perror("Unexpected error from memfd_create(\"\", MFD_HUGETLB)");
 		return -1;
 	}
 
@@ -667,14 +759,14 @@ static int kerndat_detect_stack_guard_gap(void)
 
 		/*
 		 * When reading /proc/$pid/[s]maps the
-		 * start/end addresses might be cutted off
+		 * start/end addresses might be cut off
 		 * with PAGE_SIZE on kernels prior 4.12
 		 * (see kernel commit 1be7107fbe18ee).
 		 *
 		 * Same time there was semi-complete
 		 * patch released which hitted a number
 		 * of repos (Ubuntu, Fedora) where instead
-		 * of PAGE_SIZE the 1M gap is cutted off.
+		 * of PAGE_SIZE the 1M gap is cut off.
 		 */
 		if (start == (unsigned long)mem) {
 			kdat.stack_guard_gap_hidden = false;
@@ -816,6 +908,162 @@ static int kerndat_x86_has_ptrace_fpu_xsave_bug(void)
 	return 0;
 }
 
+static int kerndat_has_rseq(void)
+{
+	if (syscall(__NR_rseq, NULL, 0, 0, 0) != -1) {
+		pr_err("rseq should fail\n");
+		return -1;
+	}
+	if (errno == ENOSYS)
+		pr_info("rseq syscall isn't supported\n");
+	else
+		kdat.has_rseq = true;
+
+	return 0;
+}
+
+static int kerndat_has_ptrace_get_rseq_conf(void)
+{
+	pid_t pid;
+	int len;
+	struct __ptrace_rseq_configuration rseq;
+
+	pid = fork_and_ptrace_attach(NULL);
+	if (pid < 0)
+		return -1;
+
+	len = ptrace(PTRACE_GET_RSEQ_CONFIGURATION, pid, sizeof(rseq), &rseq);
+	if (len != sizeof(rseq)) {
+		kdat.has_ptrace_get_rseq_conf = false;
+		pr_info("ptrace(PTRACE_GET_RSEQ_CONFIGURATION) is not supported\n");
+		goto out;
+	}
+
+	/*
+	 * flags is always zero from the kernel side, if it will be changed
+	 * we need to pay attention to that and, possibly, make changes on the CRIU side.
+	 */
+	if (rseq.flags != 0) {
+		kdat.has_ptrace_get_rseq_conf = false;
+		pr_err("ptrace(PTRACE_GET_RSEQ_CONFIGURATION): rseq.flags != 0\n");
+	} else {
+		kdat.has_ptrace_get_rseq_conf = true;
+	}
+
+out:
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+	return 0;
+}
+
+int kerndat_sockopt_buf_lock(void)
+{
+	int exit_code = -1;
+	socklen_t len;
+	u32 buf_lock;
+	int sock;
+
+	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sock < 0) {
+		pr_perror("Unable to create a socket");
+		return -1;
+	}
+
+	len = sizeof(buf_lock);
+	if (getsockopt(sock, SOL_SOCKET, SO_BUF_LOCK, &buf_lock, &len)) {
+		if (errno != ENOPROTOOPT) {
+			pr_perror("Unable to get SO_BUF_LOCK with getsockopt");
+			goto err;
+		}
+		kdat.has_sockopt_buf_lock = false;
+	} else
+		kdat.has_sockopt_buf_lock = true;
+
+	exit_code = 0;
+err:
+	close(sock);
+	return exit_code;
+}
+
+static int kerndat_has_move_mount_set_group(void)
+{
+	char tmpdir[] = "/tmp/.criu.move_mount_set_group.XXXXXX";
+	char subdir[64];
+	int exit_code = -1;
+
+	if (mkdtemp(tmpdir) == NULL) {
+		pr_perror("Fail to make dir %s", tmpdir);
+		return -1;
+	}
+
+	if (mount("criu.move_mount_set_group", tmpdir, "tmpfs", 0, NULL)) {
+		pr_perror("Fail to mount tmfps to %s", tmpdir);
+		rmdir(tmpdir);
+		return -1;
+	}
+
+	if (mount(NULL, tmpdir, NULL, MS_PRIVATE, NULL)) {
+		pr_perror("Fail to make %s private", tmpdir);
+		goto out;
+	}
+
+	if (snprintf(subdir, sizeof(subdir), "%s/subdir", tmpdir) >= sizeof(subdir)) {
+		pr_err("Fail to snprintf subdir\n");
+		goto out;
+	}
+
+	if (mkdir(subdir, 0700)) {
+		pr_perror("Fail to make dir %s", subdir);
+		goto out;
+	}
+
+	if (mount(subdir, subdir, NULL, MS_BIND, NULL)) {
+		pr_perror("Fail to make bind-mount %s", subdir);
+		goto out;
+	}
+
+	if (mount(NULL, tmpdir, NULL, MS_SHARED, NULL)) {
+		pr_perror("Fail to make %s private", tmpdir);
+		goto out;
+	}
+
+	if (sys_move_mount(AT_FDCWD, tmpdir, AT_FDCWD, subdir, MOVE_MOUNT_SET_GROUP)) {
+		if (errno == EINVAL || errno == ENOSYS) {
+			pr_debug("No MOVE_MOUNT_SET_GROUP kernel feature\n");
+			kdat.has_move_mount_set_group = false;
+			exit_code = 0;
+			goto out;
+		}
+		pr_perror("Fail to MOVE_MOUNT_SET_GROUP");
+		goto out;
+	}
+
+	kdat.has_move_mount_set_group = true;
+	exit_code = 0;
+out:
+	if (umount2(tmpdir, MNT_DETACH))
+		pr_warn("Fail to umount2 %s: %m\n", tmpdir);
+	if (rmdir(tmpdir))
+		pr_warn("Fail to rmdir %s: %m\n", tmpdir);
+	return exit_code;
+}
+
+static int kerndat_has_openat2(void)
+{
+	if (sys_openat2(AT_FDCWD, ".", NULL, 0) != -1) {
+		pr_err("openat2 should fail\n");
+		return -1;
+	}
+	if (errno == ENOSYS) {
+		pr_debug("No openat2 syscall support\n");
+		kdat.has_openat2 = false;
+	} else {
+		kdat.has_openat2 = true;
+	}
+
+	return 0;
+}
+
 #define KERNDAT_CACHE_FILE     KDAT_RUNDIR "/criu.kdat"
 #define KERNDAT_CACHE_FILE_TMP KDAT_RUNDIR "/.criu.kdat"
 
@@ -914,7 +1162,7 @@ static int kerndat_uffd(void)
 		if (err == ENOSYS)
 			return 0;
 		if (err == EPERM) {
-			pr_info("Lazy pages are not permited\n");
+			pr_info("Lazy pages are not permitted\n");
 			return 0;
 		}
 		pr_err("Lazy pages are not available\n");
@@ -1109,7 +1357,7 @@ static int kerndat_has_pidfd_getfd(void)
 	if (val_b == val_a) {
 		kdat.has_pidfd_getfd = true;
 	} else {
-		/* If val_b != val_a then something unexpected happend. */
+		/* If val_b != val_a, something unexpected happened. */
 		pr_err("Unexpected value read from socket\n");
 		ret = -1;
 	}
@@ -1208,13 +1456,43 @@ static int kerndat_has_nftables_concat(void)
 #endif
 }
 
+/*
+ * Some features depend on resource that can be dynamically changed
+ * at the OS runtime. There are cases that we cannot determine the
+ * availability of those features at the first time we run kerndat
+ * check. So in later kerndat checks, we need to retry to get those
+ * information. This function contains calls to those kerndat checks.
+ *
+ * Those kerndat checks must
+ * Return -1 on error
+ * Return 0 when the check is successful but no new information
+ * Return 1 when the check is successful and there is new information
+ */
+int kerndat_try_load_new(void)
+{
+	int ret;
+
+	ret = kerndat_get_hugetlb_dev();
+	if (ret < 0)
+		return ret;
+
+	/* New information is found, we need to save to the cache */
+	if (ret)
+		kerndat_save_cache();
+	return 0;
+}
+
 int kerndat_init(void)
 {
 	int ret;
 
 	ret = kerndat_try_load_cache();
-	if (ret <= 0)
+	if (ret < 0)
 		return ret;
+
+	if (ret == 0)
+		return kerndat_try_load_new();
+
 	ret = 0;
 
 	/* kerndat_try_load_cache can leave some trash in kdat */
@@ -1229,6 +1507,10 @@ int kerndat_init(void)
 	}
 	if (!ret && kerndat_get_shmemdev()) {
 		pr_err("kerndat_get_shmemdev failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_get_hugetlb_dev() < 0) {
+		pr_err("kerndat_get_hugetlb_dev failed when initializing kerndat.\n");
 		ret = -1;
 	}
 	if (!ret && kerndat_get_dirty_track()) {
@@ -1289,6 +1571,10 @@ int kerndat_init(void)
 	}
 	if (!ret && kerndat_has_memfd_create()) {
 		pr_err("kerndat_has_memfd_create failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_memfd_hugetlb()) {
+		pr_err("kerndat_has_memfd_hugetlb failed when initializing kerndat.\n");
 		ret = -1;
 	}
 	if (!ret && kerndat_detect_stack_guard_gap()) {
@@ -1357,6 +1643,26 @@ int kerndat_init(void)
 	}
 	if (!ret && kerndat_has_nftables_concat()) {
 		pr_err("kerndat_has_nftables_concat failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_sockopt_buf_lock()) {
+		pr_err("kerndat_sockopt_buf_lock failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_move_mount_set_group()) {
+		pr_err("kerndat_has_move_mount_set_group failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_openat2()) {
+		pr_err("kerndat_has_openat2 failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_rseq()) {
+		pr_err("kerndat_has_rseq failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_ptrace_get_rseq_conf()) {
+		pr_err("kerndat_has_ptrace_get_rseq_conf failed when initializing kerndat.\n");
 		ret = -1;
 	}
 

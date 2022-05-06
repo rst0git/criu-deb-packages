@@ -80,6 +80,11 @@ enum xfeature {
 	(XFEATURE_MASK_FP | XFEATURE_MASK_SSE | XFEATURE_MASK_YMM | XFEATURE_MASK_OPMASK | XFEATURE_MASK_ZMM_Hi256 | \
 	 XFEATURE_MASK_Hi16_ZMM | XFEATURE_MASK_PKRU | XFEATURE_MASK_BNDREGS | XFEATURE_MASK_BNDCSR)
 
+/* xsave structure features which is safe to fill with garbage (see validate_random_xstate()) */
+#define XFEATURE_MASK_FAULTINJ                                                                                       \
+	(XFEATURE_MASK_FP | XFEATURE_MASK_SSE | XFEATURE_MASK_YMM | XFEATURE_MASK_OPMASK | XFEATURE_MASK_ZMM_Hi256 | \
+	 XFEATURE_MASK_Hi16_ZMM)
+
 struct fpx_sw_bytes {
 	uint32_t magic1;
 	uint32_t extended_size;
@@ -105,7 +110,7 @@ struct i387_fxsave_struct {
 			uint32_t fos; /* FPU Operand Selector		*/
 		};
 	};
-	uint32_t mxcsr; /* MXCSR Register State */
+	uint32_t mxcsr;	     /* MXCSR Register State */
 	uint32_t mxcsr_mask; /* MXCSR Mask		*/
 
 	/* 8*16 bytes for each FP-reg = 128 bytes				*/
@@ -264,7 +269,7 @@ struct xsave_struct_ia32 {
 
 typedef struct {
 	/*
-	 * The FPU xsave area must be continious and FP_MIN_ALIGN_BYTES
+	 * The FPU xsave area must be continuous and FP_MIN_ALIGN_BYTES
 	 * aligned, thus make sure the compiler won't insert any hole here.
 	 */
 
@@ -277,13 +282,13 @@ typedef struct {
 } fpu_state_64_t;
 
 struct user_i387_ia32_struct {
-	uint32_t cwd; /* FPU Control Word		*/
-	uint32_t swd; /* FPU Status Word		*/
-	uint32_t twd; /* FPU Tag Word			*/
-	uint32_t fip; /* FPU IP Offset		*/
-	uint32_t fcs; /* FPU IP Selector		*/
-	uint32_t foo; /* FPU Operand Pointer Offset	*/
-	uint32_t fos; /* FPU Operand Pointer Selector	*/
+	uint32_t cwd;	       /* FPU Control Word		*/
+	uint32_t swd;	       /* FPU Status Word		*/
+	uint32_t twd;	       /* FPU Tag Word			*/
+	uint32_t fip;	       /* FPU IP Offset		*/
+	uint32_t fcs;	       /* FPU IP Selector		*/
+	uint32_t foo;	       /* FPU Operand Pointer Offset	*/
+	uint32_t fos;	       /* FPU Operand Pointer Selector	*/
 	uint32_t st_space[20]; /* 8*10 bytes for each FP-reg = 80 bytes */
 };
 
