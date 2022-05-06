@@ -35,7 +35,7 @@
  * Thus, the old code that saves and restores AA profiles is still relevant, we
  * just need to add the new code in this file to walk the namespace and dump
  * any blobs in that AA namespace, and then restore these blobs on restore so
- * that the profiles the old code tries to use are actualy present.
+ * that the profiles the old code tries to use are actually present.
  */
 
 static AaNamespace **namespaces = NULL;
@@ -630,7 +630,7 @@ int suspend_aa(void)
 	}
 
 	ret = do_suspend(true);
-	if (rm_rf(policydir) < 0)
+	if (rmrf(policydir) < 0)
 		pr_err("failed removing policy dir %s\n", policydir);
 
 	return ret;
@@ -668,7 +668,7 @@ int dump_aa_namespaces(void)
 
 bool check_aa_ns_dumping(void)
 {
-	char contents[48];
+	char contents[49];
 	int major, minor, ret;
 	FILE *f;
 

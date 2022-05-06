@@ -20,6 +20,7 @@
 #include "file-lock.h"
 #include "irmap.h"
 #include "mount.h"
+#include "mount-v2.h"
 #include "namespaces.h"
 #include "net.h"
 #include "sk-inet.h"
@@ -229,7 +230,7 @@ out:
 		tmp_string[0] = 0;
 
 	/* Check for unsupported configuration file entries */
-	if (configuration[i] + offset + 1 != 0 && strchr(configuration[i] + offset, ' ')) {
+	if (strchr(configuration[i] + offset, ' ')) {
 		int j;
 		len = strlen(configuration[i] + offset);
 		for (j = 0; j < len - 1; j++) {
@@ -549,7 +550,7 @@ static size_t parse_size(char *optarg)
 static int parse_join_ns(const char *ptr)
 {
 	char *aux, *ns_file, *extra_opts = NULL;
-	char *ns;
+	cleanup_free char *ns = NULL;
 
 	ns = xstrdup(ptr);
 	if (ns == NULL)
@@ -697,6 +698,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "file-validation", required_argument, 0, 1098 },
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
+		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
 		{},
 	};
 
@@ -1071,7 +1073,7 @@ int check_options(void)
 	if (opts.link_remap_ok)
 		pr_info("Will allow link remaps on FS\n");
 	if (opts.weak_sysctls)
-		pr_info("Will skip non-existant sysctls on restore\n");
+		pr_info("Will skip non-existent sysctls on restore\n");
 
 	if (opts.deprecated_ok)
 		pr_info("Turn deprecated stuff ON\n");
@@ -1102,6 +1104,16 @@ int check_options(void)
 		return 1;
 	}
 #endif
+
+	if (opts.mntns_compat_mode && opts.mode != CR_RESTORE) {
+		pr_err("Option --mntns-compat-mode is only valid on restore\n");
+		return 1;
+	} else if (!opts.mntns_compat_mode && opts.mode == CR_RESTORE) {
+		if (check_mount_v2()) {
+			pr_debug("Mount engine fallback to --mntns-compat-mode mode\n");
+			opts.mntns_compat_mode = true;
+		}
+	}
 
 	if (check_namespace_opts()) {
 		pr_err("Error: namespace flags conflict\n");

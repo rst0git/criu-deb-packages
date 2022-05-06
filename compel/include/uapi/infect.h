@@ -106,9 +106,9 @@ struct infect_ctx {
 
 	unsigned long task_size;
 	unsigned long syscall_ip; /* entry point of infection */
-	unsigned long flags; /* fine-tune (e.g. faults) */
+	unsigned long flags;	  /* fine-tune (e.g. faults) */
 
-	void (*child_handler)(int, siginfo_t *, void *); /* hander for SIGCHLD deaths */
+	void (*child_handler)(int, siginfo_t *, void *); /* handler for SIGCHLD deaths */
 	struct sigaction orig_handler;
 
 	open_proc_fn open_proc;
@@ -167,5 +167,11 @@ extern unsigned long compel_task_size(void);
 
 extern uint64_t compel_get_leader_sp(struct parasite_ctl *ctl);
 extern uint64_t compel_get_thread_sp(struct parasite_thread_ctl *tctl);
+
+extern uint64_t compel_get_leader_ip(struct parasite_ctl *ctl);
+extern uint64_t compel_get_thread_ip(struct parasite_thread_ctl *tctl);
+
+void compel_set_leader_ip(struct parasite_ctl *ctl, uint64_t v);
+void compel_set_thread_ip(struct parasite_thread_ctl *tctl, uint64_t v);
 
 #endif

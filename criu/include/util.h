@@ -166,6 +166,7 @@ extern int is_anon_link_type(char *link, char *type);
 
 extern int cr_system(int in, int out, int err, char *cmd, char *const argv[], unsigned flags);
 extern int cr_system_userns(int in, int out, int err, char *cmd, char *const argv[], unsigned flags, int userns_pid);
+extern pid_t fork_and_ptrace_attach(int (*child_setup)(void));
 extern int cr_daemon(int nochdir, int noclose, int close_fd);
 extern int status_ready(void);
 extern int is_root_user(void);
@@ -241,6 +242,10 @@ static inline bool issubpath(const char *path, const char *sub_path)
 	return strstartswith2(path, sub_path, &end) && (end == '/' || end == '\0');
 }
 
+extern char *get_relative_path(char *path, char *sub_path);
+extern bool is_sub_path(char *path, char *sub_path);
+extern bool is_same_path(char *path1, char *path2);
+
 int strip_deleted(char *path, int len);
 int cut_path_ending(char *path, char *sub_path);
 
@@ -284,8 +289,8 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port);
 int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk);
 int setup_tcp_client(char *hostname);
 
-/* *dir should be writable and at least PATH_MAX long */
-int rm_rf(char *dir);
+/* path should be writable and no more than PATH_MAX long */
+int rmrf(char *path);
 
 #define LAST_PID_PATH "sys/kernel/ns_last_pid"
 #define PID_MAX_PATH  "sys/kernel/pid_max"
@@ -392,5 +397,14 @@ static inline void cleanup_freep(void *p)
 }
 
 extern int run_command(char *buf, size_t buf_size, int (*child_fn)(void *), void *args);
+
+/*
+ * criu_run_id is a unique value of the current run. It can be used to
+ * generate resource ID-s to avoid conflicts with other CRIU processes.
+ */
+extern uint64_t criu_run_id;
+extern void util_init(void);
+
+extern char *resolve_mountpoint(char *path);
 
 #endif /* __CR_UTIL_H__ */

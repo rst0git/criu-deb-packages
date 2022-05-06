@@ -23,6 +23,7 @@
 #include "common/compiler.h"
 
 #include "linux/mount.h"
+#include "linux/rseq.h"
 
 #include "clone-noasan.h"
 #include "cr_options.h"
@@ -809,6 +810,23 @@ static int open_cores(int pid, CoreEntry *leader_core)
 			rsti(current)->has_seccomp = true;
 			break;
 		}
+	}
+
+	for (i = 0; i < current->nr_threads; i++) {
+		ThreadCoreEntry *tc = cores[i]->thread_core;
+		struct rst_rseq *rseqs = rsti(current)->rseqe;
+		RseqEntry *rseqe = tc->rseq_entry;
+
+		/* compatibility with older CRIU versions */
+		if (!rseqe)
+			continue;
+
+		/* rseq cs had no RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL */
+		if (!rseqe->has_rseq_cs_pointer)
+			continue;
+
+		rseqs[i].rseq_abi_pointer = rseqe->rseq_abi_pointer;
+		rseqs[i].rseq_cs_pointer = rseqe->rseq_cs_pointer;
 	}
 
 	return 0;
@@ -1962,6 +1980,50 @@ static int attach_to_tasks(bool root_seized)
 	return 0;
 }
 
+static int restore_rseq_cs(void)
+{
+	struct pstree_item *item;
+
+	for_each_pstree_item(item) {
+		int i;
+
+		if (!task_alive(item))
+			continue;
+
+		if (item->nr_threads == 1) {
+			item->threads[0].real = item->pid->real;
+		} else {
+			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads)) {
+				pr_err("restore_rseq_cs: parse_threads failed\n");
+				return -1;
+			}
+		}
+
+		for (i = 0; i < item->nr_threads; i++) {
+			pid_t pid = item->threads[i].real;
+			struct rst_rseq *rseqe = rsti(item)->rseqe;
+
+			if (!rseqe) {
+				pr_err("restore_rseq_cs: rsti(item)->rseqe is NULL\n");
+				return -1;
+			}
+
+			if (!rseqe[i].rseq_cs_pointer || !rseqe[i].rseq_abi_pointer)
+				continue;
+
+			if (ptrace_poke_area(
+				    pid, &rseqe[i].rseq_cs_pointer,
+				    decode_pointer(rseqe[i].rseq_abi_pointer + offsetof(struct criu_rseq, rseq_cs)),
+				    sizeof(uint64_t))) {
+				pr_err("Can't restore rseq_cs pointer (pid: %d)\n", pid);
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
 static int catch_tasks(bool root_seized, enum trace_flags *flag)
 {
 	struct pstree_item *item;
@@ -2061,7 +2123,7 @@ static int finalize_restore_detach(void)
 		for (i = 0; i < item->nr_threads; i++) {
 			pid = item->threads[i].real;
 			if (pid < 0) {
-				pr_err("pstree item has unvalid pid %d\n", pid);
+				pr_err("pstree item has invalid pid %d\n", pid);
 				continue;
 			}
 
@@ -2388,6 +2450,29 @@ skip_ns_bouncing:
 		pr_err("Unable to flush breakpoints\n");
 
 	finalize_restore();
+	/*
+	 * Some external devices such as GPUs might need a very late
+	 * trigger to kick-off some events, memory notifiers and for
+	 * restarting the previously restored queues during criu restore
+	 * stage. This is needed since criu pie code may shuffle VMAs
+	 * around so things such as registering MMU notifiers (for GPU
+	 * mapped memory) could be done sanely once the pie code hands
+	 * over the control to master process.
+	 */
+	for_each_pstree_item(item) {
+		pr_info("Run late stage hook from criu master for external devices\n");
+		ret = run_plugins(RESUME_DEVICES_LATE, item->pid->real);
+		/*
+		 * This may not really be an error. Only certain plugin hooks
+		 * (if available) will return success such as amdgpu_plugin that
+		 * validates the pid of the resuming tasks in the kernel mode.
+		 * Most of the times, it'll be -ENOTSUP and in few cases, it
+		 * might actually be a true error code but that would be also
+		 * captured in the plugin so no need to print the error here.
+		 */
+		if (ret < 0)
+			pr_debug("restore late stage hook for external plugin failed\n");
+	}
 
 	ret = run_scripts(ACT_PRE_RESUME);
 	if (ret)
@@ -2395,6 +2480,10 @@ skip_ns_bouncing:
 
 	if (restore_freezer_state())
 		pr_err("Unable to restore freezer state\n");
+
+	/* just before releasing threads we have to restore rseq_cs */
+	if (restore_rseq_cs())
+		pr_err("Unable to restore rseq_cs state\n");
 
 	/* Detaches from processes and they continue run through sigreturn. */
 	if (finalize_restore_detach())
@@ -2971,6 +3060,50 @@ static int prep_sched_info(struct rst_sched_param *sp, ThreadCoreEntry *tc)
 	return 0;
 }
 
+static int prep_rseq(struct rst_rseq_param *rseq, ThreadCoreEntry *tc)
+{
+	/* compatibility with older CRIU versions */
+	if (!tc->rseq_entry)
+		return 0;
+
+	rseq->rseq_abi_pointer = tc->rseq_entry->rseq_abi_pointer;
+	rseq->rseq_abi_size = tc->rseq_entry->rseq_abi_size;
+	rseq->signature = tc->rseq_entry->signature;
+
+	if (rseq->rseq_abi_pointer && !kdat.has_rseq) {
+		pr_err("rseq: can't restore as kernel doesn't support it\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+#if defined(__GLIBC__) && defined(RSEQ_SIG)
+static void prep_libc_rseq_info(struct rst_rseq_param *rseq)
+{
+	if (!kdat.has_rseq) {
+		rseq->rseq_abi_pointer = 0;
+		return;
+	}
+
+	rseq->rseq_abi_pointer = encode_pointer(__criu_thread_pointer() + __rseq_offset);
+	rseq->rseq_abi_size = __rseq_size;
+	rseq->signature = RSEQ_SIG;
+}
+#else
+static void prep_libc_rseq_info(struct rst_rseq_param *rseq)
+{
+	/*
+	 * TODO: handle built-in rseq on other libc'ies like musl
+	 * We can do that using get_rseq_conf kernel feature.
+	 *
+	 * For now we just assume that other libc libraries are
+	 * not registering rseq by default.
+	 */
+	rseq->rseq_abi_pointer = 0;
+}
+#endif
+
 static rlim_t decode_rlim(rlim_t ival)
 {
 	return ival == -1 ? RLIM_INFINITY : ival;
@@ -3058,11 +3191,11 @@ static int prepare_rlimits(int pid, struct task_restore_args *ta, CoreEntry *cor
 	return 0;
 }
 
-static int signal_to_mem(SiginfoEntry *sie)
+static int signal_to_mem(SiginfoEntry *se)
 {
 	siginfo_t *info, *t;
 
-	info = (siginfo_t *)sie->siginfo.data;
+	info = (siginfo_t *)se->siginfo.data;
 	t = rst_mem_alloc(sizeof(siginfo_t), RM_PRIVATE);
 	if (!t)
 		return -1;
@@ -3083,24 +3216,24 @@ static int open_signal_image(int type, pid_t pid, unsigned int *nr)
 
 	*nr = 0;
 	while (1) {
-		SiginfoEntry *sie;
+		SiginfoEntry *se;
 
-		ret = pb_read_one_eof(img, &sie, PB_SIGINFO);
+		ret = pb_read_one_eof(img, &se, PB_SIGINFO);
 		if (ret <= 0)
 			break;
-		if (sie->siginfo.len != sizeof(siginfo_t)) {
+		if (se->siginfo.len != sizeof(siginfo_t)) {
 			pr_err("Unknown image format\n");
 			ret = -1;
 			break;
 		}
 
-		ret = signal_to_mem(sie);
+		ret = signal_to_mem(se);
 		if (ret)
 			break;
 
 		(*nr)++;
 
-		siginfo_entry__free_unpacked(sie, NULL);
+		siginfo_entry__free_unpacked(se, NULL);
 	}
 
 	close_image(img);
@@ -3624,6 +3757,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	strncpy(task_args->comm, core->tc->comm, TASK_COMM_LEN - 1);
 	task_args->comm[TASK_COMM_LEN - 1] = 0;
 
+	prep_libc_rseq_info(&task_args->libc_rseq);
+
 	/*
 	 * Fill up per-thread data.
 	 */
@@ -3680,6 +3815,10 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		thread_args[i].gpregs = *CORE_THREAD_ARCH_INFO(tcore)->gpregs;
 		thread_args[i].clear_tid_addr = CORE_THREAD_ARCH_INFO(tcore)->clear_tid_addr;
 		core_get_tls(tcore, &thread_args[i].tls);
+
+		ret = prep_rseq(&thread_args[i].rseq, tcore->thread_core);
+		if (ret)
+			goto err;
 
 		rst_reloc_creds(&thread_args[i], &creds_pos_next);
 

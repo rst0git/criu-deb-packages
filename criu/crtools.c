@@ -56,15 +56,56 @@ void flush_early_log_to_stderr(void)
 
 static int image_dir_mode(char *argv[], int optind)
 {
-	if (!strcmp(argv[optind], "dump") || !strcmp(argv[optind], "pre-dump") ||
-	    (!strcmp(argv[optind], "cpuinfo") && !strcmp(argv[optind + 1], "dump")))
+	switch (opts.mode) {
+	case CR_DUMP:
+		/* fallthrough */
+	case CR_PRE_DUMP:
 		return O_DUMP;
-
-	if (!strcmp(argv[optind], "restore") ||
-	    (!strcmp(argv[optind], "cpuinfo") && !strcmp(argv[optind + 1], "restore")))
+	case CR_RESTORE:
 		return O_RSTR;
+	case CR_CPUINFO:
+		if (!strcmp(argv[optind + 1], "dump"))
+			return O_DUMP;
+		/* fallthrough */
+	default:
+		return -1;
+	}
 
+	/* never reached */
+	BUG();
 	return -1;
+}
+
+static int parse_criu_mode(char *mode)
+{
+	if (!strcmp(mode, "dump"))
+		opts.mode = CR_DUMP;
+	else if (!strcmp(mode, "pre-dump"))
+		opts.mode = CR_PRE_DUMP;
+	else if (!strcmp(mode, "restore"))
+		opts.mode = CR_RESTORE;
+	else if (!strcmp(mode, "lazy-pages"))
+		opts.mode = CR_LAZY_PAGES;
+	else if (!strcmp(mode, "check"))
+		opts.mode = CR_CHECK;
+	else if (!strcmp(mode, "page-server"))
+		opts.mode = CR_PAGE_SERVER;
+	else if (!strcmp(mode, "service"))
+		opts.mode = CR_SERVICE;
+	else if (!strcmp(mode, "swrk"))
+		opts.mode = CR_SWRK;
+	else if (!strcmp(mode, "dedup"))
+		opts.mode = CR_DEDUP;
+	else if (!strcmp(mode, "cpuinfo"))
+		opts.mode = CR_CPUINFO;
+	else if (!strcmp(mode, "exec"))
+		opts.mode = CR_EXEC_DEPRECATED;
+	else if (!strcmp(mode, "show"))
+		opts.mode = CR_SHOW_DEPRECATED;
+	else
+		return -1;
+
+	return 0;
 }
 
 int main(int argc, char *argv[], char *envp[])
@@ -106,7 +147,30 @@ int main(int argc, char *argv[], char *envp[])
 
 	log_set_loglevel(opts.log_level);
 
-	if (optind < argc && !strcmp(argv[optind], "swrk")) {
+	/*
+	 * There kernel might send us lethal signals in the following cases:
+	 * 1) Writing a pipe which reader has disappeared.
+	 * 2) Writing to a socket of type SOCK_STREAM which is no longer connected.
+	 * We deal with write()/Send() failures on our own, and prefer not to get killed.
+	 * So we ignore SIGPIPEs.
+	 *
+	 * Pipes are used in various places:
+	 * 1) Receiving application page data
+	 * 2) Transmitting data to the image streamer
+	 * 3) Emitting logs (potentially to a pipe).
+	 * Sockets are mainly used in transmitting memory data.
+	 */
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		pr_perror("Failed to set a SIGPIPE signal ignore.");
+		return 1;
+	}
+
+	if (parse_criu_mode(argv[optind])) {
+		pr_err("unknown command: %s\n", argv[optind]);
+		goto usage;
+	}
+
+	if (opts.mode == CR_SWRK) {
 		if (argc != optind + 2) {
 			fprintf(stderr, "Usage: criu swrk <fd>\n");
 			return 1;
@@ -120,9 +184,6 @@ int main(int argc, char *argv[], char *envp[])
 		opts.swrk_restore = true;
 		return cr_service_work(atoi(argv[optind + 1]));
 	}
-
-	if (check_options())
-		return 1;
 
 	if (opts.imgs_dir == NULL)
 		SET_CHAR_OPTS(imgs_dir, ".");
@@ -138,7 +199,7 @@ int main(int argc, char *argv[], char *envp[])
 			goto usage;
 		}
 
-		if (strcmp(argv[optind], "restore")) {
+		if (opts.mode != CR_RESTORE) {
 			pr_err("--exec-cmd is available for the restore command only\n");
 			goto usage;
 		}
@@ -155,8 +216,11 @@ int main(int argc, char *argv[], char *envp[])
 		opts.exec_cmd[argc - optind - 1] = NULL;
 	} else {
 		/* No subcommands except for cpuinfo and restore --exec-cmd */
-		if (strcmp(argv[optind], "cpuinfo") && has_sub_command) {
+		if (opts.mode != CR_CPUINFO && has_sub_command) {
 			pr_err("excessive parameter%s for command %s\n", (argc - optind) > 2 ? "s" : "", argv[optind]);
+			goto usage;
+		} else if (opts.mode == CR_CPUINFO && !has_sub_command) {
+			pr_err("cpuinfo requires an action: dump or check\n");
 			goto usage;
 		}
 	}
@@ -167,7 +231,7 @@ int main(int argc, char *argv[], char *envp[])
 	}
 
 	/* We must not open imgs dir, if service is called */
-	if (strcmp(argv[optind], "service")) {
+	if (opts.mode != CR_SERVICE) {
 		ret = open_image_dir(opts.imgs_dir, image_dir_mode(argv, optind));
 		if (ret < 0) {
 			pr_err("Couldn't open image dir %s\n", opts.imgs_dir);
@@ -176,32 +240,18 @@ int main(int argc, char *argv[], char *envp[])
 	}
 
 	/*
-	 * The kernel might send us lethal signals when writing to a pipe
-	 * which reader has disappeared. We deal with write() failures on our
-	 * own, and prefer not to get killed. So we ignore SIGPIPEs.
-	 *
-	 * Pipes are used in various places:
-	 * 1) Receiving application page data
-	 * 2) Transmitting data to the image streamer
-	 * 3) Emitting logs (potentially to a pipe).
-	 */
-	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-		pr_perror("Failed to set a SIGPIPE signal ignore.");
-		return 1;
-	}
-
-	/*
 	 * When a process group becomes an orphan,
 	 * its processes are sent a SIGHUP signal
 	 */
-	if (!strcmp(argv[optind], "restore") && opts.restore_detach && opts.final_state == TASK_STOPPED &&
-	    opts.shell_job)
+	if (opts.mode == CR_RESTORE && opts.restore_detach && opts.final_state == TASK_STOPPED && opts.shell_job)
 		pr_warn("Stopped and detached shell job will get SIGHUP from OS.\n");
 
 	if (chdir(opts.work_dir)) {
 		pr_perror("Can't change directory to %s", opts.work_dir);
 		return 1;
 	}
+
+	util_init();
 
 	if (log_init(opts.output))
 		return 1;
@@ -211,11 +261,14 @@ int main(int argc, char *argv[], char *envp[])
 		return 1;
 	}
 
+	if (check_options())
+		return 1;
+
 	if (fault_injected(FI_CANNOT_MAP_VDSO))
 		kdat.can_map_vdso = 0;
 
 	if (!list_empty(&opts.inherit_fds)) {
-		if (strcmp(argv[optind], "restore")) {
+		if (opts.mode != CR_RESTORE) {
 			pr_err("--inherit-fd is restore-only option\n");
 			return 1;
 		}
@@ -226,13 +279,14 @@ int main(int argc, char *argv[], char *envp[])
 	if (opts.img_parent)
 		pr_info("Will do snapshot from %s\n", opts.img_parent);
 
-	if (!strcmp(argv[optind], "dump")) {
+	if (opts.mode == CR_DUMP) {
 		if (!opts.tree_id)
 			goto opt_pid_missing;
+
 		return cr_dump_tasks(opts.tree_id);
 	}
 
-	if (!strcmp(argv[optind], "pre-dump")) {
+	if (opts.mode == CR_PRE_DUMP) {
 		if (!opts.tree_id)
 			goto opt_pid_missing;
 
@@ -244,7 +298,7 @@ int main(int argc, char *argv[], char *envp[])
 		return cr_pre_dump_tasks(opts.tree_id) != 0;
 	}
 
-	if (!strcmp(argv[optind], "restore")) {
+	if (opts.mode == CR_RESTORE) {
 		if (opts.tree_id)
 			pr_warn("Using -t with criu restore is obsoleted\n");
 
@@ -259,22 +313,22 @@ int main(int argc, char *argv[], char *envp[])
 		return ret != 0;
 	}
 
-	if (!strcmp(argv[optind], "lazy-pages"))
+	if (opts.mode == CR_LAZY_PAGES)
 		return cr_lazy_pages(opts.daemon_mode) != 0;
 
-	if (!strcmp(argv[optind], "check"))
+	if (opts.mode == CR_CHECK)
 		return cr_check() != 0;
 
-	if (!strcmp(argv[optind], "page-server"))
+	if (opts.mode == CR_PAGE_SERVER)
 		return cr_page_server(opts.daemon_mode, false, -1) != 0;
 
-	if (!strcmp(argv[optind], "service"))
+	if (opts.mode == CR_SERVICE)
 		return cr_service(opts.daemon_mode);
 
-	if (!strcmp(argv[optind], "dedup"))
+	if (opts.mode == CR_DEDUP)
 		return cr_dedup() != 0;
 
-	if (!strcmp(argv[optind], "cpuinfo")) {
+	if (opts.mode == CR_CPUINFO) {
 		if (!argv[optind + 1]) {
 			pr_err("cpuinfo requires an action: dump or check\n");
 			goto usage;
@@ -285,12 +339,12 @@ int main(int argc, char *argv[], char *envp[])
 			return cpuinfo_check();
 	}
 
-	if (!strcmp(argv[optind], "exec")) {
+	if (opts.mode == CR_EXEC_DEPRECATED) {
 		pr_err("The \"exec\" action is deprecated by the Compel library.\n");
 		return -1;
 	}
 
-	if (!strcmp(argv[optind], "show")) {
+	if (opts.mode == CR_SHOW_DEPRECATED) {
 		pr_err("The \"show\" action is deprecated by the CRIT utility.\n");
 		pr_err("To view an image use the \"crit decode -i $name --pretty\" command.\n");
 		return -1;
@@ -354,6 +408,9 @@ usage:
 	       "                        in lazy-pages mode: 'criu lazy-pages -D DIR'\n"
 	       "                        --lazy-pages and lazy-pages mode require userfaultfd\n"
 	       "  --stream              dump/restore images using criu-image-streamer\n"
+	       "  --mntns-compat-mode   Use mount engine in compatibility mode. By default criu\n"
+	       "                        tries to use mount-v2 mode with more reliable algorithm\n"
+	       "                        based on MOVE_MOUNT_SET_GROUP kernel feature\n"
 	       "  --network-lock METHOD\n"
 	       "                      network locking/unlocking method; argument\n"
 	       "                      can be 'nftables' or 'iptables' (default).\n"
@@ -388,6 +445,8 @@ usage:
 	       "  -j|--" OPT_SHELL_JOB "        allow one to dump and restore shell jobs\n"
 	       "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
 	       "  -L|--libdir           path to a plugin directory (by default " CR_PLUGIN_DEFAULT ")\n"
+	       "  --timeout NUM         a timeout (in seconds) on collecting tasks during dump\n"
+	       "                        (default 10 seconds)\n"
 	       "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
 	       "  --irmap-scan-path FILE\n"
 	       "                        add a path the irmap hints to scan\n"

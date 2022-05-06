@@ -19,7 +19,7 @@ if [ "$UNAME_M" != "x86_64" ]; then
 
 	# But with the introduction of baremetal aarch64 systems in
 	# Travis (arch: arm64-graviton2) we can override this using
-	# an evironment variable
+	# an environment variable
 	[ -n "$RUN_TESTS" ] || SKIP_CI_TEST=1
 fi
 
@@ -62,11 +62,16 @@ ci_prep () {
 }
 
 test_stream() {
-	# We must test CRIU features that dump content into an image file to ensure
-	# streaming compatibility.
-	STREAM_TEST_PATTERN='.*(ghost|fifo|unlink|memfd|shmem|socket_queue).*'
+	# Testing CRIU streaming to criu-image-streamer
+
+	# FIXME: Currently, hugetlb mappings is not premapped, so in the restore content
+	# phase, we skip page read these pages, enqueue the iovec for later reading in
+	# restorer and eventually close the page read. However, image-streamer expects the
+	# whole image to be read and the image is not reopened, sent twice. These MAP_HUGETLB
+	# test cases will result in EPIPE error at the moment.
+	STREAM_TEST_EXCLUDE="-x maps09 -x maps10"
 	# shellcheck disable=SC2086
-	./test/zdtm.py run --stream -p 2 --keep-going -T "$STREAM_TEST_PATTERN" $ZDTM_OPTS
+	./test/zdtm.py run --stream -p 2 --keep-going -a $STREAM_TEST_EXCLUDE $ZDTM_OPTS
 }
 
 print_header() {
@@ -83,9 +88,11 @@ print_env() {
 	print_header "uname -a"
 	uname -a || :
 	print_header "Mounted file systems"
-	mount || :
+	cat /proc/self/mountinfo || :
 	print_header "Kernel command line"
 	cat /proc/cmdline || :
+	print_header "Kernel modules"
+	lsmod || :
 	print_header "Distribution information"
 	[ -e /etc/lsb-release ] && cat /etc/lsb-release
 	[ -e /etc/redhat-release ] && cat /etc/redhat-release
@@ -103,6 +110,9 @@ print_env() {
 	lscpu || :
 	set -x
 }
+
+# FIXME: workaround for the issue https://github.com/checkpoint-restore/criu/issues/1866
+modprobe -v sit || :
 
 print_env
 
@@ -133,6 +143,13 @@ time make unittest
 [ -n "$SKIP_CI_TEST" ] && exit 0
 
 ulimit -c unlimited
+
+cgid=$$
+cleanup_cgroup() {
+	./test/zdtm_umount_cgroups $cgid
+}
+trap cleanup_cgroup EXIT
+./test/zdtm_mount_cgroups $cgid
 
 echo "|$(pwd)/test/abrt.sh %P %p %s %e" > /proc/sys/kernel/core_pattern
 
@@ -196,6 +213,19 @@ fi
 
 # shellcheck disable=SC2086
 ./test/zdtm.py run -a -p 2 --keep-going $ZDTM_OPTS
+if criu/criu check --feature move_mount_set_group; then
+	# shellcheck disable=SC2086
+	./test/zdtm.py run -a -p 2 --mntns-compat-mode --keep-going $ZDTM_OPTS
+fi
+
+# shellcheck disable=SC2086
+./test/zdtm.py run -a -p 2 --keep-going --criu-config $ZDTM_OPTS
+
+# Newer kernels are blocking access to userfaultfd:
+# uffd: Set unprivileged_userfaultfd sysctl knob to 1 if kernel faults must be handled without obtaining CAP_SYS_PTRACE capability
+if [ -e /proc/sys/vm/unprivileged_userfaultfd ]; then
+	echo 1 > /proc/sys/vm/unprivileged_userfaultfd
+fi
 
 LAZY_EXCLUDE="-x maps04 -x cmdlinenv00 -x maps007"
 
@@ -206,10 +236,8 @@ LAZY_OPTS="-p 2 -T $LAZY_TESTS $LAZY_EXCLUDE $ZDTM_OPTS"
 ./test/zdtm.py run $LAZY_OPTS --lazy-pages
 # shellcheck disable=SC2086
 ./test/zdtm.py run $LAZY_OPTS --remote-lazy-pages
-# FIXME: post-copy migration of THP over TLS (sometimes) fails with:
-#     Error (criu/tls.c:321): tls: Pull callback recv failed: Connection reset by peer
 # shellcheck disable=SC2086
-./test/zdtm.py run $LAZY_OPTS --remote-lazy-pages --tls -x lazy-thp
+./test/zdtm.py run $LAZY_OPTS --remote-lazy-pages --tls
 
 bash -x ./test/jenkins/criu-fault.sh
 if [ "$UNAME_M" == "x86_64" ]; then
@@ -221,6 +249,9 @@ bash -x ./test/jenkins/criu-inhfd.sh
 
 if [ -z "$SKIP_EXT_DEV_TEST" ]; then
 	make -C test/others/mnt-ext-dev/ run
+	if criu/criu check --feature move_mount_set_group; then
+		EXTRA_OPTS=--mntns-compat-mode make -C test/others/mnt-ext-dev/ run
+	fi
 fi
 
 make -C test/others/make/ run CC="$CC"
@@ -258,6 +289,9 @@ ip net add test
 
 # more crit testing
 make -C test/others/crit run
+
+# coredump testing
+make -C test/others/criu-coredump run
 
 # libcriu testing
 make -C test/others/libcriu run

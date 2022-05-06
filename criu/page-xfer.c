@@ -50,8 +50,8 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_ADD_F  6
 #define PS_IOV_GET    7
 
-#define PS_IOV_FLUSH	     0x1023
-#define PS_IOV_FLUSH_N_CLOSE 0x1024
+#define PS_IOV_CLOSE	   0x1023
+#define PS_IOV_FORCE_CLOSE 0x1024
 
 #define PS_CMD_BITS 16
 #define PS_CMD_MASK ((1 << PS_CMD_BITS) - 1)
@@ -606,7 +606,7 @@ static inline u32 ppb_xfer_flags(struct page_xfer *xfer, struct page_pipe_buf *p
  *
  *	Since, iov-C is not processed completely, we need to find
  *	"partial_read_byte" count to place out dummy-iov for
- *	remainig processing of iov-C. This function is performed by
+ *	remaining processing of iov-C. This function is performed by
  *	analyze_iov function.
  *
  *	dummy-iov will be(2): {C+3,1}. dummy-iov will be placed
@@ -1223,8 +1223,8 @@ static int page_server_serve(int sk)
 			ret = page_server_add(sk, &pi, flags);
 			break;
 		}
-		case PS_IOV_FLUSH:
-		case PS_IOV_FLUSH_N_CLOSE: {
+		case PS_IOV_CLOSE:
+		case PS_IOV_FORCE_CLOSE: {
 			int32_t status = 0;
 
 			ret = 0;
@@ -1250,7 +1250,9 @@ static int page_server_serve(int sk)
 			break;
 		}
 
-		if (ret || (pi.cmd == PS_IOV_FLUSH_N_CLOSE))
+		if (ret)
+			break;
+		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE)
 			break;
 	}
 
@@ -1258,6 +1260,8 @@ static int page_server_serve(int sk)
 		pr_err("The data were not flushed\n");
 		ret = -1;
 	}
+
+	tls_terminate_session(ret != 0);
 
 	if (ret == 0 && opts.ps_socket == -1) {
 		char c;
@@ -1272,7 +1276,6 @@ static int page_server_serve(int sk)
 		}
 	}
 
-	tls_terminate_session();
 	page_server_close();
 
 	pr_info("Session over\n");
@@ -1490,9 +1493,9 @@ int disconnect_from_page_server(void)
 		 * the parent process) so we must order the
 		 * page-server to terminate itself.
 		 */
-		pi.cmd = PS_IOV_FLUSH_N_CLOSE;
+		pi.cmd = PS_IOV_FORCE_CLOSE;
 	else
-		pi.cmd = PS_IOV_FLUSH;
+		pi.cmd = PS_IOV_CLOSE;
 
 	if (send_psi(page_server_sk, &pi))
 		goto out;
@@ -1504,7 +1507,7 @@ int disconnect_from_page_server(void)
 
 	ret = 0;
 out:
-	tls_terminate_session();
+	tls_terminate_session(ret != 0);
 	close_safe(&page_server_sk);
 
 	return ret ?: status;

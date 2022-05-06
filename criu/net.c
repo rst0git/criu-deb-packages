@@ -662,7 +662,7 @@ static int dump_macvlan(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nl
 
 	ret = nla_parse_nested(data, IFLA_MACVLAN_FLAGS, info[IFLA_INFO_DATA], NULL);
 	if (ret < 0) {
-		pr_err("failed ot parse macvlan data\n");
+		pr_err("failed to parse macvlan data\n");
 		return -1;
 	}
 
@@ -772,7 +772,7 @@ static int dump_sit(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nlattr
 	pr_info("Some data for SIT provided\n");
 	ret = nla_parse_nested(data, IFLA_IPTUN_MAX, info[IFLA_INFO_DATA], NULL);
 	if (ret < 0) {
-		pr_err("failed ot parse sit data\n");
+		pr_err("failed to parse sit data\n");
 		return -1;
 	}
 
@@ -1172,7 +1172,7 @@ struct newlink_req {
  * request.
  */
 struct newlink_extras {
-	int link; /* IFLA_LINK */
+	int link;	  /* IFLA_LINK */
 	int target_netns; /* IFLA_NET_NS_FD */
 };
 
@@ -1744,7 +1744,7 @@ static int __restore_link(struct ns_id *ns, struct net_link *link, int nlsk)
 
 	switch (nde->type) {
 	case ND_TYPE__LOOPBACK: /* fallthrough */
-	case ND_TYPE__EXTLINK: /* see comment in images/netdev.proto */
+	case ND_TYPE__EXTLINK:	/* see comment in images/netdev.proto */
 		return restore_link_parms(link, nlsk);
 	case ND_TYPE__VENET:
 		return restore_one_link(ns, link, nlsk, venet_link_info, NULL);
@@ -2250,12 +2250,12 @@ static int restore_ip_dump(int type, int pid, char *cmd)
 	sockfd = img_raw_fd(img);
 	if (sockfd < 0) {
 		pr_err("Getting raw FD failed\n");
-		return -1;
+		goto out_image;
 	}
 	tmp_file = tmpfile();
 	if (!tmp_file) {
 		pr_perror("Failed to open tmpfile");
-		return -1;
+		goto out_image;
 	}
 
 	while ((n = read(sockfd, buf, 1024)) > 0) {
@@ -2264,24 +2264,33 @@ static int restore_ip_dump(int type, int pid, char *cmd)
 			pr_perror("Failed to write to tmpfile "
 				  "[written: %d; total: %d]",
 				  written, n);
-			goto close;
+			goto out_tmp_file;
 		}
 	}
 
 	if (fseek(tmp_file, 0, SEEK_SET)) {
 		pr_perror("Failed to set file position to beginning of tmpfile");
-		goto close;
+		goto out_tmp_file;
 	}
 
-	if (img) {
-		ret = run_ip_tool(cmd, "restore", NULL, NULL, fileno(tmp_file), -1, 0);
-		close_image(img);
+	if (type == CR_FD_RULE) {
+		/*
+		 * Delete 3 default rules to prevent duplicates. See kernel's
+		 * function fib_default_rules_init() for the details.
+		 */
+		run_ip_tool("rule", "flush", NULL, NULL, -1, -1, 0);
+		run_ip_tool("rule", "delete", "table", "local", -1, -1, 0);
 	}
 
-close:
+	ret = run_ip_tool(cmd, "restore", NULL, NULL, fileno(tmp_file), -1, 0);
+
+out_tmp_file:
 	if (fclose(tmp_file)) {
 		pr_perror("Failed to close tmpfile");
 	}
+
+out_image:
+	close_image(img);
 
 	return ret;
 }
@@ -2304,31 +2313,7 @@ static inline int restore_route(int pid)
 
 static inline int restore_rule(int pid)
 {
-	struct cr_img *img;
-	int ret = 0;
-
-	img = open_image(CR_FD_RULE, O_RSTR, pid);
-	if (!img) {
-		ret = -1;
-		goto out;
-	}
-
-	if (empty_image(img))
-		goto close;
-
-	/*
-	 * Delete 3 default rules to prevent duplicates. See kernel's
-	 * function fib_default_rules_init() for the details.
-	 */
-	run_ip_tool("rule", "flush", NULL, NULL, -1, -1, 0);
-	run_ip_tool("rule", "delete", "table", "local", -1, -1, 0);
-
-	if (restore_ip_dump(CR_FD_RULE, pid, "rule"))
-		ret = -1;
-close:
-	close_image(img);
-out:
-	return ret;
+	return restore_ip_dump(CR_FD_RULE, pid, "rule");
 }
 
 /*
@@ -2355,7 +2340,7 @@ static int prepare_xtable_lock(void)
 	}
 
 	if (mount(NULL, "/", NULL, MS_SLAVE | MS_REC, NULL)) {
-		pr_perror("Unable to conver mounts to slave mounts");
+		pr_perror("Unable to convert mounts to slave mounts");
 		return -1;
 	}
 	/*
@@ -3207,7 +3192,7 @@ void network_unlock(void)
 
 int veth_pair_add(char *in, char *out)
 {
-	char *e_str;
+	cleanup_free char *e_str = NULL;
 
 	e_str = xmalloc(200); /* For 3 IFNAMSIZ + 8 service characters */
 	if (!e_str)

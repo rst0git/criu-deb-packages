@@ -1,4 +1,4 @@
-#define _XOPEN_SOURCE
+#define _XOPEN_SOURCE 500
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -26,6 +26,9 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sched.h>
+#include <ftw.h>
+#include <time.h>
+#include <libgen.h>
 
 #include "linux/mount.h"
 
@@ -44,9 +47,12 @@
 #include "files.h"
 #include "pstree.h"
 #include "sched.h"
+#include "mount-v2.h"
 
 #include "cr-errno.h"
 #include "action-scripts.h"
+
+#include "compel/infect-util.h"
 
 #define VMA_OPT_LEN 128
 
@@ -654,6 +660,65 @@ out:
 	return ret;
 }
 
+pid_t fork_and_ptrace_attach(int (*child_setup)(void))
+{
+	pid_t pid;
+	int sk_pair[2], sk;
+	char c = 0;
+
+	if (socketpair(PF_LOCAL, SOCK_SEQPACKET, 0, sk_pair)) {
+		pr_perror("socketpair");
+		return -1;
+	}
+
+	pid = fork();
+	if (pid < 0) {
+		pr_perror("fork");
+		return -1;
+	}
+
+	if (pid == 0) {
+		sk = sk_pair[1];
+		close(sk_pair[0]);
+
+		if (child_setup && child_setup() != 0)
+			exit(1);
+
+		if (write(sk, &c, 1) != 1) {
+			pr_perror("write");
+			exit(1);
+		}
+
+		while (1)
+			sleep(1000);
+		exit(1);
+	}
+
+	sk = sk_pair[0];
+	close(sk_pair[1]);
+
+	if (read(sk, &c, 1) != 1) {
+		close(sk);
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+		pr_perror("read");
+		return -1;
+	}
+
+	close(sk);
+
+	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
+		pr_perror("Unable to ptrace the child");
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+		return -1;
+	}
+
+	waitpid(pid, NULL, 0);
+
+	return pid;
+}
+
 int status_ready(void)
 {
 	char c = 0;
@@ -1106,7 +1171,7 @@ out:
 int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 {
 	int ret;
-	struct sockaddr_in caddr;
+	struct sockaddr_storage caddr;
 	socklen_t clen = sizeof(caddr);
 
 	if (daemon_mode) {
@@ -1134,13 +1199,20 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 		return -1;
 
 	if (sk >= 0) {
+		char port[6];
+		char address[INET6_ADDRSTRLEN];
 		*ask = accept(sk, (struct sockaddr *)&caddr, &clen);
 		if (*ask < 0) {
 			pr_perror("Can't accept connection to server");
 			goto err;
-		} else
-			pr_info("Accepted connection from %s:%u\n", inet_ntoa(caddr.sin_addr),
-				(int)ntohs(caddr.sin_port));
+		}
+		ret = getnameinfo((struct sockaddr *)&caddr, clen, address, sizeof(address), port, sizeof(port),
+				  NI_NUMERICHOST | NI_NUMERICSERV);
+		if (ret) {
+			pr_err("Failed converting address: %s\n", gai_strerror(ret));
+			goto err;
+		}
+		pr_info("Accepted connection from %s:%s\n", address, port);
 		close(sk);
 	}
 
@@ -1613,44 +1685,25 @@ ssize_t write_all(int fd, const void *buf, size_t size)
 	return n;
 }
 
-int rm_rf(char *target)
+static int remove_one(const char *fpath, const struct stat *sb, int tflag, struct FTW *ftwbuf)
 {
-	int offset = strlen(target);
-	DIR *dir = NULL;
-	struct dirent *de;
-	int ret = -1;
+	int ret;
 
-	dir = opendir(target);
-	if (!dir) {
-		pr_perror("unable to open %s", target);
+	ret = remove(fpath);
+	if (ret) {
+		pr_perror("rmrf: unable to remove %s", fpath);
 		return -1;
 	}
 
-	while ((de = readdir(dir))) {
-		int n;
+	return 0;
+}
 
-		if (dir_dots(de))
-			continue;
+#define NFTW_FD_MAX 64
 
-		n = snprintf(target + offset, PATH_MAX - offset, "/%s", de->d_name);
-		if (n < 0 || n >= PATH_MAX) {
-			pr_err("snprintf failed\n");
-			goto out;
-		}
-
-		if (de->d_type == DT_DIR && rm_rf(target))
-			goto out;
-
-		if (remove(target) < 0) {
-			pr_perror("unable to remove %s", target);
-			goto out;
-		}
-	}
-
-	ret = 0;
-out:
-	target[offset] = 0;
-	return ret;
+int rmrf(char *path)
+{
+	pr_debug("rmrf: removing %s\n", path);
+	return nftw(path, remove_one, NFTW_FD_MAX, FTW_DEPTH | FTW_PHYS);
 }
 
 __attribute__((returns_twice)) static pid_t raw_legacy_clone(unsigned long flags, int *pidfd)
@@ -1687,8 +1740,8 @@ __attribute__((returns_twice)) static pid_t raw_legacy_clone(unsigned long flags
 		     */
 			"addx %%g0, 0, %%g1"
 			: "=r"(g1), "=r"(o0), "=r"(o1), "=r"(o2) /* outputs */
-			: "r"(g1), "r"(o0), "r"(o1), "r"(o2) /* inputs */
-			: "%cc"); /* clobbers */
+			: "r"(g1), "r"(o0), "r"(o1), "r"(o2)	 /* inputs */
+			: "%cc");				 /* clobbers */
 
 		is_error = g1;
 		retval = o0;
@@ -1814,4 +1867,185 @@ int run_command(char *buf, size_t buf_size, int (*child_fn)(void *), void *args)
 	close(pipefd[0]);
 
 	return fret;
+}
+
+uint64_t criu_run_id;
+
+void util_init()
+{
+	struct timespec tp;
+
+	clock_gettime(CLOCK_MONOTONIC, &tp);
+	criu_run_id = ((uint64_t)getpid() << 32) + tp.tv_sec + tp.tv_nsec;
+	compel_run_id = criu_run_id;
+}
+
+/*
+ * This function cuts sub_path from the path.
+ * 1) It assumes all relative paths given are relative to "/":
+ * 	/a/b/c is the same as a/b/c
+ * 2) It can handle paths with multiple consequent slashes:
+ * 	///a///b///c is the same as /a/b/c
+ * 3) It always returns relative path, with no leading slash:
+ * 	get_relative_path("/a/b/c", "/") would be "a/b/c"
+ * 	get_relative_path("/a/b/c", "/a/b") would be "c"
+ * 	get_relative_path("/", "/") would be ""
+ * 4) It can handle paths with single dots:
+ * 	get_relative_path("./a/b", "a/") would be "b"
+ * 5) Note ".." in paths are not supported and handled as normal directory name
+ */
+char *get_relative_path(char *path, char *sub_path)
+{
+	bool skip_slashes = true;
+
+	while (1) {
+		if ((*path == '/' || *path == '\0') && (*sub_path == '/' || *sub_path == '\0'))
+			skip_slashes = true;
+
+		if (skip_slashes) {
+			while (*path == '/' || (path[0] == '.' && (path[1] == '/' || path[1] == '\0')))
+				path++;
+			while (*sub_path == '/' || (sub_path[0] == '.' && (sub_path[1] == '/' || sub_path[1] == '\0')))
+				sub_path++;
+		}
+
+		if (*sub_path == '\0') {
+			if (skip_slashes)
+				return path;
+			return NULL;
+		}
+		skip_slashes = false;
+
+		if (*path == '\0')
+			return NULL;
+
+		if (*path != *sub_path)
+			return NULL;
+
+		path++;
+		sub_path++;
+	}
+
+	/* will never get here */
+	return NULL;
+}
+
+bool is_sub_path(char *path, char *sub_path)
+{
+	char *rel_path;
+
+	rel_path = get_relative_path(path, sub_path);
+	if (!rel_path)
+		return false;
+
+	return true;
+}
+
+bool is_same_path(char *path1, char *path2)
+{
+	char *rel_path;
+
+	rel_path = get_relative_path(path1, path2);
+	if (!rel_path || *rel_path != '\0')
+		return false;
+
+	return true;
+}
+
+/*
+ * Checks if path is a mountpoint
+ * (path should be visible - no overmounts)
+ */
+static int path_is_mountpoint(char *path, bool *is_mountpoint)
+{
+	char *dname, *bname, *free_name;
+	struct open_how how = {
+		.flags = O_PATH,
+		.resolve = RESOLVE_NO_XDEV,
+	};
+	int exit_code = -1;
+	int dfd, fd;
+
+	dname = free_name = xstrdup(path);
+	if (!dname)
+		return -1;
+	dname = dirname(dname);
+
+	bname = get_relative_path(path, dname);
+	if (!bname || *bname == '\0') {
+		pr_err("Failed to get bname for %s\n", path);
+		goto err_free;
+	}
+
+	dfd = open(dname, O_PATH);
+	if (dfd < 0) {
+		pr_perror("Failed to open dir %s", dname);
+		goto err_free;
+	}
+
+	fd = sys_openat2(dfd, bname, &how, sizeof(how));
+	if (fd < 0) {
+		if (errno != EXDEV) {
+			pr_perror("Failed to open %s at %s", bname, dname);
+			goto err_close;
+		}
+
+		/*
+		 * EXDEV means that dfd and bname are from different
+		 * mounts, meaning that bname is a mountpoint
+		 */
+		*is_mountpoint = true;
+	} else {
+		/*
+		 * No error means that dfd and bname are from same mount,
+		 * meaning that bname is not a mountpoint
+		 */
+		*is_mountpoint = false;
+		close(fd);
+	}
+
+	exit_code = 0;
+err_close:
+	close(dfd);
+err_free:
+	xfree(free_name);
+	return exit_code;
+}
+
+/*
+ * Resolves real mountpoint path by any path on it
+ * (path should be visible - no overmountes)
+ */
+char *resolve_mountpoint(char *path)
+{
+	char *mp_path, *free_path;
+	bool is_mountpoint;
+
+	mp_path = free_path = xstrdup(path);
+	if (!mp_path)
+		return NULL;
+
+	while (1) {
+		/*
+		 * If we see "/" or "." we can't check if they are mountpoints
+		 * by openat2 RESOLVE_NO_XDEV, let's just assume they are.
+		 */
+		if (is_same_path(mp_path, "/"))
+			return mp_path;
+
+		if (path_is_mountpoint(mp_path, &is_mountpoint) == -1) {
+			xfree(free_path);
+			return NULL;
+		}
+
+		if (is_mountpoint)
+			return mp_path;
+
+		/* Try parent directory */
+		mp_path = dirname(mp_path);
+	}
+
+	/* never get here */
+	xfree(free_path);
+	return NULL;
 }
