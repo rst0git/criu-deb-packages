@@ -1,3 +1,9 @@
+criu (3.17-2ppa2.18.04) bionic; urgency=medium
+
+  * Disable building package on armhf
+
+ -- Radostin Stoyanov <radostin@redhat.com>  Tue, 10 May 2022 10:31:13 +0100
+
 criu (3.17-1ppa2.18.04) bionic; urgency=medium
 
   * New upstream version 3.17
