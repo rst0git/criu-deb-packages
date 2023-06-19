@@ -22,7 +22,6 @@
 #include <compel/ptrace.h>
 #include "common/compiler.h"
 
-#include "linux/mount.h"
 #include "linux/rseq.h"
 
 #include "clone-noasan.h"
@@ -85,6 +84,8 @@
 #include "files-reg.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include "compel/include/asm/syscall.h"
+
+#include "linux/mount.h"
 
 #include "protobuf.h"
 #include "images/sa.pb-c.h"
@@ -351,6 +352,10 @@ static int root_prepare_shared(void)
 	if (ret)
 		goto err;
 
+	ret = add_fake_unix_queuers();
+	if (ret)
+		goto err;
+
 	/*
 	 * This should be called with all packets collected AND all
 	 * fdescs and fles prepared BUT post-prep-s not run.
@@ -364,10 +369,6 @@ static int root_prepare_shared(void)
 		goto err;
 
 	ret = unix_prepare_root_shared();
-	if (ret)
-		goto err;
-
-	ret = add_fake_unix_queuers();
 	if (ret)
 		goto err;
 
@@ -1348,7 +1349,22 @@ static inline int fork_with_pid(struct pstree_item *item)
 			return -1;
 
 		item->pid->state = ca.core->tc->task_state;
-		rsti(item)->cg_set = ca.core->tc->cg_set;
+
+		/*
+		 * Zombie tasks' cgroup is not dumped/restored.
+		 * cg_set == 0 is skipped in prepare_task_cgroup()
+		 */
+		if (item->pid->state == TASK_DEAD) {
+			rsti(item)->cg_set = 0;
+		} else {
+			if (ca.core->thread_core->has_cg_set)
+				rsti(item)->cg_set = ca.core->thread_core->cg_set;
+			else
+				rsti(item)->cg_set = ca.core->tc->cg_set;
+		}
+
+		if (ca.core->tc->has_stop_signo)
+			item->pid->stop_signo = ca.core->tc->stop_signo;
 
 		if (item->pid->state != TASK_DEAD && !task_alive(item)) {
 			pr_err("Unknown task state %d\n", item->pid->state);
@@ -1778,7 +1794,7 @@ static int restore_task_with_children(void *_arg)
 	}
 
 	if (log_init_by_pid(vpid(current)))
-		return -1;
+		goto err;
 
 	if (current->parent == NULL) {
 		/*
@@ -1804,6 +1820,9 @@ static int restore_task_with_children(void *_arg)
 			if (prepare_timens(0))
 				goto err;
 		}
+
+		if (set_opts_cap_eff())
+			goto err;
 
 		/* Wait prepare_userns */
 		if (restore_finish_ns_stage(CR_STATE_ROOT_TASK, CR_STATE_PREPARE_NAMESPACES) < 0)
@@ -1960,6 +1979,10 @@ static int attach_to_tasks(bool root_seized)
 				return -1;
 			}
 
+			if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD)) {
+				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
+				return -1;
+			}
 			/*
 			 * Suspend seccomp if necessary. We need to do this because
 			 * although seccomp is restored at the very end of the
@@ -2024,7 +2047,7 @@ static int restore_rseq_cs(void)
 	return 0;
 }
 
-static int catch_tasks(bool root_seized, enum trace_flags *flag)
+static int catch_tasks(bool root_seized)
 {
 	struct pstree_item *item;
 
@@ -2054,31 +2077,13 @@ static int catch_tasks(bool root_seized, enum trace_flags *flag)
 				return -1;
 			}
 
-			ret = compel_stop_pie(pid, rsti(item)->breakpoint, flag, fault_injected(FI_NO_BREAKPOINTS));
+			ret = compel_stop_pie(pid, rsti(item)->breakpoint, fault_injected(FI_NO_BREAKPOINTS));
 			if (ret < 0)
 				return -1;
 		}
 	}
 
 	return 0;
-}
-
-static int clear_breakpoints(void)
-{
-	struct pstree_item *item;
-	int ret = 0, i;
-
-	if (fault_injected(FI_NO_BREAKPOINTS))
-		return 0;
-
-	for_each_pstree_item(item) {
-		if (!task_alive(item))
-			continue;
-		for (i = 0; i < item->nr_threads; i++)
-			ret |= ptrace_flush_breakpoints(item->threads[i].real);
-	}
-
-	return ret;
 }
 
 static void finalize_restore(void)
@@ -2104,8 +2109,14 @@ static void finalize_restore(void)
 
 		xfree(ctl);
 
-		if ((item->pid->state == TASK_STOPPED) || (opts.final_state == TASK_STOPPED))
+		if (opts.final_state == TASK_STOPPED)
 			kill(item->pid->real, SIGSTOP);
+		else if (item->pid->state == TASK_STOPPED) {
+			if (item->pid->stop_signo > 0)
+				kill(item->pid->real, item->pid->stop_signo);
+			else
+				kill(item->pid->real, SIGSTOP);
+		}
 	}
 }
 
@@ -2215,7 +2226,6 @@ static void reap_zombies(void)
 
 static int restore_root_task(struct pstree_item *init)
 {
-	enum trace_flags flag = TRACE_ALL;
 	int ret, fd, mnt_ns_fd = -1;
 	int root_seized = 0;
 	struct pstree_item *item;
@@ -2378,6 +2388,10 @@ skip_ns_bouncing:
 	if (ret < 0)
 		goto out_kill;
 
+	ret = stop_cgroupd();
+	if (ret < 0)
+		goto out_kill;
+
 	ret = move_veth_to_bridge();
 	if (ret < 0)
 		goto out_kill;
@@ -2430,7 +2444,7 @@ skip_ns_bouncing:
 
 	timing_stop(TIME_RESTORE);
 
-	if (catch_tasks(root_seized, &flag)) {
+	if (catch_tasks(root_seized)) {
 		pr_err("Can't catch all tasks\n");
 		goto out_kill_network_unlocked;
 	}
@@ -2440,14 +2454,11 @@ skip_ns_bouncing:
 
 	__restore_switch_stage(CR_STATE_COMPLETE);
 
-	ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1), flag);
+	ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
 	if (ret) {
 		pr_err("Can't stop all tasks on rt_sigreturn\n");
 		goto out_kill_network_unlocked;
 	}
-
-	if (clear_breakpoints())
-		pr_err("Unable to flush breakpoints\n");
 
 	finalize_restore();
 	/*
@@ -3078,7 +3089,6 @@ static int prep_rseq(struct rst_rseq_param *rseq, ThreadCoreEntry *tc)
 	return 0;
 }
 
-#if defined(__GLIBC__) && defined(RSEQ_SIG)
 static void prep_libc_rseq_info(struct rst_rseq_param *rseq)
 {
 	if (!kdat.has_rseq) {
@@ -3086,23 +3096,21 @@ static void prep_libc_rseq_info(struct rst_rseq_param *rseq)
 		return;
 	}
 
-	rseq->rseq_abi_pointer = encode_pointer(__criu_thread_pointer() + __rseq_offset);
-	rseq->rseq_abi_size = __rseq_size;
-	rseq->signature = RSEQ_SIG;
-}
+	if (!kdat.has_ptrace_get_rseq_conf) {
+#if defined(__GLIBC__) && defined(RSEQ_SIG)
+		rseq->rseq_abi_pointer = encode_pointer(__criu_thread_pointer() + __rseq_offset);
+		rseq->rseq_abi_size = __rseq_size;
+		rseq->signature = RSEQ_SIG;
 #else
-static void prep_libc_rseq_info(struct rst_rseq_param *rseq)
-{
-	/*
-	 * TODO: handle built-in rseq on other libc'ies like musl
-	 * We can do that using get_rseq_conf kernel feature.
-	 *
-	 * For now we just assume that other libc libraries are
-	 * not registering rseq by default.
-	 */
-	rseq->rseq_abi_pointer = 0;
-}
+		rseq->rseq_abi_pointer = 0;
 #endif
+		return;
+	}
+
+	rseq->rseq_abi_pointer = kdat.libc_rseq_conf.rseq_abi_pointer;
+	rseq->rseq_abi_size = kdat.libc_rseq_conf.rseq_abi_size;
+	rseq->signature = kdat.libc_rseq_conf.signature;
+}
 
 static rlim_t decode_rlim(rlim_t ival)
 {
@@ -3391,7 +3399,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 
 			args = rst_mem_remap_ptr(this_pos, RM_PRIVATE);
 			args->lsm_profile = lsm_profile;
-			strlcpy(args->lsm_profile, rendered, lsm_profile_len + 1);
+			__strlcpy(args->lsm_profile, rendered, lsm_profile_len + 1);
 			xfree(rendered);
 		}
 	} else {
@@ -3425,7 +3433,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 
 			args = rst_mem_remap_ptr(this_pos, RM_PRIVATE);
 			args->lsm_sockcreate = lsm_sockcreate;
-			strlcpy(args->lsm_sockcreate, rendered, lsm_sockcreate_len + 1);
+			__strlcpy(args->lsm_sockcreate, rendered, lsm_sockcreate_len + 1);
 			xfree(rendered);
 		}
 	} else {
@@ -3759,6 +3767,10 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	prep_libc_rseq_info(&task_args->libc_rseq);
 
+	task_args->uid = opts.uid;
+	for (i = 0; i < CR_CAP_SIZE; i++)
+		task_args->cap_eff[i] = opts.cap_eff[i];
+
 	/*
 	 * Fill up per-thread data.
 	 */
@@ -3815,6 +3827,13 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		thread_args[i].gpregs = *CORE_THREAD_ARCH_INFO(tcore)->gpregs;
 		thread_args[i].clear_tid_addr = CORE_THREAD_ARCH_INFO(tcore)->clear_tid_addr;
 		core_get_tls(tcore, &thread_args[i].tls);
+
+		if (tcore->thread_core->has_cg_set && rsti(current)->cg_set != tcore->thread_core->cg_set) {
+			thread_args[i].cg_set = tcore->thread_core->cg_set;
+			thread_args[i].cgroupd_sk = dup(get_service_fd(CGROUPD_SK));
+		} else {
+			thread_args[i].cg_set = -1;
+		}
 
 		ret = prep_rseq(&thread_args[i].rseq, tcore->thread_core);
 		if (ret)
@@ -3910,6 +3929,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	close_service_fd(USERNSD_SK);
 	close_service_fd(FDSTORE_SK_OFF);
 	close_service_fd(RPC_SK_OFF);
+	close_service_fd(CGROUPD_SK);
 
 	__gcov_flush();
 
