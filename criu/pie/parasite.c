@@ -3,7 +3,6 @@
 #include <signal.h>
 #include <linux/limits.h>
 #include <linux/capability.h>
-#include <sys/mount.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
@@ -14,6 +13,7 @@
 #include "int.h"
 #include "types.h"
 #include <compel/plugins/std/syscall.h>
+#include "linux/mount.h"
 #include "parasite.h"
 #include "fcntl.h"
 #include "prctl.h"
@@ -745,7 +745,7 @@ static int parasite_dump_cgroup(struct parasite_dump_cgroup_args *args)
 		return -1;
 	}
 
-	cgroup = sys_openat(proc, "self/cgroup", O_RDONLY, 0);
+	cgroup = sys_openat(proc, args->thread_cgrp, O_RDONLY, 0);
 	sys_close(proc);
 	if (cgroup < 0) {
 		pr_err("can't get /proc/self/cgroup fd\n");
