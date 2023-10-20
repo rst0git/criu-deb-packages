@@ -56,7 +56,7 @@ install: lib-c lib-a lib-py lib/c/criu.pc.in
 	$(Q) install -m 644 lib/c/criu.pc $(DESTDIR)$(LIBDIR)/pkgconfig
 ifeq ($(PYTHON),python3)
 	$(E) "  INSTALL " pycriu
-	$(Q) $(PYTHON) -m pip install --upgrade --ignore-installed --prefix=$(DESTDIR)$(PREFIX) ./lib
+	$(Q) $(PYTHON) -m pip install --no-index --no-deps --progress-bar off --no-build-isolation --upgrade --ignore-installed --prefix=$(DESTDIR)$(PREFIX) ./lib
 endif
 .PHONY: install
 
