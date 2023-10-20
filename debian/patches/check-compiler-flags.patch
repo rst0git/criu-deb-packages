@@ -1,0 +1,28 @@
+From f926d169cc33a3f16cf86afa71faacff9682ce9e Mon Sep 17 00:00:00 2001
+From: Radostin Stoyanov <radostin@redhat.com>
+Date: Fri, 20 Oct 2023 23:25:09 +0100
+Subject: [PATCH] check-compiler-flags
+
+Signed-off-by: Radostin Stoyanov <radostin@redhat.com>
+---
+ Makefile | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/Makefile b/Makefile
+index 8061a42..a1a783c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -113,7 +113,10 @@ WARNINGS		:= -Wall -Wformat-security -Wdeclaration-after-statement -Wstrict-prot
+ # understand it.
+ # Note: There is similar problem with kernel list, where this warning is also
+ # disabled: https://github.com/torvalds/linux/commit/49beadbd47c2
++SUPPORTS_FLAGS := $(shell $(CC) -fsyntax-only -Wno-dangling-pointer -Wno-unknown-warning-option -xc /dev/null 2>&1 | grep -q "unrecognized option" && echo "no" || echo "yes")
++ifeq ($(SUPPORTS_FLAGS),yes)
+ WARNINGS		+= -Wno-dangling-pointer -Wno-unknown-warning-option
++endif
+ 
+ CFLAGS-GCOV		:= --coverage -fno-exceptions -fno-inline -fprofile-update=atomic
+ export CFLAGS-GCOV
+-- 
+2.41.0
+
