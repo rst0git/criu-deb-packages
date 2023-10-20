@@ -11,6 +11,7 @@ Build-Depends:
  libcap-dev,
  libgnutls28-dev,
  libgnutls30,
+ libnftables-dev,
  libnet1-dev,
  libnl-3-dev,
  libprotobuf-c-dev,
