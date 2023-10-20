@@ -1,3 +1,9 @@
+criu (3.18-1) focal; urgency=medium
+
+  * New upstream version 3.18
+
+ -- Radostin Stoyanov <radostin@redhat.com>  Mon, 19 Jun 2023 14:18:30 +0100
+
 criu (3.17.1-1ppa1.20.04) focal; urgency=medium
 
   * New upstream version 3.17.1
