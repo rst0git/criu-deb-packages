@@ -1,6 +1,8 @@
 #!/bin/sh
 
-CRIU=$(readlink -f `dirname ${BASH_SOURCE[0]}`/../../criu/criu)
+BASE_DIR="$(readlink -f "$(dirname "${BASH_SOURCE[0]}")/../../")"
+
+CRIU="${BASE_DIR}/criu/criu"
 criu=$CRIU
 if [ $(which python3) ]; then
 	PYTHON=python3
@@ -11,7 +13,9 @@ else
 	exit 1
 fi
 #export PYTHON
-CRIT=$(readlink -f `dirname ${BASH_SOURCE[0]}`/../../crit/crit-"${PYTHON}")
+export PYTHONPATH="${BASE_DIR}/lib:${BASE_DIR}/crit:${PYTHONPATH-}"
+CRIT="python3 -m crit"
 crit=$CRIT
-CRIU_COREDUMP=$(readlink -f `dirname ${BASH_SOURCE[0]}`/../../coredump/coredump-"${PYTHON}")
+
+CRIU_COREDUMP="${BASE_DIR}/coredump/coredump"
 criu_coredump=$CRIU_COREDUMP

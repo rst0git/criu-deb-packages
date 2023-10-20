@@ -46,8 +46,8 @@ def decode(opts):
         img = pycriu.images.load(inf(opts), opts['pretty'], opts['nopl'])
     except pycriu.images.MagicException as exc:
         print("Unknown magic %#x.\n"\
-          "Maybe you are feeding me an image with "\
-          "raw data(i.e. pages.img)?" % exc.magic, file=sys.stderr)
+              "Maybe you are feeding me an image with "\
+              "raw data(i.e. pages.img)?" % exc.magic, file=sys.stderr)
         sys.exit(1)
 
     if opts['pretty']:
@@ -64,8 +64,8 @@ def encode(opts):
         img = json.load(inf(opts))
     except UnicodeDecodeError:
         print("Cannot read JSON.\n"\
-          "Maybe you are feeding me an image with protobuf data? "\
-          "Encode expects JSON input.", file=sys.stderr)
+              "Maybe you are feeding me an image with protobuf data? "\
+              "Encode expects JSON input.", file=sys.stderr)
         sys.exit(1)
     pycriu.images.dump(img, outf(opts, False))
 
@@ -135,7 +135,7 @@ def ftype_find_in_files(opts, ft, fid):
     if files_img is None:
         try:
             files_img = pycriu.images.load(dinf(opts, "files.img"))['entries']
-        except:
+        except Exception:
             files_img = []
 
     if len(files_img) == 0:
