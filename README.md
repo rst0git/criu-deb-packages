@@ -79,3 +79,60 @@ Then, enter the following:
 ```console
 dput criu-ppa <package>_source.changes
 ```
+
+## Upload a package to OBS
+
+### Install Open Build Service Commander
+
+The following pachage provides a commandline client for the Open Build Service.
+
+- Fedora/CentOS
+
+```console
+sudo dnf install osc
+```
+
+- Ubuntu/Debian
+
+```console
+sudo apt-get install osc
+```
+
+The first time you use the `osc` command it will ask to configure your credentials in `~/.config/osc/oscrc`
+
+### Checkout content from OBS
+
+```
+osc co devel:tools:criu
+```
+
+If you already have a local copy, you can update all packages and check out all newly added packages from within a project directory as follows:
+
+```
+osc up
+osc up [directory]
+osc up *            # from within a project dir, update all packages
+osc up              # from within a project dir, update all packages AND check out all newly added packages
+```
+
+### Add and remove files for next checkin
+
+The following commands can be used to add and remove files:
+
+```
+osc add FILE [FILE...]
+osc delete FILE [...]
+
+# Add all files new in the local copy, and remove all disappeared files.
+osc addremove
+```
+
+### Upload changed content to OBS
+
+
+```
+osc ci                          # current dir
+osc ci [file1] [file2]          # only specific files
+osc ci [dir1] [dir2] ...        # multiple packages
+osc ci -m "updated foobar"      # specify a commit message
+```
