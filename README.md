@@ -2,6 +2,15 @@
 
 This repository contains all files necessary to build the Ubuntu/Debian packages for CRIU published in the [OpenBuildService](https://build.opensuse.org/project/show/devel:tools:criu) and [Launchpad](https://launchpad.net/~criu).
 
+# Git Branches
+
+The following branches contain the source tree for each criu package:
+
+- [open-build-service](https://github.com/rst0git/criu-deb-packages/tree/open-build-service)
+- [launchpad-22.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-22.04)
+- [launchpad-20.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-20.04)
+- [launchpad-18.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-18.04)
+
 ## Versioning
 Ubuntu package names are suffixed by the version number of the package. This allows Ubuntu to distinguish newer packages from older ones and so remain up to date.
 
