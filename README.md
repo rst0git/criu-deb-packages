@@ -58,7 +58,7 @@ The following command will build a new source package with .orig.tar.gz file. Th
 debuild -S -sa
 ```
 
-## Upload a package
+## Upload a package to Launchpad
 
 ### Update /etc/dput.cf
 
