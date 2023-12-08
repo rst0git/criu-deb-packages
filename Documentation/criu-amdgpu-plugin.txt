@@ -3,7 +3,7 @@ ROCM Support(1)
 
 NAME
 ----
-amdgpu_plugin - A plugin extension to CRIU to support checkpoint/restore in
+criu-amdgpu-plugin - A plugin extension to CRIU to support checkpoint/restore in
 userspace for AMD GPUs.
 
 
@@ -22,7 +22,7 @@ Though *criu* is a great tool for checkpointing and restoring running
 applications, it has certain limitations such as it cannot handle
 applications that have device files open. In order to support *ROCm* based
 workloads with *criu* we need to augment criu's core functionality with a
-plugin based extension mechanism. *amdgpu_plugin* provides the necessary support
+plugin based extension mechanism. *criu-amdgpu-plugin* provides the necessary support
 to criu to allow Checkpoint / Restore with ROCm.
 
 
@@ -96,6 +96,15 @@ executing criu command.
 
     E.g:
     KFD_CAPABILITY_CHECK=1
+
+*KFD_MAX_BUFFER_SIZE*::
+    On some systems, VRAM sizes may exceed RAM sizes, and so buffers for dumping
+    and restoring VRAM may be unable to fit. Set to a nonzero value (in bytes)
+    to set a limit on the plugin's memory usage.
+    Default:0 (Disabled)
+
+    E.g:
+    KFD_MAX_BUFFER_SIZE="2G"
 
 
 AUTHOR

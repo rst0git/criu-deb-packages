@@ -41,7 +41,6 @@ install-crit: lib
 	$(Q) $(MAKE) $(build)=crit install
 .PHONY: install-crit
 
-
 install-criu: criu
 	$(Q) $(MAKE) $(build)=criu install
 .PHONY: install-criu
