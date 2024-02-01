@@ -23,6 +23,11 @@ clean:
 
 override_dh_auto_install:
 	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr" LIBEXECDIR="/usr/lib" PYTHON="python3"
+	# Fix for pip 22.0.2 on Ubuntu 22.04
+	if [ -x "$(CURDIR)/debian/criu/usr/local/bin/crit" ]; then \
+		mkdir -p "$(CURDIR)/debian/criu/usr/bin/"; \
+		mv "$(CURDIR)/debian/criu/usr/local/bin/crit" "$(CURDIR)/debian/criu/usr/bin/"; \
+	fi
 
 override_dh_auto_test:
 	# disabled: doesn't work yet
