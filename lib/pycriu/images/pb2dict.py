@@ -3,7 +3,6 @@ import collections
 import os
 import quopri
 import socket
-import sys
 from ipaddress import IPv4Address, IPv6Address, ip_address
 
 from google.protobuf.descriptor import FieldDescriptor as FD
@@ -103,6 +102,7 @@ mmap_status_map = [
     ('VMA_AREA_SOCKET', 1 << 11),
     ('VMA_AREA_VVAR', 1 << 12),
     ('VMA_AREA_AIORING', 1 << 13),
+    ('VMA_AREA_MEMFD', 1 << 14),
     ('VMA_UNSUPP', 1 << 31),
 ]
 
@@ -247,17 +247,11 @@ def encode_dev(field, value):
 
 
 def encode_base64(value):
-    if (sys.version_info > (3, 0)):
-        return base64.encodebytes(value).decode()
-    else:
-        return base64.encodebytes(value)
+    return base64.encodebytes(value).decode()
 
 
 def decode_base64(value):
-    if (sys.version_info > (3, 0)):
-        return base64.decodebytes(str.encode(value))
-    else:
-        return base64.decodebytes(value)
+    return base64.decodebytes(str.encode(value))
 
 
 def encode_unix(value):
@@ -371,7 +365,7 @@ def pb2dict(pb, pretty=False, is_hex=False):
 def _dict2pb_cast(field, value):
     # Not considering TYPE_MESSAGE here, as repeated
     # and non-repeated messages need special treatment
-    # in this case, and are hadled separately.
+    # in this case, and are handled separately.
     if field.type == FD.TYPE_BYTES:
         return get_bytes_dec(field)(value)
     elif field.type == FD.TYPE_ENUM:
