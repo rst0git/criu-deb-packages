@@ -1,3 +1,9 @@
+criu (3.19-1ppa1.22.04) jammy; urgency=medium
+
+  * New upstream version 3.19
+
+ -- Radostin Stoyanov <radostin@redhat.com>  Sat, 03 Feb 2024 08:00:18 +0100
+
 criu (3.17.1-1ppa1.22.04) jammy; urgency=medium
 
   * New upstream version 3.17.1
