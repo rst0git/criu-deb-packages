@@ -117,7 +117,10 @@ WARNINGS		:= -Wall -Wformat-security -Wdeclaration-after-statement -Wstrict-prot
 # understand it.
 # Note: There is similar problem with kernel list, where this warning is also
 # disabled: https://github.com/torvalds/linux/commit/49beadbd47c2
+SUPPORTS_FLAGS := $(shell $(CC) -fsyntax-only -Wno-dangling-pointer -Wno-unknown-warning-option -xc /dev/null 2>&1 | grep -q "unrecognized option" && echo "no" || echo "yes")
+ifeq ($(SUPPORTS_FLAGS),yes)
 WARNINGS		+= -Wno-dangling-pointer -Wno-unknown-warning-option
+endif
 
 CFLAGS-GCOV		:= --coverage -fno-exceptions -fno-inline -fprofile-update=atomic
 export CFLAGS-GCOV
