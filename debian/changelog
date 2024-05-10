@@ -1,4 +1,4 @@
-criu (3.19-2) focal; urgency=medium
+criu (3.19-2ppa2.20.04) focal; urgency=medium
 
   * Apply patch "criu: fix a fatal failure if nft doesn't work"
 
