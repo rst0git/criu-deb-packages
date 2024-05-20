@@ -362,7 +362,7 @@ static int ipv6_conf_op(char *tgt, SysctlEntry **conf, int n, int op, SysctlEntr
 static int unix_conf_op(SysctlEntry ***rconf, size_t *n, int op)
 {
 	int i, ret = -1, flags = 0;
-	char path[ARRAY_SIZE(unix_conf_entries)][MAX_CONF_UNIX_PATH] = {};
+	char path[ARRAY_SIZE(unix_conf_entries)+1][MAX_CONF_UNIX_PATH] = {};
 	struct sysctl_req req[ARRAY_SIZE(unix_conf_entries)] = {};
 	SysctlEntry **conf = *rconf;
 
