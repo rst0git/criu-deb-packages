@@ -1,3 +1,9 @@
+criu (3.19-1ppa2.24.04) noble; urgency=medium
+
+  * Set release to nobel
+
+ -- Radostin Stoyanov <radostin@redhat.com>  Mon, 20 May 2024 18:53:47 +0100
+
 criu (3.19-1ppa1.24.04) jammy; urgency=medium
 
   * New upstream version 3.19
