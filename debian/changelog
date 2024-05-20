@@ -1,3 +1,9 @@
+criu (3.19-4) stable; urgency=low
+
+  * Apply fix for Ubuntu 24.04
+
+ -- Radostin Stoyanov <radostin@redhat.com>  Mon, 20 May 2024 10:52:56 +0100
+
 criu (3.19-3) stable; urgency=low
 
   * Apply patch "criu: fix a fatal failure if nft doesn't work"
