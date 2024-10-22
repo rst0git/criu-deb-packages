@@ -739,6 +739,7 @@ static int parasite_start_daemon(struct parasite_ctl *ctl)
 {
 	pid_t pid = ctl->rpid;
 	struct infect_ctx *ictx = &ctl->ictx;
+	user_fpregs_struct_t ext_regs;
 
 	/*
 	 * Get task registers before going daemon, since the
@@ -746,7 +747,7 @@ static int parasite_start_daemon(struct parasite_ctl *ctl)
 	 * while in daemon it is not such.
 	 */
 
-	if (compel_get_task_regs(pid, &ctl->orig.regs, NULL, ictx->save_regs, ictx->regs_arg, ictx->flags)) {
+	if (compel_get_task_regs(pid, &ctl->orig.regs, &ext_regs, ictx->save_regs, ictx->regs_arg, ictx->flags)) {
 		pr_err("Can't obtain regs for thread %d\n", pid);
 		return -1;
 	}
@@ -757,6 +758,9 @@ static int parasite_start_daemon(struct parasite_ctl *ctl)
 	}
 
 	if (ictx->make_sigframe(ictx->regs_arg, ctl->sigframe, ctl->rsigframe, &ctl->orig.sigmask))
+		return -1;
+
+	if (parasite_setup_shstk(ctl, &ext_regs))
 		return -1;
 
 	if (parasite_init_daemon(ctl))
@@ -812,7 +816,7 @@ static int parasite_memfd_exchange(struct parasite_ctl *ctl, unsigned long size,
 	uint8_t orig_code[MEMFD_FNAME_SZ] = MEMFD_FNAME;
 	pid_t pid = ctl->rpid;
 	long sret = -ENOSYS;
-	int ret, fd, lfd;
+	int ret, fd, lfd, remote_flags;
 
 	if (ctl->ictx.flags & INFECT_NO_MEMFD)
 		return 1;
@@ -856,7 +860,11 @@ static int parasite_memfd_exchange(struct parasite_ctl *ctl, unsigned long size,
 		goto err_cure;
 	}
 
-	ctl->remote_map = remote_mmap(ctl, NULL, size, remote_prot, MAP_FILE | MAP_SHARED, fd, 0);
+	remote_flags = MAP_FILE | MAP_SHARED;
+	if (ctl->ictx.remote_map_addr){
+		remote_flags |= MAP_FIXED_NOREPLACE;
+	}
+	ctl->remote_map = remote_mmap(ctl, (void *)ctl->ictx.remote_map_addr, size, remote_prot, remote_flags, fd, 0);
 	if (!ctl->remote_map) {
 		pr_err("Can't rmap memfd for parasite blob\n");
 		goto err_curef;

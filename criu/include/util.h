@@ -170,6 +170,7 @@ extern pid_t fork_and_ptrace_attach(int (*child_setup)(void));
 extern int cr_daemon(int nochdir, int noclose, int close_fd);
 extern int status_ready(void);
 extern int is_root_user(void);
+extern int close_fds(int minfd);
 
 extern int set_proc_self_fd(int fd);
 
@@ -386,6 +387,11 @@ static inline void print_stack_trace(pid_t pid)
 
 extern int mount_detached_fs(const char *fsname);
 
+extern int cr_fsopen(const char *fsname, unsigned int flags);
+extern int cr_fsconfig(int fd, unsigned int cmd, const char *key, const char *value, int aux);
+extern int cr_fsmount(int fd, unsigned int flags, unsigned int attr_flags);
+extern void fsfd_dump_messages(int fd);
+
 extern char *get_legacy_iptables_bin(bool ipv6, bool restore);
 
 extern int set_opts_cap_eff(void);
@@ -410,5 +416,7 @@ extern uint64_t criu_run_id;
 extern void util_init(void);
 
 extern char *resolve_mountpoint(char *path);
+
+extern int cr_close_range(unsigned int fd, unsigned int max_fd, unsigned int flags);
 
 #endif /* __CR_UTIL_H__ */
