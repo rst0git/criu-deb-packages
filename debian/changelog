@@ -1,3 +1,15 @@
+criu (4.0-1ppa2.22.04) jammy; urgency=medium
+
+  * Update package in 22.04
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Sun, 27 Oct 2024 18:27:14 +0000
+
+criu (4.0-1ppa1.22.04) jammy; urgency=medium
+
+  * Update to version 4.0
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Sun, 27 Oct 2024 17:23:14 +0000
+
 criu (3.19-1ppa1.22.04) jammy; urgency=medium
 
   * New upstream version 3.19
