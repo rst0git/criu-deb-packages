@@ -4,7 +4,7 @@ set -x -e
 CI_PKGS=(protobuf-c-compiler libprotobuf-c-dev libaio-dev libgnutls28-dev
 		libgnutls30 libprotobuf-dev protobuf-compiler libcap-dev
 		libnl-3-dev gdb bash libnet-dev util-linux asciidoctor
-		libnl-route-3-dev time flake8 libbsd-dev python3-yaml
+		libnl-route-3-dev time libbsd-dev python3-yaml
 		libperl-dev pkg-config python3-protobuf python3-pip
 		python3-importlib-metadata python3-junit.xml libdrm-dev)
 
@@ -262,6 +262,9 @@ make -C test/others/rpc/ run
 
 ./test/zdtm.py run -t zdtm/static/env00 --sibling
 
+./test/zdtm.py run -t zdtm/static/maps00 --preload-libfault
+./test/zdtm.py run -t zdtm/static/maps02 --preload-libfault
+
 ./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --dedup
 ./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --noauto-dedup
 ./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --page-server
@@ -288,14 +291,38 @@ ip net add test
 
 # Rootless tests
 # Check if cap_checkpoint_restore is supported and also if unshare -c is supported.
-if capsh --supports=cap_checkpoint_restore && unshare -c /bin/true; then
+#
+# Do not run this test in a container (see https://github.com/checkpoint-restore/criu/issues/2312).
+# Before v6.8-rc1~215^2~6, the kernel currently did not show correct device and
+# inode numbers in /proc/pid/maps for stackable file systems.
+skip=0
+findmnt -no FSTYPE / | grep overlay && {
+	./criu/criu check --feature overlayfs_maps || skip=1
+}
+unshare -c /bin/true || skip=1
+capsh --supports=cap_checkpoint_restore || skip=1
+
+if [ "$skip" == 0 ]; then
 	make -C test/zdtm/ cleanout
 	rm -rf test/dump
 	setcap cap_checkpoint_restore,cap_sys_ptrace+eip criu/criu
+	if [ -d /sys/fs/selinux ] && command -v getenforce &>/dev/null; then
+		# Note: selinux in Enforcing mode prevents us from calling clone3() or writing to ns_last_pid on restore; hence set to Permissive for the test and then set back.
+		selinuxmode=$(getenforce)
+		if [ "$selinuxmode" != "Disabled" ]; then
+			setenforce Permissive
+		fi
+
+	fi
 	# Run it as non-root in a user namespace. Since CAP_CHECKPOINT_RESTORE behaves differently in non-user namespaces (e.g. no access to map_files) this tests that we can dump and restore
 	# under those conditions. Note that the "... && true" part is necessary; we need at least one statement after the tests so that bash can reap zombies in the user namespace,
 	# otherwise it will exec the last statement and get replaced and nobody will be left to reap our zombies.
 	sudo --user=#65534 --group=#65534 unshare -Ucfpm --mount-proc -- bash -c "./test/zdtm.py run -t zdtm/static/maps00 -f h --rootless && true"
+	if [ -d /sys/fs/selinux ] && command -v getenforce &>/dev/null; then
+		if [ "$selinuxmode" != "Disabled" ]; then
+			setenforce "$selinuxmode"
+		fi
+	fi
 	setcap -r criu/criu
 else
 	echo "Skipping unprivileged mode tests"
@@ -327,7 +354,13 @@ make -C test/others/action-script run
 # compel testing
 make -C compel/test
 
-# amdgpu_plugin testing
+# amdgpu and cuda plugin testing
 make amdgpu_plugin
 make -C plugins/amdgpu/ test_topology_remap
 ./plugins/amdgpu/test_topology_remap
+
+./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin cuda
+./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin amdgpu
+./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin amdgpu cuda
+
+./test/zdtm.py run -t zdtm/static/sigpending -t zdtm/static/pthread00 --mocked-cuda-checkpoint --fault 138

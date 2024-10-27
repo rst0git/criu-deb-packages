@@ -49,7 +49,6 @@
 #include "images/inventory.pb-c.h"
 
 #include "shmem.h"
-#include "restorer.h"
 
 /*
  * sys_getgroups() buffer size. Not too much, to avoid stack overflow.
@@ -76,6 +75,10 @@
 
 #ifndef FALLOC_FL_PUNCH_HOLE
 #define FALLOC_FL_PUNCH_HOLE 0x02
+#endif
+
+#ifndef ARCH_RT_SIGRETURN_RST
+#define ARCH_RT_SIGRETURN_RST ARCH_RT_SIGRETURN
 #endif
 
 #define sys_prctl_safe(opcode, val1, val2, val3)                                \
@@ -631,7 +634,7 @@ static int restore_thread_common(struct thread_restore_args *args)
 
 static void noinline rst_sigreturn(unsigned long new_sp, struct rt_sigframe *sigframe)
 {
-	ARCH_RT_SIGRETURN(new_sp, sigframe);
+	ARCH_RT_SIGRETURN_RST(new_sp, sigframe);
 }
 
 static int send_cg_set(int sk, int cg_set)
@@ -747,6 +750,10 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 		pr_err("Thread pid mismatch %d/%d\n", my_pid, args->pid);
 		goto core_restore_end;
 	}
+
+	/* restore original shadow stack */
+	if (arch_shstk_restore(&args->shstk))
+		goto core_restore_end;
 
 	/* All signals must be handled by thread leader */
 	ksigfillset(&to_block);
@@ -1668,6 +1675,9 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		pr_debug("lazy-pages: uffd %d\n", args->uffd);
 	}
 
+	if (arch_shstk_switch_to_restorer(&args->shstk))
+		goto core_restore_end;
+
 	/*
 	 * Park vdso/vvar in a safe place if architecture doesn't support
 	 * mapping them with arch_prctl().
@@ -1719,6 +1729,13 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start > vma_entry->shmid)
 			break;
 
+		/*
+		 * shadow stack VMAs cannot be remapped, they must be
+		 * recreated with map_shadow_stack system call
+		 */
+		if (vma_entry_is(vma_entry, VMA_AREA_SHSTK))
+			continue;
+
 		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
 	}
@@ -1735,6 +1752,13 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 		if (vma_entry->start < vma_entry->shmid)
 			break;
+
+		/*
+		 * shadow stack VMAs cannot be remapped, they must be
+		 * recreated with map_shadow_stack system call
+		 */
+		if (vma_entry_is(vma_entry, VMA_AREA_SHSTK))
+			continue;
 
 		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
@@ -2161,6 +2185,14 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	ret = ret || restore_child_subreaper(args->child_subreaper);
 
 	futex_set_and_wake(&thread_inprogress, args->nr_threads);
+
+	/*
+	 * Shadow stack of the leader can be locked only after all other
+	 * threads were cloned, otherwise they may start with read-only
+	 * shadow stack.
+	 */
+	if (arch_shstk_restore(&args->shstk))
+		goto core_restore_end;
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
 
