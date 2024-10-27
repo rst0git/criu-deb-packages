@@ -15,6 +15,10 @@ TMP     = $(CURDIR)/debian/$(PACKAGE)
 %:
 	dh ${@} --with python3
 
+# We want cuda_plugin.so to retain its name:
+override_dh_python3:
+	dh_python3 --no-ext-rename
+
 override_dh_auto_install:
 	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr" LIBEXECDIR="/usr/lib" PYTHON="python3"
 	# Fix for pip 22.0.2 on Ubuntu 22.04
