@@ -1,4 +1,4 @@
-# CRIU Debian Packages
+# CRIU Packages for Ubuntu and Debian
 
 This repository contains all the files necessary to build the Ubuntu/Debian packages for CRIU, published in the [Open Build Service](https://build.opensuse.org/project/show/devel:tools:criu) and [Launchpad](https://launchpad.net/~criu).
 
