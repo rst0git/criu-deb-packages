@@ -2,6 +2,9 @@
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
+# Run pip install without internet access
+export PIPFLAGS=--no-build-isolation --no-index --no-deps --progress-bar off --upgrade --ignore-installed
+
 version := $(shell dpkg-parsechangelog -S Version | sed -rne 's,([^-\+]+)+(\+dfsg)*.*,\1,p'i)
 source := $(shell dpkg-parsechangelog -S Source)
 upstreampck := $(source)_$(version).orig.tar.gz
