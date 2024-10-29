@@ -1,3 +1,9 @@
+criu (4.0-3) stable; urgency=medium
+
+  * Fix crit installation on Ubuntu 24.04
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Tue, 29 Oct 2024 09:52:32 +0000
+
 criu (4.0-2) stable; urgency=medium
 
   * Drop git tag from version
