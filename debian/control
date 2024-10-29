@@ -12,6 +12,7 @@ Build-Depends:
  libprotobuf-c-dev,
  libprotobuf-dev,
  libbsd-dev,
+ gnutls-dev,
  pkg-config,
  protobuf-c-compiler,
  protobuf-compiler,
