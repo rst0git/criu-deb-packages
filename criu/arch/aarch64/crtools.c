@@ -23,6 +23,37 @@
 #include "compel/infect.h"
 #include "pstree.h"
 
+#ifndef HWCAP_PACA
+/* Copied from linux: arch/arm64/include/uapi/asm/hwcap.h */
+#define HWCAP_PACA (1 << 30)
+
+/* Copied from linux: arch/arm64/include/uapi/asm/ptrace.h */
+/* pointer authentication keys (NT_ARM_PACA_KEYS, NT_ARM_PACG_KEYS) */
+struct user_pac_address_keys {
+	__uint128_t apiakey;
+	__uint128_t apibkey;
+	__uint128_t apdakey;
+	__uint128_t apdbkey;
+};
+
+struct user_pac_generic_keys {
+	__uint128_t apgakey;
+};
+#endif
+
+#ifndef HWCAP_PACG
+#define HWCAP_PACG (1UL << 31)
+#endif
+
+/* Copied from linux: include/uapi/linux/elf.h */
+#ifndef NT_ARM_PACA_KEYS
+#define NT_ARM_PACA_KEYS 0x407 /* ARM pointer authentication address keys */
+#endif
+
+#ifndef NT_ARM_PACG_KEYS
+#define NT_ARM_PACG_KEYS 0x408
+#endif
+
 #ifndef NT_ARM_PAC_ENABLED_KEYS
 #define NT_ARM_PAC_ENABLED_KEYS	0x40a	/* AArch64 pointer authentication enabled keys. */
 #endif
