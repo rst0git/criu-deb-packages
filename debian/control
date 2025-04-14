@@ -15,6 +15,7 @@ Build-Depends:
  gnutls-dev,
  libnftables-dev,
  pkg-config,
+ uuid-dev,
  protobuf-c-compiler,
  protobuf-compiler,
  python3-all,
