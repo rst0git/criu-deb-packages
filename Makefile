@@ -19,7 +19,7 @@ endif
 
 #
 # Supported Architectures
-ifneq ($(filter-out x86 arm aarch64 ppc64 s390 mips loongarch64,$(ARCH)),)
+ifneq ($(filter-out x86 arm aarch64 ppc64 s390 mips loongarch64 riscv64,$(ARCH)),)
         $(error "The architecture $(ARCH) isn't supported")
 endif
 
@@ -84,6 +84,10 @@ ifeq ($(ARCH),loongarch64)
         DEFINES		:= -DCONFIG_LOONGARCH64
 endif
 
+ifeq ($(ARCH),riscv64)
+        DEFINES		:= -DCONFIG_RISCV64
+endif
+
 #
 # CFLAGS_PIE:
 #
@@ -134,6 +138,10 @@ endif
 ifneq ($(GCOV),)
         LDFLAGS         += -lgcov
         CFLAGS          += $(CFLAGS-GCOV)
+endif
+
+ifneq ($(NETWORK_LOCK_DEFAULT),)
+	CFLAGS		+= -DNETWORK_LOCK_DEFAULT=$(NETWORK_LOCK_DEFAULT)
 endif
 
 ifeq ($(ASAN),1)
@@ -437,7 +445,7 @@ help:
 
 ruff:
 	@ruff --version
-	ruff ${RUFF_FLAGS} --config=scripts/ruff.toml \
+	ruff check ${RUFF_FLAGS} --config=scripts/ruff.toml \
 		test/zdtm.py \
 		test/inhfd/*.py \
 		test/others/rpc/config_file.py \
@@ -462,7 +470,7 @@ shellcheck:
 	shellcheck -x test/others/action-script/*.sh
 
 codespell:
-	codespell -S tags
+	codespell
 
 lint: ruff shellcheck codespell
 	# Do not append \n to pr_perror, pr_pwarn or fail

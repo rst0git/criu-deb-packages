@@ -427,7 +427,7 @@ static int gen_parasite_saddr(struct sockaddr_un *saddr, int key)
 	int sun_len;
 
 	saddr->sun_family = AF_UNIX;
-	snprintf(saddr->sun_path, UNIX_PATH_MAX, "X/crtools-pr-%d-%" PRIx64, key, compel_run_id);
+	snprintf(saddr->sun_path, UNIX_PATH_MAX, "X/crtools-pr-%d-%s", key, compel_run_id);
 
 	sun_len = SUN_LEN(saddr);
 	*saddr->sun_path = '\0';
@@ -1300,7 +1300,7 @@ struct plain_regs_struct {
 	user_fpregs_struct_t fpregs;
 };
 
-static int save_regs_plain(void *to, user_regs_struct_t *r, user_fpregs_struct_t *f)
+static int save_regs_plain(pid_t pid, void *to, user_regs_struct_t *r, user_fpregs_struct_t *f)
 {
 	struct plain_regs_struct *prs = to;
 
