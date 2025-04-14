@@ -16,6 +16,7 @@ Build-Depends:
  libnl-3-dev,
  libprotobuf-c-dev,
  libprotobuf-dev,
+ uuid-dev,
  pkg-config,
  protobuf-c-compiler,
  protobuf-compiler,
