@@ -1,3 +1,9 @@
+criu (4.1-1ppa1.24.04) noble; urgency=medium
+
+  * Update to version 4.1
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Mon, 14 Apr 2025 15:59:42 +0100
+
 criu (4.0-2ppa1.24.04) noble; urgency=medium
 
   * Fix crit installation
