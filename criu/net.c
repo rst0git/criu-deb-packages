@@ -2128,6 +2128,79 @@ nft_ctx_free_out:
 }
 #endif
 
+static const char *ipv4_sysctl_entries[] = {
+	"ping_group_range",
+};
+
+#define IPV4_SYSCTL_BASE "net/ipv4"
+#define IPV4_SYSCTL_FMT IPV4_SYSCTL_BASE"/%s"
+#define MAX_IPV4_SYSCTL_OPT 32
+#define MAX_IPV4_SYSCTL_PATH (sizeof(IPV4_SYSCTL_FMT) + MAX_IPV4_SYSCTL_OPT - 2)
+#define MAX_STR_IPV4_SYSCTL_LEN 200
+
+static int ipv4_sysctls_op(SysctlEntry ***rsysctl, size_t *pn, int op)
+{
+	int i, ret = -1, flags = 0;
+	char path[ARRAY_SIZE(ipv4_sysctl_entries)][MAX_IPV4_SYSCTL_PATH] = {};
+	struct sysctl_req req[ARRAY_SIZE(ipv4_sysctl_entries)] = {};
+	SysctlEntry **sysctl = *rsysctl;
+	size_t n = *pn;
+
+	if (n != ARRAY_SIZE(ipv4_sysctl_entries)) {
+		pr_err("unix: Unexpected entries in sysctlig (%zu %zu)\n", n, ARRAY_SIZE(ipv4_sysctl_entries));
+		return -EINVAL;
+	}
+
+	if (opts.weak_sysctls || op == CTL_READ)
+		flags = CTL_FLAGS_OPTIONAL;
+
+	for (i = 0; i < n; i++) {
+		snprintf(path[i], MAX_IPV4_SYSCTL_PATH, IPV4_SYSCTL_FMT, ipv4_sysctl_entries[i]);
+		req[i].name = path[i];
+		req[i].flags = flags;
+
+		switch (sysctl[i]->type) {
+		case SYSCTL_TYPE__CTL_STR:
+			req[i].type = CTL_STR(MAX_STR_IPV4_SYSCTL_LEN);
+
+			/* skip write if have no value */
+			if (op == CTL_WRITE && !sysctl[i]->sarg)
+				continue;
+
+			req[i].arg = sysctl[i]->sarg;
+			break;
+		default:
+			pr_err("ipv4: Unknown sysctl type %d\n", sysctl[i]->type);
+			return -1;
+		}
+	}
+
+	ret = sysctl_op(req, n, op, CLONE_NEWNET);
+	if (ret < 0) {
+		pr_err("unix: Failed to %s %s/<sysctls>\n", (op == CTL_READ) ? "read" : "write", IPV4_SYSCTL_BASE);
+		return -1;
+	}
+
+	if (op == CTL_READ) {
+		bool has_entries = false;
+
+		for (i = 0; i < n; i++) {
+			if (req[i].flags & CTL_FLAGS_HAS) {
+				sysctl[i]->has_iarg = true;
+				if (!has_entries)
+					has_entries = true;
+			}
+		}
+
+		if (!has_entries) {
+			*pn = 0;
+			*rsysctl = NULL;
+		}
+	}
+
+	return 0;
+}
+
 static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 {
 	void *buf, *o_buf;
@@ -2142,6 +2215,9 @@ static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 	int size6 = ARRAY_SIZE(devconfs6);
 	char def_stable_secret[MAX_STR_CONF_LEN + 1] = {};
 	char all_stable_secret[MAX_STR_CONF_LEN + 1] = {};
+	SysctlEntry *ipv4_sysctls = NULL;
+	size_t ipv4_sysctl_size = ARRAY_SIZE(ipv4_sysctl_entries);
+	char ping_group_range[MAX_STR_IPV4_SYSCTL_LEN + 1] = {};
 	NetnsId *ids;
 	struct netns_id *p;
 
@@ -2149,10 +2225,16 @@ static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 	list_for_each_entry(p, &ns->net.ids, node)
 		i++;
 
+	/*
+	 * Here we allocate one single big buffer for storing multiple arrays
+	 * of protobuf entries and pointers to entries in it and we later use
+	 * xptr_pull_s to claim a part of this buffer of proper size for each
+	 * particular array. Next we read data from sysctl files to those
+	 * arrays and then finally save them into images.
+	 */
 	o_buf = buf = xmalloc(i * (sizeof(NetnsId *) + sizeof(NetnsId)) +
-			      size4 * (sizeof(SysctlEntry *) + sizeof(SysctlEntry)) * 2 +
-			      size6 * (sizeof(SysctlEntry *) + sizeof(SysctlEntry)) * 2 +
-			      sizex * (sizeof(SysctlEntry *) + sizeof(SysctlEntry)));
+			      (2 * size4 + 2 * size6 + sizex + ipv4_sysctl_size) *
+			      (sizeof(SysctlEntry *) + sizeof(SysctlEntry)));
 	if (!buf)
 		goto out;
 
@@ -2217,6 +2299,21 @@ static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 		netns.unix_conf[i]->type = SYSCTL_TYPE__CTL_32;
 	}
 
+	netns.n_ipv4_sysctl = ipv4_sysctl_size;
+	netns.ipv4_sysctl = xptr_pull_s(&buf, ipv4_sysctl_size * sizeof(SysctlEntry *));
+	ipv4_sysctls = xptr_pull_s(&buf, ipv4_sysctl_size * sizeof(SysctlEntry));
+	for (i = 0; i < ipv4_sysctl_size; i++) {
+		sysctl_entry__init(&ipv4_sysctls[i]);
+		netns.ipv4_sysctl[i] = &ipv4_sysctls[i];
+		if (!strcmp(ipv4_sysctl_entries[i], "ping_group_range")) {
+			netns.ipv4_sysctl[i]->type = SYSCTL_TYPE__CTL_STR;
+			netns.ipv4_sysctl[i]->sarg = ping_group_range;
+		} else {
+			/* Need to handle this case when we have more sysctls */
+			BUG();
+		}
+	}
+
 	ret = ipv4_conf_op("default", netns.def_conf4, size4, CTL_READ, NULL);
 	if (ret < 0)
 		goto err_free;
@@ -2232,6 +2329,10 @@ static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 		goto err_free;
 
 	ret = unix_conf_op(&netns.unix_conf, &netns.n_unix_conf, CTL_READ);
+	if (ret < 0)
+		goto err_free;
+
+	ret = ipv4_sysctls_op(&netns.ipv4_sysctl, &netns.n_ipv4_sysctl, CTL_READ);
 	if (ret < 0)
 		goto err_free;
 
@@ -2583,6 +2684,12 @@ static int restore_netns_conf(struct ns_id *ns)
 
 	if ((netns)->unix_conf) {
 		ret = unix_conf_op(&(netns)->unix_conf, &(netns)->n_unix_conf, CTL_WRITE);
+		if (ret)
+			goto out;
+	}
+
+	if ((netns)->ipv4_sysctl) {
+		ret = ipv4_sysctls_op(&(netns)->ipv4_sysctl, &(netns)->n_ipv4_sysctl, CTL_WRITE);
 		if (ret)
 			goto out;
 	}
@@ -3066,9 +3173,43 @@ err:
 	return ret;
 }
 
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+static inline FILE *redirect_nftables_output(struct nft_ctx *nft)
+{
+	FILE *fp;
+	int fd;
+
+	fd = dup(log_get_fd());
+	if (fd < 0) {
+		pr_perror("dup() to redirect nftables output failed");
+		return NULL;
+	}
+
+	fp = fdopen(fd, "w");
+	if (!fp) {
+		pr_perror("fdopen() to redirect nftables output failed");
+		return NULL;
+	}
+
+	/**
+	 * Without setvbuf() the output from libnftables will be
+	 * somewhere in the log file, probably at the end.
+	 * With setvbuf() potential output will be at the correct
+	 * position.
+	 */
+	setvbuf(fp, NULL, _IONBF, 0);
+
+	nft_ctx_set_output(nft, fp);
+	nft_ctx_set_error(nft, fp);
+
+	return fp;
+}
+#endif
+
 static inline int nftables_lock_network_internal(void)
 {
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	cleanup_file FILE *fp = NULL;
 	struct nft_ctx *nft;
 	int ret = 0;
 	char table[32];
@@ -3080,6 +3221,10 @@ static inline int nftables_lock_network_internal(void)
 	nft = nft_ctx_new(NFT_CTX_DEFAULT);
 	if (!nft)
 		return -1;
+
+	fp = redirect_nftables_output(nft);
+	if (!fp)
+		goto out;
 
 	snprintf(buf, sizeof(buf), "create table %s", table);
 	if (NFT_RUN_CMD(nft, buf))
@@ -3168,6 +3313,7 @@ static inline int nftables_network_unlock(void)
 {
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 	int ret = 0;
+	cleanup_file FILE *fp = NULL;
 	struct nft_ctx *nft;
 	char table[32];
 	char buf[128];
@@ -3177,6 +3323,10 @@ static inline int nftables_network_unlock(void)
 
 	nft = nft_ctx_new(NFT_CTX_DEFAULT);
 	if (!nft)
+		return -1;
+
+	fp = redirect_nftables_output(nft);
+	if (!fp)
 		return -1;
 
 	snprintf(buf, sizeof(buf), "delete table %s", table);

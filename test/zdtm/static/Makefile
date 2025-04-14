@@ -8,6 +8,7 @@ TST_NOFILE	:=				\
 		sleeping00			\
 		pid00				\
 		caps00				\
+		caps01				\
 		wait00				\
 		zombie00			\
 		zombie01			\
@@ -23,6 +24,7 @@ TST_NOFILE	:=				\
 		sse20				\
 		mprotect00			\
 		timers				\
+		timers01			\
 		timerfd				\
 		unbound_sock			\
 		sched_prio00			\
@@ -53,10 +55,18 @@ TST_NOFILE	:=				\
 		shm				\
 		shm-mp				\
 		ptrace_sig			\
+		pidfd_self			\
+		pidfd_of_thread			\
+		pidfd_dead			\
+		pidfd_diffdead			\
+		pidfd_child			\
+		pidfd_kill			\
+		fd_from_pidfd			\
 		pipe00				\
 		pipe01				\
 		pipe02				\
 		pthread00			\
+		pthread00-pac			\
 		pthread01			\
 		pthread02			\
 		pthread_timers			\
@@ -488,6 +498,12 @@ STATE_OUT	= $(TST_STATE:%=%.out)
 
 include ../Makefile.inc
 
+ifeq ($(ARCH),aarch64)
+	PAC_CFLAGS := -mbranch-protection=standard
+else
+	PAC_CFLAGS :=
+endif
+
 all:	$(TST) criu-rtc.so
 install: all
 .PHONY: all install
@@ -579,6 +595,8 @@ uptime_grow:		LDLIBS += -lrt -pthread
 unlink_largefile:	CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
 inotify_system_nodel:	CFLAGS += -DNO_DEL
 pthread00:		LDLIBS += -pthread
+pthread00-pac:		CFLAGS += ${PAC_CFLAGS}
+pthread00-pac:		LDLIBS += -pthread
 pthread01:		LDLIBS += -pthread
 pthread02:		LDLIBS += -pthread
 pthread_timers:		LDLIBS += -lrt -pthread

@@ -17,6 +17,7 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sched.h>
+#include <linux/elf.h>
 
 #include "types.h"
 #include <compel/ptrace.h>
@@ -79,6 +80,7 @@
 #include "timens.h"
 #include "bpfmap.h"
 #include "apparmor.h"
+#include "pidfd.h"
 
 #include "parasite-syscall.h"
 #include "files-reg.h"
@@ -280,7 +282,7 @@ static struct collect_image_info *cinfos_files[] = {
 	&unix_sk_cinfo,	      &fifo_cinfo,     &pipe_cinfo,    &nsfile_cinfo,	    &packet_sk_cinfo,
 	&netlink_sk_cinfo,    &eventfd_cinfo,  &epoll_cinfo,   &epoll_tfd_cinfo,    &signalfd_cinfo,
 	&tunfile_cinfo,	      &timerfd_cinfo,  &inotify_cinfo, &inotify_mark_cinfo, &fanotify_cinfo,
-	&fanotify_mark_cinfo, &ext_file_cinfo, &memfd_cinfo,
+	&fanotify_mark_cinfo, &ext_file_cinfo, &memfd_cinfo, &pidfd_cinfo
 };
 
 /* These images are required to restore namespaces */
@@ -1706,6 +1708,9 @@ static int restore_task_with_children(void *_arg)
 				     arg);
 }
 
+int __attribute((weak)) arch_ptrace_restore(int pid, struct pstree_item *item);
+int arch_ptrace_restore(int pid, struct pstree_item *item) { return 0; }
+
 static int attach_to_tasks(bool root_seized)
 {
 	struct pstree_item *item;
@@ -1746,6 +1751,8 @@ static int attach_to_tasks(bool root_seized)
 				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
 				return -1;
 			}
+			if (arch_ptrace_restore(pid, item))
+				return -1;
 			/*
 			 * Suspend seccomp if necessary. We need to do this because
 			 * although seccomp is restored at the very end of the
@@ -2328,6 +2335,7 @@ int prepare_task_entries(void)
 	task_entries->nr_helpers = 0;
 	futex_set(&task_entries->start, CR_STATE_FAIL);
 	mutex_init(&task_entries->userns_sync_lock);
+	mutex_init(&task_entries->cgroupd_sync_lock);
 	mutex_init(&task_entries->last_pid_mutex);
 
 	return 0;
@@ -2353,11 +2361,11 @@ int cr_restore_tasks(void)
 	if (init_service_fd())
 		return 1;
 
-	if (cr_plugin_init(CR_PLUGIN_STAGE__RESTORE))
-		return -1;
-
 	if (check_img_inventory(/* restore = */ true) < 0)
 		goto err;
+
+	if (cr_plugin_init(CR_PLUGIN_STAGE__RESTORE))
+		return -1;
 
 	if (init_stats(RESTORE_STATS))
 		goto err;
@@ -2991,6 +2999,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 	args->creds.cap_eff = NULL;
 	args->creds.cap_prm = NULL;
 	args->creds.cap_bnd = NULL;
+	args->creds.cap_amb = NULL;
 	args->creds.groups = NULL;
 	args->creds.lsm_profile = NULL;
 
@@ -2998,6 +3007,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 	copy_caps(args->cap_eff, ce->cap_eff, ce->n_cap_eff);
 	copy_caps(args->cap_prm, ce->cap_prm, ce->n_cap_prm);
 	copy_caps(args->cap_bnd, ce->cap_bnd, ce->n_cap_bnd);
+	copy_caps(args->cap_amb, ce->cap_amb, ce->n_cap_amb);
 
 	if (ce->n_groups && !groups_match(ce->groups, ce->n_groups)) {
 		unsigned int *groups;
@@ -3099,6 +3109,9 @@ static void *restorer_munmap_addr(CoreEntry *core, void *restorer_blob)
 #endif
 	return restorer_sym(restorer_blob, arch_export_unmap);
 }
+
+void arch_rsti_init(struct pstree_item *p) __attribute__((weak));
+void arch_rsti_init(struct pstree_item *p) {}
 
 static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, unsigned long alen, CoreEntry *core)
 {
@@ -3319,6 +3332,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 */
 	creds_pos_next = creds_pos;
 	siginfo_n = task_args->siginfo_n;
+	arch_rsti_init(current);
 	for (i = 0; i < current->nr_threads; i++) {
 		CoreEntry *tcore;
 		struct rt_sigframe *sigframe;
