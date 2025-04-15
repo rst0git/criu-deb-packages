@@ -1,7 +1,7 @@
 Source: criu
 Section: admin
 Priority: optional
-Maintainer: Salvatore Bonaccorso <carnil@debian.org>
+Maintainer: Radostin Stoyanov <rstoyanov@fedoraproject.org>
 Build-Depends:
  asciidoctor,
  debhelper (>= 11),
