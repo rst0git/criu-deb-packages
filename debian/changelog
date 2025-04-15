@@ -1,3 +1,9 @@
+criu (4.1-1ppa1.22.04) jammy; urgency=medium
+
+  * Update to version 4.1
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Tue, 15 Apr 2025 12:25:27 +0100
+
 criu (4.0-1ppa2.22.04) jammy; urgency=medium
 
   * Update package in 22.04
