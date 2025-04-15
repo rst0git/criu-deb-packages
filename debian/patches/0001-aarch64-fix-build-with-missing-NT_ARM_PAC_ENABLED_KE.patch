@@ -1,0 +1,44 @@
+From 5d5a1e15f3aaffa64262366162888e9275a38dfd Mon Sep 17 00:00:00 2001
+From: Adrian Reber <areber@redhat.com>
+Date: Wed, 9 Apr 2025 13:25:44 +0000
+Subject: [PATCH] aarch64: fix build with missing NT_ARM_PAC_ENABLED_KEYS
+
+On a RHEL 8 based system building CRIU fails with:
+
+criu/arch/aarch64/crtools.c: In function 'save_pac_keys':
+criu/arch/aarch64/crtools.c:73:39: error: 'NT_ARM_PAC_ENABLED_KEYS' undeclared (first use in this function); did you mean 'NT_ARM_PACA_KEYS'?
+   ret = ptrace(PTRACE_GETREGSET, pid, NT_ARM_PAC_ENABLED_KEYS, &iov);
+                                       ^~~~~~~~~~~~~~~~~~~~~~~
+                                       NT_ARM_PACA_KEYS
+criu/arch/aarch64/crtools.c:73:39: note: each undeclared identifier is reported only once for each function it appears in
+criu/arch/aarch64/crtools.c: In function 'arch_ptrace_restore':
+criu/arch/aarch64/crtools.c:261:44: error: 'NT_ARM_PAC_ENABLED_KEYS' undeclared (first use in this function); did you mean 'NT_ARM_PACA_KEYS'?
+   if ((ret = ptrace(PTRACE_SETREGSET, pid, NT_ARM_PAC_ENABLED_KEYS, &iov))) {
+                                            ^~~~~~~~~~~~~~~~~~~~~~~
+                                            NT_ARM_PACA_KEYS
+
+This adds the missing define if it is undefined.
+
+Signed-off-by: Adrian Reber <areber@redhat.com>
+---
+ criu/arch/aarch64/crtools.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/criu/arch/aarch64/crtools.c b/criu/arch/aarch64/crtools.c
+index 6cde03ee3..c077dd06b 100644
+--- a/criu/arch/aarch64/crtools.c
++++ b/criu/arch/aarch64/crtools.c
+@@ -23,6 +23,10 @@
+ #include "compel/infect.h"
+ #include "pstree.h"
+ 
++#ifndef NT_ARM_PAC_ENABLED_KEYS
++#define NT_ARM_PAC_ENABLED_KEYS	0x40a	/* AArch64 pointer authentication enabled keys. */
++#endif
++
+ extern unsigned long getauxval(unsigned long type);
+ 
+ #define assign_reg(dst, src, e) dst->e = (__typeof__(dst->e))(src)->e
+-- 
+2.49.0
+
