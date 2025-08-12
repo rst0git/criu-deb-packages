@@ -1,3 +1,9 @@
+criu (4.1.1-1) stable; urgency=medium
+
+  * Update to new upstream version
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Tue, 12 Aug 2025 09:51:28 +0100
+
 criu (4.1-1) stable; urgency=medium
 
   * Update to new upstream release
