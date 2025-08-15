@@ -1,0 +1,51 @@
+From 04012eac7f4dfe6bbe1a08e7ce7acf411e7a6229 Mon Sep 17 00:00:00 2001
+From: Ignacio Moreno Gonzalez <Ignacio.MorenoGonzalez@kuka.com>
+Date: Wed, 16 Jul 2025 16:32:25 +0200
+Subject: [PATCH] compel: flush caches after parasite injection
+
+After the CRIU process saves the parasite code for the target thread in
+the shared mmap, it is necessary to call __clear_cache before the target
+thread executes the code.
+
+Without this step, the target thread may not see the correct code to
+execute, which can result in a SIGILL signal.
+
+For the specific arm64 case. this is important so that the newly copied
+code is flushed from d-cache to RAM, so that the target thread sees the
+new code.
+
+The change is based on commit 6be10a2 by @fu.lin and on input received
+from @adrianreber.
+
+[ avagin: tweak code comment ]
+
+Signed-off-by: Ignacio Moreno Gonzalez <Ignacio.MorenoGonzalez@kuka.com>
+Signed-off-by: Andrei Vagin <avagin@gmail.com>
+---
+ compel/src/lib/infect.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/compel/src/lib/infect.c b/compel/src/lib/infect.c
+index 4ea27bc63..22fcf24fa 100644
+--- a/compel/src/lib/infect.c
++++ b/compel/src/lib/infect.c
+@@ -1054,6 +1054,16 @@ int compel_infect_no_daemon(struct parasite_ctl *ctl, unsigned long nr_threads,
+ 
+ 	memcpy(ctl->local_map, ctl->pblob.hdr.mem, ctl->pblob.hdr.bsize);
+ 	compel_relocs_apply(ctl->local_map, ctl->remote_map, &ctl->pblob);
++	/*
++	 * Ensure the infected thread sees the updated code.
++	 *
++	 * On architectures like ARM64, the Data Cache (D-cache) and
++	 * Instruction Cache (I-cache) are not automatically coherent.
++	 * Modifications land in the D-cache, so we must flush (clean) the
++	 * D-cache to push changes to RAM to ensure the CPU fetches the updated
++	 * instructions.
++	 */
++	__builtin___clear_cache(ctl->local_map, ctl->local_map + ctl->pblob.hdr.bsize);
+ 
+ 	p = parasite_size;
+ 
+-- 
+2.50.1
+
