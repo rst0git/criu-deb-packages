@@ -1,3 +1,9 @@
+criu (4.1.1-2ppa1.24.04) noble; urgency=medium
+
+  * Apply patches for aarch64
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Fri, 15 Aug 2025 09:28:40 +0100
+
 criu (4.1.1-1ppa1.24.04) noble; urgency=medium
 
   * Update to version 4.1.1
