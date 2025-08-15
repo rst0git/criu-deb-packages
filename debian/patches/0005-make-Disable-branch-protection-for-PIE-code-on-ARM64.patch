@@ -1,0 +1,38 @@
+From 5a4ac2b0fc39dd9b872bbfb95815067913dccff7 Mon Sep 17 00:00:00 2001
+From: Andrei Vagin <avagin@gmail.com>
+Date: Fri, 15 Aug 2025 01:44:01 +0000
+Subject: [PATCH] make: Disable branch-protection for PIE code on ARM64
+
+Branch protection uses PAC. It cryptographically "signs" a function's
+return address before it is stored on the stack. Upon return, the address
+is authenticated using a secret key. If the signature is invalid, the
+program will fault.
+
+The PIE code is used for the parasite and the restorer. In both cases, it
+runs in a foreign process. The case of the restorer is even trickier
+because it needs to restore the original PAC keys, which invalidates
+all previously "signed" pointers within the restorer itself.
+
+Fixes #2709
+
+Signed-off-by: Andrei Vagin <avagin@gmail.com>
+---
+ Makefile | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/Makefile b/Makefile
+index 5d8e89a..7272cfc 100644
+--- a/Makefile
++++ b/Makefile
+@@ -64,6 +64,8 @@ endif
+ 
+ ifeq ($(ARCH),aarch64)
+         DEFINES		:= -DCONFIG_AARCH64
++        CC_MBRANCH_PROT := $(shell $(CC) -c -x c /dev/null -mbranch-protection=none -o /dev/null >/dev/null 2>&1 && echo "-mbranch-protection=none")
++        CFLAGS_PIE	:= $(CC_MBRANCH_PROT)
+ endif
+ 
+ ifeq ($(ARCH),ppc64)
+-- 
+2.50.1
+
