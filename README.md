@@ -7,6 +7,7 @@ This repository contains all the files necessary to build the Ubuntu/Debian pack
 The following branches contain the source tree for each CRIU package:
 
 - [open-build-service](https://github.com/rst0git/criu-deb-packages/tree/open-build-service)
+- [launchpad-25.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-25.04)
 - [launchpad-24.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-24.04)
 - [launchpad-22.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-22.04)
 - [launchpad-20.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-20.04)
