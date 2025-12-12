@@ -1,5 +1,0 @@
-0001-aarch64-fix-build-with-missing-NT_ARM_PAC_ENABLED_KE.patch
-0002-aarch64-crtools-fix-define-for-missing-constants.patch
-0003-compel-flush-caches-after-parasite-injection.patch
-0004-restore-flush-caches-during-restore.patch
-0005-make-Disable-branch-protection-for-PIE-code-on-ARM64.patch
