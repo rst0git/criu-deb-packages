@@ -23,29 +23,37 @@
 #include "compel/infect.h"
 #include "pstree.h"
 
-#ifndef HWCAP_PACA
-/* Copied from linux: arch/arm64/include/uapi/asm/hwcap.h */
-#define HWCAP_PACA (1 << 30)
-
-/* Copied from linux: arch/arm64/include/uapi/asm/ptrace.h */
-/* pointer authentication keys (NT_ARM_PACA_KEYS, NT_ARM_PACG_KEYS) */
-struct user_pac_address_keys {
+/*
+ * cr_user_pac_* are a copy of the corresponding uapi structs
+ * in arch/arm64/include/uapi/asm/ptrace.h
+ */
+struct cr_user_pac_address_keys {
 	__uint128_t apiakey;
 	__uint128_t apibkey;
 	__uint128_t apdakey;
 	__uint128_t apdbkey;
 };
 
-struct user_pac_generic_keys {
+struct cr_user_pac_generic_keys {
 	__uint128_t apgakey;
 };
+
+/*
+ * The following HWCAP constants are copied from
+ * arch/arm64/include/uapi/asm/hwcap.h
+ */
+#ifndef HWCAP_PACA
+#define HWCAP_PACA (1 << 30)
 #endif
 
 #ifndef HWCAP_PACG
 #define HWCAP_PACG (1UL << 31)
 #endif
 
-/* Copied from linux: include/uapi/linux/elf.h */
+/*
+ * The following NT_ARM_PAC constants are copied from
+ * include/uapi/linux/elf.h
+ */
 #ifndef NT_ARM_PACA_KEYS
 #define NT_ARM_PACA_KEYS 0x407 /* ARM pointer authentication address keys */
 #endif
@@ -64,8 +72,8 @@ extern unsigned long getauxval(unsigned long type);
 
 static int save_pac_keys(int pid, CoreEntry *core)
 {
-	struct user_pac_address_keys paca;
-	struct user_pac_generic_keys pacg;
+	struct cr_user_pac_address_keys paca;
+	struct cr_user_pac_generic_keys pacg;
 	PacKeys *pac_entry;
 	long pac_enabled_key;
 	struct iovec iov;
@@ -259,8 +267,8 @@ int restore_gpregs(struct rt_sigframe *f, UserRegsEntry *r)
 int arch_ptrace_restore(int pid, struct pstree_item *item)
 {
 	unsigned long hwcaps = getauxval(AT_HWCAP);
-	struct user_pac_address_keys upaca;
-	struct user_pac_generic_keys upacg;
+	struct cr_user_pac_address_keys upaca;
+	struct cr_user_pac_generic_keys upacg;
 	PacAddressKeys *paca;
 	PacGenericKeys *pacg;
 	long pac_enabled_keys;

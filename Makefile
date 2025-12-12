@@ -43,7 +43,7 @@ ifeq ($(ARCH),arm)
         endif
 
         ifeq ($(ARMV),8)
-                # Running 'setarch linux32 uname -m' returns armv8l on travis aarch64.
+                # Running 'setarch linux32 uname -m' returns armv8l on aarch64.
                 # This tells CRIU to handle armv8l just as armv7hf. Right now this is
                 # only used for compile testing. No further verification of armv8l exists.
                 ARCHCFLAGS += -march=armv7-a
@@ -451,6 +451,10 @@ ruff:
 		test/zdtm.py \
 		test/inhfd/*.py \
 		test/others/rpc/config_file.py \
+		test/others/action-script/check_actions.py \
+		test/others/pycriu/*.py \
+		lib/pycriu/criu.py \
+		lib/pycriu/__init__.py \
 		lib/pycriu/images/pb2dict.py \
 		lib/pycriu/images/images.py \
 		scripts/criu-ns \
@@ -464,7 +468,8 @@ ruff:
 shellcheck:
 	shellcheck --version
 	shellcheck scripts/*.sh
-	shellcheck scripts/ci/*.sh scripts/ci/apt-install
+	shellcheck scripts/ci/*.sh
+	shellcheck contrib/apt-install contrib/dependencies/*.sh
 	shellcheck -x test/others/crit/*.sh
 	shellcheck -x test/others/libcriu/*.sh
 	shellcheck -x test/others/crit/*.sh test/others/criu-coredump/*.sh
@@ -487,7 +492,7 @@ lint: ruff shellcheck codespell
 	! git --no-pager grep -E '\s+$$' \*.c \*.h
 .PHONY: lint ruff shellcheck codespell
 
-codecov: SHELL := $(shell which bash)
+codecov: SHELL := $(shell command -v bash)
 codecov:
 	curl -Os https://uploader.codecov.io/latest/linux/codecov
 	chmod +x codecov
