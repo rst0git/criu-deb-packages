@@ -1,3 +1,9 @@
+criu (4.2-1ppa1.25.04) plucky; urgency=medium
+
+  * Create new package for 25.04
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Sat, 13 Dec 2025 08:44:05 +0900
+
 criu (4.2-1ppa1.24.04) noble; urgency=medium
 
   * Update to version 4.2
