@@ -25,7 +25,8 @@ override_dh_python3:
 clean:
 	@ echo CLEAN
 	rm -f ../$(upstreampck)
-	tar czf ../$(upstreampck) --exclude=.git --exclude=debian --exclude=.pc .
+	tar czf ../$(upstreampck) --exclude=.git --exclude=debian --exclude=.pc \
+		--exclude='criu-build-deps*' --exclude='*.buildinfo' --exclude='*.changes' .
 	dh_testdir
 	dh_auto_clean
 	dh_clean
