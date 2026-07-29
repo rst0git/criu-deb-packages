@@ -1,3 +1,9 @@
+criu (4.2.1-2) stable; urgency=medium
+
+  * Fix armhf builds on ARMv8 hosts by enabling the ARMv7 FPU.
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Wed, 29 Jul 2026 15:15:16 +0100
+
 criu (4.2.1-1) stable; urgency=medium
 
   * Update to new upstream version
