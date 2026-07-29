@@ -2,17 +2,37 @@
 
 This repository contains all the files necessary to build the Ubuntu/Debian packages for CRIU, published in the [Open Build Service](https://build.opensuse.org/project/show/devel:tools:criu) and [Launchpad](https://launchpad.net/~criu).
 
-# Git Branches
+## Git Branches
 
-The following branches contain the source tree for each CRIU package:
+Ubuntu release lifecycle dates are documented in the
+[official list of Ubuntu releases](https://ubuntu.com/project/docs/release-team/list-of-releases/).
+Debian release lifecycle dates are documented in the
+[official list of Debian releases](https://www.debian.org/releases/).
+The Launchpad categories below describe which Ubuntu branches this repository
+actively maintains.
 
-- [open-build-service](https://github.com/rst0git/criu-deb-packages/tree/open-build-service)
+### Maintained Launchpad Branches
+
+These branches receive package updates for currently maintained Ubuntu LTS releases:
+
 - [launchpad-26.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-26.04)
-- [launchpad-25.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-25.04)
 - [launchpad-24.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-24.04)
 - [launchpad-22.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-22.04)
+
+### Historical Launchpad Branches
+
+These branches are retained for older Ubuntu releases and do not receive new package updates:
+
+- [launchpad-25.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-25.04)
 - [launchpad-20.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-20.04)
 - [launchpad-18.04](https://github.com/rst0git/criu-deb-packages/tree/launchpad-18.04)
+
+### Debian Packages
+
+Debian packages are built from the
+[open-build-service](https://github.com/rst0git/criu-deb-packages/tree/open-build-service)
+branch for the distributions enabled in the
+[OBS project](https://build.opensuse.org/project/show/devel%3Atools%3Acriu).
 
 ## Building Source Packages for OBS
 
