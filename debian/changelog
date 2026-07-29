@@ -1,3 +1,11 @@
+criu (4.2.1-1ppa1.26.04) resolute; urgency=medium
+
+  * Create new package for 26.04
+  * Replace gnutls-dev with libgnutls28-dev.
+  * Replace pkg-config with pkgconf.
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Wed, 29 Jul 2026 14:03:08 +0100
+
 criu (4.2.1-1ppa1.24.04) noble; urgency=medium
 
   * Update to version 4.2.1
