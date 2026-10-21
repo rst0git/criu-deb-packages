@@ -1,5 +1,7 @@
 #!/usr/bin/make -f
 
+include /usr/share/dpkg/architecture.mk
+
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
 # Run pip install without internet access
@@ -7,6 +9,16 @@ export PIPFLAGS=--no-build-isolation --no-index --no-deps --progress-bar off --u
 
 # Enable installation of python packages
 export PIP_BREAK_SYSTEM_PACKAGES=1
+
+CRIU_MAKE_ARGS :=
+ifeq ($(DEB_HOST_ARCH),armhf)
+# ARMv8 workers report armv8l, where CRIU otherwise selects ARMv7
+# without an FPU.
+CRIU_MAKE_ARGS += ARCHCFLAGS=-march=armv7-a+fp
+
+override_dh_auto_build:
+	dh_auto_build -- $(CRIU_MAKE_ARGS)
+endif
 
 version := $(shell dpkg-parsechangelog -S Version | sed -rne 's,([^-\+]+)+(\+dfsg)*.*,\1,p'i)
 source := $(shell dpkg-parsechangelog -S Source)
@@ -23,7 +35,7 @@ override_dh_python3:
 	dh_python3 --no-ext-rename
 
 override_dh_auto_install:
-	dh_auto_install -- DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr" LIBEXECDIR="/usr/lib" PYTHON="python3"
+	dh_auto_install -- $(CRIU_MAKE_ARGS) DESTDIR="$(CURDIR)/debian/criu" PREFIX="/usr" LIBEXECDIR="/usr/lib" PYTHON="python3"
 	# Fix for pip 22.0.2 on Ubuntu 22.04
 	if [ -x "$(CURDIR)/debian/criu/usr/local/bin/crit" ]; then \
 		mkdir -p "$(CURDIR)/debian/criu/usr/bin/"; \
