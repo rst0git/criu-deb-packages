@@ -1,3 +1,11 @@
+criu (4.3-1ppa1.22.04) jammy; urgency=medium
+
+  * Update to version 4.3.
+  * Enable LZ4 memory compression and compressed-image support in CRIT.
+  * Fix armhf builds on ARMv8 hosts by enabling the ARMv7 FPU.
+
+ -- Radostin Stoyanov <rstoyanov@fedoraproject.org>  Wed, 21 Oct 2026 10:04:31 +0100
+
 criu (4.2.1-1ppa1.22.04) jammy; urgency=medium
 
   * Update to version 4.2.1
