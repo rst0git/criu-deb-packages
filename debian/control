@@ -7,6 +7,7 @@ Build-Depends:
  debhelper (>= 11),
  dh-python,
  libcap-dev,
+ liblz4-dev,
  libnet1-dev,
  libnl-3-dev,
  libprotobuf-c-dev,
@@ -19,6 +20,7 @@ Build-Depends:
  protobuf-c-compiler,
  protobuf-compiler,
  python3-all,
+ python3-lz4,
  python3-pip,
  python3-setuptools,
  python3-protobuf
@@ -31,6 +33,7 @@ Rules-Requires-Root: no
 Package: criu
 Architecture: amd64 arm64 armhf ppc64el s390x
 Depends:
+ python3-lz4,
  python3-protobuf,
  ${misc:Depends},
  ${python3:Depends},
