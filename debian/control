@@ -11,6 +11,7 @@ Build-Depends:
  libcap-dev,
  libgnutls28-dev,
  libgnutls30,
+ liblz4-dev,
  libnftables-dev,
  libnet1-dev,
  libnl-3-dev,
@@ -21,6 +22,7 @@ Build-Depends:
  protobuf-c-compiler,
  protobuf-compiler,
  python3-all,
+ python3-lz4,
  python3-pip,
  python3-setuptools,
  python3-protobuf
@@ -34,6 +36,7 @@ Package: criu
 Architecture: amd64 arm64 armhf ppc64el s390x
 Depends:
  libgnutls30,
+ python3-lz4,
  python3-protobuf,
  ${misc:Depends},
  ${python3:Depends},
